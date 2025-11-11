@@ -1,0 +1,13 @@
+{
+  "images_dir": "./sample_images",
+  "output_dir": "./logs",
+  "n": 10,
+  "duration": 0.5,
+  "isi": 0.2,
+  "bg": [128, 128, 128],
+  "seed": 42,
+  "fullscreen": false,
+  "win_size": [1024, 768],
+  "fixation_size": 48,
+  "image_size": [512, 512]
+}

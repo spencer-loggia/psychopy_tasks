@@ -1,0 +1,23 @@
+{
+  "shapes_tsv": "./task/shape_definitions.tsv",
+  "colors_tsv": "./task/test_color_definition.tsv",
+  "output_dir": "./logs",
+  "n": 20,
+  "duration": 0.75,
+  "isi": 0.5,
+  "bg": [128, 128, 128],
+  "seed": 42,
+  "fullscreen": true,
+  "win_size": [1920, 1080],
+  "fixation_size": 48,
+  "image_size": [54, 54],
+  "ibi": 1.0,
+  "num_afc": 4,
+  "choice_time": 3.0,
+  "dot_size": 10,
+  "dot_color": [155, 155, 155],
+  "init_dot_color": [100, 100, 100],
+  "margin": 200,
+  "stroke_width": 0.75,
+  "stoke_color": [0, 0, 0]
+}

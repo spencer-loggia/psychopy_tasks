@@ -1,6 +1,6 @@
 {
-  "shapes_tsv": "./task/shape_definitions.tsv",
-  "colors_tsv": "./task/test_color_definition.tsv",
+  "shapes_tsv": "./task/resources/shape_definitions.tsv",
+  "colors_tsv": "./task/resources/test_color_definition.tsv",
   "output_dir": "./logs",
   "n": 20,
   "duration": 0.75,
@@ -9,7 +9,8 @@
   "seed": 42,
   "fullscreen": true,
   "win_size": [1920, 1080],
-  "fixation_size": 48,
+  "fixation_size": 0,
+  "self_initiation": true,
   "image_size": [54, 54],
   "ibi": 1.0,
   "num_afc": 4,

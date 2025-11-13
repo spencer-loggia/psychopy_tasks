@@ -49,14 +49,16 @@ def parse_args():
     p.add_argument("--dot_size", type=int, default=None, help="Dot size in pixels")
     p.add_argument("--dot_color", type=int, nargs=3, default=None, help="Persistent dot RGB color 0-255")
     p.add_argument("--init_dot_color", type=int, nargs=3, default=None, help="Init pre-stimulus dot RGB color 0-255")
-    p.add_argument("--bg", type=int, nargs=3, default=(128, 128, 128), help="Background RGB (0-255)")
-    p.add_argument("--output_dir", default="./logs", help="Output dir for logs")
+    p.add_argument("--bg", type=int, nargs=3, default=None, help="Background RGB (0-255)")
+    p.add_argument("--output_dir", default=None, help="Output dir for logs")
     p.add_argument("--seed", type=int, default=None, help="Random seed")
-    p.add_argument("--fullscreen", action="store_true", help="Fullscreen")
+    p.add_argument("--fullscreen", action="store_true", default=None, help="Fullscreen")
     p.add_argument("--win_size", type=int, nargs=2, default=None, help="Window size when not fullscreen")
     p.add_argument("--image_size", type=int, nargs=2, default=None, help="Raster draw size (W H)")
     p.add_argument("--likelihood_tsv", help="Optional TSV file (color,shape,prob) defining color-shape probabilities")
-    p.add_argument("--debug", action="store_true", help="Enable debug outputs (write debug images to logs/)")
+    p.add_argument("--debug", action="store_true", default=None, help="Enable debug outputs (write debug images to logs/)")
+    p.add_argument("--self_initiation", action="store_true", default=None, help="Require participant to self-initiate each block by clicking an onset cue")
+    p.add_argument("--fixation_size", type=int, default=None, help="Fixation cross size in pixels; 0 disables fixation")
     return p.parse_args()
 
 
@@ -81,6 +83,8 @@ def run_task(
     margin: int = 50,
     debug: bool = False,
     likelihood_tsv: Optional[str] = None,
+    self_initiation: bool = False,
+    fixation_size: Optional[int] = None,
 ):
     # Set debug flag before rasterization if requested
     utils.set_debug(debug)
@@ -115,7 +119,6 @@ def run_task(
     def load_likelihood(path: Optional[str]):
         # returns numpy array shape (n_colors, m_shapes)
         if path is None:
-            # uniform default
             arr = np.ones((n_colors, m_shapes), dtype=float)
             total = float(arr.sum())
             msg_logger.log("WARN", f"No likelihood TSV provided; using uniform distribution (sum={total:.6f})")
@@ -172,17 +175,22 @@ def run_task(
 
     # Window + background + fixation
     win = utils.setup_window(bg_rgb_255=bg, fullscreen=fullscreen, size=win_size)
-    fix = utils.make_fixation_cross(win, size=32)
-    from psychopy import visual as _visual
-    bg_rect = _visual.Rect(
-        win,
-        width=win.size[0],
-        height=win.size[1],
-        fillColor=utils.rgb255_to_psychopy(bg),
-        fillColorSpace="rgb",
-        lineColor=None,
-        units="pix",
-    )
+    # determine fixation size (allow 0 to disable fixation). If caller
+    # didn't provide one, default to 32.
+    if fixation_size is None:
+        fixation_size = 32
+    fix = utils.make_fixation_cross(win, size=fixation_size)
+
+    # If self-initiation requested, build an onset cue ImageStim via utility
+    onset_stim = None
+    if self_initiation:
+        try:
+            onset_stim = utils.make_onset_cue_stim(win, bg_rgb_255=bg, size_frac=0.0625, cells=8, sigma_frac=0.22, zero_threshold=1)
+        except Exception:
+            onset_stim = None
+
+    # Create background rectangle via utility
+    bg_rect = utils.make_bg_rect(win, bg)
 
     logger = EventLogger(output_dir, filename="active_foraging_log.tsv")
     pylogging.console.setLevel(pylogging.CRITICAL)
@@ -215,17 +223,13 @@ def run_task(
             picks = np.random.choice(len(all_pairs), size=num_afc, replace=True, p=flat_probs)
         blocks.append([all_pairs[int(i)] for i in picks])
 
+    # Task start
+    logger.log("task_start", image_name="", notes=f"n_blocks={n_blocks} num_afc={num_afc}")
+
     for block_idx in range(1, n_blocks + 1):
         logger.log("block_start", image_name="", requested_duration_s=None, flip_time_psychopy_s=None, flip_time_perf_s=time.perf_counter(), end_time_perf_s=None, notes=f"block={block_idx}")
 
-        # Pre-block fixation cue
-        if isi and isi > 0:
-            bg_rect.draw()
-            fix.draw()
-            cue_flip = win.flip()
-            cue_perf = time.perf_counter()
-            logger.log("block_cue", image_name="", requested_duration_s=isi, flip_time_psychopy_s=cue_flip, flip_time_perf_s=cue_perf, end_time_perf_s=cue_perf + isi, notes=f"block={block_idx}")
-            core.wait(isi)
+        # No separate pre-block fixation/ISI wait: per-stimulus pre-dot ISI is handled inside the utility.
 
         block_paths = blocks[block_idx - 1]
 
@@ -259,6 +263,7 @@ def run_task(
             isi=isi,
             init_dot_color=init_dot_color,
             bg_rgb_255=bg,
+            onset_cue=onset_stim,
         )
         if aborted:
             return
@@ -289,6 +294,8 @@ def run_task(
 
         logger.log("block_end", image_name="", notes=f"block={block_idx}")
 
+    # Task end
+    logger.log("task_end", image_name="", notes="done")
     logger.close()
     try:
         msg_logger.close()
@@ -343,6 +350,7 @@ def main():
     image_size = tuple(_get("image_size", cfg.get("image_size", None))) if _get("image_size", None) else None
     margin = int(_get("margin", cfg.get("margin", 50)))
     debug = bool(_get("debug", cfg.get("debug", False)))
+    likelihood_tsv = _get("likelihood_tsv", cfg.get("likelihood_tsv", None))
     # stroke options were removed to match utils.rasterize_svg_with_color signature
 
     try:
@@ -366,7 +374,9 @@ def main():
             image_size=image_size,
             margin=margin,
             debug=debug,
-        
+            self_initiation=_get("self_initiation", cfg.get("self_initiation", False)),
+            fixation_size=_get("fixation_size", cfg.get("fixation_size", None)),
+            likelihood_tsv=likelihood_tsv,
         )
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)

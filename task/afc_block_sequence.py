@@ -53,15 +53,15 @@ def parse_args():
     p.add_argument("--isi", type=float, default=None, help="Pre-block fixation delay (seconds) before first stimulus)")
     p.add_argument("--dot_size", type=int, default=None, help="Dot size in pixels")
     p.add_argument("--dot_color", type=int, nargs=3, default=None, help="Dot RGB color 0-255")
-    p.add_argument("--bg", type=int, nargs=3, default=(128, 128, 128), help="Background RGB (0-255)")
+    p.add_argument("--bg", type=int, nargs=3, default=None, help="Background RGB (0-255)")
     p.add_argument("--margin", type=int, default=None, help="Margin from window edge in pixels (overrides default 50)")
-    p.add_argument("--output_dir", default="./logs", help="Output dir for logs")
+    p.add_argument("--output_dir", default=None, help="Output dir for logs")
     p.add_argument("--init_dot_color", type=int, nargs=3, default=None, help="Initial pre-stimulus dot RGB color 0-255")
     p.add_argument("--seed", type=int, default=None, help="Random seed")
-    p.add_argument("--fullscreen", action="store_true", help="Fullscreen")
+    p.add_argument("--fullscreen", action="store_true", default=None, help="Fullscreen")
     p.add_argument("--win_size", type=int, nargs=2, default=None, help="Window size when not fullscreen")
     p.add_argument("--image_size", type=int, nargs=2, default=None, help="Raster draw size (W H)")
-    p.add_argument("--debug", action="store_true", help="Enable debug outputs (write debug images to logs/)")
+    p.add_argument("--debug", action="store_true", default=None, help="Enable debug outputs (write debug images to logs/)")
     # svg_size removed; use --image_size for both rasters and SVG rasterization
     return p.parse_args()
 
@@ -109,16 +109,7 @@ def run_task(
     # Window + background + fixation
     win = utils.setup_window(bg_rgb_255=bg, fullscreen=fullscreen, size=win_size)
     fix = utils.make_fixation_cross(win, size=32)
-    from psychopy import visual as _visual
-    bg_rect = _visual.Rect(
-        win,
-        width=win.size[0],
-        height=win.size[1],
-        fillColor=utils.rgb255_to_psychopy(bg),
-        fillColorSpace="rgb",
-        lineColor=None,
-        units="pix",
-    )
+    bg_rect = utils.make_bg_rect(win, bg)
 
     # Prepare logger
     logger = EventLogger(output_dir, filename="afc_block_sequence_log.tsv")
@@ -127,6 +118,9 @@ def run_task(
     # Pre-sample blocks (each block samples `num_afc` unique stimuli without
     # replacement within the block). Blocks are independent.
     blocks = utils.sample_blocks(image_files, num_afc, n_blocks, seed=seed)
+
+    # Task start
+    logger.log("task_start", image_name="", notes=f"n_blocks={n_blocks} num_afc={num_afc}")
 
     # main block loop
     for block_idx in range(1, n_blocks + 1):
@@ -144,7 +138,8 @@ def run_task(
         # before the first stimulus of the block so the subject has a cue.
         if isi and isi > 0:
             bg_rect.draw()
-            fix.draw()
+            if fix is not None:
+                fix.draw()
             cue_flip = win.flip()
             cue_perf = time.perf_counter()
             logger.log(
@@ -247,6 +242,7 @@ def run_task(
         logger.log("block_end", image_name="", notes=f"block={block_idx}")
 
     # finished
+    logger.log("task_end", image_name="", notes="done")
     logger.close()
     win.close()
     core.quit()

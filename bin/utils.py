@@ -2,6 +2,10 @@
 Utility helpers for PsychoPy tasks (simplified).
 Robust transparency on all platforms by using RGB + alpha MASK for ImageStim.
 Also supports loading SVG by rasterizing to a requested pixel size (via cairosvg).
+
+Modularity helpers included:
+- make_bg_rect: create a full-window background rect in one call.
+- make_onset_cue_stim: build a checkerboard ImageStim with a centered 2D Gaussian alpha mask.
 """
 from pathlib import Path
 import random
@@ -70,7 +74,26 @@ def setup_window(
 
 
 def make_fixation_cross(win: visual.Window, size: int = 40, color: Tuple[int, int, int] = (0, 0, 0)):
+    # If size is zero or negative, return None to indicate no fixation should be shown.
+    if size is None or size <= 0:
+        return None
     return visual.TextStim(win, text="+", height=size, color=rgb255_to_psychopy(color), colorSpace="rgb")
+
+
+def make_bg_rect(win: visual.Window, bg_rgb_255: Tuple[int, int, int]):
+    """Create a full-window background rectangle in pixel units.
+
+    This avoids duplicating rectangle construction logic across tasks.
+    """
+    return visual.Rect(
+        win,
+        width=win.size[0],
+        height=win.size[1],
+        fillColor=rgb255_to_psychopy(bg_rgb_255),
+        fillColorSpace="rgb",
+        lineColor=None,
+        units="pix",
+    )
 
 
 def _to_pil_rgba(obj: Union[Image.Image, Path, np.ndarray]) -> Optional[Image.Image]:
@@ -357,8 +380,9 @@ def make_image_stim_from_array(
     """
     Create an ImageStim from PIL/Path/ndarray.
 
-    - If bg_rgb_255 is given, we pre-composite RGBA onto that solid color (no transparency).
-    - Otherwise we pass RGB + a 2D 0..1 mask, which is robust on macOS and elsewhere.
+        - If bg_rgb_255 is given, we pre-composite RGBA onto that solid color (no transparency).
+        - Otherwise we pass RGB + a 2D mask in the range [-1, 1] (PsychoPy convention),
+            which is robust on macOS and elsewhere.
     """
     pil = _to_pil_rgba(img_obj)
     if pil is None and isinstance(img_obj, Path) and img_obj.suffix.lower() in VECTOR_EXTS:
@@ -391,14 +415,70 @@ def make_image_stim_from_array(
         # prevent border smoothing artifacts
         return visual.ImageStim(win, image=rgb, size=size, units="pix", interpolate=False)
 
-    # Otherwise preserve transparency via RGB + 0..1 mask. Use no
-    # interpolation to avoid haloing on mask edges.
-    mask = np.asarray(a, dtype=np.float32) / 255.0  # H x W, 0..1
-    return visual.ImageStim(win, image=rgb, mask=mask, size=size, units="pix", interpolate=False)
+    # Otherwise preserve transparency via RGB + mask. PsychoPy expects masks in
+    # the range [-1, 1] where -1 is fully transparent and +1 is fully opaque.
+    # Convert the 8-bit alpha channel to that range to avoid unintended 50% opacity.
+    mask01 = np.asarray(a, dtype=np.float32) / 255.0  # H x W, 0..1
+    mask_pm1 = (mask01 * 2.0) - 1.0                  # H x W, -1..1
+    return visual.ImageStim(win, image=rgb, mask=mask_pm1, size=size, units="pix", interpolate=False)
 
 
 def clear_events():
     event.clearEvents()
+
+
+def make_onset_cue_stim(
+    win: visual.Window,
+    bg_rgb_255: Tuple[int, int, int],
+    size_frac: float = 0.0625,
+    cells: int = 8,
+    sigma_frac: float = 0.22,
+    zero_threshold: int = 1,
+):
+    """Create a checkerboard onset cue ImageStim with a centered 2D Gaussian alpha mask.
+
+    Parameters:
+    - size_frac: fraction of min(window size) for cue edge length
+    - cells: number of checkerboard cells per side
+    - sigma_frac: sigma expressed as a fraction of cue width
+    - zero_threshold: values <= this threshold in [0..255] are set to 0 in the mask
+    """
+    from PIL import Image, ImageDraw
+
+    w = int(max(4, min(win.size) * float(size_frac)))
+    if w <= 0:
+        w = 400
+
+    # Build checkerboard RGB on top of background color
+    cb = Image.new("RGB", (w, w), color=(int(bg_rgb_255[0]), int(bg_rgb_255[1]), int(bg_rgb_255[2])))
+    draw = ImageDraw.Draw(cb)
+    cell = max(2, w // int(cells))
+    for y in range(0, w, cell):
+        for x in range(0, w, cell):
+            xi = x // cell
+            yi = y // cell
+            fill = (0, 0, 0) if ((xi + yi) % 2 == 0) else (255, 255, 255)
+            draw.rectangle([x, y, x + cell - 1, y + cell - 1], fill=fill)
+
+    # 2D Gaussian mask centered at cue
+    cx = (w - 1) / 2.0
+    cy = (w - 1) / 2.0
+    sigma = max(2.0, w * float(sigma_frac))
+    yy, xx = np.mgrid[0:w, 0:w]
+    gauss = np.exp(-0.5 * (((xx - cx) / sigma) ** 2 + ((yy - cy) / sigma) ** 2))
+    mask_arr = np.clip(gauss * 255.0, 0, 255)
+    mask_u8 = mask_arr.astype(np.uint8)
+    if zero_threshold is not None and zero_threshold > 0:
+        mask_u8[mask_u8 <= int(zero_threshold)] = 0
+    cb.putalpha(Image.fromarray(mask_u8, mode="L"))
+
+    # Convert to ImageStim (preserve alpha; ImageStim builder will provide proper mask)
+    stim = make_image_stim_from_array(win, cb, size=(w, w), bg_rgb_255=None)
+    try:
+        stim.pos = (0, 0)
+    except Exception:
+        pass
+    return stim
 
 
 def present_block_with_persistent_dots(
@@ -417,6 +497,7 @@ def present_block_with_persistent_dots(
     isi: float = 0.0,
     init_dot_color: Optional[Tuple[int, int, int]] = None,
     bg_rgb_255: Optional[Tuple[int, int, int]] = None,
+    onset_cue: Optional[visual.ImageStim] = None,
 ):
     """Present stimuli one at a time, leave faint dots at their locations,
     show all dots for `choice_time`, then clear.
@@ -434,6 +515,78 @@ def present_block_with_persistent_dots(
 
     dots: List[visual.Circle] = []
     _visual = visual
+    stim_sizes: List[Tuple[float, float]] = []
+
+    # If an onset cue is provided, show it and wait for the participant to
+    # self-initiate by clicking/tapping the cue. The function will then fade
+    # the cue out and proceed to present stimuli. If the onset cue click
+    # triggers an abort (escape), return (True, None).
+    from psychopy import event as _event
+    mouse = _event.Mouse(win=win)
+
+    if onset_cue is not None:
+        # center onset cue by default
+        try:
+            onset_cue.pos = (0, 0)
+            # reset opacity in case previous block hid it
+            onset_cue.opacity = 1.0
+        except Exception:
+            pass
+        # show onset cue and wait for click inside its bounding box
+        bg_rect.draw()
+        onset_cue.draw()
+        if fix is not None:
+            fix.draw()
+        oc_flip = win.flip()
+        oc_perf = time.perf_counter()
+        logger.log(
+            "onset_cue_shown",
+            image_name="onset_cue",
+            requested_duration_s=None,
+            flip_time_psychopy_s=oc_flip,
+            flip_time_perf_s=oc_perf,
+            end_time_perf_s=None,
+            notes=f"block={block_idx}",
+        )
+
+        # wait for click within onset cue
+        onset_start = time.perf_counter()
+        while True:
+            if _event.getKeys(["escape"]):
+                logger.log("abort", image_name="", notes="escape_pressed")
+                win.close()
+                _core.quit()
+                return True, None
+
+            buttons = mouse.getPressed()
+            if any(buttons):
+                click_pos = mouse.getPos()
+                # determine bounding box from onset_cue.size and pos
+                try:
+                    oc_w, oc_h = onset_cue.size
+                except Exception:
+                    oc_w, oc_h = (200, 200)
+                oc_x, oc_y = getattr(onset_cue, "pos", (0, 0))
+                if abs(click_pos[0] - oc_x) <= oc_w / 2.0 and abs(click_pos[1] - oc_y) <= oc_h / 2.0:
+                    click_perf = time.perf_counter()
+                    logger.log(
+                        "onset_cue_clicked",
+                        image_name="onset_cue",
+                        requested_duration_s=None,
+                        flip_time_psychopy_s=None,
+                        flip_time_perf_s=click_perf,
+                        end_time_perf_s=None,
+                        notes=f"block={block_idx} click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f})",
+                    )
+                    # Immediately dismiss onset cue (no fade)
+                    try:
+                        onset_cue.opacity = 0.0
+                    except Exception:
+                        pass
+                    break
+
+            _core.wait(0.01)
+
 
     for idx, (p, pos) in enumerate(zip(block_paths, positions), start=1):
         # support two kinds of block items:
@@ -451,6 +604,11 @@ def present_block_with_persistent_dots(
             pil_img = preloaded[p]
         stim = make_image_stim_from_array(win, pil_img, size=None, bg_rgb_255=bg_rgb_255)
         stim.pos = pos
+        # record stimulus pixel size for click hit-testing later
+        try:
+            stim_sizes.append(tuple(stim.size))
+        except Exception:
+            stim_sizes.append((0.0, 0.0))
         # Optionally show the dot for `isi` seconds before the stimulus
         # appears. We create the dot first (so it persists) and draw it along
         # with existing dots, then wait `isi` seconds before showing the stim.
@@ -472,7 +630,8 @@ def present_block_with_persistent_dots(
             bg_rect.draw()
             for d in dots:
                 d.draw()
-            fix.draw()
+            if fix is not None:
+                fix.draw()
             dot_flip = win.flip()
             dot_perf = time.perf_counter()
             logger.log(
@@ -491,7 +650,8 @@ def present_block_with_persistent_dots(
         for d in dots:
             d.draw()
         stim.draw()
-        fix.draw()
+        if fix is not None:
+            fix.draw()
         flip_ps = win.flip()
         flip_perf = time.perf_counter()
         logger.log(
@@ -517,7 +677,8 @@ def present_block_with_persistent_dots(
         bg_rect.draw()
         for d in dots:
             d.draw()
-        fix.draw()
+        if fix is not None:
+            fix.draw()
         off_perf = time.perf_counter()
         win.flip()
         logger.log(
@@ -553,7 +714,8 @@ def present_block_with_persistent_dots(
     bg_rect.draw()
     for d in dots:
         d.draw()
-    fix.draw()
+    if fix is not None:
+        fix.draw()
     choice_flip = win.flip()
     choice_perf = time.perf_counter()
     logger.log(
@@ -566,16 +728,8 @@ def present_block_with_persistent_dots(
         notes=f"block={block_idx}",
     )
 
-    # helper: compute hit test radius (half of smallest stim dimension or a minimum)
-    try:
-        min_dim = min((d.radius * 2.0) for d in dots) if dots else None
-    except Exception:
-        min_dim = None
-    if min_dim is None or min_dim <= 0:
-        # fallback: use 64 pixels or half of the first stimulus size if available
-        hit_radius = 64.0
-    else:
-        hit_radius = max(24.0, min_dim / 2.0)
+    # Note: click hitboxes are based on stimulus size (not the dot size).
+    # We'll compute per-stim hit radius later when a click candidate is found.
 
     # convert draw positions to a list for easy indexing
     pos_list = list(positions)
@@ -588,7 +742,8 @@ def present_block_with_persistent_dots(
         bg_rect.draw()
         for d in dots:
             d.draw()
-        fix.draw()
+        if fix is not None:
+            fix.draw()
         win.flip()
 
         # check for escape abort
@@ -614,27 +769,34 @@ def present_block_with_persistent_dots(
                     best_dist = dist
                     chosen_idx = i
 
-            if best_dist is not None and best_dist <= hit_radius:
-                # register the choice (1-based index)
-                choice_time_perf = time.perf_counter()
-                chosen_info = {
-                    "chosen_index": int(chosen_idx),
-                    "chosen_pos": tuple(pos_list[chosen_idx - 1]),
-                    "choice_time_perf_s": float(choice_time_perf),
-                    "choice_time_psychopy_s": None,
-                    "notes": f"block={block_idx}",
-                }
-                logger.log(
-                    "choice_made",
-                    image_name=getattr(block_paths[chosen_idx - 1], "name", str(block_paths[chosen_idx - 1])),
-                    requested_duration_s=None,
-                    flip_time_psychopy_s=None,
-                    flip_time_perf_s=choice_time_perf,
-                    end_time_perf_s=None,
-                    notes=f"block={block_idx} idx={chosen_idx} dist={best_dist:.1f} click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f})",
-                )
-                choice_made = True
-                break
+            if best_dist is not None:
+                # determine hit radius based on the chosen stimulus native size
+                try:
+                    w, h = stim_sizes[chosen_idx - 1]
+                    candidate_radius = max(24.0, min(w, h) / 2.0)
+                except Exception:
+                    candidate_radius = 64.0
+                if best_dist <= candidate_radius:
+                    # register the choice (1-based index)
+                    choice_time_perf = time.perf_counter()
+                    chosen_info = {
+                        "chosen_index": int(chosen_idx),
+                        "chosen_pos": tuple(pos_list[chosen_idx - 1]),
+                        "choice_time_perf_s": float(choice_time_perf),
+                        "choice_time_psychopy_s": None,
+                        "notes": f"block={block_idx}",
+                    }
+                    logger.log(
+                        "choice_made",
+                        image_name=getattr(block_paths[chosen_idx - 1], "name", str(block_paths[chosen_idx - 1])),
+                        requested_duration_s=None,
+                        flip_time_psychopy_s=None,
+                        flip_time_perf_s=choice_time_perf,
+                        end_time_perf_s=None,
+                        notes=f"block={block_idx} idx={chosen_idx} dist={best_dist:.1f} click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f})",
+                    )
+                    choice_made = True
+                    break
 
         # no click: check timeout
         if elapsed >= choice_time:
@@ -647,7 +809,8 @@ def present_block_with_persistent_dots(
 
     # clear dots
     bg_rect.draw()
-    fix.draw()
+    if fix is not None:
+        fix.draw()
     win.flip()
 
     return False, chosen_info

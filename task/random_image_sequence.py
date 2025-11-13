@@ -36,17 +36,17 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Random image sequence task with preloading (raster + SVG)")
     parser.add_argument("--config", help="Path to JSON config file. If provided, CLI args override config keys.")
     parser.add_argument("--images_dir", required=False, help="Path to image resources directory")
-    parser.add_argument("--n", type=int, default=10, help="Number of images to display")
+    parser.add_argument("--n", type=int, default=None, help="Number of images to display")
     parser.add_argument("--duration", type=float, required=False, help="Display duration for each image (seconds)")
-    parser.add_argument("--bg", type=int, nargs=3, default=(128, 128, 128), help="Background gray RGB (3 ints 0-255)")
-    parser.add_argument("--output_dir", required=False, help="Directory to save event logs")
+    parser.add_argument("--bg", type=int, nargs=3, default=None, help="Background gray RGB (3 ints 0-255)")
+    parser.add_argument("--output_dir", required=False, default=None, help="Directory to save event logs")
     parser.add_argument("--seed", type=int, default=None, help="Random seed (optional)")
-    parser.add_argument("--fullscreen", action="store_true", help="Run fullscreen")
+    parser.add_argument("--fullscreen", action="store_true", default=None, help="Run fullscreen")
     parser.add_argument("--win_size", type=int, nargs=2, default=None, help="Window size when not fullscreen, e.g. --win_size 1024 768")
-    parser.add_argument("--fixation_size", type=int, default=40, help="Fixation cross size (px)")
+    parser.add_argument("--fixation_size", type=int, default=None, help="Fixation cross size (px)")
     parser.add_argument("--image_size", type=int, nargs=2, default=None, help="Raster image draw size (W H) in pixels (also used to resize preloaded rasters)")
     # svg_size removed; use --image_size for both rasters and SVG rasterization
-    parser.add_argument("--debug", action="store_true", help="Enable debug outputs (write debug images to logs/)")
+    parser.add_argument("--debug", action="store_true", default=None, help="Enable debug outputs (write debug images to logs/)")
     parser.add_argument("--isi", type=float, default=None, help="Inter-stimulus interval in seconds (fixation visible). If omitted, value from --config is used.")
     return parser.parse_args()
 
@@ -91,16 +91,7 @@ def run_task(
     # Create a full-window background patch so we can reliably show a solid
     # background during ISI periods (some backends may retain previous
     # textures if nothing is drawn).
-    from psychopy import visual as _visual
-    bg_rect = _visual.Rect(
-        win,
-        width=win.size[0],
-        height=win.size[1],
-        fillColor=utils.rgb255_to_psychopy(bg),
-        fillColorSpace="rgb",
-        lineColor=None,
-        units="pix",
-    )
+    bg_rect = utils.make_bg_rect(win, bg)
 
     # Logger & quiet console
     logger = EventLogger(output_dir, filename="image_sequence_log.tsv")
@@ -125,7 +116,8 @@ def run_task(
     # stim(duration) -> gray(ISI) -> stim(duration) ...
     if isi and isi > 0:
         bg_rect.draw()
-        fix.draw()
+        if fix is not None:
+            fix.draw()
         isi_flip_ps = win.flip()
         isi_perf = time.perf_counter()
         logger.log(
@@ -139,10 +131,14 @@ def run_task(
         )
         core.wait(isi)
 
+    # Task start
+    logger.log("task_start", image_name="", notes=f"n={n}")
+
     # Main loop
     for idx, (img_name, stim) in enumerate(image_stims, start=1):
         stim.draw()
-        fix.draw()  # fixation on top
+        if fix is not None:
+            fix.draw()  # fixation on top
         flip_time_ps = win.flip()
         flip_time_perf = time.perf_counter()
         logger.log(
@@ -162,7 +158,8 @@ def run_task(
         # a full-window rect of the background color, draw fixation, and
         # flip that.
         bg_rect.draw()
-        fix.draw()
+        if fix is not None:
+            fix.draw()
         win.flip()
         end_time_perf = time.perf_counter()
         logger.log(
@@ -183,7 +180,8 @@ def run_task(
             break
 
     # Final fixation and cleanup
-    fix.draw()
+    if fix is not None:
+        fix.draw()
     final_flip_ps = win.flip()
     final_perf = time.perf_counter()
     logger.log("fixation_post_start", image_name="", requested_duration_s=1.0,
@@ -191,6 +189,7 @@ def run_task(
                end_time_perf_s=final_perf + 1.0, notes="post-sequence fixation")
     core.wait(1.0)
 
+    logger.log("task_end", image_name="", notes="done")
     logger.close()
     win.close()
     core.quit()
@@ -224,19 +223,19 @@ def main():
 
     try:
         run_task(
-            images_dir=_get("images_dir", args.images_dir),
-            n=int(_get("n", args.n)),
-            duration=float(_get("duration", args.duration)),
-            bg=tuple(_get("bg", args.bg)),
-            output_dir=_get("output_dir", args.output_dir),
-            seed=_get("seed", args.seed),
-            fullscreen=bool(_get("fullscreen", args.fullscreen)),
-            win_size=tuple(_get("win_size", tuple(args.win_size) if args.win_size else None)) if _get("win_size", None) else None,
-            fixation_size=int(_get("fixation_size", args.fixation_size)),
-            image_size=tuple(_get("image_size", tuple(args.image_size) if args.image_size else None)) if _get("image_size", None) else None,
-            svg_size=tuple(_get("svg_size", tuple(args.svg_size) if args.svg_size else None)) if _get("svg_size", None) else None,
-            isi=float(_get("isi", args.isi if hasattr(args, "isi") else 0.0)),
-               debug=args.debug,
+            images_dir=_get("images_dir", cfg.get("images_dir")),
+            n=int(_get("n", cfg.get("n", 10))),
+            duration=float(_get("duration", cfg.get("duration"))),
+            bg=tuple(_get("bg", cfg.get("bg", (128, 128, 128)))),
+            output_dir=_get("output_dir", cfg.get("output_dir", "./logs")),
+            seed=_get("seed", cfg.get("seed", None)),
+            fullscreen=bool(_get("fullscreen", cfg.get("fullscreen", False))),
+            win_size=tuple(_get("win_size", cfg.get("win_size", None))) if _get("win_size", None) else None,
+            fixation_size=int(_get("fixation_size", cfg.get("fixation_size", 40))),
+            image_size=tuple(_get("image_size", cfg.get("image_size", None))) if _get("image_size", None) else None,
+            svg_size=tuple(_get("svg_size", cfg.get("svg_size", None))) if _get("svg_size", None) else None,
+            isi=float(_get("isi", cfg.get("isi", 0.0))),
+            debug=bool(_get("debug", cfg.get("debug", False))),
         )
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)

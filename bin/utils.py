@@ -430,7 +430,7 @@ def clear_events():
 def make_onset_cue_stim(
     win: visual.Window,
     bg_rgb_255: Tuple[int, int, int],
-    size_frac: float = 0.0625,
+    size_frac: float = 0.125,
     cells: int = 8,
     sigma_frac: float = 0.22,
     zero_threshold: int = 1,

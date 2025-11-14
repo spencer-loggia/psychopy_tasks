@@ -185,7 +185,7 @@ def run_task(
     onset_stim = None
     if self_initiation:
         try:
-            onset_stim = utils.make_onset_cue_stim(win, bg_rgb_255=bg, size_frac=0.0625, cells=8, sigma_frac=0.22, zero_threshold=1)
+            onset_stim = utils.make_onset_cue_stim(win, bg_rgb_255=bg, size_frac=0.125, cells=8, sigma_frac=0.22, zero_threshold=1)
         except Exception:
             onset_stim = None
 
@@ -244,7 +244,11 @@ def run_task(
         positions = utils.clamp_positions(sampled_positions, stim_size, effective_win_size, margin=margin)
 
         for i, (spos, cpos) in enumerate(zip(sampled_positions, positions), start=1):
-            logger.log("position_assigned", image_name=str(block_paths[i - 1]), notes=f"sampled={spos} clamped={cpos} block={block_idx} idx={i}")
+            # Non-task diagnostic message: use MessageLogger instead of EventLogger
+            try:
+                msg_logger.log("INFO", f"position_assigned block={block_idx} idx={i} sampled={spos} clamped={cpos}")
+            except Exception:
+                pass
 
         # Present this block and handle the single choice using shared utility.
         aborted, choice_info = utils.present_block_with_persistent_dots(
@@ -268,22 +272,8 @@ def run_task(
         if aborted:
             return
 
-        # canonical choice logging
-        if choice_info is None:
-            logger.log("no_choice", image_name="", notes=f"block={block_idx}")
-        else:
-            ci = choice_info
-            sid, cid = block_paths[ci["chosen_index"] - 1]
-            img_name = f"shape{sid}_color{cid}"
-            logger.log(
-                "choice_registered",
-                image_name=img_name,
-                requested_duration_s=None,
-                flip_time_psychopy_s=None,
-                flip_time_perf_s=ci.get("choice_time_perf_s"),
-                end_time_perf_s=None,
-                notes=f"block={block_idx} idx={ci.get('chosen_index')} click_xy={ci.get('chosen_pos')}",
-            )
+        # Choice events are already logged inside the utility (choice_made/choice_end);
+        # avoid redundant event rows here.
 
         # ibi
         if ibi and ibi > 0:

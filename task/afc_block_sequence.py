@@ -37,7 +37,7 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from bin import utils
-from bin.logger import EventLogger
+from bin.logger import EventLogger, MessageLogger
 from bin.config import load_config, validate_config
 
 
@@ -62,6 +62,9 @@ def parse_args():
     p.add_argument("--win_size", type=int, nargs=2, default=None, help="Window size when not fullscreen")
     p.add_argument("--image_size", type=int, nargs=2, default=None, help="Raster draw size (W H)")
     p.add_argument("--debug", action="store_true", default=None, help="Enable debug outputs (write debug images to logs/)")
+    p.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate (Hz); skip auto-detection if provided")
+    p.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi GPIO LED pulses for onset cues")
+    p.add_argument("--raspi_pin", type=int, default=None, help="GPIO pin to use for raspi LED pulses (BCM numbering)")
     # svg_size removed; use --image_size for both rasters and SVG rasterization
     return p.parse_args()
 
@@ -89,6 +92,9 @@ def run_task(
     margin: int = 50,
     init_dot_color: Optional[Tuple[int, int, int]] = None,
     debug: bool = False,
+    refresh_rate: Optional[float] = None,
+    raspi: bool = False,
+    raspi_pin: int = 18,
 ):
     # Configure debug behavior before any rasterization
     utils.set_debug(debug)
@@ -111,9 +117,66 @@ def run_task(
     fix = utils.make_fixation_cross(win, size=32)
     bg_rect = utils.make_bg_rect(win, bg)
 
-    # Prepare logger
+    # Prepare loggers
     logger = EventLogger(output_dir, filename="afc_block_sequence_log.tsv")
+    msg_logger = MessageLogger(output_dir, filename="afc_block_sequence_message_log.tsv")
     pylogging.console.setLevel(pylogging.CRITICAL)
+
+    # Initialize pigpio if requested
+    pigpio_pi = None
+    if raspi:
+        try:
+            import pigpio as _pigpio
+
+            pigpio_pi = _pigpio.pi()
+            if getattr(pigpio_pi, "connected", None) is False:
+                try:
+                    pigpio_pi.stop()
+                except Exception:
+                    pass
+                pigpio_pi = None
+                msg_logger.log("WARN", "pigpio present but not connected; raspi disabled")
+        except Exception:
+            pigpio_pi = None
+            try:
+                msg_logger.log("WARN", "pigpio not available; raspi disabled")
+            except Exception:
+                pass
+
+    # Detect or override frame rate once per task
+    if refresh_rate is not None and float(refresh_rate) > 0:
+        fps = float(refresh_rate)
+        frame_dur = 1.0 / fps
+        try:
+            msg_logger.log("INFO", f"fps_override refresh_rate={fps:.6f}Hz frame_dur_s={frame_dur:.9f}")
+        except Exception:
+            pass
+    else:
+        fps, frame_dur = utils.detect_frame_rate(win, msg_logger=msg_logger)
+    # Log global quantization for task timing parameters
+    try:
+        def _q(seconds: float, at_least_one: bool = False):
+            frames = int(round(max(0.0, float(seconds)) * float(fps)))
+            if at_least_one:
+                frames = max(1, frames)
+            return frames, frames / float(fps)
+
+        dur_fr, dur_s = _q(duration, at_least_one=True)
+        isi_fr, isi_s = _q(isi, at_least_one=False)
+        ch_fr, ch_s = _q(choice_time, at_least_one=False)
+        ibi_fr, ibi_s = _q(ibi, at_least_one=False)
+        msg_logger.log(
+            "INFO",
+            (
+                f"timing_quantization_global fps={fps:.6f} frame_dur_s={frame_dur:.9f} "
+                f"duration={duration:.6f}s-> {dur_fr}fr({dur_s:.6f}s) "
+                f"isi={isi:.6f}s-> {isi_fr}fr({isi_s:.6f}s) "
+                f"choice_time={choice_time:.6f}s-> {ch_fr}fr({ch_s:.6f}s) "
+                f"ibi={ibi:.6f}s-> {ibi_fr}fr({ibi_s:.6f}s)"
+            ),
+        )
+    except Exception:
+        pass
 
     # Pre-sample blocks (each block samples `num_afc` unique stimuli without
     # replacement within the block). Blocks are independent.
@@ -178,11 +241,15 @@ def run_task(
 
         # Log sampled vs clamped positions for debugging (one row per assign).
         for i, (spos, cpos) in enumerate(zip(sampled_positions, positions), start=1):
-            logger.log(
-                "position_assigned",
-                image_name=block_paths[i - 1].name if i - 1 < len(block_paths) else "",
-                notes=f"sampled={spos} clamped={cpos} block={block_idx} idx={i}",
-            )
+            # Non-task diagnostic: log to message logger
+            try:
+                img = block_paths[i - 1].name if i - 1 < len(block_paths) else ""
+            except Exception:
+                img = ""
+            try:
+                msg_logger.log("INFO", f"position_assigned block={block_idx} idx={i} image={img} sampled={spos} clamped={cpos}")
+            except Exception:
+                pass
 
         # Present stimuli for this block using the shared utility which
         # draws stimuli one-at-a-time, leaves persistent dots, shows the
@@ -203,47 +270,55 @@ def run_task(
             isi=isi,
             init_dot_color=init_dot_color,
             bg_rgb_255=bg,
+            msg_logger=msg_logger,
+            fps=fps,
+            raspi=bool(raspi and pigpio_pi is not None),
+            pigpio_pi=pigpio_pi,
+            raspi_pin=raspi_pin,
         )
         if aborted:
             return
 
-        # Log the canonical single choice result for this block (one row)
-        if choice_info is None:
-            logger.log("no_choice", image_name="", notes=f"block={block_idx}")
-        else:
-            ci = choice_info
-            img_name = getattr(block_paths[ci["chosen_index"] - 1], "name", str(block_paths[ci["chosen_index"] - 1]))
-            click_xy = ci.get("chosen_pos")
-            logger.log(
-                "choice_registered",
-                image_name=img_name,
-                requested_duration_s=None,
-                flip_time_psychopy_s=None,
-                flip_time_perf_s=ci.get("choice_time_perf_s"),
-                end_time_perf_s=None,
-                notes=f"block={block_idx} idx={ci.get('chosen_index')} click_xy={click_xy}",
-            )
+        # Choice logging handled within utils.present_block_with_persistent_dots
 
-        # Inter-block interval
+        # Inter-block interval (frame-locked)
         if ibi and ibi > 0:
+            ibi_frames = int(round(float(ibi) * fps))
+            ibi_frames = max(0, ibi_frames)
+            ibi_s = ibi_frames / fps
+            try:
+                msg_logger.log("INFO", f"timing_quantization block={block_idx} ibi={ibi:.6f}s-> {ibi_frames}fr({ibi_s:.6f}s)")
+            except Exception:
+                pass
+            bg_rect.draw()
+            if fix is not None:
+                fix.draw()
             ibi_flip = win.flip()
             ibi_perf = time.perf_counter()
             logger.log(
                 "ibi_start",
                 image_name="",
-                requested_duration_s=ibi,
+                requested_duration_s=ibi_s,
                 flip_time_psychopy_s=ibi_flip,
                 flip_time_perf_s=ibi_perf,
-                end_time_perf_s=ibi_perf + ibi,
+                end_time_perf_s=ibi_perf + ibi_s,
                 notes=f"after_block={block_idx}",
             )
-            core.wait(ibi)
+            for _f in range(max(0, ibi_frames - 1)):
+                bg_rect.draw()
+                if fix is not None:
+                    fix.draw()
+                win.flip()
 
         logger.log("block_end", image_name="", notes=f"block={block_idx}")
 
     # finished
     logger.log("task_end", image_name="", notes="done")
     logger.close()
+    try:
+        msg_logger.close()
+    except Exception:
+        pass
     win.close()
     core.quit()
 
@@ -293,6 +368,9 @@ def main():
     win_size = tuple(_get("win_size", cfg.get("win_size", None))) if _get("win_size", None) else None
     image_size = tuple(_get("image_size", cfg.get("image_size", None))) if _get("image_size", None) else None
     svg_size = None
+    refresh_rate = _get("refresh_rate", cfg.get("refresh_rate", cfg.get("refrech_rate", None)))
+    raspi = _get("raspi", cfg.get("raspi", False))
+    raspi_pin = int(_get("raspi_pin", cfg.get("raspi_pin", 18)))
 
     try:
         run_task(
@@ -314,6 +392,9 @@ def main():
             win_size=win_size,
             image_size=image_size,
             svg_size=svg_size,
+            refresh_rate=refresh_rate,
+            raspi=_get("raspi", cfg.get("raspi", False)),
+            raspi_pin=_get("raspi_pin", cfg.get("raspi_pin", 18)),
         )
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)

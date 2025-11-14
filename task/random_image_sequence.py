@@ -28,7 +28,7 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from bin import utils
-from bin.logger import EventLogger
+from bin.logger import EventLogger, MessageLogger
 from bin.config import load_config, validate_config
 
 
@@ -48,6 +48,9 @@ def parse_args():
     # svg_size removed; use --image_size for both rasters and SVG rasterization
     parser.add_argument("--debug", action="store_true", default=None, help="Enable debug outputs (write debug images to logs/)")
     parser.add_argument("--isi", type=float, default=None, help="Inter-stimulus interval in seconds (fixation visible). If omitted, value from --config is used.")
+    parser.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate (Hz); skip auto-detection if provided")
+    parser.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi GPIO features (no-op if unused)")
+    parser.add_argument("--raspi_pin", type=int, default=None, help="GPIO pin to use for raspi features (BCM numbering)")
     return parser.parse_args()
 
 
@@ -65,6 +68,9 @@ def run_task(
     svg_size: Optional[Tuple[int, int]] = None,    # svg rasterization size
     isi: float = 0.0,
     debug: bool = False,
+    refresh_rate: Optional[float] = None,
+    raspi: bool = False,
+    raspi_pin: int = 18,
 ):
     # Enable or disable debug outputs (writing debug PNGs)
     utils.set_debug(debug)
@@ -93,9 +99,65 @@ def run_task(
     # textures if nothing is drawn).
     bg_rect = utils.make_bg_rect(win, bg)
 
-    # Logger & quiet console
+    # Loggers & quiet console
     logger = EventLogger(output_dir, filename="image_sequence_log.tsv")
+    msg_logger = MessageLogger(output_dir, filename="image_sequence_message_log.tsv")
     pylogging.console.setLevel(pylogging.CRITICAL)
+
+    # Initialize pigpio if requested (harmless if not used here)
+    pigpio_pi = None
+    if raspi:
+        try:
+            import pigpio as _pigpio
+
+            pigpio_pi = _pigpio.pi()
+            if getattr(pigpio_pi, "connected", None) is False:
+                try:
+                    pigpio_pi.stop()
+                except Exception:
+                    pass
+                pigpio_pi = None
+                msg_logger.log("WARN", "pigpio present but not connected; raspi disabled")
+        except Exception:
+            pigpio_pi = None
+            try:
+                msg_logger.log("WARN", "pigpio not available; raspi disabled")
+            except Exception:
+                pass
+
+    # Detect or override frame rate once per task
+    if refresh_rate is not None and float(refresh_rate) > 0:
+        fps = float(refresh_rate)
+        frame_dur = 1.0 / fps
+        try:
+            msg_logger.log("INFO", f"fps_override refresh_rate={fps:.6f}Hz frame_dur_s={frame_dur:.9f}")
+        except Exception:
+            pass
+    else:
+        fps, frame_dur = utils.detect_frame_rate(win, msg_logger=msg_logger)
+
+    # Global timing quantization
+    def _q(seconds: float, at_least_one: bool = False):
+        frames = int(round(max(0.0, float(seconds)) * float(fps)))
+        if at_least_one:
+            frames = max(1, frames)
+        return frames, frames / float(fps)
+
+    stim_frames, stim_s = _q(duration, at_least_one=True)
+    isi_frames, isi_s = _q(isi, at_least_one=False)
+    final_fix_frames, final_fix_s = _q(1.0, at_least_one=False)
+    try:
+        msg_logger.log(
+            "INFO",
+            (
+                f"timing_quantization_global fps={fps:.6f} frame_dur_s={frame_dur:.9f} "
+                f"duration={duration:.6f}s-> {stim_frames}fr({stim_s:.6f}s) "
+                f"isi={isi:.6f}s-> {isi_frames}fr({isi_s:.6f}s) "
+                f"final_fixation=1.000000s-> {final_fix_frames}fr({final_fix_s:.6f}s)"
+            ),
+        )
+    except Exception:
+        pass
 
     # Convert preloaded PIL images to ImageStim (do NOT pass bg_rgb_255: preserve transparency)
     image_stims = []
@@ -114,49 +176,55 @@ def run_task(
     # Pre-sequence ISI: show the gray background for `isi` seconds before the
     # first stimulus. This implements the requested sequence: gray(ISI) ->
     # stim(duration) -> gray(ISI) -> stim(duration) ...
-    if isi and isi > 0:
-        bg_rect.draw()
-        if fix is not None:
-            fix.draw()
-        isi_flip_ps = win.flip()
-        isi_perf = time.perf_counter()
-        logger.log(
-            "isi_start",
-            image_name="",
-            requested_duration_s=isi,
-            flip_time_psychopy_s=isi_flip_ps,
-            flip_time_perf_s=isi_perf,
-            end_time_perf_s=isi_perf + isi,
-            notes="pre-sequence ISI",
-        )
-        core.wait(isi)
+    if isi_frames > 0:
+        # Pre-sequence ISI for exactly isi_frames frames
+        first_flip = True
+        for _f in range(isi_frames):
+            bg_rect.draw()
+            if fix is not None:
+                fix.draw()
+            isi_flip_ps = win.flip()
+            if first_flip:
+                isi_perf = time.perf_counter()
+                logger.log(
+                    "isi_start",
+                    image_name="",
+                    requested_duration_s=isi_s,
+                    flip_time_psychopy_s=isi_flip_ps,
+                    flip_time_perf_s=isi_perf,
+                    end_time_perf_s=isi_perf + isi_s,
+                    notes="pre-sequence ISI",
+                )
+                first_flip = False
 
     # Task start
     logger.log("task_start", image_name="", notes=f"n={n}")
 
     # Main loop
     for idx, (img_name, stim) in enumerate(image_stims, start=1):
-        stim.draw()
-        if fix is not None:
-            fix.draw()  # fixation on top
-        flip_time_ps = win.flip()
-        flip_time_perf = time.perf_counter()
-        logger.log(
-            "image_on",
-            image_name=img_name,
-            requested_duration_s=duration,
-            flip_time_psychopy_s=flip_time_ps,
-            flip_time_perf_s=flip_time_perf,
-            end_time_perf_s=None,
-            notes=f"index={idx}",
-        )
-        core.wait(duration)
-
-        # Clear the screen to background (fixation on top) so the ISI shows
-        # the gray background with fixation. Some OpenGL backends won't
-        # clear previous textures when nothing is drawn, so explicitly draw
-        # a full-window rect of the background color, draw fixation, and
-        # flip that.
+        first_flip = True
+        for _f in range(stim_frames):
+            stim.draw()
+            if fix is not None:
+                fix.draw()  # fixation on top
+            flip_time_ps = win.flip()
+            if first_flip:
+                flip_time_perf = time.perf_counter()
+                logger.log(
+                    "image_on",
+                    image_name=img_name,
+                    requested_duration_s=stim_s,
+                    flip_time_psychopy_s=flip_time_ps,
+                    flip_time_perf_s=flip_time_perf,
+                    end_time_perf_s=None,
+                    notes=f"index={idx}",
+                )
+                first_flip = False
+            # Abort?
+            if event.getKeys(["escape"]):
+                logger.log("abort", image_name="", notes="escape_pressed")
+                break
+        # Clear the screen to background (fixation on top) and log image_off
         bg_rect.draw()
         if fix is not None:
             fix.draw()
@@ -165,15 +233,18 @@ def run_task(
         logger.log(
             "image_off",
             image_name=img_name,
-            requested_duration_s=duration,
+            requested_duration_s=stim_s,
             flip_time_psychopy_s=None,
             flip_time_perf_s=None,
             end_time_perf_s=end_time_perf,
             notes=f"index={idx}",
         )
-        if isi and isi > 0:
-            core.wait(isi)
-
+        # ISI between images
+        for _f in range(isi_frames):
+            bg_rect.draw()
+            if fix is not None:
+                fix.draw()
+            win.flip()
         # Abort?
         if event.getKeys(["escape"]):
             logger.log("abort", image_name="", notes="escape_pressed")
@@ -184,10 +255,15 @@ def run_task(
         fix.draw()
     final_flip_ps = win.flip()
     final_perf = time.perf_counter()
-    logger.log("fixation_post_start", image_name="", requested_duration_s=1.0,
+    # Frame-locked post-sequence fixation
+    logger.log("fixation_post_start", image_name="", requested_duration_s=final_fix_s,
                flip_time_psychopy_s=final_flip_ps, flip_time_perf_s=final_perf,
-               end_time_perf_s=final_perf + 1.0, notes="post-sequence fixation")
-    core.wait(1.0)
+               end_time_perf_s=final_perf + final_fix_s, notes="post-sequence fixation")
+    for _f in range(max(0, final_fix_frames - 1)):
+        if fix is not None:
+            fix.draw()
+        bg_rect.draw()
+        win.flip()
 
     logger.log("task_end", image_name="", notes="done")
     logger.close()
@@ -236,6 +312,9 @@ def main():
             svg_size=tuple(_get("svg_size", cfg.get("svg_size", None))) if _get("svg_size", None) else None,
             isi=float(_get("isi", cfg.get("isi", 0.0))),
             debug=bool(_get("debug", cfg.get("debug", False))),
+            refresh_rate=_get("refresh_rate", cfg.get("refresh_rate", cfg.get("refrech_rate", None))),
+            raspi=_get("raspi", cfg.get("raspi", False)),
+            raspi_pin=_get("raspi_pin", cfg.get("raspi_pin", 18)),
         )
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)

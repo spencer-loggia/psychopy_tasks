@@ -14,6 +14,7 @@ import io
 
 import numpy as np
 from PIL import Image
+import threading
 from psychopy import visual, event
 import time
 
@@ -71,6 +72,36 @@ def setup_window(
     if size is None:
         size = (1024, 768)
     return visual.Window(size=size, fullscr=False, **win_kwargs)
+
+
+def detect_frame_rate(win: visual.Window, msg_logger=None) -> Tuple[float, float]:
+    """Detect the display refresh rate and return (fps, frameDur_s).
+
+    Attempts to use Window.getActualFrameRate(); falls back to 60 Hz if unavailable.
+    Logs detection to the optional message logger.
+    """
+    fps = None
+    try:
+        fps = win.getActualFrameRate(nIdentical=20, nMaxFrames=120, nWarmUpFrames=10, threshold=1)
+        # getActualFrameRate may return a float; if it's nonsensical (<= 0), ignore.
+        if fps is not None and fps <= 0:
+            fps = None
+    except Exception:
+        fps = None
+    if fps is None:
+        fps = 60.0
+        if msg_logger is not None:
+            try:
+                msg_logger.log("WARN", f"Frame rate detection failed; using fallback fps={fps:.3f}")
+            except Exception:
+                pass
+    frame_dur = 1.0 / float(fps)
+    if msg_logger is not None:
+        try:
+            msg_logger.log("INFO", f"frame_timing fps={fps:.6f} frame_dur_s={frame_dur:.9f}")
+        except Exception:
+            pass
+    return float(fps), float(frame_dur)
 
 
 def make_fixation_cross(win: visual.Window, size: int = 40, color: Tuple[int, int, int] = (0, 0, 0)):
@@ -481,6 +512,38 @@ def make_onset_cue_stim(
     return stim
 
 
+def _send_led_pulse(pi, pin: int, duration_us: int):
+    """Send a precisely timed LED pulse using pigpio waves in a background thread.
+
+    This function will create a single wave with the requested duration (microseconds),
+    send it, wait for completion, then delete the wave. It swallows errors to avoid
+    disrupting the main presentation loop.
+    """
+    try:
+        import pigpio as _pigpio
+    except Exception:
+        return
+    try:
+        pi.set_mode(pin, _pigpio.OUTPUT)
+        on_mask = 1 << pin
+        pulse = _pigpio.pulse(on_mask, 0, int(duration_us))
+        pi.wave_clear()
+        pi.wave_add_generic([pulse])
+        wid = pi.wave_create()
+        if wid >= 0:
+            pi.wave_send_once(wid)
+            # wait for transmission to finish, then delete the wave
+            while pi.wave_tx_busy():
+                time.sleep(0.001)
+            try:
+                pi.wave_delete(wid)
+            except Exception:
+                pass
+    except Exception:
+        # ignore errors during pigpio operations
+        return
+
+
 def present_block_with_persistent_dots(
     win: visual.Window,
     preloaded: Dict[Union[Path, Tuple[int, int]], Image.Image],
@@ -498,6 +561,11 @@ def present_block_with_persistent_dots(
     init_dot_color: Optional[Tuple[int, int, int]] = None,
     bg_rgb_255: Optional[Tuple[int, int, int]] = None,
     onset_cue: Optional[visual.ImageStim] = None,
+    msg_logger=None,
+    fps: Optional[float] = None,
+    raspi: bool = False,
+    pigpio_pi=None,
+    raspi_pin: int = 18,
 ):
     """Present stimuli one at a time, leave faint dots at their locations,
     show all dots for `choice_time`, then clear.
@@ -516,6 +584,18 @@ def present_block_with_persistent_dots(
     dots: List[visual.Circle] = []
     _visual = visual
     stim_sizes: List[Tuple[float, float]] = []
+    # Establish frame timing
+    if fps is None:
+        fps, frame_dur = detect_frame_rate(win, msg_logger=msg_logger)
+    else:
+        frame_dur = 1.0 / float(fps)
+
+    def _q_to_frames(seconds: float, at_least_one: bool = True) -> Tuple[int, float]:
+        frames = int(round(max(0.0, float(seconds)) * float(fps)))
+        if at_least_one:
+            frames = max(1, frames)
+        actual_s = frames * frame_dur
+        return frames, actual_s
 
     # If an onset cue is provided, show it and wait for the participant to
     # self-initiate by clicking/tapping the cue. The function will then fade
@@ -549,6 +629,25 @@ def present_block_with_persistent_dots(
             notes=f"block={block_idx}",
         )
 
+        # If Raspberry Pi GPIO is requested, schedule a pulse aligned to this flip.
+        if raspi and pigpio_pi is not None:
+            try:
+                pulse_frames, pulse_s = _q_to_frames(0.25, at_least_one=True)
+                dur_us = int(round(pulse_s * 1e6))
+                threading.Thread(target=_send_led_pulse, args=(pigpio_pi, raspi_pin, dur_us), daemon=True).start()
+                if msg_logger is not None:
+                    try:
+                        msg_logger.log("INFO", f"raspi_pulse_scheduled block={block_idx} duration_s={pulse_s:.6f} dur_us={dur_us}")
+                    except Exception:
+                        pass
+            except Exception:
+                # don't let pigpio failures block the task
+                if msg_logger is not None:
+                    try:
+                        msg_logger.log("WARN", "raspi_pulse_failed_to_schedule")
+                    except Exception:
+                        pass
+
         # wait for click within onset cue
         onset_start = time.perf_counter()
         while True:
@@ -578,15 +677,43 @@ def present_block_with_persistent_dots(
                         end_time_perf_s=None,
                         notes=f"block={block_idx} click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f})",
                     )
-                    # Immediately dismiss onset cue (no fade)
-                    try:
-                        onset_cue.opacity = 0.0
-                    except Exception:
-                        pass
+                    # Remove onset cue on the next flip so we can tie a flip timestamp
+                    bg_rect.draw()
+                    if fix is not None:
+                        fix.draw()
+                    rem_flip = win.flip()
+                    rem_perf = time.perf_counter()
+                    logger.log(
+                        "onset_cue_removed",
+                        image_name="onset_cue",
+                        requested_duration_s=None,
+                        flip_time_psychopy_s=rem_flip,
+                        flip_time_perf_s=rem_perf,
+                        end_time_perf_s=None,
+                        notes=f"block={block_idx} click_to_flip_delay_s={(rem_perf - click_perf):.6f}",
+                    )
                     break
 
             _core.wait(0.01)
 
+
+    # Quantize durations to frames and log rounding in message logger
+    stim_frames, stim_s = _q_to_frames(duration, at_least_one=True)
+    isi_frames, isi_s = _q_to_frames(isi, at_least_one=False)
+    choice_frames, choice_s = _q_to_frames(choice_time, at_least_one=False)
+    if msg_logger is not None:
+        try:
+            msg_logger.log(
+                "INFO",
+                (
+                    f"timing_quantization block={block_idx} "
+                    f"stim_duration={duration:.6f}s-> {stim_frames}fr({stim_s:.6f}s) "
+                    f"isi={isi:.6f}s-> {isi_frames}fr({isi_s:.6f}s) "
+                    f"choice_time={choice_time:.6f}s-> {choice_frames}fr({choice_s:.6f}s)"
+                ),
+            )
+        except Exception:
+            pass
 
     for idx, (p, pos) in enumerate(zip(block_paths, positions), start=1):
         # support two kinds of block items:
@@ -612,7 +739,7 @@ def present_block_with_persistent_dots(
         # Optionally show the dot for `isi` seconds before the stimulus
         # appears. We create the dot first (so it persists) and draw it along
         # with existing dots, then wait `isi` seconds before showing the stim.
-        if isi and isi > 0:
+        if isi_frames > 0:
             # use init_dot_color if provided, otherwise fall back to dot_color
             cue_color = init_dot_color if init_dot_color is not None else dot_color
             dot = _visual.Circle(
@@ -626,45 +753,51 @@ def present_block_with_persistent_dots(
             dot.pos = pos
             dots.append(dot)
 
-            # draw background + all dots (including this new one) + fixation
+            # Pre-stimulus dot/cue for exactly isi_frames frames
+            first_flip = True
+            dot_on_perf = None
+            for _f in range(isi_frames if isi_frames > 0 else 0):
+                bg_rect.draw()
+                for d in dots:
+                    d.draw()
+                if fix is not None:
+                    fix.draw()
+                dot_flip = win.flip()
+                if first_flip:
+                    dot_on_perf = time.perf_counter()
+                    logger.log(
+                        "dot_on",
+                        image_name=name,
+                        requested_duration_s=isi_s,
+                        flip_time_psychopy_s=dot_flip,
+                        flip_time_perf_s=dot_on_perf,
+                        end_time_perf_s=(dot_on_perf + isi_s) if dot_on_perf is not None else None,
+                        notes=f"block={block_idx} idx={idx}",
+                    )
+                    first_flip = False
+
+        # Draw background, existing dots, then current stim and fixation
+        first_flip = True
+        for _f in range(stim_frames):
             bg_rect.draw()
             for d in dots:
                 d.draw()
+            stim.draw()
             if fix is not None:
                 fix.draw()
-            dot_flip = win.flip()
-            dot_perf = time.perf_counter()
-            logger.log(
-                "dot_on",
-                image_name=name,
-                requested_duration_s=isi,
-                flip_time_psychopy_s=dot_flip,
-                flip_time_perf_s=dot_perf,
-                end_time_perf_s=dot_perf + isi,
-                notes=f"block={block_idx} idx={idx}",
-            )
-            _core.wait(isi)
-
-        # Draw background, existing dots, then current stim and fixation
-        bg_rect.draw()
-        for d in dots:
-            d.draw()
-        stim.draw()
-        if fix is not None:
-            fix.draw()
-        flip_ps = win.flip()
-        flip_perf = time.perf_counter()
-        logger.log(
-            "stim_on",
-            image_name=name,
-            requested_duration_s=duration,
-            flip_time_psychopy_s=flip_ps,
-            flip_time_perf_s=flip_perf,
-            end_time_perf_s=None,
-            notes=f"block={block_idx} idx={idx}",
-        )
-
-        _core.wait(duration)
+            flip_ps = win.flip()
+            if first_flip:
+                flip_perf = time.perf_counter()
+                logger.log(
+                    "stim_on",
+                    image_name=name,
+                    requested_duration_s=stim_s,
+                    flip_time_psychopy_s=flip_ps,
+                    flip_time_perf_s=flip_perf,
+                    end_time_perf_s=None,
+                    notes=f"block={block_idx} idx={idx}",
+                )
+                first_flip = False
 
         # After stimulus, update the most recent dot's color to the persistent dot_color
         if dots:
@@ -684,7 +817,7 @@ def present_block_with_persistent_dots(
         logger.log(
             "stim_off",
             image_name=name,
-            requested_duration_s=duration,
+            requested_duration_s=stim_s,
             flip_time_psychopy_s=None,
             flip_time_perf_s=None,
             end_time_perf_s=off_perf,
@@ -710,7 +843,7 @@ def present_block_with_persistent_dots(
     choice_made = False
     chosen_info = None
 
-    # log choice start (no psychopy flip timestamp available for a mouse click; we record perf times)
+    # log choice start (frame-locked start)
     bg_rect.draw()
     for d in dots:
         d.draw()
@@ -721,10 +854,10 @@ def present_block_with_persistent_dots(
     logger.log(
         "choice_start",
         image_name="",
-        requested_duration_s=choice_time,
+        requested_duration_s=choice_s,
         flip_time_psychopy_s=choice_flip,
         flip_time_perf_s=choice_perf,
-        end_time_perf_s=choice_perf + choice_time,
+        end_time_perf_s=choice_perf + choice_s,
         notes=f"block={block_idx}",
     )
 
@@ -734,11 +867,12 @@ def present_block_with_persistent_dots(
     # convert draw positions to a list for easy indexing
     pos_list = list(positions)
 
-    while True:
-        now = time.perf_counter()
-        elapsed = now - start
-
-        # draw background, dots and fixation each frame so the display stays active
+    # frame-locked choice loop for exactly choice_frames frames unless a click happens
+    click_registered = False
+    click_perf_capture = None
+    click_meta = None
+    for _f in range(choice_frames if choice_frames > 0 else 0):
+        # draw frame
         bg_rect.draw()
         for d in dots:
             d.draw()
@@ -753,12 +887,11 @@ def present_block_with_persistent_dots(
             _core.quit()
             return True, None
 
-        # check for mouse clicks (any button)
+        # check for click between flips
         buttons = mouse.getPressed()
-        if any(buttons):
-            # get click position in window coordinates
+        if not click_registered and any(buttons):
             click_pos = mouse.getPos()
-            # find nearest stimulus position
+            # nearest stimulus position
             chosen_idx = None
             best_dist = None
             for i, ppos in enumerate(pos_list, start=1):
@@ -768,21 +901,18 @@ def present_block_with_persistent_dots(
                 if best_dist is None or dist < best_dist:
                     best_dist = dist
                     chosen_idx = i
-
             if best_dist is not None:
-                # determine hit radius based on the chosen stimulus native size
                 try:
                     w, h = stim_sizes[chosen_idx - 1]
                     candidate_radius = max(24.0, min(w, h) / 2.0)
                 except Exception:
                     candidate_radius = 64.0
                 if best_dist <= candidate_radius:
-                    # register the choice (1-based index)
-                    choice_time_perf = time.perf_counter()
+                    click_perf_capture = time.perf_counter()
                     chosen_info = {
                         "chosen_index": int(chosen_idx),
                         "chosen_pos": tuple(pos_list[chosen_idx - 1]),
-                        "choice_time_perf_s": float(choice_time_perf),
+                        "choice_time_perf_s": float(click_perf_capture),
                         "choice_time_psychopy_s": None,
                         "notes": f"block={block_idx}",
                     }
@@ -791,27 +921,48 @@ def present_block_with_persistent_dots(
                         image_name=getattr(block_paths[chosen_idx - 1], "name", str(block_paths[chosen_idx - 1])),
                         requested_duration_s=None,
                         flip_time_psychopy_s=None,
-                        flip_time_perf_s=choice_time_perf,
+                        flip_time_perf_s=click_perf_capture,
                         end_time_perf_s=None,
                         notes=f"block={block_idx} idx={chosen_idx} dist={best_dist:.1f} click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f})",
                     )
-                    choice_made = True
+                    click_meta = {"idx": chosen_idx}
+                    click_registered = True
                     break
 
-        # no click: check timeout
-        if elapsed >= choice_time:
-            # choice period ended without a valid selection
-            logger.log("choice_end", image_name="", notes=f"block={block_idx} no_choice")
-            break
-
-        # small sleep to avoid busy loop
-        _core.wait(0.01)
-
-    # clear dots
-    bg_rect.draw()
-    if fix is not None:
-        fix.draw()
-    win.flip()
+    if click_registered:
+        # Clear dots on the next flip and log the flip timestamp
+        bg_rect.draw()
+        if fix is not None:
+            fix.draw()
+        clr_flip = win.flip()
+        clr_perf = time.perf_counter()
+        logger.log(
+            "choice_cleared",
+            image_name="",
+            requested_duration_s=None,
+            flip_time_psychopy_s=clr_flip,
+            flip_time_perf_s=clr_perf,
+            end_time_perf_s=None,
+            notes=f"block={block_idx} idx={click_meta.get('idx') if click_meta else ''} click_to_flip_delay_s={(clr_perf - (click_perf_capture or clr_perf)):.6f}",
+        )
+    else:
+        # Timed out without a valid selection
+        logger.log("choice_end", image_name="", notes=f"block={block_idx} no_choice")
+        # Clear dots on the next flip and log
+        bg_rect.draw()
+        if fix is not None:
+            fix.draw()
+        clr_flip = win.flip()
+        clr_perf = time.perf_counter()
+        logger.log(
+            "choice_cleared",
+            image_name="",
+            requested_duration_s=None,
+            flip_time_psychopy_s=clr_flip,
+            flip_time_perf_s=clr_perf,
+            end_time_perf_s=None,
+            notes=f"block={block_idx} timeout_to_flip_delay_s={frame_dur:.6f}",
+        )
 
     return False, chosen_info
 

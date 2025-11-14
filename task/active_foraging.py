@@ -59,6 +59,9 @@ def parse_args():
     p.add_argument("--debug", action="store_true", default=None, help="Enable debug outputs (write debug images to logs/)")
     p.add_argument("--self_initiation", action="store_true", default=None, help="Require participant to self-initiate each block by clicking an onset cue")
     p.add_argument("--fixation_size", type=int, default=None, help="Fixation cross size in pixels; 0 disables fixation")
+    p.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate (Hz); skip auto-detection if provided")
+    p.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi GPIO LED pulses for onset cues")
+    p.add_argument("--raspi_pin", type=int, default=None, help="GPIO pin to use for raspi LED pulses (BCM numbering)")
     return p.parse_args()
 
 
@@ -85,6 +88,9 @@ def run_task(
     likelihood_tsv: Optional[str] = None,
     self_initiation: bool = False,
     fixation_size: Optional[int] = None,
+    refresh_rate: Optional[float] = None,
+    raspi: bool = False,
+    raspi_pin: int = 18,
 ):
     # Set debug flag before rasterization if requested
     utils.set_debug(debug)
@@ -175,6 +181,40 @@ def run_task(
 
     # Window + background + fixation
     win = utils.setup_window(bg_rgb_255=bg, fullscreen=fullscreen, size=win_size)
+    # Measure or override frame rate once per task
+    if refresh_rate is not None and float(refresh_rate) > 0:
+        fps = float(refresh_rate)
+        frame_dur = 1.0 / fps
+        try:
+            msg_logger.log("INFO", f"fps_override refresh_rate={fps:.6f}Hz frame_dur_s={frame_dur:.9f}")
+        except Exception:
+            pass
+    else:
+        fps, frame_dur = utils.detect_frame_rate(win, msg_logger=msg_logger)
+    try:
+        # Log global timing quantization once based on detected fps
+        def _q(seconds: float, at_least_one: bool = False):
+            frames = int(round(max(0.0, float(seconds)) * float(fps)))
+            if at_least_one:
+                frames = max(1, frames)
+            return frames, frames / float(fps)
+
+        dur_fr, dur_s = _q(duration, at_least_one=True)
+        isi_fr, isi_s = _q(isi, at_least_one=False)
+        ch_fr, ch_s = _q(choice_time, at_least_one=False)
+        ibi_fr, ibi_s = _q(ibi, at_least_one=False)
+        msg_logger.log(
+            "INFO",
+            (
+                f"timing_quantization_global fps={fps:.6f} frame_dur_s={frame_dur:.9f} "
+                f"duration={duration:.6f}s-> {dur_fr}fr({dur_s:.6f}s) "
+                f"isi={isi:.6f}s-> {isi_fr}fr({isi_s:.6f}s) "
+                f"choice_time={choice_time:.6f}s-> {ch_fr}fr({ch_s:.6f}s) "
+                f"ibi={ibi:.6f}s-> {ibi_fr}fr({ibi_s:.6f}s)"
+            ),
+        )
+    except Exception:
+        pass
     # determine fixation size (allow 0 to disable fixation). If caller
     # didn't provide one, default to 32.
     if fixation_size is None:
@@ -194,6 +234,29 @@ def run_task(
 
     logger = EventLogger(output_dir, filename="active_foraging_log.tsv")
     pylogging.console.setLevel(pylogging.CRITICAL)
+
+    # Initialize pigpio if requested; do not fail the task if pigpio is unavailable.
+    pigpio_pi = None
+    if raspi:
+        try:
+            import pigpio as _pigpio
+
+            pigpio_pi = _pigpio.pi()
+            # pigpio.pi() may return a connection object even when daemon isn't running;
+            # check for connected attribute if present.
+            if getattr(pigpio_pi, "connected", None) is False:
+                try:
+                    pigpio_pi.stop()
+                except Exception:
+                    pass
+                pigpio_pi = None
+                msg_logger.log("WARN", "pigpio present but not connected; raspi disabled")
+        except Exception:
+            pigpio_pi = None
+            try:
+                msg_logger.log("WARN", "pigpio not available; raspi disabled")
+            except Exception:
+                pass
 
     # Pre-sample blocks of pairs according to likelihood distribution
     # Build flat probability list in the same order as all_pairs
@@ -268,6 +331,11 @@ def run_task(
             init_dot_color=init_dot_color,
             bg_rgb_255=bg,
             onset_cue=onset_stim,
+            msg_logger=msg_logger,
+            fps=fps,
+            raspi=bool(raspi and pigpio_pi is not None),
+            pigpio_pi=pigpio_pi,
+            raspi_pin=raspi_pin,
         )
         if aborted:
             return
@@ -275,12 +343,28 @@ def run_task(
         # Choice events are already logged inside the utility (choice_made/choice_end);
         # avoid redundant event rows here.
 
-        # ibi
+        # ibi (frame-locked)
         if ibi and ibi > 0:
+            ibi_frames = int(round(float(ibi) * fps))
+            ibi_frames = max(0, ibi_frames)
+            ibi_s = ibi_frames / fps
+            try:
+                msg_logger.log("INFO", f"timing_quantization block={block_idx} ibi={ibi:.6f}s-> {ibi_frames}fr({ibi_s:.6f}s)")
+            except Exception:
+                pass
+            # initial flip
+            bg_rect.draw()
+            if fix is not None:
+                fix.draw()
             ibi_flip = win.flip()
             ibi_perf = time.perf_counter()
-            logger.log("ibi_start", image_name="", requested_duration_s=ibi, flip_time_psychopy_s=ibi_flip, flip_time_perf_s=ibi_perf, end_time_perf_s=ibi_perf + ibi, notes=f"after_block={block_idx}")
-            core.wait(ibi)
+            logger.log("ibi_start", image_name="", requested_duration_s=ibi_s, flip_time_psychopy_s=ibi_flip, flip_time_perf_s=ibi_perf, end_time_perf_s=ibi_perf + ibi_s, notes=f"after_block={block_idx}")
+            # remaining frames-1
+            for _f in range(max(0, ibi_frames - 1)):
+                bg_rect.draw()
+                if fix is not None:
+                    fix.draw()
+                win.flip()
 
         logger.log("block_end", image_name="", notes=f"block={block_idx}")
 
@@ -341,6 +425,10 @@ def main():
     margin = int(_get("margin", cfg.get("margin", 50)))
     debug = bool(_get("debug", cfg.get("debug", False)))
     likelihood_tsv = _get("likelihood_tsv", cfg.get("likelihood_tsv", None))
+    # Accept both 'refresh_rate' and the common misspelling 'refrech_rate' from config
+    refresh_rate = _get("refresh_rate", cfg.get("refresh_rate", cfg.get("refrech_rate", None)))
+    raspi = _get("raspi", cfg.get("raspi", False))
+    raspi_pin = int(_get("raspi_pin", cfg.get("raspi_pin", 18)))
     # stroke options were removed to match utils.rasterize_svg_with_color signature
 
     try:
@@ -367,6 +455,9 @@ def main():
             self_initiation=_get("self_initiation", cfg.get("self_initiation", False)),
             fixation_size=_get("fixation_size", cfg.get("fixation_size", None)),
             likelihood_tsv=likelihood_tsv,
+            refresh_rate=refresh_rate,
+            raspi=_get("raspi", cfg.get("raspi", False)),
+            raspi_pin=_get("raspi_pin", cfg.get("raspi_pin", 18)),
         )
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)

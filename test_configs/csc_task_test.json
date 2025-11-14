@@ -2,6 +2,7 @@
   "shapes_tsv": "./task/resources/shape_definitions.tsv",
   "colors_tsv": "./task/resources/test_color_definition.tsv",
   "output_dir": "./logs",
+  "refresh_rate": 120,
   "n": 20,
   "duration": 0.5,
   "isi": 0.25,

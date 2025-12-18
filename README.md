@@ -1,7 +1,5 @@
 # Random Image Sequence (PsychoPy scaffold)
 
-This scaffold presents randomly sampled images centered on a fixation cross, preloads images into RAM, and logs precise timestamps to TSV.
-
 Files added
 - `bin/`:
   - `__init__.py`
@@ -11,13 +9,6 @@ Files added
 - `task/`:
   - `random_image_sequence.py` (task runner)
 - `requirements.txt`
-
-Install
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
 
 Generate sample images (for quick testing)
 ```bash

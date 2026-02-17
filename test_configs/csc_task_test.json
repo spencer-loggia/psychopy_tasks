@@ -5,7 +5,7 @@
   "refresh_rate": 120,
   "n": 20,
   "duration": 0.5,
-  "isi": 0.25,
+  "isi": 0.0,
   "bg": [128, 128, 128],
   "seed": 42,
   "fullscreen": true,
@@ -14,12 +14,15 @@
   "self_initiation": true,
   "image_size": [200, 200],
   "ibi": 0.75,
-  "num_afc": 4,
+  "num_afc": 2,
   "choice_time": 2.0,
   "dot_size": 40,
   "dot_color": [155, 155, 155],
   "init_dot_color": [100, 100, 100],
   "margin": 200,
   "stroke_width": 0.75,
-  "stoke_color": [0, 0, 0]
+  "stoke_color": [0, 0, 0],
+  "fixed_positions": true,
+  "sequential": false,
+  "is_memory": false
 }

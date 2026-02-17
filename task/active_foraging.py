@@ -59,6 +59,10 @@ def parse_args():
     p.add_argument("--debug", action="store_true", default=None, help="Enable debug outputs (write debug images to logs/)")
     p.add_argument("--self_initiation", action="store_true", default=None, help="Require participant to self-initiate each block by clicking an onset cue")
     p.add_argument("--fixation_size", type=int, default=None, help="Fixation cross size in pixels; 0 disables fixation")
+    p.add_argument("--fixed_positions", action="store_true", default=None, help="Fix option positions to fixed locations (only supported for 2 or 4 options)")
+    p.add_argument("--position_spacing", type=int, default=None, help="Spacing (pixels) to use for fixed positions; ignored if --fixed_positions not set")
+    p.add_argument("--is_memory", action="store_true", default=None, help="If set, items are removed and replaced by dots for the choice period (memory task). If not set, config value or default True is used")
+    p.add_argument("--sequential", action="store_true", default=None, help="Present stimuli sequentially (one at a time). If not set, config value or default True is used")
     p.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate (Hz); skip auto-detection if provided")
     p.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi GPIO LED pulses for onset cues")
     p.add_argument("--raspi_pin", type=int, default=None, help="GPIO pin to use for raspi LED pulses (BCM numbering)")
@@ -91,6 +95,10 @@ def run_task(
     refresh_rate: Optional[float] = None,
     raspi: bool = False,
     raspi_pin: int = 18,
+    fixed_positions: bool = False,
+    position_spacing: Optional[int] = None,
+    sequential: bool = True,
+    is_memory: bool = True,
 ):
     # Set debug flag before rasterization if requested
     utils.set_debug(debug)
@@ -303,8 +311,24 @@ def run_task(
 
         effective_win_size = tuple(win_size) if win_size is not None else tuple(win.size)
 
-        sampled_positions = utils.sample_non_overlapping_positions(num_afc, stim_size, effective_win_size, margin=margin)
-        positions = utils.clamp_positions(sampled_positions, stim_size, effective_win_size, margin=margin)
+        # Determine positions: either fixed grid/left-right or randomly sampled non-overlapping
+        if fixed_positions:
+            # Only support 2 or 4 options for fixed layout
+            if num_afc not in (2, 4):
+                raise ValueError("fixed_positions only supported for num_afc == 2 or num_afc == 4")
+            # default spacing if not provided
+            spacing = int(position_spacing) if position_spacing is not None else 300
+            sampled_positions = []
+            if num_afc == 2:
+                # left and right of fixation along the horizontal axis
+                sampled_positions = [(-spacing, 0), (spacing, 0)]
+            else:
+                # four corners: one in each quadrant (x,y) combinations
+                sampled_positions = [(-spacing, spacing), (spacing, spacing), (-spacing, -spacing), (spacing, -spacing)]
+            positions = utils.clamp_positions(sampled_positions, stim_size, effective_win_size, margin=margin)
+        else:
+            sampled_positions = utils.sample_non_overlapping_positions(num_afc, stim_size, effective_win_size, margin=margin)
+            positions = utils.clamp_positions(sampled_positions, stim_size, effective_win_size, margin=margin)
 
         for i, (spos, cpos) in enumerate(zip(sampled_positions, positions), start=1):
             # Non-task diagnostic message: use MessageLogger instead of EventLogger
@@ -336,6 +360,8 @@ def run_task(
             raspi=bool(raspi and pigpio_pi is not None),
             pigpio_pi=pigpio_pi,
             raspi_pin=raspi_pin,
+            sequential=sequential,
+            is_memory=is_memory,
         )
         if aborted:
             return
@@ -429,6 +455,12 @@ def main():
     refresh_rate = _get("refresh_rate", cfg.get("refresh_rate", cfg.get("refrech_rate", None)))
     raspi = _get("raspi", cfg.get("raspi", False))
     raspi_pin = int(_get("raspi_pin", cfg.get("raspi_pin", 18)))
+    fixed_positions = bool(_get("fixed_positions", cfg.get("fixed_positions", False)))
+    # position_spacing may be omitted; leave as None to let run_task choose a default
+    pos_spacing_val = _get("position_spacing", cfg.get("position_spacing", None))
+    position_spacing = int(pos_spacing_val) if pos_spacing_val is not None else None
+    sequential = bool(_get("sequential", cfg.get("sequential", True)))
+    is_memory = bool(_get("is_memory", cfg.get("is_memory", True)))
     # stroke options were removed to match utils.rasterize_svg_with_color signature
 
     try:
@@ -458,6 +490,10 @@ def main():
             refresh_rate=refresh_rate,
             raspi=_get("raspi", cfg.get("raspi", False)),
             raspi_pin=_get("raspi_pin", cfg.get("raspi_pin", 18)),
+            fixed_positions=fixed_positions,
+            position_spacing=position_spacing,
+            sequential=sequential,
+            is_memory=is_memory,
         )
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)

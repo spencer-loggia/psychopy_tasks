@@ -566,6 +566,8 @@ def present_block_with_persistent_dots(
     raspi: bool = False,
     pigpio_pi=None,
     raspi_pin: int = 18,
+    sequential: bool = True,
+    is_memory: bool = True,
 ):
     """Present stimuli one at a time, leave faint dots at their locations,
     show all dots for `choice_time`, then clear.
@@ -584,6 +586,8 @@ def present_block_with_persistent_dots(
     dots: List[visual.Circle] = []
     _visual = visual
     stim_sizes: List[Tuple[float, float]] = []
+    # stims to potentially keep visible during the choice period when is_memory is False
+    stims_for_choice: List[visual.ImageStim] = []
     # Establish frame timing
     if fps is None:
         fps, frame_dur = detect_frame_rate(win, msg_logger=msg_logger)
@@ -715,45 +719,175 @@ def present_block_with_persistent_dots(
         except Exception:
             pass
 
-    for idx, (p, pos) in enumerate(zip(block_paths, positions), start=1):
-        # support two kinds of block items:
-        # - Path objects pointing to raster images (used by afc_block_sequence)
-        # - (shape_id, color_id) tuples used by active_foraging
-        if isinstance(p, tuple) and len(p) == 2:
-            sid, cid = p
-            name = f"shape{sid}_color{cid}"
-            pil_img = preloaded.get((sid, cid))
-            if pil_img is None:
-                # fall back to string key if user provided stringified keys
-                pil_img = preloaded.get(p)
-        else:
-            name = getattr(p, "name", str(p))
-            pil_img = preloaded[p]
-        stim = make_image_stim_from_array(win, pil_img, size=None, bg_rgb_255=bg_rgb_255)
-        stim.pos = pos
-        # record stimulus pixel size for click hit-testing later
-        try:
-            stim_sizes.append(tuple(stim.size))
-        except Exception:
-            stim_sizes.append((0.0, 0.0))
-        # Optionally show the dot for `isi` seconds before the stimulus
-        # appears. We create the dot first (so it persists) and draw it along
-        # with existing dots, then wait `isi` seconds before showing the stim.
-        if isi_frames > 0:
-            # use init_dot_color if provided, otherwise fall back to dot_color
-            cue_color = init_dot_color if init_dot_color is not None else dot_color
-            dot = _visual.Circle(
-                win,
-                radius=dot_size / 2.0,
-                fillColor=rgb255_to_psychopy(cue_color),
-                fillColorSpace="rgb",
-                lineColor=None,
-                units="pix",
-            )
-            dot.pos = pos
-            dots.append(dot)
+    # If sequential: original behavior (per-stimulus loop)
+    if sequential:
+        for idx, (p, pos) in enumerate(zip(block_paths, positions), start=1):
+            # support two kinds of block items:
+            # - Path objects pointing to raster images (used by afc_block_sequence)
+            # - (shape_id, color_id) tuples used by active_foraging
+            if isinstance(p, tuple) and len(p) == 2:
+                sid, cid = p
+                name = f"shape{sid}_color{cid}"
+                pil_img = preloaded.get((sid, cid))
+                if pil_img is None:
+                    # fall back to string key if user provided stringified keys
+                    pil_img = preloaded.get(p)
+            else:
+                name = getattr(p, "name", str(p))
+                pil_img = preloaded[p]
+            stim = make_image_stim_from_array(win, pil_img, size=None, bg_rgb_255=bg_rgb_255)
+            stim.pos = pos
+            # keep a reference in case we need to show the stimulus during choice (is_memory False)
+            stims_for_choice.append(stim)
+            # record stimulus pixel size for click hit-testing later
+            try:
+                stim_sizes.append(tuple(stim.size))
+            except Exception:
+                stim_sizes.append((0.0, 0.0))
+            # Optionally show the dot for `isi` seconds before the stimulus
+            # appears. We create the dot first (so it persists) and draw it along
+            # with existing dots, then wait `isi` seconds before showing the stim.
+            if isi_frames > 0:
+                # use init_dot_color if provided, otherwise fall back to dot_color
+                cue_color = init_dot_color if init_dot_color is not None else dot_color
+                dot = _visual.Circle(
+                    win,
+                    radius=dot_size / 2.0,
+                    fillColor=rgb255_to_psychopy(cue_color),
+                    fillColorSpace="rgb",
+                    lineColor=None,
+                    units="pix",
+                )
+                dot.pos = pos
+                dots.append(dot)
 
-            # Pre-stimulus dot/cue for exactly isi_frames frames
+                # Pre-stimulus dot/cue for exactly isi_frames frames
+                first_flip = True
+                dot_on_perf = None
+                for _f in range(isi_frames if isi_frames > 0 else 0):
+                    bg_rect.draw()
+                    for d in dots:
+                        d.draw()
+                    if fix is not None:
+                        fix.draw()
+                    dot_flip = win.flip()
+                    if first_flip:
+                        dot_on_perf = time.perf_counter()
+                        logger.log(
+                            "dot_on",
+                            image_name=name,
+                            requested_duration_s=isi_s,
+                            flip_time_psychopy_s=dot_flip,
+                            flip_time_perf_s=dot_on_perf,
+                            end_time_perf_s=(dot_on_perf + isi_s) if dot_on_perf is not None else None,
+                            notes=f"block={block_idx} idx={idx}",
+                        )
+                        first_flip = False
+
+            # Draw background, existing dots, then current stim and fixation
+            first_flip = True
+            for _f in range(stim_frames):
+                bg_rect.draw()
+                for d in dots:
+                    d.draw()
+                stim.draw()
+                if fix is not None:
+                    fix.draw()
+                flip_ps = win.flip()
+                if first_flip:
+                    flip_perf = time.perf_counter()
+                    logger.log(
+                        "stim_on",
+                        image_name=name,
+                        requested_duration_s=stim_s,
+                        flip_time_psychopy_s=flip_ps,
+                        flip_time_perf_s=flip_perf,
+                        end_time_perf_s=None,
+                        notes=f"block={block_idx} idx={idx}",
+                    )
+                    first_flip = False
+
+            # After stimulus: either persist a dot (memory task) or keep the stimulus visible
+            if dots and is_memory:
+                last_dot = dots[-1]
+                # set persistent color
+                last_dot.fillColor = rgb255_to_psychopy(dot_color)
+                last_dot.fillColorSpace = "rgb"
+            elif dots and not is_memory:
+                # remove the last pre-stimulus cue dot so it doesn't persist
+                try:
+                    dots.pop()
+                except Exception:
+                    pass
+
+            # draw background + either all dots or kept stimuli + fixation (so the correct cue remains visible)
+            bg_rect.draw()
+            if is_memory:
+                for d in dots:
+                    d.draw()
+            else:
+                for s in stims_for_choice:
+                    s.draw()
+            if fix is not None:
+                fix.draw()
+            off_perf = time.perf_counter()
+            win.flip()
+            logger.log(
+                "stim_off",
+                image_name=name,
+                requested_duration_s=stim_s,
+                flip_time_psychopy_s=None,
+                flip_time_perf_s=None,
+                end_time_perf_s=off_perf,
+                notes=f"block={block_idx} idx={idx}",
+            )
+
+            # small safety: check for abort
+            if event.getKeys(["escape"]):
+                logger.log("abort", image_name="", notes="escape_pressed")
+                win.close()
+                _core.quit()
+                return True, None
+
+        # After all stimuli in this block were shown, enter the choice period.
+    else:
+        # Non-sequential: present all items at once.
+        stims: List[visual.ImageStim] = []
+        names: List[str] = []
+        for idx, (p, pos) in enumerate(zip(block_paths, positions), start=1):
+            if isinstance(p, tuple) and len(p) == 2:
+                sid, cid = p
+                name = f"shape{sid}_color{cid}"
+                pil_img = preloaded.get((sid, cid))
+                if pil_img is None:
+                    pil_img = preloaded.get(p)
+            else:
+                name = getattr(p, "name", str(p))
+                pil_img = preloaded[p]
+            stim = make_image_stim_from_array(win, pil_img, size=None, bg_rgb_255=bg_rgb_255)
+            stim.pos = pos
+            stims.append(stim)
+            names.append(name)
+            try:
+                stim_sizes.append(tuple(stim.size))
+            except Exception:
+                stim_sizes.append((0.0, 0.0))
+
+        # Optionally show pre-stimulus dots for isi duration
+        if isi_frames > 0:
+            cue_color = init_dot_color if init_dot_color is not None else dot_color
+            for pos in positions:
+                dot = _visual.Circle(
+                    win,
+                    radius=dot_size / 2.0,
+                    fillColor=rgb255_to_psychopy(cue_color),
+                    fillColorSpace="rgb",
+                    lineColor=None,
+                    units="pix",
+                )
+                dot.pos = pos
+                dots.append(dot)
+
             first_flip = True
             dot_on_perf = None
             for _f in range(isi_frames if isi_frames > 0 else 0):
@@ -765,64 +899,76 @@ def present_block_with_persistent_dots(
                 dot_flip = win.flip()
                 if first_flip:
                     dot_on_perf = time.perf_counter()
-                    logger.log(
-                        "dot_on",
-                        image_name=name,
-                        requested_duration_s=isi_s,
-                        flip_time_psychopy_s=dot_flip,
-                        flip_time_perf_s=dot_on_perf,
-                        end_time_perf_s=(dot_on_perf + isi_s) if dot_on_perf is not None else None,
-                        notes=f"block={block_idx} idx={idx}",
-                    )
+                    # log dot_on for each stim
+                    for idx, name in enumerate(names, start=1):
+                        logger.log(
+                            "dot_on",
+                            image_name=name,
+                            requested_duration_s=isi_s,
+                            flip_time_psychopy_s=dot_flip,
+                            flip_time_perf_s=dot_on_perf,
+                            end_time_perf_s=(dot_on_perf + isi_s) if dot_on_perf is not None else None,
+                            notes=f"block={block_idx} idx={idx}",
+                        )
                     first_flip = False
 
-        # Draw background, existing dots, then current stim and fixation
+        # Show all stimuli simultaneously for stim_frames
         first_flip = True
         for _f in range(stim_frames):
             bg_rect.draw()
             for d in dots:
                 d.draw()
-            stim.draw()
+            for s in stims:
+                s.draw()
             if fix is not None:
                 fix.draw()
             flip_ps = win.flip()
             if first_flip:
                 flip_perf = time.perf_counter()
-                logger.log(
-                    "stim_on",
-                    image_name=name,
-                    requested_duration_s=stim_s,
-                    flip_time_psychopy_s=flip_ps,
-                    flip_time_perf_s=flip_perf,
-                    end_time_perf_s=None,
-                    notes=f"block={block_idx} idx={idx}",
-                )
+                for idx, name in enumerate(names, start=1):
+                    logger.log(
+                        "stim_on",
+                        image_name=name,
+                        requested_duration_s=stim_s,
+                        flip_time_psychopy_s=flip_ps,
+                        flip_time_perf_s=flip_perf,
+                        end_time_perf_s=None,
+                        notes=f"block={block_idx} idx={idx}",
+                    )
                 first_flip = False
 
-        # After stimulus, update the most recent dot's color to the persistent dot_color
-        if dots:
-            last_dot = dots[-1]
-            # set persistent color
-            last_dot.fillColor = rgb255_to_psychopy(dot_color)
-            last_dot.fillColorSpace = "rgb"
-
-        # draw background + all dots + fixation (so the dot remains visible)
-        bg_rect.draw()
-        for d in dots:
-            d.draw()
-        if fix is not None:
-            fix.draw()
-        off_perf = time.perf_counter()
-        win.flip()
-        logger.log(
-            "stim_off",
-            image_name=name,
-            requested_duration_s=stim_s,
-            flip_time_psychopy_s=None,
-            flip_time_perf_s=None,
-            end_time_perf_s=off_perf,
-            notes=f"block={block_idx} idx={idx}",
-        )
+        # After stimuli: either persist dots (memory) or keep stimuli visible
+        if is_memory:
+            for d in dots:
+                d.fillColor = rgb255_to_psychopy(dot_color)
+                d.fillColorSpace = "rgb"
+            # draw background + all dots + fixation and log stim_off for each
+            bg_rect.draw()
+            for d in dots:
+                d.draw()
+            if fix is not None:
+                fix.draw()
+            off_perf = time.perf_counter()
+            win.flip()
+        else:
+            # draw background + all kept stimuli + fixation and log stim_off for each
+            bg_rect.draw()
+            for s in stims:
+                s.draw()
+            if fix is not None:
+                fix.draw()
+            off_perf = time.perf_counter()
+            win.flip()
+        for idx, name in enumerate(names, start=1):
+            logger.log(
+                "stim_off",
+                image_name=name,
+                requested_duration_s=stim_s,
+                flip_time_psychopy_s=None,
+                flip_time_perf_s=None,
+                end_time_perf_s=off_perf,
+                notes=f"block={block_idx} idx={idx}",
+            )
 
         # small safety: check for abort
         if event.getKeys(["escape"]):
@@ -830,8 +976,6 @@ def present_block_with_persistent_dots(
             win.close()
             _core.quit()
             return True, None
-
-    # After all stimuli in this block were shown, enter the choice period.
     # We'll draw the dots and wait up to `choice_time` seconds, but poll for
     # mouse clicks so a choice can end the choice period immediately.
     from psychopy import event as _event
@@ -845,8 +989,13 @@ def present_block_with_persistent_dots(
 
     # log choice start (frame-locked start)
     bg_rect.draw()
-    for d in dots:
-        d.draw()
+    if is_memory:
+        for d in dots:
+            d.draw()
+    else:
+        # show stimuli as the cue during choice
+        for s in (stims_for_choice if sequential else stims):
+            s.draw()
     if fix is not None:
         fix.draw()
     choice_flip = win.flip()
@@ -874,8 +1023,12 @@ def present_block_with_persistent_dots(
     for _f in range(choice_frames if choice_frames > 0 else 0):
         # draw frame
         bg_rect.draw()
-        for d in dots:
-            d.draw()
+        if is_memory:
+            for d in dots:
+                d.draw()
+        else:
+            for s in (stims_for_choice if sequential else stims):
+                s.draw()
         if fix is not None:
             fix.draw()
         win.flip()
@@ -965,6 +1118,9 @@ def present_block_with_persistent_dots(
         )
 
     return False, chosen_info
+
+    # --- simultaneous (non-sequential) branch ---
+    # Note: unreachable when sequential branch returns; keep for clarity
 
 
 def sample_non_overlapping_positions(

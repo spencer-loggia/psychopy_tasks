@@ -520,6 +520,8 @@ def _send_led_pulse_immediate(chip, pin: int, duration_s: float):
     hardware-timed pulse to turn it off after the specified duration, ensuring
     microsecond-level precision without thread scheduling delays.
     
+    Uses tx_pulse from Python lgpio bindings (not gpio_tx_pulse from C API).
+    
     Raises exception if hardware timing is unavailable - does NOT fall back to
     software timing as that would not meet precision requirements.
     
@@ -538,10 +540,10 @@ def _send_led_pulse_immediate(chip, pin: int, duration_s: float):
     lgpio.gpio_write(chip, pin, 1)
     
     # Use hardware-timed pulse to turn it off after duration
-    # gpio_tx_pulse(chip, pin, on_micros, off_micros, offset_micros, cycles)
-    # We want: stay on for 0us more, then off for the duration, start immediately, 1 cycle
+    # tx_pulse(handle, gpio, pulse_on, pulse_off, pulse_offset=0, pulse_cycles=0)
+    # We want: turn off after duration_us (on=0, off=duration_us)
     duration_us = int(duration_s * 1_000_000)
-    result = lgpio.gpio_tx_pulse(chip, pin, 0, duration_us, 0, 1)
+    result = lgpio.tx_pulse(chip, pin, 0, duration_us, 0, 1)
     
     # Check if pulse was queued successfully
     if result < 0:

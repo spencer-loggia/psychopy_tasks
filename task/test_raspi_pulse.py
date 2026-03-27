@@ -47,9 +47,16 @@ def main():
         print(f"Pin {PIN} set HIGH at {time.strftime('%H:%M:%S.%f')[:-3]}")
 
         # Use hardware-timed pulse to turn off after duration
-        # gpio_tx_pulse(chip, pin, on_micros, off_micros, offset_micros, cycles)
+        # tx_pulse(handle, gpio, pulse_on, pulse_off, pulse_offset=0, pulse_cycles=0)
+        # pulse_on=0 means turn off immediately after current state
+        # pulse_off=duration means stay off for duration
+        # pulse_cycles=1 means execute once
         duration_us = int(PULSE_DURATION_S * 1_000_000)
-        lgpio.gpio_tx_pulse(chip, PIN, 0, duration_us, 0, 1)
+        result = lgpio.tx_pulse(chip, PIN, 0, duration_us, 0, 1)
+        
+        if result < 0:
+            raise RuntimeError(f"tx_pulse failed with error code {result}")
+            
         print(f"Hardware pulse scheduled for {duration_us} microseconds")
         
         # Wait for pulse to complete
@@ -72,9 +79,10 @@ def main():
         print(f"\nERROR: Hardware pulse failed: {e}")
         print("\nHardware-timed GPIO pulse is required for timing precision.")
         print("This may indicate:")
-        print("  - lgpio version does not support gpio_tx_pulse")
+        print("  - lgpio version does not support tx_pulse")
         print("  - Hardware PWM/timing features not available")
         print("  - Insufficient permissions")
+        print(f"  - Error details: {e}")
         print("\nPlease check your lgpio installation and hardware support.")
         try:
             lgpio.gpio_write(chip, PIN, 0)

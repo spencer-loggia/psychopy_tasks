@@ -513,46 +513,32 @@ def make_onset_cue_stim(
     return stim
 
 
-def _send_led_pulse_immediate(chip, pin: int, duration_s: float):
-    """Send a precisely timed LED pulse using lgpio hardware timing.
-
-    This sets the pin HIGH immediately (in the calling thread) and uses lgpio's
-    hardware-timed pulse to turn it off after the specified duration, ensuring
-    microsecond-level precision without thread scheduling delays.
+def _send_led_pulse_on_flip(chip, pin: int, duration_us: int):
+    """GPIO pulse callback executed by PsychoPy at flip time.
     
-    Uses tx_pulse from Python lgpio bindings (not gpio_tx_pulse from C API).
-    
-    Raises exception if hardware timing is unavailable - does NOT fall back to
-    software timing as that would not meet precision requirements.
+    This is called by PsychoPy's callOnFlip mechanism, ensuring the GPIO write
+    happens at the exact moment the frame is presented, minimizing latency.
     
     Args:
-        chip: lgpio chip handle (from lgpio.gpiochip_open)
+        chip: lgpio chip handle
         pin: GPIO pin number (BCM numbering)
-        duration_s: pulse duration in seconds (converted to microseconds)
-    
-    Raises:
-        ImportError: if lgpio not available
-        Exception: if hardware pulse fails
+        duration_us: pulse duration in microseconds
     """
     import lgpio
     
-    # Set pin HIGH immediately (in main thread for minimal latency)
+    # Set pin HIGH immediately (called at flip time by PsychoPy)
     lgpio.gpio_write(chip, pin, 1)
     
     # Use hardware-timed pulse to turn it off after duration
-    # tx_pulse(handle, gpio, pulse_on, pulse_off, pulse_offset=0, pulse_cycles=0)
-    # We want: turn off after duration_us (on=0, off=duration_us)
-    duration_us = int(duration_s * 1_000_000)
     result = lgpio.tx_pulse(chip, pin, 0, duration_us, 0, 1)
     
-    # Check if pulse was queued successfully
+    # If pulse fails, at least turn the pin back off
     if result < 0:
-        # Clean up: set pin back to LOW
         try:
             lgpio.gpio_write(chip, pin, 0)
         except Exception:
             pass
-        raise RuntimeError(f"Hardware pulse failed with code {result}. lgpio hardware timing may not be supported.")
+        raise RuntimeError(f"Hardware pulse failed with code {result} during flip callback")
 
 
 def present_block_with_persistent_dots(
@@ -632,6 +618,34 @@ def present_block_with_persistent_dots(
         onset_cue.draw()
         if fix is not None:
             fix.draw()
+        
+        # If Raspberry Pi GPIO is requested, register callback to send pulse at flip time.
+        # This ensures minimal latency between visual flip and GPIO pulse.
+        if raspi and pigpio_pi is not None:
+            try:
+                pulse_frames, pulse_s = _q_to_frames(0.25, at_least_one=True)
+                duration_us = int(pulse_s * 1_000_000)
+                # Register callback to execute at flip time
+                win.callOnFlip(_send_led_pulse_on_flip, pigpio_pi, raspi_pin, duration_us)
+                if msg_logger is not None:
+                    try:
+                        msg_logger.log("INFO", f"raspi_pulse_registered block={block_idx} duration_s={pulse_s:.6f}")
+                    except Exception:
+                        pass
+            except Exception as e:
+                # Failed to register pulse callback
+                error_msg = f"CRITICAL: Failed to register GPIO pulse callback: {e}. Task cannot continue."
+                if msg_logger is not None:
+                    try:
+                        msg_logger.log("ERROR", error_msg)
+                    except Exception:
+                        pass
+                print(f"\n{error_msg}", file=sys.stderr)
+                logger.log("abort", image_name="", notes=f"gpio_callback_registration_failed: {e}")
+                win.close()
+                _core.quit()
+                return True, None
+        
         oc_flip = win.flip()
         oc_perf = time.perf_counter()
         logger.log(
@@ -643,33 +657,14 @@ def present_block_with_persistent_dots(
             end_time_perf_s=None,
             notes=f"block={block_idx}",
         )
-
-        # If Raspberry Pi GPIO is requested, send pulse immediately after flip.
-        # This minimizes latency between visual flip and GPIO pulse.
+        
+        # Log successful pulse execution if raspi was enabled
         if raspi and pigpio_pi is not None:
-            try:
-                pulse_frames, pulse_s = _q_to_frames(0.25, at_least_one=True)
-                # Call directly (not threaded) - the function sets HIGH immediately
-                # and schedules hardware-timed turn-off for minimal latency
-                _send_led_pulse_immediate(pigpio_pi, raspi_pin, pulse_s)
-                if msg_logger is not None:
-                    try:
-                        msg_logger.log("INFO", f"raspi_pulse_sent block={block_idx} duration_s={pulse_s:.6f}")
-                    except Exception:
-                        pass
-            except Exception as e:
-                # Hardware pulse failed - this is a critical error for timing precision
-                error_msg = f"CRITICAL: Hardware GPIO pulse failed: {e}. Task cannot continue with required timing precision."
-                if msg_logger is not None:
-                    try:
-                        msg_logger.log("ERROR", error_msg)
-                    except Exception:
-                        pass
-                print(f"\n{error_msg}", file=sys.stderr)
-                logger.log("abort", image_name="", notes=f"gpio_hardware_pulse_failed: {e}")
-                win.close()
-                _core.quit()
-                return True, None
+            if msg_logger is not None:
+                try:
+                    msg_logger.log("INFO", f"raspi_pulse_executed block={block_idx} at_flip_time")
+                except Exception:
+                    pass
 
         # wait for click within onset cue
         onset_start = time.perf_counter()

@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-Simple test script to send a 5-second 5V pulse through Raspberry Pi GPIO pin 18.
+Simple test script to send a 5-second pulse through Raspberry Pi GPIO pin 18.
 
-This version uses lgpio's hardware-timed pulse for microsecond precision.
+This demonstrates hardware-timed GPIO pulse using lgpio's tx_pulse function.
+For integration with PsychoPy visual flips, use win.callOnFlip() to ensure
+the GPIO write happens at the exact moment the frame is presented (minimizing
+latency between visual stimulus and GPIO pulse).
 
 Usage:
     python task/test_raspi_pulse.py

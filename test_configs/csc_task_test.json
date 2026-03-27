@@ -24,5 +24,7 @@
   "stoke_color": [0, 0, 0],
   "fixed_positions": true,
   "sequential": false,
-  "is_memory": false
+  "is_memory": false,
+  "raspi": true,
+  "raspi_pin": 18
 }

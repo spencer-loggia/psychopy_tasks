@@ -1,3 +1,5 @@
 psychopy>=2023.2
 numpy>=1.21
 Pillow>=9.0
+cairosvg>=2.5.0
+lgpio>=0.2.0

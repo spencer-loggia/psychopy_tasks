@@ -122,24 +122,21 @@ def run_task(
     msg_logger = MessageLogger(output_dir, filename="afc_block_sequence_message_log.tsv")
     pylogging.console.setLevel(pylogging.CRITICAL)
 
-    # Initialize pigpio if requested
-    pigpio_pi = None
+    # Initialize lgpio if requested
+    pigpio_pi = None  # naming kept for compatibility with presenter API
     if raspi:
         try:
-            import pigpio as _pigpio
+            import lgpio
 
-            pigpio_pi = _pigpio.pi()
-            if getattr(pigpio_pi, "connected", None) is False:
-                try:
-                    pigpio_pi.stop()
-                except Exception:
-                    pass
-                pigpio_pi = None
-                msg_logger.log("WARN", "pigpio present but not connected; raspi disabled")
-        except Exception:
+            chip = lgpio.gpiochip_open(0)  # 0 is the default chip for RPi5
+            # Claim the pin as output
+            lgpio.gpio_claim_output(chip, raspi_pin)
+            pigpio_pi = chip  # store chip handle
+            msg_logger.log("INFO", f"lgpio initialized on chip 0, pin {raspi_pin} claimed as output")
+        except Exception as e:
             pigpio_pi = None
             try:
-                msg_logger.log("WARN", "pigpio not available; raspi disabled")
+                msg_logger.log("WARN", f"lgpio not available or failed to initialize: {e}; raspi disabled")
             except Exception:
                 pass
 

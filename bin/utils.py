@@ -11,6 +11,7 @@ from pathlib import Path
 import random
 from typing import List, Tuple, Optional, Dict, Union
 import io
+import sys
 
 import numpy as np
 from PIL import Image
@@ -512,36 +513,44 @@ def make_onset_cue_stim(
     return stim
 
 
-def _send_led_pulse(pi, pin: int, duration_us: int):
-    """Send a precisely timed LED pulse using pigpio waves in a background thread.
+def _send_led_pulse_immediate(chip, pin: int, duration_s: float):
+    """Send a precisely timed LED pulse using lgpio hardware timing.
 
-    This function will create a single wave with the requested duration (microseconds),
-    send it, wait for completion, then delete the wave. It swallows errors to avoid
-    disrupting the main presentation loop.
+    This sets the pin HIGH immediately (in the calling thread) and uses lgpio's
+    hardware-timed pulse to turn it off after the specified duration, ensuring
+    microsecond-level precision without thread scheduling delays.
+    
+    Raises exception if hardware timing is unavailable - does NOT fall back to
+    software timing as that would not meet precision requirements.
+    
+    Args:
+        chip: lgpio chip handle (from lgpio.gpiochip_open)
+        pin: GPIO pin number (BCM numbering)
+        duration_s: pulse duration in seconds (converted to microseconds)
+    
+    Raises:
+        ImportError: if lgpio not available
+        Exception: if hardware pulse fails
     """
-    try:
-        import pigpio as _pigpio
-    except Exception:
-        return
-    try:
-        pi.set_mode(pin, _pigpio.OUTPUT)
-        on_mask = 1 << pin
-        pulse = _pigpio.pulse(on_mask, 0, int(duration_us))
-        pi.wave_clear()
-        pi.wave_add_generic([pulse])
-        wid = pi.wave_create()
-        if wid >= 0:
-            pi.wave_send_once(wid)
-            # wait for transmission to finish, then delete the wave
-            while pi.wave_tx_busy():
-                time.sleep(0.001)
-            try:
-                pi.wave_delete(wid)
-            except Exception:
-                pass
-    except Exception:
-        # ignore errors during pigpio operations
-        return
+    import lgpio
+    
+    # Set pin HIGH immediately (in main thread for minimal latency)
+    lgpio.gpio_write(chip, pin, 1)
+    
+    # Use hardware-timed pulse to turn it off after duration
+    # gpio_tx_pulse(chip, pin, on_micros, off_micros, offset_micros, cycles)
+    # We want: stay on for 0us more, then off for the duration, start immediately, 1 cycle
+    duration_us = int(duration_s * 1_000_000)
+    result = lgpio.gpio_tx_pulse(chip, pin, 0, duration_us, 0, 1)
+    
+    # Check if pulse was queued successfully
+    if result < 0:
+        # Clean up: set pin back to LOW
+        try:
+            lgpio.gpio_write(chip, pin, 0)
+        except Exception:
+            pass
+        raise RuntimeError(f"Hardware pulse failed with code {result}. lgpio hardware timing may not be supported.")
 
 
 def present_block_with_persistent_dots(
@@ -633,24 +642,32 @@ def present_block_with_persistent_dots(
             notes=f"block={block_idx}",
         )
 
-        # If Raspberry Pi GPIO is requested, schedule a pulse aligned to this flip.
+        # If Raspberry Pi GPIO is requested, send pulse immediately after flip.
+        # This minimizes latency between visual flip and GPIO pulse.
         if raspi and pigpio_pi is not None:
             try:
                 pulse_frames, pulse_s = _q_to_frames(0.25, at_least_one=True)
-                dur_us = int(round(pulse_s * 1e6))
-                threading.Thread(target=_send_led_pulse, args=(pigpio_pi, raspi_pin, dur_us), daemon=True).start()
+                # Call directly (not threaded) - the function sets HIGH immediately
+                # and schedules hardware-timed turn-off for minimal latency
+                _send_led_pulse_immediate(pigpio_pi, raspi_pin, pulse_s)
                 if msg_logger is not None:
                     try:
-                        msg_logger.log("INFO", f"raspi_pulse_scheduled block={block_idx} duration_s={pulse_s:.6f} dur_us={dur_us}")
+                        msg_logger.log("INFO", f"raspi_pulse_sent block={block_idx} duration_s={pulse_s:.6f}")
                     except Exception:
                         pass
-            except Exception:
-                # don't let pigpio failures block the task
+            except Exception as e:
+                # Hardware pulse failed - this is a critical error for timing precision
+                error_msg = f"CRITICAL: Hardware GPIO pulse failed: {e}. Task cannot continue with required timing precision."
                 if msg_logger is not None:
                     try:
-                        msg_logger.log("WARN", "raspi_pulse_failed_to_schedule")
+                        msg_logger.log("ERROR", error_msg)
                     except Exception:
                         pass
+                print(f"\n{error_msg}", file=sys.stderr)
+                logger.log("abort", image_name="", notes=f"gpio_hardware_pulse_failed: {e}")
+                win.close()
+                _core.quit()
+                return True, None
 
         # wait for click within onset cue
         onset_start = time.perf_counter()

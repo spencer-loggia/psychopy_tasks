@@ -2,11 +2,13 @@
 """
 Simple test script to send a 5-second 5V pulse through Raspberry Pi GPIO pin 18.
 
+This version uses lgpio's hardware-timed pulse for microsecond precision.
+
 Usage:
     python task/test_raspi_pulse.py
 
 Requirements:
-    - pigpio daemon must be running: sudo pigpiod
+    - lgpio library installed: pip install lgpio
     - Run with appropriate permissions for GPIO access
 """
 import time
@@ -14,55 +16,77 @@ import sys
 
 def main():
     try:
-        import pigpio
+        import lgpio
     except ImportError:
-        print("ERROR: pigpio not installed. Install with: pip install pigpio")
+        print("ERROR: lgpio not installed. Install with: pip install lgpio")
         sys.exit(1)
 
     # GPIO pin to use (BCM numbering)
     PIN = 18
     PULSE_DURATION_S = 5.0
 
-    print(f"Connecting to pigpio daemon...")
-    pi = pigpio.pi()
-
-    if not pi.connected:
-        print("ERROR: Could not connect to pigpio daemon.")
-        print("Make sure pigpiod is running: sudo pigpiod")
+    print(f"Opening GPIO chip...")
+    try:
+        chip = lgpio.gpiochip_open(0)  # 0 is the default chip for RPi5
+    except Exception as e:
+        print(f"ERROR: Could not open GPIO chip: {e}")
+        print("Make sure you have permission to access GPIO (may need sudo)")
         sys.exit(1)
 
-    print(f"Connected to pigpio daemon.")
-    print(f"Sending 5V pulse on GPIO pin {PIN} for {PULSE_DURATION_S} seconds...")
+    print(f"GPIO chip opened successfully.")
+    print(f"Sending pulse on GPIO pin {PIN} for {PULSE_DURATION_S} seconds...")
+    print(f"Using hardware-timed pulse for microsecond precision.\n")
 
     try:
-        # Set pin to output mode
-        pi.set_mode(PIN, pigpio.OUTPUT)
+        # Claim pin as output
+        lgpio.gpio_claim_output(chip, PIN)
 
-        # Send high (5V on Raspberry Pi)
-        pi.write(PIN, 1)
+        # Send high immediately (3.3V on Raspberry Pi 5)
+        lgpio.gpio_write(chip, PIN, 1)
         start = time.time()
-        print(f"Pin {PIN} set HIGH at {time.strftime('%H:%M:%S')}")
+        print(f"Pin {PIN} set HIGH at {time.strftime('%H:%M:%S.%f')[:-3]}")
 
-        # Wait for pulse duration
-        time.sleep(PULSE_DURATION_S)
-
-        # Send low (0V)
-        pi.write(PIN, 0)
+        # Use hardware-timed pulse to turn off after duration
+        # gpio_tx_pulse(chip, pin, on_micros, off_micros, offset_micros, cycles)
+        duration_us = int(PULSE_DURATION_S * 1_000_000)
+        lgpio.gpio_tx_pulse(chip, PIN, 0, duration_us, 0, 1)
+        print(f"Hardware pulse scheduled for {duration_us} microseconds")
+        
+        # Wait for pulse to complete
+        time.sleep(PULSE_DURATION_S + 0.1)
+        
         end = time.time()
         actual_duration = end - start
-        print(f"Pin {PIN} set LOW at {time.strftime('%H:%M:%S')}")
-        print(f"Actual pulse duration: {actual_duration:.3f} seconds")
+        print(f"\nPin {PIN} turned LOW (hardware-timed)")
+        print(f"Measured duration from script: {actual_duration:.3f} seconds")
+        print(f"Note: Hardware timing is precise to microseconds,")
+        print(f"      independent of Python's timing inaccuracies.")
 
     except KeyboardInterrupt:
         print("\nInterrupted by user, cleaning up...")
-        pi.write(PIN, 0)
+        try:
+            lgpio.gpio_write(chip, PIN, 0)
+        except Exception:
+            pass
     except Exception as e:
-        print(f"ERROR: {e}")
-        pi.write(PIN, 0)
+        print(f"\nERROR: Hardware pulse failed: {e}")
+        print("\nHardware-timed GPIO pulse is required for timing precision.")
+        print("This may indicate:")
+        print("  - lgpio version does not support gpio_tx_pulse")
+        print("  - Hardware PWM/timing features not available")
+        print("  - Insufficient permissions")
+        print("\nPlease check your lgpio installation and hardware support.")
+        try:
+            lgpio.gpio_write(chip, PIN, 0)
+        except Exception:
+            pass
     finally:
         # Cleanup
-        pi.stop()
-        print("Disconnected from pigpio daemon.")
+        try:
+            lgpio.gpiochip_close(chip)
+            print("\nGPIO chip closed.")
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()

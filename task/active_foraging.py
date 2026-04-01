@@ -21,7 +21,8 @@ import sys
 import time
 import random
 from pathlib import Path
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Dict
+import pandas as pd
 
 from psychopy import core, logging as pylogging, event
 
@@ -65,7 +66,13 @@ def parse_args():
     p.add_argument("--sequential", action="store_true", default=None, help="Present stimuli sequentially (one at a time). If not set, config value or default True is used")
     p.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate (Hz); skip auto-detection if provided")
     p.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi GPIO LED pulses for onset cues")
-    p.add_argument("--raspi_pin", type=int, default=None, help="GPIO pin to use for raspi LED pulses (BCM numbering)")
+    p.add_argument("--trial_start_pin", type=int, default=None, help="GPIO pin to use for trial start pulses (BCM numbering)")
+    p.add_argument("--pump_pin", type=int, default=None, help="GPIO pin for pump reward delivery")
+    p.add_argument("--buzz_pin", type=int, default=None, help="GPIO pin for timeout buzzer")
+    p.add_argument("--freq_space_tsv", help="CSV file defining color-shape pair probabilities")
+    p.add_argument("--reward_space_tsv", help="CSV file defining reward levels for color-shape pairs")
+    p.add_argument("--pump_pulse_time_seconds", type=float, default=None, help="Duration of pump pulse in seconds")
+    p.add_argument("--timeout_duration_seconds", type=float, default=None, help="Duration of timeout period in seconds")
     return p.parse_args()
 
 
@@ -94,11 +101,19 @@ def run_task(
     fixation_size: Optional[int] = None,
     refresh_rate: Optional[float] = None,
     raspi: bool = False,
-    raspi_pin: int = 18,
+    trial_start_pin: int = 18,
+    pump_pin: int = 17,
+    buzz_pin: int = 16,
     fixed_positions: bool = False,
     position_spacing: Optional[int] = None,
     sequential: bool = True,
     is_memory: bool = True,
+    freq_space_tsv: Optional[str] = None,
+    reward_space_tsv: Optional[str] = None,
+    pump_pulse_time_seconds: float = 0.25,
+    timeout_duration_seconds: float = 3.0,
+    reward_to_pulse_map: Optional[Dict[str, int]] = None,
+    reward_to_timeout_map: Optional[Dict[str, int]] = None,
 ):
     # Set debug flag before rasterization if requested
     utils.set_debug(debug)
@@ -129,55 +144,132 @@ def run_task(
     if num_afc > len(all_pairs):
         raise ValueError("num_afc cannot be larger than the number of available pairs")
 
-    # Load or construct likelihood distribution (n_colors x m_shapes)
-    def load_likelihood(path: Optional[str]):
-        # returns numpy array shape (n_colors, m_shapes)
-        if path is None:
-            arr = np.ones((n_colors, m_shapes), dtype=float)
+    # Expected number of color-shape pairs for validation
+    expected_len = n_colors * m_shapes
+
+    # Load frequency space (determines probability of each color-shape pair)
+    # If freq_space_tsv is provided, use it; otherwise fall back to likelihood_tsv
+    if freq_space_tsv is not None:
+        freq_path = Path(freq_space_tsv)
+        if not freq_path.exists():
+            raise FileNotFoundError(f"freq_space_tsv not found: {freq_space_tsv}")
+        # Load as specified: first column, reshape to (36, 36), transpose
+        freq_df = pd.read_csv(freq_path)
+        freq_flat = freq_df.iloc[:, 0].values
+        # Validate length matches expected pairs
+        if len(freq_flat) != expected_len:
+            raise ValueError(f"freq_space has {len(freq_flat)} entries but expected {expected_len} (n_colors={n_colors} * m_shapes={m_shapes})")
+        # Reshape: user specifies reshape((36, 36)).T, but we need to use actual dims
+        freq_matrix = freq_flat.reshape((m_shapes, n_colors)).T  # shape (n_colors, m_shapes)
+        likelihood = freq_matrix.astype(float)
+        # Normalize
+        total = float(likelihood.sum())
+        if total <= 0.0:
+            msg_logger.log("WARN", "freq_space sums to zero; using uniform distribution")
+            likelihood = np.ones((n_colors, m_shapes), dtype=float) / float(n_colors * m_shapes)
+        else:
+            likelihood = likelihood / total
+        msg_logger.log("INFO", f"Loaded freq_space from {freq_space_tsv} (sum={total:.6f})")
+    elif likelihood_tsv is not None:
+        # Legacy: load from likelihood_tsv (previous format)
+        def load_likelihood(path: Optional[str]):
+            # returns numpy array shape (n_colors, m_shapes)
+            if path is None:
+                arr = np.ones((n_colors, m_shapes), dtype=float)
+                total = float(arr.sum())
+                msg_logger.log("WARN", f"No likelihood TSV provided; using uniform distribution (sum={total:.6f})")
+                arr = arr / total
+                return arr
+
+            p = Path(path)
+            if not p.exists():
+                raise FileNotFoundError(f"Likelihood TSV not found: {path}")
+
+            arr = np.zeros((n_colors, m_shapes), dtype=float)
+            import csv
+
+            with p.open("r", encoding="utf-8") as fh:
+                reader = csv.DictReader(fh, delimiter="\t")
+                if reader.fieldnames is None:
+                    # expect three columns without header -> not supported
+                    raise ValueError("Likelihood TSV must have header columns: color,shape,prob")
+                for row in reader:
+                    try:
+                        cid = int(row.get("color") or row.get("Color") or row.get(reader.fieldnames[0]))
+                        sid = int(row.get("shape") or row.get("Shape") or row.get(reader.fieldnames[1]))
+                        prob = float(row.get("prob") or row.get("Prob") or row.get(reader.fieldnames[2]))
+                    except Exception as e:
+                        raise ValueError(f"Invalid row in likelihood TSV: {row}") from e
+                    if cid not in color_ids:
+                        raise ValueError(f"Likelihood TSV references unknown color id: {cid}")
+                    if sid not in shape_ids:
+                        raise ValueError(f"Likelihood TSV references unknown shape id: {sid}")
+                    ci = color_ids.index(cid)
+                    si = shape_ids.index(sid)
+                    arr[ci, si] = prob
+
             total = float(arr.sum())
-            msg_logger.log("WARN", f"No likelihood TSV provided; using uniform distribution (sum={total:.6f})")
-            arr = arr / total
+            if total == 0.0:
+                msg_logger.log("WARN", "Likelihood TSV sums to zero; falling back to uniform distribution")
+                arr = np.ones((n_colors, m_shapes), dtype=float)
+                arr /= arr.sum()
+                return arr
+            if not np.isclose(total, 1.0):
+                msg_logger.log("WARN", f"Likelihood TSV sum is {total:.6f}; normalizing to sum to 1")
+                arr = arr / total
             return arr
 
-        p = Path(path)
-        if not p.exists():
-            raise FileNotFoundError(f"Likelihood TSV not found: {path}")
+        likelihood = load_likelihood(likelihood_tsv)
+    else:
+        # No freq_space or likelihood provided; use uniform
+        likelihood = np.ones((n_colors, m_shapes), dtype=float)
+        likelihood /= likelihood.sum()
+        msg_logger.log("WARN", "No freq_space_tsv or likelihood_tsv provided; using uniform distribution")
 
-        arr = np.zeros((n_colors, m_shapes), dtype=float)
-        import csv
-
-        with p.open("r", encoding="utf-8") as fh:
-            reader = csv.DictReader(fh, delimiter="\t")
-            if reader.fieldnames is None:
-                # expect three columns without header -> not supported
-                raise ValueError("Likelihood TSV must have header columns: color,shape,prob")
-            for row in reader:
-                try:
-                    cid = int(row.get("color") or row.get("Color") or row.get(reader.fieldnames[0]))
-                    sid = int(row.get("shape") or row.get("Shape") or row.get(reader.fieldnames[1]))
-                    prob = float(row.get("prob") or row.get("Prob") or row.get(reader.fieldnames[2]))
-                except Exception as e:
-                    raise ValueError(f"Invalid row in likelihood TSV: {row}") from e
-                if cid not in color_ids:
-                    raise ValueError(f"Likelihood TSV references unknown color id: {cid}")
-                if sid not in shape_ids:
-                    raise ValueError(f"Likelihood TSV references unknown shape id: {sid}")
-                ci = color_ids.index(cid)
-                si = shape_ids.index(sid)
-                arr[ci, si] = prob
-
-        total = float(arr.sum())
-        if total == 0.0:
-            msg_logger.log("WARN", "Likelihood TSV sums to zero; falling back to uniform distribution")
-            arr = np.ones((n_colors, m_shapes), dtype=float)
-            arr /= arr.sum()
-            return arr
-        if not np.isclose(total, 1.0):
-            msg_logger.log("WARN", f"Likelihood TSV sum is {total:.6f}; normalizing to sum to 1")
-            arr = arr / total
-        return arr
-
-    likelihood = load_likelihood(likelihood_tsv)
+    # Load reward space (maps each color-shape pair to a reward level)
+    # Initialize default: all pairs have reward 0
+    reward_map: Dict[Tuple[int, int], int] = {}
+    for pair in all_pairs:
+        reward_map[pair] = 0
+    
+    if reward_space_tsv is not None:
+        reward_path = Path(reward_space_tsv)
+        if not reward_path.exists():
+            raise FileNotFoundError(f"reward_space_tsv not found: {reward_space_tsv}")
+        # Load as specified: first column, reshape to (36, 36), transpose
+        reward_df = pd.read_csv(reward_path)
+        reward_flat = reward_df.iloc[:, 0].values
+        # Validate length matches expected pairs
+        if len(reward_flat) != expected_len:
+            raise ValueError(f"reward_space has {len(reward_flat)} entries but expected {expected_len} (n_colors={n_colors} * m_shapes={m_shapes})")
+        # Reshape: same as freq_space
+        reward_matrix = reward_flat.reshape((m_shapes, n_colors)).T  # shape (n_colors, m_shapes)
+        
+        # Build reward_map from matrix
+        for (sid, cid) in all_pairs:
+            ci = color_ids.index(cid)
+            si = shape_ids.index(sid)
+            reward_level = int(reward_matrix[ci, si])
+            reward_map[(sid, cid)] = reward_level
+        
+        # Validate reward levels match reward_to_pulse_map and reward_to_timeout_map
+        unique_rewards = set(reward_map.values())
+        if reward_to_pulse_map is not None:
+            # Convert keys to int for comparison
+            pulse_keys = set(int(k) for k in reward_to_pulse_map.keys())
+            if not unique_rewards.issubset(pulse_keys):
+                missing = unique_rewards - pulse_keys
+                raise ValueError(f"reward_space contains reward levels {missing} not defined in reward_to_pulse_map")
+        if reward_to_timeout_map is not None:
+            # Convert keys to int for comparison
+            timeout_keys = set(int(k) for k in reward_to_timeout_map.keys())
+            if not unique_rewards.issubset(timeout_keys):
+                missing = unique_rewards - timeout_keys
+                raise ValueError(f"reward_space contains reward levels {missing} not defined in reward_to_timeout_map")
+        
+        msg_logger.log("INFO", f"Loaded reward_space from {reward_space_tsv}, unique rewards: {sorted(unique_rewards)}")
+    else:
+        msg_logger.log("INFO", "No reward_space_tsv provided; all pairs have reward level 0")
 
     # Pre-render all pair images (SVG recolored to each color)
     preloaded: dict = {}
@@ -245,21 +337,28 @@ def run_task(
 
     # Initialize lgpio if requested; do not fail the task if lgpio is unavailable.
     pigpio_pi = None  # naming kept for compatibility with presenter API
+    gpio_chip = None
     if raspi:
         try:
             import lgpio
 
             chip = lgpio.gpiochip_open(0)  # 0 is the default chip for RPi5
-            # Claim the pin as output
-            lgpio.gpio_claim_output(chip, raspi_pin)
+            # Claim all three pins as outputs
+            lgpio.gpio_claim_output(chip, trial_start_pin)
+            lgpio.gpio_claim_output(chip, pump_pin)
+            lgpio.gpio_claim_output(chip, buzz_pin)
             pigpio_pi = chip  # store chip handle
-            msg_logger.log("INFO", f"lgpio initialized on chip 0, pin {raspi_pin} claimed as output")
+            gpio_chip = chip  # store for later use
+            msg_logger.log("INFO", f"lgpio initialized on chip 0, pins claimed: trial_start={trial_start_pin}, pump={pump_pin}, buzz={buzz_pin}")
         except Exception as e:
             pigpio_pi = None
+            gpio_chip = None
             try:
                 msg_logger.log("WARN", f"lgpio not available or failed to initialize: {e}; raspi disabled")
             except Exception:
                 pass
+    else:
+        msg_logger.log("INFO", "raspi=False; GPIO pin signals will not be sent (events will be logged only)")
 
     # Pre-sample blocks of pairs according to likelihood distribution
     # Build flat probability list in the same order as all_pairs
@@ -354,12 +453,120 @@ def run_task(
             fps=fps,
             raspi=bool(raspi and pigpio_pi is not None),
             pigpio_pi=pigpio_pi,
-            raspi_pin=raspi_pin,
+            raspi_pin=trial_start_pin,
             sequential=sequential,
             is_memory=is_memory,
         )
         if aborted:
             return
+
+        # Handle reward/timeout based on choice
+        if choice_info is not None:
+            chosen_idx = choice_info["chosen_index"]  # 1-based
+            chosen_pair = block_paths[chosen_idx - 1]  # (shape_id, color_id)
+            reward_level = reward_map.get(chosen_pair, 0)
+            
+            # Log the reward level
+            logger.log(
+                "reward_determined",
+                image_name=str(chosen_pair),
+                requested_duration_s=None,
+                flip_time_psychopy_s=None,
+                flip_time_perf_s=time.perf_counter(),
+                end_time_perf_s=None,
+                notes=f"block={block_idx} idx={chosen_idx} pair={chosen_pair} reward_level={reward_level}",
+            )
+            
+            # Deliver pump pulses if reward_to_pulse_map specifies any
+            num_pulses = 0
+            if reward_to_pulse_map is not None:
+                num_pulses = reward_to_pulse_map.get(str(reward_level), 0)
+            
+            if num_pulses > 0:
+                for pulse_num in range(1, num_pulses + 1):
+                    pulse_start_perf = time.perf_counter()
+                    if raspi and gpio_chip is not None:
+                        try:
+                            import lgpio
+                            lgpio.gpio_write(gpio_chip, pump_pin, 1)
+                        except Exception as e:
+                            msg_logger.log("ERROR", f"Failed to set pump_pin high: {e}")
+                    
+                    logger.log(
+                        "pump_pulse_start",
+                        image_name="",
+                        requested_duration_s=pump_pulse_time_seconds,
+                        flip_time_psychopy_s=None,
+                        flip_time_perf_s=pulse_start_perf,
+                        end_time_perf_s=None,
+                        notes=f"block={block_idx} reward_level={reward_level} pulse={pulse_num}/{num_pulses}",
+                    )
+                    
+                    # Wait for pulse duration
+                    core.wait(pump_pulse_time_seconds)
+                    
+                    pulse_end_perf = time.perf_counter()
+                    if raspi and gpio_chip is not None:
+                        try:
+                            import lgpio
+                            lgpio.gpio_write(gpio_chip, pump_pin, 0)
+                        except Exception as e:
+                            msg_logger.log("ERROR", f"Failed to set pump_pin low: {e}")
+                    
+                    logger.log(
+                        "pump_pulse_end",
+                        image_name="",
+                        requested_duration_s=pump_pulse_time_seconds,
+                        flip_time_psychopy_s=None,
+                        flip_time_perf_s=pulse_end_perf,
+                        end_time_perf_s=None,
+                        notes=f"block={block_idx} reward_level={reward_level} pulse={pulse_num}/{num_pulses}",
+                    )
+            
+            # Apply timeout if reward_to_timeout_map specifies it
+            apply_timeout = 0
+            if reward_to_timeout_map is not None:
+                apply_timeout = reward_to_timeout_map.get(str(reward_level), 0)
+            
+            if apply_timeout > 0:
+                timeout_start_perf = time.perf_counter()
+                if raspi and gpio_chip is not None:
+                    try:
+                        import lgpio
+                        lgpio.gpio_write(gpio_chip, buzz_pin, 1)
+                    except Exception as e:
+                        msg_logger.log("ERROR", f"Failed to set buzz_pin high: {e}")
+                
+                logger.log(
+                    "timeout_start",
+                    image_name="",
+                    requested_duration_s=timeout_duration_seconds,
+                    flip_time_psychopy_s=None,
+                    flip_time_perf_s=timeout_start_perf,
+                    end_time_perf_s=None,
+                    notes=f"block={block_idx} reward_level={reward_level}",
+                )
+                
+                # Wait for timeout duration
+                core.wait(timeout_duration_seconds)
+                
+                timeout_end_perf = time.perf_counter()
+                if raspi and gpio_chip is not None:
+                    try:
+                        import lgpio
+                        lgpio.gpio_write(gpio_chip, buzz_pin, 0)
+                    except Exception as e:
+                        msg_logger.log("ERROR", f"Failed to set buzz_pin low: {e}")
+                
+                logger.log(
+                    "timeout_end",
+                    image_name="",
+                    requested_duration_s=timeout_duration_seconds,
+                    flip_time_psychopy_s=None,
+                    flip_time_perf_s=timeout_end_perf,
+                    end_time_perf_s=None,
+                    notes=f"block={block_idx} reward_level={reward_level}",
+                )
 
         # Choice events are already logged inside the utility (choice_made/choice_end);
         # avoid redundant event rows here.
@@ -449,13 +656,23 @@ def main():
     # Accept both 'refresh_rate' and the common misspelling 'refrech_rate' from config
     refresh_rate = _get("refresh_rate", cfg.get("refresh_rate", cfg.get("refrech_rate", None)))
     raspi = _get("raspi", cfg.get("raspi", False))
-    raspi_pin = int(_get("raspi_pin", cfg.get("raspi_pin", 18)))
+    trial_start_pin = int(_get("trial_start_pin", cfg.get("trial_start_pin", 18)))
+    pump_pin = int(_get("pump_pin", cfg.get("pump_pin", 17)))
+    buzz_pin = int(_get("buzz_pin", cfg.get("buzz_pin", 16)))
     fixed_positions = bool(_get("fixed_positions", cfg.get("fixed_positions", False)))
     # position_spacing may be omitted; leave as None to let run_task choose a default
     pos_spacing_val = _get("position_spacing", cfg.get("position_spacing", None))
     position_spacing = int(pos_spacing_val) if pos_spacing_val is not None else None
     sequential = bool(_get("sequential", cfg.get("sequential", True)))
     is_memory = bool(_get("is_memory", cfg.get("is_memory", True)))
+    
+    # New reward system parameters
+    freq_space_tsv = _get("freq_space_tsv", cfg.get("freq_space_tsv", None))
+    reward_space_tsv = _get("reward_space_tsv", cfg.get("reward_space_tsv", None))
+    pump_pulse_time_seconds = float(_get("pump_pulse_time_seconds", cfg.get("pump_pulse_time_seconds", 0.25)))
+    timeout_duration_seconds = float(_get("timeout_duration_seconds", cfg.get("timeout_duration_seconds", 3.0)))
+    reward_to_pulse_map = cfg.get("reward_to_pulse_map", None)
+    reward_to_timeout_map = cfg.get("reward_to_timeout_map", None)
     # stroke options were removed to match utils.rasterize_svg_with_color signature
 
     try:
@@ -484,11 +701,19 @@ def main():
             likelihood_tsv=likelihood_tsv,
             refresh_rate=refresh_rate,
             raspi=_get("raspi", cfg.get("raspi", False)),
-            raspi_pin=_get("raspi_pin", cfg.get("raspi_pin", 18)),
+            trial_start_pin=trial_start_pin,
+            pump_pin=pump_pin,
+            buzz_pin=buzz_pin,
             fixed_positions=fixed_positions,
             position_spacing=position_spacing,
             sequential=sequential,
             is_memory=is_memory,
+            freq_space_tsv=freq_space_tsv,
+            reward_space_tsv=reward_space_tsv,
+            pump_pulse_time_seconds=pump_pulse_time_seconds,
+            timeout_duration_seconds=timeout_duration_seconds,
+            reward_to_pulse_map=reward_to_pulse_map,
+            reward_to_timeout_map=reward_to_timeout_map,
         )
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)

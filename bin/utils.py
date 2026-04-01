@@ -1047,54 +1047,66 @@ def present_block_with_persistent_dots(
             fix.draw()
         win.flip()
 
-        # check for escape abort
-        if _event.getKeys(["escape"]):
-            logger.log("abort", image_name="", notes="escape_pressed")
-            win.close()
-            _core.quit()
-            return True, None
+        # Poll for clicks/touches multiple times between frames to catch brief touchscreen taps
+        # Use a tight polling loop similar to onset cue detection for better touch responsiveness
+        inter_frame_polls = 5  # Check 5 times between frames for touch events
+        for _poll in range(inter_frame_polls):
+            # check for escape abort
+            if _event.getKeys(["escape"]):
+                logger.log("abort", image_name="", notes="escape_pressed")
+                win.close()
+                _core.quit()
+                return True, None
 
-        # check for click between flips
-        buttons = mouse.getPressed()
-        if not click_registered and any(buttons):
-            click_pos = mouse.getPos()
-            # nearest stimulus position
-            chosen_idx = None
-            best_dist = None
-            for i, ppos in enumerate(pos_list, start=1):
-                dx = click_pos[0] - ppos[0]
-                dy = click_pos[1] - ppos[1]
-                dist = (dx * dx + dy * dy) ** 0.5
-                if best_dist is None or dist < best_dist:
-                    best_dist = dist
-                    chosen_idx = i
-            if best_dist is not None:
-                try:
-                    w, h = stim_sizes[chosen_idx - 1]
-                    candidate_radius = max(24.0, min(w, h) / 2.0)
-                except Exception:
-                    candidate_radius = 64.0
-                if best_dist <= candidate_radius:
-                    click_perf_capture = time.perf_counter()
-                    chosen_info = {
-                        "chosen_index": int(chosen_idx),
-                        "chosen_pos": tuple(pos_list[chosen_idx - 1]),
-                        "choice_time_perf_s": float(click_perf_capture),
-                        "choice_time_psychopy_s": None,
-                        "notes": f"block={block_idx}",
-                    }
-                    logger.log(
-                        "choice_made",
-                        image_name=getattr(block_paths[chosen_idx - 1], "name", str(block_paths[chosen_idx - 1])),
-                        requested_duration_s=None,
-                        flip_time_psychopy_s=None,
-                        flip_time_perf_s=click_perf_capture,
-                        end_time_perf_s=None,
-                        notes=f"block={block_idx} idx={chosen_idx} dist={best_dist:.1f} click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f})",
-                    )
-                    click_meta = {"idx": chosen_idx}
-                    click_registered = True
-                    break
+            # check for click between flips
+            buttons = mouse.getPressed()
+            if not click_registered and any(buttons):
+                click_pos = mouse.getPos()
+                # nearest stimulus position
+                chosen_idx = None
+                best_dist = None
+                for i, ppos in enumerate(pos_list, start=1):
+                    dx = click_pos[0] - ppos[0]
+                    dy = click_pos[1] - ppos[1]
+                    dist = (dx * dx + dy * dy) ** 0.5
+                    if best_dist is None or dist < best_dist:
+                        best_dist = dist
+                        chosen_idx = i
+                if best_dist is not None:
+                    try:
+                        w, h = stim_sizes[chosen_idx - 1]
+                        candidate_radius = max(24.0, min(w, h) / 2.0)
+                    except Exception:
+                        candidate_radius = 64.0
+                    if best_dist <= candidate_radius:
+                        click_perf_capture = time.perf_counter()
+                        chosen_info = {
+                            "chosen_index": int(chosen_idx),
+                            "chosen_pos": tuple(pos_list[chosen_idx - 1]),
+                            "choice_time_perf_s": float(click_perf_capture),
+                            "choice_time_psychopy_s": None,
+                            "notes": f"block={block_idx}",
+                        }
+                        logger.log(
+                            "choice_made",
+                            image_name=getattr(block_paths[chosen_idx - 1], "name", str(block_paths[chosen_idx - 1])),
+                            requested_duration_s=None,
+                            flip_time_psychopy_s=None,
+                            flip_time_perf_s=click_perf_capture,
+                            end_time_perf_s=None,
+                            notes=f"block={block_idx} idx={chosen_idx} dist={best_dist:.1f} click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f})",
+                        )
+                        click_meta = {"idx": chosen_idx}
+                        click_registered = True
+                        break
+            
+            # Small wait between polls to avoid excessive CPU usage while maintaining responsiveness
+            if not click_registered and _poll < inter_frame_polls - 1:
+                _core.wait(0.001)  # 1ms wait between polls
+        
+        # Break out of frame loop if click was registered
+        if click_registered:
+            break
 
     if click_registered:
         # Clear dots on the next flip and log the flip timestamp

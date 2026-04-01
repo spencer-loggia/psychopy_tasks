@@ -17,8 +17,8 @@
     "2": 0,
     "3": 0
   },
-  "pump_pin": 17,
-  "buzz_pin": 16,
+  "pump_pin": 23,
+  "buzz_pin": 24,
   "trial_start_pin": 18,
   "output_dir": "./logs",
   "refresh_rate": 120,

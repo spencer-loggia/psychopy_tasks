@@ -17,6 +17,9 @@
     "2": 0,
     "3": 0
   },
+  "pump_pin": 17,
+  "buzz_pin": 16,
+  "trial_start_pin": 18,
   "output_dir": "./logs",
   "refresh_rate": 120,
   "n": 20,
@@ -41,6 +44,5 @@
   "fixed_positions": true,
   "sequential": false,
   "is_memory": false,
-  "raspi": true,
-  "raspi_pin": 18
+  "raspi": true
 }

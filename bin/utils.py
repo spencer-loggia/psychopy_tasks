@@ -1042,6 +1042,14 @@ def present_block_with_persistent_dots(
     click_registered = False
     click_perf_capture = None
     click_meta = None
+    try:
+        _btn0, _times0 = mouse.getPressed(getTime=True)
+        if isinstance(_times0, (list, tuple)) and len(_times0) >= 3:
+            last_click_times = [float(t or 0.0) for t in _times0[:3]]
+        else:
+            last_click_times = [0.0, 0.0, 0.0]
+    except Exception:
+        last_click_times = [0.0, 0.0, 0.0]
     for _f in range(choice_frames if choice_frames > 0 else 0):
         # draw frame
         bg_rect.draw()
@@ -1055,8 +1063,7 @@ def present_block_with_persistent_dots(
             fix.draw()
         win.flip()
         
-        # Small wait to allow touch events to be processed (critical for touch screens)
-        _core.wait(0.01)  # 1ms wait - allows event processing without impacting timing significantly
+        _core.wait(0.001)
 
         # check for escape abort
         if _event.getKeys(["escape"]):
@@ -1065,10 +1072,27 @@ def present_block_with_persistent_dots(
             _core.quit()
             return True, None
 
-        # check for click between flips
-        buttons = mouse.getPressed()
-        if not click_registered and any(buttons):
-            click_pos = mouse.getPos()
+        # check for click/tap between flips (use latched click times for brief taps)
+        click_pos = mouse.getPos()
+        buttons = (False, False, False)
+        new_click = False
+        try:
+            buttons, click_times = mouse.getPressed(getTime=True)
+            if not isinstance(buttons, (list, tuple)):
+                buttons = (False, False, False)
+            if isinstance(click_times, (list, tuple)):
+                for bi in range(min(3, len(click_times))):
+                    ct = float(click_times[bi] or 0.0)
+                    if ct > last_click_times[bi]:
+                        new_click = True
+                        last_click_times[bi] = ct
+        except Exception:
+            try:
+                buttons = mouse.getPressed()
+            except Exception:
+                buttons = (False, False, False)
+
+        if not click_registered and (new_click or any(buttons)):
             # Check each stimulus using rectangular bounding box (better for touch screens)
             chosen_idx = None
             for i, ppos in enumerate(pos_list, start=1):
@@ -1090,6 +1114,19 @@ def present_block_with_persistent_dots(
                     if dist <= 64.0:
                         chosen_idx = i
                         break
+
+            if chosen_idx is None and msg_logger is not None:
+                try:
+                    msg_logger.log(
+                        "INFO",
+                        (
+                            f"choice_click_no_hit block={block_idx} "
+                            f"click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f}) "
+                            f"buttons={tuple(bool(b) for b in buttons)}"
+                        ),
+                    )
+                except Exception:
+                    pass
             
             if chosen_idx is not None:
                 click_perf_capture = time.perf_counter()

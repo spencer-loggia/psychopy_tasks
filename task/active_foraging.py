@@ -73,6 +73,9 @@ def parse_args():
     p.add_argument("--reward_space_tsv", help="CSV file defining reward levels for color-shape pairs")
     p.add_argument("--pump_pulse_time_seconds", type=float, default=None, help="Duration of pump pulse in seconds")
     p.add_argument("--timeout_duration_seconds", type=float, default=None, help="Duration of timeout period in seconds")
+    p.add_argument("--n_colors", type=int, default=None, help="Expected number of base colors (excluding luminance levels)")
+    p.add_argument("--n_shapes", type=int, default=None, help="Expected number of shapes")
+    p.add_argument("--n_lum_levels", type=int, default=None, help="Expected number of luminance levels per base color")
     return p.parse_args()
 
 
@@ -114,6 +117,9 @@ def run_task(
     timeout_duration_seconds: float = 3.0,
     reward_to_pulse_map: Optional[Dict[str, int]] = None,
     reward_to_timeout_map: Optional[Dict[str, int]] = None,
+    n_colors_expected: Optional[int] = None,
+    n_shapes_expected: Optional[int] = None,
+    n_lum_levels: Optional[int] = None,
 ):
     # Set debug flag before rasterization if requested
     utils.set_debug(debug)
@@ -127,13 +133,54 @@ def run_task(
     # message logger for warnings/debug/info
     msg_logger = MessageLogger(output_dir, filename="active_foraging_message_log.tsv")
 
-    # Build ordered lists of color and shape ids (used to index likelihood matrix)
-    color_ids = sorted(colors.keys())
-    shape_ids = sorted(shapes.keys())
-    n_colors = len(color_ids)
-    m_shapes = len(shape_ids)
+    # Keep TSV order (do not sort): color ordering defines luminance grouping.
+    color_ids = list(colors.keys())
+    shape_ids = list(shapes.keys())
 
-    # Build all pairs (shape_id, color_id) in the same order as flattened likelihood
+    n_color_defs = len(color_ids)
+    n_shape_defs = len(shape_ids)
+
+    # Resolve expected dimensions (supports legacy configs by inferring when omitted)
+    if n_shapes_expected is None:
+        n_shapes_expected = n_shape_defs
+    if n_lum_levels is None:
+        n_lum_levels = 1
+    if n_colors_expected is None:
+        if n_color_defs % int(n_lum_levels) != 0:
+            raise ValueError(
+                f"Cannot infer n_colors: color definitions={n_color_defs} not divisible by n_lum_levels={n_lum_levels}"
+            )
+        n_colors_expected = int(n_color_defs // int(n_lum_levels))
+
+    n_colors_expected = int(n_colors_expected)
+    n_shapes_expected = int(n_shapes_expected)
+    n_lum_levels = int(n_lum_levels)
+
+    if n_colors_expected <= 0 or n_shapes_expected <= 0 or n_lum_levels <= 0:
+        raise ValueError("n_colors, n_shapes, and n_lum_levels must all be positive integers")
+
+    expected_color_defs = n_colors_expected * n_lum_levels
+    if n_color_defs != expected_color_defs:
+        raise ValueError(
+            f"colors_tsv has {n_color_defs} definitions, expected n_colors*n_lum_levels={n_colors_expected}*{n_lum_levels}={expected_color_defs}"
+        )
+    if n_shape_defs != n_shapes_expected:
+        raise ValueError(
+            f"shapes_tsv has {n_shape_defs} definitions, expected n_shapes={n_shapes_expected}"
+        )
+
+    # color_ids are ordered in TSV as:
+    # (color_1_lum_1,...,color_n_lum_1),...,(color_1_lum_L,...,color_n_lum_L)
+    # Build [lum_idx, base_color_idx] -> color_id table.
+    color_id_matrix = np.array(color_ids, dtype=int).reshape((n_lum_levels, n_colors_expected))
+
+    # Base pairs (shape_idx, base_color_idx) are what freq/reward spaces index.
+    base_pairs: List[Tuple[int, int]] = []
+    for shape_idx in range(n_shapes_expected):
+        for color_idx in range(n_colors_expected):
+            base_pairs.append((shape_idx, color_idx))
+
+    # All displayable full pairs (shape_id, color_id including luminance)
     all_pairs: List[Tuple[int, int]] = []
     for sid in shape_ids:
         for cid in color_ids:
@@ -141,11 +188,11 @@ def run_task(
 
     if num_afc < 1:
         raise ValueError("num_afc must be >= 1")
-    if num_afc > len(all_pairs):
-        raise ValueError("num_afc cannot be larger than the number of available pairs")
+    if num_afc > len(base_pairs):
+        raise ValueError("num_afc cannot be larger than the number of available base color-shape pairs")
 
     # Expected number of color-shape pairs for validation
-    expected_len = n_colors * m_shapes
+    expected_len = n_colors_expected * n_shapes_expected
 
     # Load frequency space (determines probability of each color-shape pair)
     # If freq_space_tsv is provided, use it; otherwise fall back to likelihood_tsv
@@ -158,15 +205,17 @@ def run_task(
         freq_flat = freq_df.iloc[:, 0].values
         # Validate length matches expected pairs
         if len(freq_flat) != expected_len:
-            raise ValueError(f"freq_space has {len(freq_flat)} entries but expected {expected_len} (n_colors={n_colors} * m_shapes={m_shapes})")
+            raise ValueError(
+                f"freq_space has {len(freq_flat)} entries but expected n_colors*n_shapes={n_colors_expected}*{n_shapes_expected}={expected_len}"
+            )
         # Reshape: user specifies reshape((36, 36)).T, but we need to use actual dims
-        freq_matrix = freq_flat.reshape((m_shapes, n_colors)).T  # shape (n_colors, m_shapes)
+        freq_matrix = freq_flat.reshape((n_shapes_expected, n_colors_expected)).T  # shape (n_colors, n_shapes)
         likelihood = freq_matrix.astype(float)
         # Normalize
         total = float(likelihood.sum())
         if total <= 0.0:
             msg_logger.log("WARN", "freq_space sums to zero; using uniform distribution")
-            likelihood = np.ones((n_colors, m_shapes), dtype=float) / float(n_colors * m_shapes)
+            likelihood = np.ones((n_colors_expected, n_shapes_expected), dtype=float) / float(expected_len)
         else:
             likelihood = likelihood / total
         msg_logger.log("INFO", f"Loaded freq_space from {freq_space_tsv} (sum={total:.6f})")
@@ -175,7 +224,7 @@ def run_task(
         def load_likelihood(path: Optional[str]):
             # returns numpy array shape (n_colors, m_shapes)
             if path is None:
-                arr = np.ones((n_colors, m_shapes), dtype=float)
+                arr = np.ones((n_colors_expected, n_shapes_expected), dtype=float)
                 total = float(arr.sum())
                 msg_logger.log("WARN", f"No likelihood TSV provided; using uniform distribution (sum={total:.6f})")
                 arr = arr / total
@@ -185,7 +234,7 @@ def run_task(
             if not p.exists():
                 raise FileNotFoundError(f"Likelihood TSV not found: {path}")
 
-            arr = np.zeros((n_colors, m_shapes), dtype=float)
+            arr = np.zeros((n_colors_expected, n_shapes_expected), dtype=float)
             import csv
 
             with p.open("r", encoding="utf-8") as fh:
@@ -204,14 +253,16 @@ def run_task(
                         raise ValueError(f"Likelihood TSV references unknown color id: {cid}")
                     if sid not in shape_ids:
                         raise ValueError(f"Likelihood TSV references unknown shape id: {sid}")
-                    ci = color_ids.index(cid)
+                    # Legacy likelihood_tsv addresses full color ids; map to base color index.
+                    ci_full = color_ids.index(cid)
+                    ci = int(ci_full % n_colors_expected)
                     si = shape_ids.index(sid)
                     arr[ci, si] = prob
 
             total = float(arr.sum())
             if total == 0.0:
                 msg_logger.log("WARN", "Likelihood TSV sums to zero; falling back to uniform distribution")
-                arr = np.ones((n_colors, m_shapes), dtype=float)
+                arr = np.ones((n_colors_expected, n_shapes_expected), dtype=float)
                 arr /= arr.sum()
                 return arr
             if not np.isclose(total, 1.0):
@@ -222,7 +273,7 @@ def run_task(
         likelihood = load_likelihood(likelihood_tsv)
     else:
         # No freq_space or likelihood provided; use uniform
-        likelihood = np.ones((n_colors, m_shapes), dtype=float)
+        likelihood = np.ones((n_colors_expected, n_shapes_expected), dtype=float)
         likelihood /= likelihood.sum()
         msg_logger.log("WARN", "No freq_space_tsv or likelihood_tsv provided; using uniform distribution")
 
@@ -241,16 +292,19 @@ def run_task(
         reward_flat = reward_df.iloc[:, 0].values
         # Validate length matches expected pairs
         if len(reward_flat) != expected_len:
-            raise ValueError(f"reward_space has {len(reward_flat)} entries but expected {expected_len} (n_colors={n_colors} * m_shapes={m_shapes})")
+            raise ValueError(
+                f"reward_space has {len(reward_flat)} entries but expected n_colors*n_shapes={n_colors_expected}*{n_shapes_expected}={expected_len}"
+            )
         # Reshape: same as freq_space
-        reward_matrix = reward_flat.reshape((m_shapes, n_colors)).T  # shape (n_colors, m_shapes)
+        reward_matrix = reward_flat.reshape((n_shapes_expected, n_colors_expected)).T  # shape (n_colors, n_shapes)
         
         # Build reward_map from matrix
-        for (sid, cid) in all_pairs:
-            ci = color_ids.index(cid)
-            si = shape_ids.index(sid)
-            reward_level = int(reward_matrix[ci, si])
-            reward_map[(sid, cid)] = reward_level
+        for shape_idx, sid in enumerate(shape_ids):
+            for color_idx in range(n_colors_expected):
+                reward_level = int(reward_matrix[color_idx, shape_idx])
+                for lum_idx in range(n_lum_levels):
+                    cid = int(color_id_matrix[lum_idx, color_idx])
+                    reward_map[(sid, cid)] = reward_level
         
         # Validate reward levels match reward_to_pulse_map and reward_to_timeout_map
         unique_rewards = set(reward_map.values())
@@ -360,11 +414,9 @@ def run_task(
     else:
         msg_logger.log("INFO", "raspi=False; GPIO pin signals will not be sent (events will be logged only)")
 
-    # Pre-sample blocks of pairs according to likelihood distribution
-    # Build flat probability list in the same order as all_pairs
-    color_to_idx = {cid: i for i, cid in enumerate(color_ids)}
-    shape_to_idx = {sid: i for i, sid in enumerate(shape_ids)}
-    flat_probs = np.array([likelihood[color_to_idx[cid], shape_to_idx[sid]] for (sid, cid) in all_pairs], dtype=float)
+    # Pre-sample blocks by base color-shape probabilities.
+    # Luminance is sampled uniformly after choosing base pair.
+    flat_probs = np.array([likelihood[color_idx, shape_idx] for (shape_idx, color_idx) in base_pairs], dtype=float)
     # numerical safety: ensure non-negative
     flat_probs = np.clip(flat_probs, 0.0, None)
     total_nonzero = np.count_nonzero(flat_probs)
@@ -379,14 +431,27 @@ def run_task(
         np.random.seed(int(seed))
 
     blocks = []
+    block_base_meta = []
     for _ in range(n_blocks):
         if total_nonzero >= num_afc:
-            picks = np.random.choice(len(all_pairs), size=num_afc, replace=False, p=flat_probs)
+            picks = np.random.choice(len(base_pairs), size=num_afc, replace=False, p=flat_probs)
         else:
             # Not enough non-zero entries to sample without replacement; fall back to sampling with replacement
             msg_logger.log("WARN", f"Only {total_nonzero} non-zero pairs available but num_afc={num_afc}; sampling with replacement")
-            picks = np.random.choice(len(all_pairs), size=num_afc, replace=True, p=flat_probs)
-        blocks.append([all_pairs[int(i)] for i in picks])
+            picks = np.random.choice(len(base_pairs), size=num_afc, replace=True, p=flat_probs)
+
+        block_display_pairs: List[Tuple[int, int]] = []
+        block_meta: List[Tuple[int, int, int]] = []  # (shape_idx, color_idx, lum_idx)
+        for i in picks:
+            shape_idx, color_idx = base_pairs[int(i)]
+            lum_idx = int(np.random.randint(0, n_lum_levels))
+            sid = shape_ids[shape_idx]
+            cid = int(color_id_matrix[lum_idx, color_idx])
+            block_display_pairs.append((sid, cid))
+            block_meta.append((shape_idx, color_idx, lum_idx))
+
+        blocks.append(block_display_pairs)
+        block_base_meta.append(block_meta)
 
     # Task start
     logger.log("task_start", image_name="", notes=f"n_blocks={n_blocks} num_afc={num_afc}")
@@ -397,6 +462,22 @@ def run_task(
         # No separate pre-block fixation/ISI wait: per-stimulus pre-dot ISI is handled inside the utility.
 
         block_paths = blocks[block_idx - 1]
+        block_meta = block_base_meta[block_idx - 1]
+
+        for opt_idx, ((shape_id, color_id), (shape_idx, base_color_idx, lum_idx)) in enumerate(zip(block_paths, block_meta), start=1):
+            logger.log(
+                "stimulus_selected",
+                image_name=str((shape_id, color_id)),
+                requested_duration_s=None,
+                flip_time_psychopy_s=None,
+                flip_time_perf_s=time.perf_counter(),
+                end_time_perf_s=None,
+                notes=(
+                    f"block={block_idx} idx={opt_idx} shape_id={shape_id} shape_idx={shape_idx} "
+                    f"color_id={color_id} base_color_idx={base_color_idx} "
+                    f"luminance_level={lum_idx + 1} lum_idx={lum_idx}"
+                ),
+            )
 
         # compute stim size from first pair
         first_pair = block_paths[0]
@@ -465,6 +546,7 @@ def run_task(
             chosen_idx = choice_info["chosen_index"]  # 1-based
             chosen_pair = block_paths[chosen_idx - 1]  # (shape_id, color_id)
             reward_level = reward_map.get(chosen_pair, 0)
+            chosen_shape_idx, chosen_color_idx, chosen_lum_idx = block_base_meta[block_idx - 1][chosen_idx - 1]
             
             # Log the reward level
             logger.log(
@@ -474,7 +556,11 @@ def run_task(
                 flip_time_psychopy_s=None,
                 flip_time_perf_s=time.perf_counter(),
                 end_time_perf_s=None,
-                notes=f"block={block_idx} idx={chosen_idx} pair={chosen_pair} reward_level={reward_level}",
+                notes=(
+                    f"block={block_idx} idx={chosen_idx} pair={chosen_pair} "
+                    f"base_color_idx={chosen_color_idx} shape_idx={chosen_shape_idx} "
+                    f"lum_idx={chosen_lum_idx} reward_level={reward_level}"
+                ),
             )
             
             # Deliver pump pulses if reward_to_pulse_map specifies any
@@ -697,6 +783,9 @@ def main():
     timeout_duration_seconds = float(_get("timeout_duration_seconds", cfg.get("timeout_duration_seconds", 3.0)))
     reward_to_pulse_map = cfg.get("reward_to_pulse_map", None)
     reward_to_timeout_map = cfg.get("reward_to_timeout_map", None)
+    n_colors_expected = _get("n_colors", cfg.get("n_colors", None))
+    n_shapes_expected = _get("n_shapes", cfg.get("n_shapes", None))
+    n_lum_levels = _get("n_lum_levels", cfg.get("n_lum_levels", None))
     # stroke options were removed to match utils.rasterize_svg_with_color signature
 
     try:
@@ -738,6 +827,9 @@ def main():
             timeout_duration_seconds=timeout_duration_seconds,
             reward_to_pulse_map=reward_to_pulse_map,
             reward_to_timeout_map=reward_to_timeout_map,
+            n_colors_expected=n_colors_expected,
+            n_shapes_expected=n_shapes_expected,
+            n_lum_levels=n_lum_levels,
         )
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)

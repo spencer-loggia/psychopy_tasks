@@ -1,4 +1,6 @@
-{
+{ "n_colors": 36,
+  "n_shapes": 36, 
+  "n_lum_levels": 21,
   "shapes_tsv": "./task/resources/csc2/shape_definitions.tsv",
   "colors_tsv": "./task/resources/csc2/test_color_definition.tsv",
   "freq_space_tsv": "./task/resources/csc2/freq_space_TY.csv",
@@ -25,7 +27,7 @@
   "n": 20,
   "duration": 0.5,
   "isi": 0.0,
-  "bg": [128, 128, 128],
+  "bg": [163, 169, 165],
   "seed": 42,
   "fullscreen": true,
   "win_size": [2560, 1600],

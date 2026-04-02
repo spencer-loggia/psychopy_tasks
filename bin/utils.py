@@ -994,7 +994,15 @@ def present_block_with_persistent_dots(
     # mouse clicks so a choice can end the choice period immediately.
     from psychopy import event as _event
 
+    # Clear any stale events before starting choice period
+    _event.clearEvents()
+    
     mouse = _event.Mouse(win=win)
+    # Reset mouse click times to ensure we only detect new clicks
+    try:
+        mouse.clickReset()
+    except Exception:
+        pass  # Some versions might not have this method
 
     # choice loop
     start = time.perf_counter()
@@ -1046,6 +1054,9 @@ def present_block_with_persistent_dots(
         if fix is not None:
             fix.draw()
         win.flip()
+        
+        # Small wait to allow touch events to be processed (critical for touch screens)
+        _core.wait(0.001)  # 1ms wait - allows event processing without impacting timing significantly
 
         # check for escape abort
         if _event.getKeys(["escape"]):

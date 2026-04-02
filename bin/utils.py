@@ -1047,66 +1047,60 @@ def present_block_with_persistent_dots(
             fix.draw()
         win.flip()
 
-        # Poll for clicks/touches multiple times between frames to catch brief touchscreen taps
-        # Use a tight polling loop similar to onset cue detection for better touch responsiveness
-        inter_frame_polls = 5  # Check 5 times between frames for touch events
-        for _poll in range(inter_frame_polls):
-            # check for escape abort
-            if _event.getKeys(["escape"]):
-                logger.log("abort", image_name="", notes="escape_pressed")
-                win.close()
-                _core.quit()
-                return True, None
+        # check for escape abort
+        if _event.getKeys(["escape"]):
+            logger.log("abort", image_name="", notes="escape_pressed")
+            win.close()
+            _core.quit()
+            return True, None
 
-            # check for click between flips
-            buttons = mouse.getPressed()
-            if not click_registered and any(buttons):
-                click_pos = mouse.getPos()
-                # nearest stimulus position
-                chosen_idx = None
-                best_dist = None
-                for i, ppos in enumerate(pos_list, start=1):
+        # check for click between flips
+        buttons = mouse.getPressed()
+        if not click_registered and any(buttons):
+            click_pos = mouse.getPos()
+            # Check each stimulus using rectangular bounding box (better for touch screens)
+            chosen_idx = None
+            for i, ppos in enumerate(pos_list, start=1):
+                try:
+                    w, h = stim_sizes[i - 1]
+                    # Define rectangular hit area: use full image dimensions
+                    half_w = w / 2.0
+                    half_h = h / 2.0
+                    # Check if click is within rectangular bounds of this stimulus
+                    if (abs(click_pos[0] - ppos[0]) <= half_w and 
+                        abs(click_pos[1] - ppos[1]) <= half_h):
+                        chosen_idx = i
+                        break
+                except Exception:
+                    # Fallback: use circular detection with 64px radius
                     dx = click_pos[0] - ppos[0]
                     dy = click_pos[1] - ppos[1]
                     dist = (dx * dx + dy * dy) ** 0.5
-                    if best_dist is None or dist < best_dist:
-                        best_dist = dist
+                    if dist <= 64.0:
                         chosen_idx = i
-                if best_dist is not None:
-                    try:
-                        w, h = stim_sizes[chosen_idx - 1]
-                        candidate_radius = max(24.0, min(w, h) / 2.0)
-                    except Exception:
-                        candidate_radius = 64.0
-                    if best_dist <= candidate_radius:
-                        click_perf_capture = time.perf_counter()
-                        chosen_info = {
-                            "chosen_index": int(chosen_idx),
-                            "chosen_pos": tuple(pos_list[chosen_idx - 1]),
-                            "choice_time_perf_s": float(click_perf_capture),
-                            "choice_time_psychopy_s": None,
-                            "notes": f"block={block_idx}",
-                        }
-                        logger.log(
-                            "choice_made",
-                            image_name=getattr(block_paths[chosen_idx - 1], "name", str(block_paths[chosen_idx - 1])),
-                            requested_duration_s=None,
-                            flip_time_psychopy_s=None,
-                            flip_time_perf_s=click_perf_capture,
-                            end_time_perf_s=None,
-                            notes=f"block={block_idx} idx={chosen_idx} dist={best_dist:.1f} click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f})",
-                        )
-                        click_meta = {"idx": chosen_idx}
-                        click_registered = True
                         break
             
-            # Small wait between polls to avoid excessive CPU usage while maintaining responsiveness
-            if not click_registered and _poll < inter_frame_polls - 1:
-                _core.wait(0.001)  # 1ms wait between polls
-        
-        # Break out of frame loop if click was registered
-        if click_registered:
-            break
+            if chosen_idx is not None:
+                click_perf_capture = time.perf_counter()
+                chosen_info = {
+                    "chosen_index": int(chosen_idx),
+                    "chosen_pos": tuple(pos_list[chosen_idx - 1]),
+                    "choice_time_perf_s": float(click_perf_capture),
+                    "choice_time_psychopy_s": None,
+                    "notes": f"block={block_idx}",
+                }
+                logger.log(
+                    "choice_made",
+                    image_name=getattr(block_paths[chosen_idx - 1], "name", str(block_paths[chosen_idx - 1])),
+                    requested_duration_s=None,
+                    flip_time_psychopy_s=None,
+                    flip_time_perf_s=click_perf_capture,
+                    end_time_perf_s=None,
+                    notes=f"block={block_idx} idx={chosen_idx} click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f})",
+                )
+                click_meta = {"idx": chosen_idx}
+                click_registered = True
+                break
 
     if click_registered:
         # Clear dots on the next flip and log the flip timestamp

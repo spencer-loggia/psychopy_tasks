@@ -522,6 +522,30 @@ def run_task(
                         end_time_perf_s=None,
                         notes=f"block={block_idx} reward_level={reward_level} pulse={pulse_num}/{num_pulses}",
                     )
+                    
+                    # Inter-pulse interval: wait between pulses (except after the last pulse)
+                    if pulse_num < num_pulses:
+                        interval_start_perf = time.perf_counter()
+                        logger.log(
+                            "pump_inter_pulse_interval_start",
+                            image_name="",
+                            requested_duration_s=pump_pulse_time_seconds,
+                            flip_time_psychopy_s=None,
+                            flip_time_perf_s=interval_start_perf,
+                            end_time_perf_s=None,
+                            notes=f"block={block_idx} reward_level={reward_level} after_pulse={pulse_num}/{num_pulses}",
+                        )
+                        core.wait(pump_pulse_time_seconds)
+                        interval_end_perf = time.perf_counter()
+                        logger.log(
+                            "pump_inter_pulse_interval_end",
+                            image_name="",
+                            requested_duration_s=pump_pulse_time_seconds,
+                            flip_time_psychopy_s=None,
+                            flip_time_perf_s=interval_end_perf,
+                            end_time_perf_s=None,
+                            notes=f"block={block_idx} reward_level={reward_level} after_pulse={pulse_num}/{num_pulses}",
+                        )
             
             # Apply timeout if reward_to_timeout_map specifies it
             apply_timeout = 0

@@ -1056,7 +1056,7 @@ def present_block_with_persistent_dots(
         win.flip()
         
         # Small wait to allow touch events to be processed (critical for touch screens)
-        _core.wait(0.001)  # 1ms wait - allows event processing without impacting timing significantly
+        _core.wait(0.01)  # 1ms wait - allows event processing without impacting timing significantly
 
         # check for escape abort
         if _event.getKeys(["escape"]):

@@ -21,7 +21,7 @@ import sys
 import time
 import random
 from pathlib import Path
-from typing import Tuple, Optional, List, Dict
+from typing import Tuple, Optional, List, Dict, Any
 import pandas as pd
 
 from psychopy import core, logging as pylogging, event
@@ -34,6 +34,130 @@ from bin import utils
 from bin.logger import EventLogger, MessageLogger
 import numpy as np
 from bin.config import load_config, validate_config
+
+
+def _generate_active_foraging_trial(trial_idx: int, config: dict) -> dict:
+    """
+    Generate a single trial for the active foraging task.
+    Called by TrialBufferManager in a background process.
+    
+    Args:
+        trial_idx: 1-based trial index
+        config: Dictionary with all parameters needed for trial generation
+    
+    Returns:
+        Dictionary with trial data including block_paths, block_meta, and rendered stimuli
+    """
+    # Extract config
+    base_pairs = [tuple(x) for x in config["base_pairs"]]
+    shape_ids = [int(x) for x in config["shape_ids"]]
+    color_id_matrix = np.array(config["color_id_matrix"], dtype=int)
+    flat_probs = np.array(config["flat_probs"], dtype=float)
+    num_afc = int(config["num_afc"])
+    n_lum_levels = int(config["n_lum_levels"])
+    n_blocks = int(config["n_blocks"])
+    image_size = tuple(config["image_size"])
+    bg = tuple(config["bg"])
+    total_nonzero = int(config["total_nonzero"])
+    shapes = {int(k): Path(v) for k, v in config["shapes"].items()}
+    colors = {int(k): tuple(v) for k, v in config["colors"].items()}
+    seed = config.get("seed", None)
+    
+    # Initialize RNG (use seed + trial_idx for reproducibility per trial)
+    rng_seed = None if seed is None else int(seed) + trial_idx
+    rng = np.random.default_rng(rng_seed)
+    
+    # Check if we're done (when running with fixed n_blocks)
+    if n_blocks > 0 and trial_idx > n_blocks:
+        return {"type": "done"}
+    
+    # Sample color-shape pairs for this trial
+    if total_nonzero >= num_afc:
+        picks = rng.choice(len(base_pairs), size=num_afc, replace=False, p=flat_probs)
+    else:
+        picks = rng.choice(len(base_pairs), size=num_afc, replace=True, p=flat_probs)
+    
+    block_paths: List[Tuple[int, int]] = []
+    block_meta: List[Tuple[int, int, int]] = []
+    rendered: Dict[Tuple[int, int], np.ndarray] = {}
+    
+    for i in picks:
+        shape_idx, color_idx = base_pairs[int(i)]
+        lum_idx = int(rng.integers(0, n_lum_levels))
+        sid = int(shape_ids[shape_idx])
+        cid = int(color_id_matrix[lum_idx, color_idx])
+        pair = (sid, cid)
+        block_paths.append([int(sid), int(cid)])  # Store as list for serialization
+        block_meta.append([int(shape_idx), int(color_idx), int(lum_idx)])  # Store as list
+        
+        # Rasterize if not already done
+        if pair not in rendered:
+            pil = utils.rasterize_svg_with_color(
+                shapes[sid],
+                size_px=image_size,
+                color_rgb_255=colors[cid],
+                bg_rgb_255=bg,
+            )
+            rendered[pair] = np.asarray(pil)
+    
+    # Convert rendered dict keys to strings for serialization
+    rendered_serializable = {f"{k[0]}_{k[1]}": v for k, v in rendered.items()}
+    
+    return {
+        "type": "trial",
+        "trial_idx": int(trial_idx),
+        "block_paths": block_paths,
+        "block_meta": block_meta,
+        "rendered": rendered_serializable,
+    }
+
+
+def _decode_trial_payload(payload: dict) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int, int]], Dict[Tuple[int, int], Any]]:
+    if payload.get("type") == "done":
+        return [], [], {}
+    if payload.get("type") != "trial":
+        raise RuntimeError(f"Unexpected payload from trial buffer: {payload}")
+
+    block_paths = [tuple(x) for x in payload["block_paths"]]
+    block_meta = [tuple(x) for x in payload["block_meta"]]
+    preloaded: Dict[Tuple[int, int], Any] = {}
+    for key_str, arr in payload["rendered"].items():
+        sid, cid = map(int, key_str.split('_'))
+        preloaded[(sid, cid)] = arr
+    return block_paths, block_meta, preloaded
+
+
+def _stim_size_from_preloaded(preloaded: Dict[Tuple[int, int], Any], first_pair: Tuple[int, int]) -> Tuple[int, int]:
+    item = preloaded[first_pair]
+    if isinstance(item, np.ndarray):
+        if item.ndim < 2:
+            raise ValueError(f"Invalid preloaded stimulus array shape: {item.shape}")
+        return int(item.shape[1]), int(item.shape[0])
+    return item.size
+
+
+def _compute_positions(
+    fixed_positions: bool,
+    num_afc: int,
+    position_spacing: Optional[int],
+    stim_size: Tuple[int, int],
+    effective_win_size: Tuple[int, int],
+    margin: int,
+) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+    if fixed_positions:
+        if num_afc not in (2, 4):
+            raise ValueError("fixed_positions only supported for num_afc == 2 or num_afc == 4")
+        spacing = int(position_spacing) if position_spacing is not None else 300
+        if num_afc == 2:
+            sampled_positions = [(-spacing, 0), (spacing, 0)]
+        else:
+            sampled_positions = [(-spacing, spacing), (spacing, spacing), (-spacing, -spacing), (spacing, -spacing)]
+        positions = utils.clamp_positions(sampled_positions, stim_size, effective_win_size, margin=margin)
+        return sampled_positions, positions
+
+    sampled_positions = utils.sample_non_overlapping_positions(num_afc, stim_size, effective_win_size, margin=margin)
+    positions = utils.clamp_positions(sampled_positions, stim_size, effective_win_size, margin=margin)
+    return sampled_positions, positions
 
 
 def parse_args():
@@ -76,6 +200,7 @@ def parse_args():
     p.add_argument("--n_colors", type=int, default=None, help="Expected number of base colors (excluding luminance levels)")
     p.add_argument("--n_shapes", type=int, default=None, help="Expected number of shapes")
     p.add_argument("--n_lum_levels", type=int, default=None, help="Expected number of luminance levels per base color")
+    p.add_argument("--buffer_len_trials", type=int, default=None, help="How many upcoming trials to keep buffered in a background process")
     return p.parse_args()
 
 
@@ -120,6 +245,7 @@ def run_task(
     n_colors_expected: Optional[int] = None,
     n_shapes_expected: Optional[int] = None,
     n_lum_levels: Optional[int] = None,
+    buffer_len_trials: int = 5,
 ):
     # Set debug flag before rasterization if requested
     utils.set_debug(debug)
@@ -325,13 +451,9 @@ def run_task(
     else:
         msg_logger.log("INFO", "No reward_space_tsv provided; all pairs have reward level 0")
 
-    # Pre-render all pair images (SVG recolored to each color)
+    # Preloading is deferred until after block sampling to avoid rasterizing
+    # the full color x shape x luminance combinatoric space.
     preloaded: dict = {}
-    for (sid, cid) in all_pairs:
-        svg_path = shapes[sid]
-        color = colors[cid]
-        pil = utils.rasterize_svg_with_color(svg_path, size_px=tuple(image_size), color_rgb_255=color, bg_rgb_255=bg)
-        preloaded[(sid, cid)] = pil
 
     # Window + background + fixation
     win = utils.setup_window(bg_rgb_255=bg, fullscreen=fullscreen, size=win_size)
@@ -414,8 +536,7 @@ def run_task(
     else:
         msg_logger.log("INFO", "raspi=False; GPIO pin signals will not be sent (events will be logged only)")
 
-    # Pre-sample blocks by base color-shape probabilities.
-    # Luminance is sampled uniformly after choosing base pair.
+    # Base color-shape probabilities (luminance sampled uniformly after base pair draw).
     flat_probs = np.array([likelihood[color_idx, shape_idx] for (shape_idx, color_idx) in base_pairs], dtype=float)
     # numerical safety: ensure non-negative
     flat_probs = np.clip(flat_probs, 0.0, None)
@@ -426,285 +547,278 @@ def run_task(
     else:
         flat_probs = flat_probs / float(flat_probs.sum())
 
-    # seed numpy RNG for reproducibility
-    if seed is not None:
-        np.random.seed(int(seed))
+    # Configure background trial buffer worker (separate process/core).
+    run_indefinitely = int(n_blocks) <= 0
+    buffer_len_trials = max(1, int(buffer_len_trials) if buffer_len_trials is not None else 5)
 
-    blocks = []
-    block_base_meta = []
-    for _ in range(n_blocks):
-        if total_nonzero >= num_afc:
-            picks = np.random.choice(len(base_pairs), size=num_afc, replace=False, p=flat_probs)
-        else:
-            # Not enough non-zero entries to sample without replacement; fall back to sampling with replacement
-            msg_logger.log("WARN", f"Only {total_nonzero} non-zero pairs available but num_afc={num_afc}; sampling with replacement")
-            picks = np.random.choice(len(base_pairs), size=num_afc, replace=True, p=flat_probs)
+    worker_cfg = {
+        "base_pairs": [list(pair) for pair in base_pairs],  # Convert tuples to lists for serialization
+        "shape_ids": list(shape_ids),
+        "color_id_matrix": color_id_matrix.tolist(),
+        "flat_probs": flat_probs.tolist(),
+        "num_afc": int(num_afc),
+        "n_lum_levels": int(n_lum_levels),
+        "n_blocks": int(n_blocks),
+        "image_size": list(image_size),
+        "bg": list(bg),
+        "total_nonzero": int(total_nonzero),
+        "shapes": {str(k): str(v) for k, v in shapes.items()},
+        "colors": {str(k): list(v) for k, v in colors.items()},
+        "seed": seed,
+    }
 
-        block_display_pairs: List[Tuple[int, int]] = []
-        block_meta: List[Tuple[int, int, int]] = []  # (shape_idx, color_idx, lum_idx)
-        for i in picks:
-            shape_idx, color_idx = base_pairs[int(i)]
-            lum_idx = int(np.random.randint(0, n_lum_levels))
-            sid = shape_ids[shape_idx]
-            cid = int(color_id_matrix[lum_idx, color_idx])
-            block_display_pairs.append((sid, cid))
-            block_meta.append((shape_idx, color_idx, lum_idx))
+    # Initialize TrialBufferManager for background trial generation
+    buffer_mgr = utils.TrialBufferManager(
+        trial_generator_func=_generate_active_foraging_trial,
+        config=worker_cfg,
+        buffer_size=buffer_len_trials,
+        start_idx=1
+    )
 
-        blocks.append(block_display_pairs)
-        block_base_meta.append(block_meta)
-
-    # Task start
-    logger.log("task_start", image_name="", notes=f"n_blocks={n_blocks} num_afc={num_afc}")
-
-    for block_idx in range(1, n_blocks + 1):
-        logger.log("block_start", image_name="", requested_duration_s=None, flip_time_psychopy_s=None, flip_time_perf_s=time.perf_counter(), end_time_perf_s=None, notes=f"block={block_idx}")
-
-        # No separate pre-block fixation/ISI wait: per-stimulus pre-dot ISI is handled inside the utility.
-
-        block_paths = blocks[block_idx - 1]
-        block_meta = block_base_meta[block_idx - 1]
-
-        for opt_idx, ((shape_id, color_id), (shape_idx, base_color_idx, lum_idx)) in enumerate(zip(block_paths, block_meta), start=1):
-            logger.log(
-                "stimulus_selected",
-                image_name=str((shape_id, color_id)),
-                requested_duration_s=None,
-                flip_time_psychopy_s=None,
-                flip_time_perf_s=time.perf_counter(),
-                end_time_perf_s=None,
-                notes=(
-                    f"block={block_idx} idx={opt_idx} shape_id={shape_id} shape_idx={shape_idx} "
-                    f"color_id={color_id} base_color_idx={base_color_idx} "
-                    f"luminance_level={lum_idx + 1} lum_idx={lum_idx}"
-                ),
-            )
-
-        # compute stim size from first pair
-        first_pair = block_paths[0]
-        pil0 = preloaded[first_pair]
-        stim_size = pil0.size
-
-        effective_win_size = tuple(win_size) if win_size is not None else tuple(win.size)
-
-        # Determine positions: either fixed grid/left-right or randomly sampled non-overlapping
-        if fixed_positions:
-            # Only support 2 or 4 options for fixed layout
-            if num_afc not in (2, 4):
-                raise ValueError("fixed_positions only supported for num_afc == 2 or num_afc == 4")
-            # default spacing if not provided
-            spacing = int(position_spacing) if position_spacing is not None else 300
-            sampled_positions = []
-            if num_afc == 2:
-                # left and right of fixation along the horizontal axis
-                sampled_positions = [(-spacing, 0), (spacing, 0)]
-            else:
-                # four corners: one in each quadrant (x,y) combinations
-                sampled_positions = [(-spacing, spacing), (spacing, spacing), (-spacing, -spacing), (spacing, -spacing)]
-            positions = utils.clamp_positions(sampled_positions, stim_size, effective_win_size, margin=margin)
-        else:
-            sampled_positions = utils.sample_non_overlapping_positions(num_afc, stim_size, effective_win_size, margin=margin)
-            positions = utils.clamp_positions(sampled_positions, stim_size, effective_win_size, margin=margin)
-
-        for i, (spos, cpos) in enumerate(zip(sampled_positions, positions), start=1):
-            # Non-task diagnostic message: use MessageLogger instead of EventLogger
-            try:
-                msg_logger.log("INFO", f"position_assigned block={block_idx} idx={i} sampled={spos} clamped={cpos}")
-            except Exception:
-                pass
-
-        # Present this block and handle the single choice using shared utility.
-        aborted, choice_info = utils.present_block_with_persistent_dots(
-            win=win,
-            preloaded=preloaded,
-            block_paths=block_paths,
-            positions=positions,
-            duration=duration,
-            choice_time=choice_time,
-            dot_size=dot_size,
-            dot_color=dot_color,
-            bg_rect=bg_rect,
-            fix=fix,
-            logger=logger,
-            block_idx=block_idx,
-            isi=isi,
-            init_dot_color=init_dot_color,
-            bg_rgb_255=bg,
-            onset_cue=onset_stim,
-            msg_logger=msg_logger,
-            fps=fps,
-            raspi=bool(raspi and pigpio_pi is not None),
-            pigpio_pi=pigpio_pi,
-            raspi_pin=trial_start_pin,
-            sequential=sequential,
-            is_memory=is_memory,
+    try:
+        # Task start
+        logger.log(
+            "task_start",
+            image_name="",
+            notes=f"n_blocks={n_blocks} num_afc={num_afc} run_indefinitely={run_indefinitely} buffer_len_trials={buffer_len_trials}",
         )
-        if aborted:
-            return
 
-        # Handle reward/timeout based on choice
-        if choice_info is not None:
-            chosen_idx = choice_info["chosen_index"]  # 1-based
-            chosen_pair = block_paths[chosen_idx - 1]  # (shape_id, color_id)
-            reward_level = reward_map.get(chosen_pair, 0)
-            chosen_shape_idx, chosen_color_idx, chosen_lum_idx = block_base_meta[block_idx - 1][chosen_idx - 1]
+        block_idx = 1
+        while True:
+            if (not run_indefinitely) and block_idx > n_blocks:
+                break
+
+            # Get next trial from buffer
+            payload = buffer_mgr.get_next_trial()
+
+            block_paths, block_meta, preloaded = _decode_trial_payload(payload)
+            if payload.get("type") == "done":
+                break
             
-            # Log the reward level
-            logger.log(
-                "reward_determined",
-                image_name=str(chosen_pair),
-                requested_duration_s=None,
-                flip_time_psychopy_s=None,
-                flip_time_perf_s=time.perf_counter(),
-                end_time_perf_s=None,
-                notes=(
-                    f"block={block_idx} idx={chosen_idx} pair={chosen_pair} "
-                    f"base_color_idx={chosen_color_idx} shape_idx={chosen_shape_idx} "
-                    f"lum_idx={chosen_lum_idx} reward_level={reward_level}"
-                ),
+            logger.log("block_start", image_name="", requested_duration_s=None, flip_time_psychopy_s=None, flip_time_perf_s=time.perf_counter(), end_time_perf_s=None, notes=f"block={block_idx}")
+
+            # No separate pre-block fixation/ISI wait: per-stimulus pre-dot ISI is handled inside the utility.
+            for opt_idx, ((shape_id, color_id), (shape_idx, base_color_idx, lum_idx)) in enumerate(zip(block_paths, block_meta), start=1):
+                logger.log(
+                    "stimulus_selected",
+                    image_name=str((shape_id, color_id)),
+                    requested_duration_s=None,
+                    flip_time_psychopy_s=None,
+                    flip_time_perf_s=time.perf_counter(),
+                    end_time_perf_s=None,
+                    notes=(
+                        f"block={block_idx} idx={opt_idx} shape_id={shape_id} shape_idx={shape_idx} "
+                        f"color_id={color_id} base_color_idx={base_color_idx} "
+                        f"luminance_level={lum_idx + 1} lum_idx={lum_idx}"
+                    ),
+                )
+
+            first_pair = block_paths[0]
+            stim_size = _stim_size_from_preloaded(preloaded, first_pair)
+
+            effective_win_size = tuple(win_size) if win_size is not None else tuple(win.size)
+            sampled_positions, positions = _compute_positions(
+                fixed_positions=fixed_positions,
+                num_afc=num_afc,
+                position_spacing=position_spacing,
+                stim_size=stim_size,
+                effective_win_size=effective_win_size,
+                margin=margin,
             )
-            
-            # Deliver pump pulses if reward_to_pulse_map specifies any
-            num_pulses = 0
-            if reward_to_pulse_map is not None:
-                num_pulses = reward_to_pulse_map.get(str(reward_level), 0)
-            
-            if num_pulses > 0:
-                for pulse_num in range(1, num_pulses + 1):
-                    pulse_start_perf = time.perf_counter()
-                    if raspi and gpio_chip is not None:
-                        try:
-                            import lgpio
-                            lgpio.gpio_write(gpio_chip, pump_pin, 1)
-                        except Exception as e:
-                            msg_logger.log("ERROR", f"Failed to set pump_pin high: {e}")
-                    
-                    logger.log(
-                        "pump_pulse_start",
-                        image_name="",
-                        requested_duration_s=pump_pulse_time_seconds,
-                        flip_time_psychopy_s=None,
-                        flip_time_perf_s=pulse_start_perf,
-                        end_time_perf_s=None,
-                        notes=f"block={block_idx} reward_level={reward_level} pulse={pulse_num}/{num_pulses}",
-                    )
-                    
-                    # Wait for pulse duration
-                    core.wait(pump_pulse_time_seconds)
-                    
-                    pulse_end_perf = time.perf_counter()
-                    if raspi and gpio_chip is not None:
-                        try:
-                            import lgpio
-                            lgpio.gpio_write(gpio_chip, pump_pin, 0)
-                        except Exception as e:
-                            msg_logger.log("ERROR", f"Failed to set pump_pin low: {e}")
-                    
-                    logger.log(
-                        "pump_pulse_end",
-                        image_name="",
-                        requested_duration_s=pump_pulse_time_seconds,
-                        flip_time_psychopy_s=None,
-                        flip_time_perf_s=pulse_end_perf,
-                        end_time_perf_s=None,
-                        notes=f"block={block_idx} reward_level={reward_level} pulse={pulse_num}/{num_pulses}",
-                    )
-                    
-                    # Inter-pulse interval: wait between pulses (except after the last pulse)
-                    if pulse_num < num_pulses:
-                        interval_start_perf = time.perf_counter()
+
+            for i, (spos, cpos) in enumerate(zip(sampled_positions, positions), start=1):
+                try:
+                    msg_logger.log("INFO", f"position_assigned block={block_idx} idx={i} sampled={spos} clamped={cpos}")
+                except Exception:
+                    pass
+
+            aborted, choice_info = utils.present_block_with_persistent_dots(
+                win=win,
+                preloaded=preloaded,
+                block_paths=block_paths,
+                positions=positions,
+                duration=duration,
+                choice_time=choice_time,
+                dot_size=dot_size,
+                dot_color=dot_color,
+                bg_rect=bg_rect,
+                fix=fix,
+                logger=logger,
+                block_idx=block_idx,
+                isi=isi,
+                init_dot_color=init_dot_color,
+                bg_rgb_255=bg,
+                onset_cue=onset_stim,
+                msg_logger=msg_logger,
+                fps=fps,
+                raspi=bool(raspi and pigpio_pi is not None),
+                pigpio_pi=pigpio_pi,
+                raspi_pin=trial_start_pin,
+                sequential=sequential,
+                is_memory=is_memory,
+            )
+            if aborted:
+                break
+
+            if choice_info is not None:
+                chosen_idx = choice_info["chosen_index"]
+                chosen_pair = block_paths[chosen_idx - 1]
+                reward_level = reward_map.get(chosen_pair, 0)
+                chosen_shape_idx, chosen_color_idx, chosen_lum_idx = block_meta[chosen_idx - 1]
+
+                logger.log(
+                    "reward_determined",
+                    image_name=str(chosen_pair),
+                    requested_duration_s=None,
+                    flip_time_psychopy_s=None,
+                    flip_time_perf_s=time.perf_counter(),
+                    end_time_perf_s=None,
+                    notes=(
+                        f"block={block_idx} idx={chosen_idx} pair={chosen_pair} "
+                        f"base_color_idx={chosen_color_idx} shape_idx={chosen_shape_idx} "
+                        f"lum_idx={chosen_lum_idx} reward_level={reward_level}"
+                    ),
+                )
+
+                num_pulses = 0
+                if reward_to_pulse_map is not None:
+                    num_pulses = reward_to_pulse_map.get(str(reward_level), 0)
+
+                if num_pulses > 0:
+                    for pulse_num in range(1, num_pulses + 1):
+                        pulse_start_perf = time.perf_counter()
+                        if raspi and gpio_chip is not None:
+                            try:
+                                import lgpio
+                                lgpio.gpio_write(gpio_chip, pump_pin, 1)
+                            except Exception as e:
+                                msg_logger.log("ERROR", f"Failed to set pump_pin high: {e}")
+
                         logger.log(
-                            "pump_inter_pulse_interval_start",
+                            "pump_pulse_start",
                             image_name="",
                             requested_duration_s=pump_pulse_time_seconds,
                             flip_time_psychopy_s=None,
-                            flip_time_perf_s=interval_start_perf,
+                            flip_time_perf_s=pulse_start_perf,
                             end_time_perf_s=None,
-                            notes=f"block={block_idx} reward_level={reward_level} after_pulse={pulse_num}/{num_pulses}",
+                            notes=f"block={block_idx} reward_level={reward_level} pulse={pulse_num}/{num_pulses}",
                         )
                         core.wait(pump_pulse_time_seconds)
-                        interval_end_perf = time.perf_counter()
+
+                        pulse_end_perf = time.perf_counter()
+                        if raspi and gpio_chip is not None:
+                            try:
+                                import lgpio
+                                lgpio.gpio_write(gpio_chip, pump_pin, 0)
+                            except Exception as e:
+                                msg_logger.log("ERROR", f"Failed to set pump_pin low: {e}")
+
                         logger.log(
-                            "pump_inter_pulse_interval_end",
+                            "pump_pulse_end",
                             image_name="",
                             requested_duration_s=pump_pulse_time_seconds,
                             flip_time_psychopy_s=None,
-                            flip_time_perf_s=interval_end_perf,
+                            flip_time_perf_s=pulse_end_perf,
                             end_time_perf_s=None,
-                            notes=f"block={block_idx} reward_level={reward_level} after_pulse={pulse_num}/{num_pulses}",
+                            notes=f"block={block_idx} reward_level={reward_level} pulse={pulse_num}/{num_pulses}",
                         )
-            
-            # Apply timeout if reward_to_timeout_map specifies it
-            apply_timeout = 0
-            if reward_to_timeout_map is not None:
-                apply_timeout = reward_to_timeout_map.get(str(reward_level), 0)
-            
-            if apply_timeout > 0:
-                timeout_start_perf = time.perf_counter()
-                if raspi and gpio_chip is not None:
-                    try:
-                        import lgpio
-                        lgpio.gpio_write(gpio_chip, buzz_pin, 1)
-                    except Exception as e:
-                        msg_logger.log("ERROR", f"Failed to set buzz_pin high: {e}")
-                
-                logger.log(
-                    "timeout_start",
-                    image_name="",
-                    requested_duration_s=timeout_duration_seconds,
-                    flip_time_psychopy_s=None,
-                    flip_time_perf_s=timeout_start_perf,
-                    end_time_perf_s=None,
-                    notes=f"block={block_idx} reward_level={reward_level}",
-                )
-                
-                # Wait for timeout duration
-                core.wait(timeout_duration_seconds)
-                
-                timeout_end_perf = time.perf_counter()
-                if raspi and gpio_chip is not None:
-                    try:
-                        import lgpio
-                        lgpio.gpio_write(gpio_chip, buzz_pin, 0)
-                    except Exception as e:
-                        msg_logger.log("ERROR", f"Failed to set buzz_pin low: {e}")
-                
-                logger.log(
-                    "timeout_end",
-                    image_name="",
-                    requested_duration_s=timeout_duration_seconds,
-                    flip_time_psychopy_s=None,
-                    flip_time_perf_s=timeout_end_perf,
-                    end_time_perf_s=None,
-                    notes=f"block={block_idx} reward_level={reward_level}",
-                )
 
-        # Choice events are already logged inside the utility (choice_made/choice_end);
-        # avoid redundant event rows here.
+                        if pulse_num < num_pulses:
+                            interval_start_perf = time.perf_counter()
+                            logger.log(
+                                "pump_inter_pulse_interval_start",
+                                image_name="",
+                                requested_duration_s=pump_pulse_time_seconds,
+                                flip_time_psychopy_s=None,
+                                flip_time_perf_s=interval_start_perf,
+                                end_time_perf_s=None,
+                                notes=f"block={block_idx} reward_level={reward_level} after_pulse={pulse_num}/{num_pulses}",
+                            )
+                            core.wait(pump_pulse_time_seconds)
+                            interval_end_perf = time.perf_counter()
+                            logger.log(
+                                "pump_inter_pulse_interval_end",
+                                image_name="",
+                                requested_duration_s=pump_pulse_time_seconds,
+                                flip_time_psychopy_s=None,
+                                flip_time_perf_s=interval_end_perf,
+                                end_time_perf_s=None,
+                                notes=f"block={block_idx} reward_level={reward_level} after_pulse={pulse_num}/{num_pulses}",
+                            )
 
-        # ibi (frame-locked)
-        if ibi and ibi > 0:
-            ibi_frames = int(round(float(ibi) * fps))
-            ibi_frames = max(0, ibi_frames)
-            ibi_s = ibi_frames / fps
-            try:
-                msg_logger.log("INFO", f"timing_quantization block={block_idx} ibi={ibi:.6f}s-> {ibi_frames}fr({ibi_s:.6f}s)")
-            except Exception:
-                pass
-            # initial flip
-            bg_rect.draw()
-            if fix is not None:
-                fix.draw()
-            ibi_flip = win.flip()
-            ibi_perf = time.perf_counter()
-            logger.log("ibi_start", image_name="", requested_duration_s=ibi_s, flip_time_psychopy_s=ibi_flip, flip_time_perf_s=ibi_perf, end_time_perf_s=ibi_perf + ibi_s, notes=f"after_block={block_idx}")
-            # remaining frames-1
-            for _f in range(max(0, ibi_frames - 1)):
+                apply_timeout = 0
+                if reward_to_timeout_map is not None:
+                    apply_timeout = reward_to_timeout_map.get(str(reward_level), 0)
+
+                if apply_timeout > 0:
+                    timeout_start_perf = time.perf_counter()
+                    if raspi and gpio_chip is not None:
+                        try:
+                            import lgpio
+                            lgpio.gpio_write(gpio_chip, buzz_pin, 1)
+                        except Exception as e:
+                            msg_logger.log("ERROR", f"Failed to set buzz_pin high: {e}")
+
+                    logger.log(
+                        "timeout_start",
+                        image_name="",
+                        requested_duration_s=timeout_duration_seconds,
+                        flip_time_psychopy_s=None,
+                        flip_time_perf_s=timeout_start_perf,
+                        end_time_perf_s=None,
+                        notes=f"block={block_idx} reward_level={reward_level}",
+                    )
+                    core.wait(timeout_duration_seconds)
+
+                    timeout_end_perf = time.perf_counter()
+                    if raspi and gpio_chip is not None:
+                        try:
+                            import lgpio
+                            lgpio.gpio_write(gpio_chip, buzz_pin, 0)
+                        except Exception as e:
+                            msg_logger.log("ERROR", f"Failed to set buzz_pin low: {e}")
+
+                    logger.log(
+                        "timeout_end",
+                        image_name="",
+                        requested_duration_s=timeout_duration_seconds,
+                        flip_time_psychopy_s=None,
+                        flip_time_perf_s=timeout_end_perf,
+                        end_time_perf_s=None,
+                        notes=f"block={block_idx} reward_level={reward_level}",
+                    )
+
+            if ibi and ibi > 0:
+                ibi_frames = int(round(float(ibi) * fps))
+                ibi_frames = max(0, ibi_frames)
+                ibi_s = ibi_frames / fps
+                try:
+                    msg_logger.log("INFO", f"timing_quantization block={block_idx} ibi={ibi:.6f}s-> {ibi_frames}fr({ibi_s:.6f}s)")
+                except Exception:
+                    pass
+
                 bg_rect.draw()
                 if fix is not None:
                     fix.draw()
-                win.flip()
+                ibi_flip = win.flip()
+                ibi_perf = time.perf_counter()
+                logger.log("ibi_start", image_name="", requested_duration_s=ibi_s, flip_time_psychopy_s=ibi_flip, flip_time_perf_s=ibi_perf, end_time_perf_s=ibi_perf + ibi_s, notes=f"after_block={block_idx}")
 
-        logger.log("block_end", image_name="", notes=f"block={block_idx}")
+                for _f in range(max(0, ibi_frames - 1)):
+                    bg_rect.draw()
+                    if fix is not None:
+                        fix.draw()
+                    win.flip()
+
+            logger.log("block_end", image_name="", notes=f"block={block_idx}")
+            block_idx += 1
+
+    finally:
+        # Clean up trial buffer manager
+        try:
+            buffer_mgr.close()
+        except Exception:
+            pass
 
     # Task end
     logger.log("task_end", image_name="", notes="done")
@@ -786,6 +900,7 @@ def main():
     n_colors_expected = _get("n_colors", cfg.get("n_colors", None))
     n_shapes_expected = _get("n_shapes", cfg.get("n_shapes", None))
     n_lum_levels = _get("n_lum_levels", cfg.get("n_lum_levels", None))
+    buffer_len_trials = int(_get("buffer_len_trials", cfg.get("buffer_len_trials", 5)))
     # stroke options were removed to match utils.rasterize_svg_with_color signature
 
     try:
@@ -830,6 +945,7 @@ def main():
             n_colors_expected=n_colors_expected,
             n_shapes_expected=n_shapes_expected,
             n_lum_levels=n_lum_levels,
+            buffer_len_trials=buffer_len_trials,
         )
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)

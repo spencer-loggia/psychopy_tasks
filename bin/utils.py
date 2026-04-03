@@ -9,9 +9,12 @@ Modularity helpers included:
 """
 from pathlib import Path
 import random
-from typing import List, Tuple, Optional, Dict, Union
+from typing import List, Tuple, Optional, Dict, Union, Callable, Any
 import io
 import sys
+import multiprocessing as mp
+import queue
+import traceback
 
 import numpy as np
 from PIL import Image
@@ -1232,3 +1235,180 @@ def sample_blocks(files: List[Path], num_afc: int, n_blocks: int, seed: Optional
     for _ in range(n_blocks):
         blocks.append(random.sample(files, num_afc))
     return blocks
+
+
+# -----------------------------------------------------------------------------------------
+# Trial Buffer Manager (for background trial generation with multiprocessing)
+# -----------------------------------------------------------------------------------------
+
+def _trial_buffer_worker_generic(
+    trial_generator_func: Callable[[int, dict], dict],
+    config: dict,
+    trial_queue: Any,
+    stop_event: Any,
+    start_idx: int = 0
+):
+    """
+    Generic worker process that generates trials in the background.
+    
+    Args:
+        trial_generator_func: Callable that takes (trial_idx, config) and returns trial dict
+        config: Configuration dictionary to pass to the generator
+        trial_queue: Queue to push generated trials into
+        stop_event: Event to signal worker to stop
+        start_idx: Starting trial index
+    """
+    trial_idx = start_idx
+    while not stop_event.is_set():
+        try:
+            trial_data = trial_generator_func(trial_idx, config)
+            while not stop_event.is_set():
+                try:
+                    trial_queue.put(trial_data, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+            trial_idx += 1
+        except Exception as e:
+            # Put error into queue for main process to handle
+            error_text = str(e) or repr(e)
+            error_trace = traceback.format_exc()
+            while not stop_event.is_set():
+                try:
+                    trial_queue.put(
+                        {
+                            "type": "error",
+                            "error": error_text,
+                            "traceback": error_trace,
+                            "trial_idx": trial_idx,
+                        },
+                        timeout=0.1,
+                    )
+                    break
+                except queue.Full:
+                    continue
+            break
+
+
+class TrialBufferManager:
+    """
+    Generic trial buffer manager that uses multiprocessing to pre-generate trials
+    on a separate core. Works with any task paradigm by taking a user-defined
+    trial generation callable.
+    
+    The trial_generator_func should be a function that takes:
+        - trial_idx: int (the index of the trial to generate)
+        - config: dict (containing any parameters needed for generation)
+    
+    And returns a dictionary representing the trial data.
+    
+    Example usage:
+        def my_trial_generator(trial_idx: int, config: dict) -> dict:
+            # Generate trial based on config
+            return {"trial_idx": trial_idx, "stimuli": [...], ...}
+        
+        buffer_mgr = TrialBufferManager(
+            trial_generator_func=my_trial_generator,
+            config={"param1": value1, "param2": value2},
+            buffer_size=5
+        )
+        
+        # In your task loop:
+        trial_data = buffer_mgr.get_next_trial()
+        # Use trial_data...
+        
+        # When done:
+        buffer_mgr.close()
+    """
+    
+    def __init__(
+        self, 
+        trial_generator_func: Callable[[int, dict], dict],
+        config: dict,
+        buffer_size: int = 5,
+        start_idx: int = 0
+    ):
+        """
+        Initialize the trial buffer manager.
+        
+        Args:
+            trial_generator_func: A callable that generates trial data.
+                                  Must take (trial_idx: int, config: dict) -> dict
+            config: Dictionary of configuration parameters to pass to generator
+            buffer_size: Maximum number of trials to buffer ahead (default: 5)
+            start_idx: Starting trial index (default: 0)
+        """
+        self.trial_generator_func = trial_generator_func
+        self.config = config
+        self.buffer_size = buffer_size
+        self.start_idx = start_idx
+        self.next_trial_idx = start_idx
+        
+        # Set up multiprocessing with spawn context (required for some libraries like PsychoPy)
+        ctx = mp.get_context('spawn')
+        self.trial_queue = ctx.Queue(maxsize=buffer_size)
+        self.stop_event = ctx.Event()
+        
+        # Start the worker process
+        self.worker = ctx.Process(
+            target=_trial_buffer_worker_generic,
+            args=(trial_generator_func, config, self.trial_queue, self.stop_event, start_idx)
+        )
+        self.worker.start()
+        self.is_closed = False
+    
+    def get_next_trial(self) -> dict:
+        """
+        Get the next pre-generated trial from the buffer.
+        
+        Returns:
+            Dictionary containing the trial data generated by trial_generator_func
+            
+        Raises:
+            RuntimeError: If the buffer manager has been closed or worker encountered an error
+        """
+        if self.is_closed:
+            raise RuntimeError("TrialBufferManager has been closed")
+        
+        try:
+            trial_data = self.trial_queue.get(timeout=30.0)
+            
+            # Check if worker sent an error
+            if isinstance(trial_data, dict) and trial_data.get("type") == "error":
+                error_text = trial_data.get("error", "Unknown worker error")
+                trial_idx = trial_data.get("trial_idx")
+                trace_text = trial_data.get("traceback")
+                details = f"Trial generation error at trial_idx={trial_idx}: {error_text}"
+                if trace_text:
+                    details = f"{details}\n{trace_text}"
+                raise RuntimeError(details)
+            
+            self.next_trial_idx += 1
+            return trial_data
+            
+        except Exception as e:
+            self.close()
+            raise RuntimeError(f"Failed to get next trial: {e}")
+    
+    def close(self):
+        """
+        Clean up the worker process and release resources.
+        Should be called when done using the buffer manager.
+        """
+        if self.is_closed:
+            return
+            
+        self.is_closed = True
+        self.stop_event.set()
+        
+        # Give worker time to finish cleanly
+        self.worker.join(timeout=2.0)
+        
+        # Force terminate if still alive
+        if self.worker.is_alive():
+            self.worker.terminate()
+            self.worker.join(timeout=1.0)
+    
+    def __del__(self):
+        """Destructor to ensure cleanup happens even if close() not called."""
+        self.close()

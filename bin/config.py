@@ -65,6 +65,8 @@ def validate_config(cfg: Dict[str, Any], required: Optional[List[str]] = None) -
     if "isi" in cfg:
         if not (isinstance(cfg["isi"], int) or isinstance(cfg["isi"], float)) or cfg["isi"] < 0:
             raise ValueError("Config 'isi' must be a non-negative number (seconds)")
+    # `bg` is task-specific. active_foraging derives background from colors_tsv,
+    # but other tasks may still provide `bg`.
     if "bg" in cfg:
         bg = cfg["bg"]
         if not (isinstance(bg, list) or isinstance(bg, tuple)) or len(bg) != 3:

@@ -1,7 +1,8 @@
 """
 Active foraging task.
 
-- Loads a color palette TSV (ID, R, G, B)
+- Loads a color palette TSV (ID, R, G, B) where the first data row is the
+  background gray and the remaining rows are color definitions
 - Loads a shape-definition TSV (ID, PATH) where PATH must point to an SVG
 - Builds shape-color pairs (shape_id, color_id) and rasterizes SVGs recolored
   to each color at `image_size`.
@@ -163,7 +164,13 @@ def _compute_positions(
 def parse_args():
     p = argparse.ArgumentParser(description="Active foraging task")
     p.add_argument("--config", help="Path to JSON config file. CLI overrides config keys.")
-    p.add_argument("--colors_tsv", help="Path to color TSV (overrides config)")
+    p.add_argument(
+        "--colors_tsv",
+        help=(
+            "Path to color TSV (overrides config). First data row is background gray; "
+            "remaining rows are ordered color definitions."
+        ),
+    )
     p.add_argument("--shapes_tsv", help="Path to shapes TSV (overrides config)")
     p.add_argument("--n", type=int, default=None, help="Number of blocks (overrides config n)")
     p.add_argument("--num_afc", type=int, default=None, help="Number of stimuli per block")
@@ -174,7 +181,6 @@ def parse_args():
     p.add_argument("--dot_size", type=int, default=None, help="Dot size in pixels")
     p.add_argument("--dot_color", type=int, nargs=3, default=None, help="Persistent dot RGB color 0-255")
     p.add_argument("--init_dot_color", type=int, nargs=3, default=None, help="Init pre-stimulus dot RGB color 0-255")
-    p.add_argument("--bg", type=int, nargs=3, default=None, help="Background RGB (0-255)")
     p.add_argument("--output_dir", default=None, help="Output dir for logs")
     p.add_argument("--seed", type=int, default=None, help="Random seed")
     p.add_argument("--fullscreen", action="store_true", default=None, help="Fullscreen")
@@ -216,7 +222,6 @@ def run_task(
     init_dot_color: Optional[Tuple[int, int, int]],
     dot_size: int,
     dot_color: Tuple[int, int, int],
-    bg: Tuple[int, int, int],
     output_dir: str,
     seed: Optional[int] = None,
     fullscreen: bool = False,
@@ -256,10 +261,14 @@ def run_task(
     colors = utils.load_color_palette(Path(colors_tsv))
     shapes = utils.load_shape_definitions(Path(shapes_tsv))
 
+    # First row of colors_tsv is reserved for background gray.
+    bg, colors = utils.split_background_from_palette(colors)
+
     # message logger for warnings/debug/info
     msg_logger = MessageLogger(output_dir, filename="active_foraging_message_log.tsv")
 
     # Keep TSV order (do not sort): color ordering defines luminance grouping.
+    # `colors` excludes the first TSV row, which is used as background.
     color_ids = list(colors.keys())
     shape_ids = list(shapes.keys())
 
@@ -288,7 +297,10 @@ def run_task(
     expected_color_defs = n_colors_expected * n_lum_levels
     if n_color_defs != expected_color_defs:
         raise ValueError(
-            f"colors_tsv has {n_color_defs} definitions, expected n_colors*n_lum_levels={n_colors_expected}*{n_lum_levels}={expected_color_defs}"
+            (
+                f"colors_tsv has {n_color_defs} color definitions after background row; "
+                f"expected n_colors*n_lum_levels={n_colors_expected}*{n_lum_levels}={expected_color_defs}"
+            )
         )
     if n_shape_defs != n_shapes_expected:
         raise ValueError(
@@ -868,7 +880,6 @@ def main():
     init_dot_color = tuple(_get("init_dot_color", cfg.get("init_dot_color", None))) if _get("init_dot_color", None) else None
     dot_size = int(_get("dot_size", cfg.get("dot_size", 10)))
     dot_color = tuple(_get("dot_color", cfg.get("dot_color", (155, 155, 155))))
-    bg = tuple(_get("bg", cfg.get("bg", (128, 128, 128))))
     output_dir = _get("output_dir", cfg.get("output_dir", "./logs"))
     seed = _get("seed", cfg.get("seed", None))
     fullscreen = bool(_get("fullscreen", cfg.get("fullscreen", False)))
@@ -916,7 +927,6 @@ def main():
             init_dot_color=init_dot_color,
             dot_size=dot_size,
             dot_color=dot_color,
-            bg=bg,
             output_dir=output_dir,
             seed=seed,
             fullscreen=fullscreen,

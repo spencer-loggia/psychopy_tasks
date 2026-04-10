@@ -338,8 +338,29 @@ def load_color_palette(tsv_path: Path) -> Dict[int, Tuple[int, int, int]]:
                 b = int(row.get("b") or row.get("B") or row.get(reader.fieldnames[3]))
             except Exception as e:
                 raise ValueError(f"Invalid row in color TSV: {row}") from e
+            if idv in out:
+                raise ValueError(f"Duplicate color ID in TSV: {idv}")
             out[idv] = (r, g, b)
     return out
+
+
+def split_background_from_palette(
+    colors: Dict[int, Tuple[int, int, int]]
+) -> Tuple[Tuple[int, int, int], Dict[int, Tuple[int, int, int]]]:
+    """Split first TSV row (background) from subsequent color definitions.
+
+    `colors` must preserve file row order (as produced by `load_color_palette`).
+    Returns (bg_rgb, remaining_colors).
+    """
+    if not colors:
+        raise ValueError("colors_tsv is empty; expected at least background row plus color definitions")
+
+    ordered_items = list(colors.items())
+    _bg_id, bg_rgb = ordered_items[0]
+    remaining = dict(ordered_items[1:])
+    if not remaining:
+        raise ValueError("colors_tsv must include at least one color definition after the background row")
+    return bg_rgb, remaining
 
 
 def load_shape_definitions(tsv_path: Path) -> Dict[int, Path]:

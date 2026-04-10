@@ -3,7 +3,8 @@
 # local
 logs
 sample_images
-output
+tests/output
+tests/outputs
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

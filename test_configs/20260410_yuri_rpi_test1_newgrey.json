@@ -2,10 +2,10 @@
   "n_shapes": 36, 
   "n_lum_levels": 21,
   "shapes_tsv": "./task/resources/csc2/shape_definitions.tsv",
-  "colors_tsv": "./task/resources/csc2/20260410_newgrey_idealized_amoled1.tsv",
+  "colors_tsv": "./task/resources/csc2/mt2_042026_newgrey_amoled_A.tsv",
   "freq_space_tsv": "./task/resources/csc2/freq_space_TY.csv",
   "reward_space_tsv": "./task/resources/csc2/reward_space_TY.csv",
-  "pump_pulse_time_seconds": 0.25,
+  "pump_pulse_time_seconds": 0.2,
   "timeout_duration_seconds": 3.0,
   "reward_to_pulse_map": {
     "0": 0,

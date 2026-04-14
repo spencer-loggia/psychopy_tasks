@@ -39,7 +39,7 @@
   "margin": 200,
   "stroke_width": 0.50,
   "stroke_color": [0, 0, 0],
-  "image_size": [100, 100],
+  "image_size": [150, 150],
 
 
   "self_initiation": true,
@@ -50,5 +50,6 @@
   "fixed_positions": true,
   "sequential": false,
   "is_memory": false,
-  "raspi": true
+  "raspi": true,
+  "touchscreen": true
 }

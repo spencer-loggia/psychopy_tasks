@@ -95,8 +95,8 @@ def main() -> None:
     parser.add_argument(
         "--output-image",
         type=str,
-        default="tests/outputs/color_circle_mid_lum.png",
-        help="Output PNG path",
+        default="tests/outputs/color_circle_mid_lum.tiff",
+        help="Output image path (saved as uncompressed TIFF/raw)",
     )
     parser.add_argument(
         "--canvas-size",
@@ -150,7 +150,7 @@ def main() -> None:
 
     out_img = Path(args.output_image)
     out_img.parent.mkdir(parents=True, exist_ok=True)
-    img.save(out_img)
+    img.save(out_img, format="TIFF", compression="raw")
 
     print(f"Saved circle gallery: {out_img}")
     print(f"n_colors={n_colors} middle_luminance_level_1based={mid_lum_idx + 1}")

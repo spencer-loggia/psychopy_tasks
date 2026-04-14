@@ -82,8 +82,8 @@ def main() -> None:
     parser.add_argument(
         "--output-image",
         type=str,
-        default="tests/output/reward_pair_gallery_lum21.png",
-        help="Output PNG path",
+        default="tests/output/reward_pair_gallery_lum21.tiff",
+        help="Output image path (saved as uncompressed TIFF/raw)",
     )
     parser.add_argument(
         "--output-csv",
@@ -178,7 +178,7 @@ def main() -> None:
     out_img.parent.mkdir(parents=True, exist_ok=True)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
 
-    sheet.save(out_img)
+    sheet.save(out_img, format="TIFF", compression="raw")
 
     with out_csv.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(

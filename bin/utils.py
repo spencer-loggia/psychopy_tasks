@@ -759,6 +759,149 @@ def present_block_with_persistent_dots(
         except Exception:
             pass
 
+    chosen_info = None
+    click_registered = False
+    click_perf_capture = None
+    click_meta = None
+    prev_touch_down = False
+    poll_interval_s = 0.002
+    touch_acquire_window_s = 0.050
+    choice_started = False
+    choice_flip = None
+    choice_perf = None
+    choice_window_s = float(choice_s)
+    choice_deadline = None
+    pos_list = list(positions)
+    stims: List[visual.ImageStim] = []
+    names: List[str] = []
+    choice_hit_targets: List[visual.Rect] = []
+
+    def _build_choice_hit_targets():
+        if choice_hit_targets:
+            return
+        if len(stim_sizes) < len(pos_list):
+            return
+        for ppos, stim_size in zip(pos_list, stim_sizes):
+            try:
+                w = max(1.0, float(stim_size[0]) * float(choice_hitbox_scale))
+                h = max(1.0, float(stim_size[1]) * float(choice_hitbox_scale))
+            except Exception:
+                w, h = (64.0, 64.0)
+            target = visual.Rect(
+                win,
+                width=w,
+                height=h,
+                pos=ppos,
+                units="pix",
+                fillColor=None,
+                lineColor=None,
+                opacity=0.0,
+            )
+            choice_hit_targets.append(target)
+
+    def _match_choice_target(click_pos: Tuple[float, float]) -> Optional[int]:
+        _build_choice_hit_targets()
+        for i, target in enumerate(choice_hit_targets, start=1):
+            try:
+                if target.contains(click_pos):
+                    return i
+            except Exception:
+                pass
+        return None
+
+    def _start_choice_window(start_flip_ps, start_perf: float, window_s: float, notes_suffix: str = ""):
+        nonlocal choice_started, choice_flip, choice_perf, choice_window_s, choice_deadline, prev_touch_down
+        if choice_started:
+            return
+        choice_started = True
+        choice_flip = start_flip_ps
+        choice_perf = float(start_perf)
+        choice_window_s = max(0.0, float(window_s))
+        choice_deadline = choice_perf + choice_window_s
+        prev_touch_down = any(mouse.getPressed())
+        logger.log(
+            "choice_start",
+            image_name="",
+            requested_duration_s=choice_window_s,
+            flip_time_psychopy_s=choice_flip,
+            flip_time_perf_s=choice_perf,
+            end_time_perf_s=choice_deadline,
+            notes=f"block={block_idx}{notes_suffix}",
+        )
+
+    def _poll_choice_until(deadline_perf: float) -> bool:
+        nonlocal click_registered, click_perf_capture, click_meta, prev_touch_down, chosen_info
+        while time.perf_counter() < deadline_perf and not click_registered:
+            keys = _event.getKeys(["escape"])
+            if keys:
+                logger.log("abort", image_name="", notes="escape_pressed")
+                win.close()
+                _core.quit()
+                return True
+
+            click_pos = mouse.getPos()
+            buttons = mouse.getPressed()
+            touch_down = any(buttons)
+            touch_started = touch_down and (not prev_touch_down)
+            prev_touch_down = touch_down
+
+            if touch_down and choice_perf is not None:
+                touch_onset_perf = time.perf_counter()
+                chosen_idx = _match_choice_target(click_pos)
+
+                # Some touch backends report button-down before the final touch
+                # coordinates are visible through Mouse.getPos(). Allow a brief
+                # acquisition window to pick up the coordinate update for the same tap.
+                if chosen_idx is None and touch_started and choice_deadline is not None:
+                    acquire_deadline = min(choice_deadline, touch_onset_perf + touch_acquire_window_s)
+                    while time.perf_counter() < acquire_deadline:
+                        _event.getKeys([])
+                        click_pos = mouse.getPos()
+                        chosen_idx = _match_choice_target(click_pos)
+                        if chosen_idx is not None:
+                            break
+                        remaining_acquire = acquire_deadline - time.perf_counter()
+                        if remaining_acquire > 0:
+                            _core.wait(min(poll_interval_s, remaining_acquire))
+
+                if touch_started and msg_logger is not None:
+                    try:
+                        msg_logger.log(
+                            "INFO",
+                            f"choice_touch_attempt block={block_idx} click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f}) matched_idx={chosen_idx}",
+                        )
+                    except Exception:
+                        pass
+
+                if chosen_idx is not None:
+                    click_perf_capture = touch_onset_perf
+                    chosen_info = {
+                        "chosen_index": int(chosen_idx),
+                        "chosen_pos": tuple(pos_list[chosen_idx - 1]),
+                        "choice_start_perf_s": float(choice_perf),
+                        "choice_time_perf_s": float(click_perf_capture),
+                        "reaction_time_s": float(click_perf_capture - choice_perf),
+                        "choice_time_psychopy_s": None,
+                        "notes": f"block={block_idx}",
+                    }
+                    logger.log(
+                        "choice_made",
+                        image_name=getattr(block_paths[chosen_idx - 1], "name", str(block_paths[chosen_idx - 1])),
+                        requested_duration_s=None,
+                        flip_time_psychopy_s=None,
+                        flip_time_perf_s=click_perf_capture,
+                        end_time_perf_s=None,
+                        notes=f"block={block_idx} idx={chosen_idx} click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f})",
+                    )
+                    click_meta = {"idx": chosen_idx}
+                    click_registered = True
+                    break
+
+            remaining = deadline_perf - time.perf_counter()
+            if remaining > 0:
+                _core.wait(min(poll_interval_s, remaining))
+        return False
+
     # If sequential: original behavior (per-stimulus loop)
     if sequential:
         for idx, (p, pos) in enumerate(zip(block_paths, positions), start=1):
@@ -871,7 +1014,7 @@ def present_block_with_persistent_dots(
             if fix is not None:
                 fix.draw()
             off_perf = time.perf_counter()
-            win.flip()
+            off_flip = win.flip()
             logger.log(
                 "stim_off",
                 image_name=name,
@@ -881,6 +1024,9 @@ def present_block_with_persistent_dots(
                 end_time_perf_s=off_perf,
                 notes=f"block={block_idx} idx={idx}",
             )
+
+            if (not is_memory) and idx == len(block_paths):
+                _start_choice_window(off_flip, off_perf, choice_s, notes_suffix=" response_from=all_visible")
 
             # small safety: check for abort
             if event.getKeys(["escape"]):
@@ -892,8 +1038,8 @@ def present_block_with_persistent_dots(
         # After all stimuli in this block were shown, enter the choice period.
     else:
         # Non-sequential: present all items at once.
-        stims: List[visual.ImageStim] = []
-        names: List[str] = []
+        stims = []
+        names = []
         for idx, (p, pos) in enumerate(zip(block_paths, positions), start=1):
             if isinstance(p, tuple) and len(p) == 2:
                 sid, cid = p
@@ -963,8 +1109,8 @@ def present_block_with_persistent_dots(
             if fix is not None:
                 fix.draw()
             flip_ps = win.flip()
+            flip_perf = time.perf_counter()
             if first_flip:
-                flip_perf = time.perf_counter()
                 for idx, name in enumerate(names, start=1):
                     logger.log(
                         "stim_on",
@@ -975,40 +1121,61 @@ def present_block_with_persistent_dots(
                         end_time_perf_s=None,
                         notes=f"block={block_idx} idx={idx}",
                     )
+                if not is_memory:
+                    _build_choice_hit_targets()
+                    _start_choice_window(flip_ps, flip_perf, stim_s + choice_s, notes_suffix=" response_from=stim_on")
                 first_flip = False
+            if choice_started and choice_deadline is not None:
+                if _poll_choice_until(min(choice_deadline, flip_perf + frame_dur)):
+                    return True, None
+                if click_registered:
+                    break
 
         # After stimuli: either persist dots (memory) or keep stimuli visible
-        if is_memory:
-            for d in dots:
-                d.fillColor = rgb255_to_psychopy(dot_color)
-                d.fillColorSpace = "rgb"
-            # draw background + all dots + fixation and log stim_off for each
-            bg_rect.draw()
-            for d in dots:
-                d.draw()
-            if fix is not None:
-                fix.draw()
-            off_perf = time.perf_counter()
-            win.flip()
+        if click_registered:
+            off_perf = click_perf_capture if click_perf_capture is not None else time.perf_counter()
+            for idx, name in enumerate(names, start=1):
+                logger.log(
+                    "stim_off",
+                    image_name=name,
+                    requested_duration_s=stim_s,
+                    flip_time_psychopy_s=None,
+                    flip_time_perf_s=None,
+                    end_time_perf_s=off_perf,
+                    notes=f"block={block_idx} idx={idx} early_choice=1",
+                )
         else:
-            # draw background + all kept stimuli + fixation and log stim_off for each
-            bg_rect.draw()
-            for s in stims:
-                s.draw()
-            if fix is not None:
-                fix.draw()
-            off_perf = time.perf_counter()
-            win.flip()
-        for idx, name in enumerate(names, start=1):
-            logger.log(
-                "stim_off",
-                image_name=name,
-                requested_duration_s=stim_s,
-                flip_time_psychopy_s=None,
-                flip_time_perf_s=None,
-                end_time_perf_s=off_perf,
-                notes=f"block={block_idx} idx={idx}",
-            )
+            if is_memory:
+                for d in dots:
+                    d.fillColor = rgb255_to_psychopy(dot_color)
+                    d.fillColorSpace = "rgb"
+                # draw background + all dots + fixation and log stim_off for each
+                bg_rect.draw()
+                for d in dots:
+                    d.draw()
+                if fix is not None:
+                    fix.draw()
+                off_perf = time.perf_counter()
+                win.flip()
+            else:
+                # draw background + all kept stimuli + fixation and log stim_off for each
+                bg_rect.draw()
+                for s in stims:
+                    s.draw()
+                if fix is not None:
+                    fix.draw()
+                off_perf = time.perf_counter()
+                win.flip()
+            for idx, name in enumerate(names, start=1):
+                logger.log(
+                    "stim_off",
+                    image_name=name,
+                    requested_duration_s=stim_s,
+                    flip_time_psychopy_s=None,
+                    flip_time_perf_s=None,
+                    end_time_perf_s=off_perf,
+                    notes=f"block={block_idx} idx={idx}",
+                )
 
         # small safety: check for abort
         if event.getKeys(["escape"]):
@@ -1016,154 +1183,27 @@ def present_block_with_persistent_dots(
             win.close()
             _core.quit()
             return True, None
-    # We'll draw the dots and wait up to `choice_time` seconds, but poll for
-    # mouse clicks so a choice can end the choice period immediately.
-    chosen_info = None
+    # If a response window has not started yet, start it on the first frame
+    # where the selectable targets for this mode are actually visible.
+    if not click_registered:
+        if not choice_started:
+            bg_rect.draw()
+            if is_memory:
+                for d in dots:
+                    d.draw()
+            else:
+                for s in (stims_for_choice if sequential else stims):
+                    s.draw()
+            if fix is not None:
+                fix.draw()
+            choice_flip = win.flip()
+            choice_perf_now = time.perf_counter()
+            _build_choice_hit_targets()
+            _start_choice_window(choice_flip, choice_perf_now, choice_s)
 
-    # log choice start (frame-locked start)
-    bg_rect.draw()
-    if is_memory:
-        for d in dots:
-            d.draw()
-    else:
-        # show stimuli as the cue during choice
-        for s in (stims_for_choice if sequential else stims):
-            s.draw()
-    if fix is not None:
-        fix.draw()
-    choice_flip = win.flip()
-    choice_perf = time.perf_counter()
-    logger.log(
-        "choice_start",
-        image_name="",
-        requested_duration_s=choice_s,
-        flip_time_psychopy_s=choice_flip,
-        flip_time_perf_s=choice_perf,
-        end_time_perf_s=choice_perf + choice_s,
-        notes=f"block={block_idx}",
-    )
-    # Note: click hitboxes are based on stimulus size (not the dot size).
-    # Optional scaling can enlarge or shrink selectable area.
-    # We'll compute per-stim hit radius later when a click candidate is found.
-    try:
-        _hitbox_scale = float(choice_hitbox_scale)
-    except Exception:
-        _hitbox_scale = 1.0
-    if _hitbox_scale <= 0.0:
-        _hitbox_scale = 1.0
-
-    # convert draw positions to a list for easy indexing
-    pos_list = list(positions)
-    choice_hit_targets: List[visual.Rect] = []
-    for ppos, stim_size in zip(pos_list, stim_sizes):
-        try:
-            w = max(1.0, float(stim_size[0]) * _hitbox_scale)
-            h = max(1.0, float(stim_size[1]) * _hitbox_scale)
-        except Exception:
-            w, h = (64.0, 64.0)
-        target = visual.Rect(
-            win,
-            width=w,
-            height=h,
-            pos=ppos,
-            units="pix",
-            fillColor=None,
-            lineColor=None,
-            opacity=0.0,
-        )
-        choice_hit_targets.append(target)
-
-    def _match_choice_target(click_pos: Tuple[float, float]) -> Optional[int]:
-        for i, target in enumerate(choice_hit_targets, start=1):
-            try:
-                if target.contains(click_pos):
-                    return i
-            except Exception:
-                pass
-        return None
-
-    # During choice, keep the already-flipped frame on screen and poll input
-    # at high frequency (like onset cue handling). This improves touch capture
-    # for short taps without changing what is shown.
-    click_registered = False
-    click_perf_capture = None
-    click_meta = None
-    prev_touch_down = False
-    poll_interval_s = 0.002
-    touch_acquire_window_s = 0.050
-    choice_deadline = choice_perf + max(0.0, choice_s)
-    while time.perf_counter() < choice_deadline:
-        # Process OS events (including touch events) before reading mouse state
-        keys = _event.getKeys(["escape"])
-        if keys:
-            logger.log("abort", image_name="", notes="escape_pressed")
-            win.close()
-            _core.quit()
-            return True, None
-
-        # Get position FIRST (while processing touch events), then check if pressed
-        # This ensures touchscreen coordinate updates are captured before state check
-        click_pos = mouse.getPos()
-        buttons = mouse.getPressed()
-        touch_down = any(buttons)
-        touch_started = touch_down and (not prev_touch_down)
-        prev_touch_down = touch_down
-
-        if not click_registered and touch_down:
-            touch_onset_perf = time.perf_counter()
-            chosen_idx = _match_choice_target(click_pos)
-
-            # Some touch backends report button-down before the final touch
-            # coordinates are visible through Mouse.getPos(). Allow a brief
-            # acquisition window to pick up the coordinate update for the same tap.
-            if chosen_idx is None and touch_started:
-                acquire_deadline = min(choice_deadline, touch_onset_perf + touch_acquire_window_s)
-                while time.perf_counter() < acquire_deadline:
-                    _event.getKeys([])
-                    click_pos = mouse.getPos()
-                    chosen_idx = _match_choice_target(click_pos)
-                    if chosen_idx is not None:
-                        break
-                    remaining_acquire = acquire_deadline - time.perf_counter()
-                    if remaining_acquire > 0:
-                        _core.wait(min(poll_interval_s, remaining_acquire))
-
-            if touch_started and msg_logger is not None:
-                try:
-                    msg_logger.log(
-                        "INFO",
-                        f"choice_touch_attempt block={block_idx} click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f}) matched_idx={chosen_idx}",
-                    )
-                except Exception:
-                    pass
-
-            if chosen_idx is not None:
-                click_perf_capture = touch_onset_perf
-                chosen_info = {
-                    "chosen_index": int(chosen_idx),
-                    "chosen_pos": tuple(pos_list[chosen_idx - 1]),
-                    "choice_start_perf_s": float(choice_perf),
-                    "choice_time_perf_s": float(click_perf_capture),
-                    "reaction_time_s": float(click_perf_capture - choice_perf),
-                    "choice_time_psychopy_s": None,
-                    "notes": f"block={block_idx}",
-                }
-                logger.log(
-                    "choice_made",
-                    image_name=getattr(block_paths[chosen_idx - 1], "name", str(block_paths[chosen_idx - 1])),
-                    requested_duration_s=None,
-                    flip_time_psychopy_s=None,
-                    flip_time_perf_s=click_perf_capture,
-                    end_time_perf_s=None,
-                    notes=f"block={block_idx} idx={chosen_idx} click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f})",
-                )
-                click_meta = {"idx": chosen_idx}
-                click_registered = True
-                break
-
-        remaining = choice_deadline - time.perf_counter()
-        if remaining > 0:
-            _core.wait(min(poll_interval_s, remaining))
+        if choice_deadline is not None:
+            if _poll_choice_until(choice_deadline):
+                return True, None
 
     if click_registered:
         # Clear dots on the next flip and log the flip timestamp

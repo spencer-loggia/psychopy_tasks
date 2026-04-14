@@ -589,6 +589,7 @@ def present_block_with_persistent_dots(
     raspi_pin: int = 18,
     sequential: bool = True,
     is_memory: bool = True,
+    choice_hitbox_scale: float = 1.0,
 ):
     """Present stimuli one at a time, leave faint dots at their locations,
     show all dots for `choice_time`, then clear.
@@ -1049,7 +1050,14 @@ def present_block_with_persistent_dots(
     )
 
     # Note: click hitboxes are based on stimulus size (not the dot size).
+    # Optional scaling can enlarge or shrink selectable area.
     # We'll compute per-stim hit radius later when a click candidate is found.
+    try:
+        _hitbox_scale = float(choice_hitbox_scale)
+    except Exception:
+        _hitbox_scale = 1.0
+    if _hitbox_scale <= 0.0:
+        _hitbox_scale = 1.0
 
     # convert draw positions to a list for easy indexing
     pos_list = list(positions)
@@ -1087,9 +1095,10 @@ def present_block_with_persistent_dots(
             for i, ppos in enumerate(pos_list, start=1):
                 try:
                     w, h = stim_sizes[i - 1]
-                    # Define rectangular hit area: use full image dimensions
-                    half_w = w / 2.0
-                    half_h = h / 2.0
+                    # Define rectangular hit area from image dimensions,
+                    # optionally enlarged for touch use.
+                    half_w = (w * _hitbox_scale) / 2.0
+                    half_h = (h * _hitbox_scale) / 2.0
                     # Check if click is within rectangular bounds of this stimulus
                     if (abs(click_pos[0] - ppos[0]) <= half_w and 
                         abs(click_pos[1] - ppos[1]) <= half_h):

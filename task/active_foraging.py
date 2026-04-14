@@ -195,6 +195,7 @@ def parse_args():
     p.add_argument("--is_memory", action="store_true", default=None, help="If set, items are removed and replaced by dots for the choice period (memory task). If not set, config value or default True is used")
     p.add_argument("--sequential", action="store_true", default=None, help="Present stimuli sequentially (one at a time). If not set, config value or default True is used")
     p.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate (Hz); skip auto-detection if provided")
+    p.add_argument("--touchscreen", action="store_true", default=None, help="Enable touchscreen mode (hide mouse cursor)")
     p.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi GPIO LED pulses for onset cues")
     p.add_argument("--trial_start_pin", type=int, default=None, help="GPIO pin to use for trial start pulses (BCM numbering)")
     p.add_argument("--pump_pin", type=int, default=None, help="GPIO pin for pump reward delivery")
@@ -233,6 +234,7 @@ def run_task(
     self_initiation: bool = False,
     fixation_size: Optional[int] = None,
     refresh_rate: Optional[float] = None,
+    touchscreen: bool = False,
     raspi: bool = False,
     trial_start_pin: int = 18,
     pump_pin: int = 17,
@@ -469,6 +471,18 @@ def run_task(
 
     # Window + background + fixation
     win = utils.setup_window(bg_rgb_255=bg, fullscreen=fullscreen, size=win_size)
+    if touchscreen:
+        try:
+            win.mouseVisible = False
+        except Exception:
+            try:
+                win.setMouseVisible(False)
+            except Exception:
+                pass
+        try:
+            msg_logger.log("INFO", "touchscreen=True; mouse cursor hidden")
+        except Exception:
+            pass
     # Measure or override frame rate once per task
     if refresh_rate is not None and float(refresh_rate) > 0:
         fps = float(refresh_rate)
@@ -668,6 +682,7 @@ def run_task(
                 raspi_pin=trial_start_pin,
                 sequential=sequential,
                 is_memory=is_memory,
+                choice_hitbox_scale=1.25 if touchscreen else 1.0,
             )
             if aborted:
                 break
@@ -890,6 +905,7 @@ def main():
     likelihood_tsv = _get("likelihood_tsv", cfg.get("likelihood_tsv", None))
     # Accept both 'refresh_rate' and the common misspelling 'refrech_rate' from config
     refresh_rate = _get("refresh_rate", cfg.get("refresh_rate", cfg.get("refrech_rate", None)))
+    touchscreen = bool(_get("touchscreen", cfg.get("touchscreen", False)))
     raspi = _get("raspi", cfg.get("raspi", False))
     trial_start_pin = int(_get("trial_start_pin", cfg.get("trial_start_pin", 18)))
     pump_pin = int(_get("pump_pin", cfg.get("pump_pin", 17)))
@@ -938,6 +954,7 @@ def main():
             fixation_size=_get("fixation_size", cfg.get("fixation_size", None)),
             likelihood_tsv=likelihood_tsv,
             refresh_rate=refresh_rate,
+            touchscreen=touchscreen,
             raspi=_get("raspi", cfg.get("raspi", False)),
             trial_start_pin=trial_start_pin,
             pump_pin=pump_pin,

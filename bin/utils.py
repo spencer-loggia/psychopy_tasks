@@ -590,7 +590,6 @@ def present_block_with_persistent_dots(
     sequential: bool = True,
     is_memory: bool = True,
     choice_hitbox_scale: float = 1.0,
-    touchscreen: bool = False,
 ):
     """Present stimuli one at a time, leave faint dots at their locations,
     show all dots for `choice_time`, then clear.
@@ -1018,13 +1017,6 @@ def present_block_with_persistent_dots(
             return True, None
     # We'll draw the dots and wait up to `choice_time` seconds, but poll for
     # mouse clicks so a choice can end the choice period immediately.
-    from psychopy import event as _event
-
-    mouse = _event.Mouse(win=win)
-
-    # choice loop
-    start = time.perf_counter()
-    choice_made = False
     chosen_info = None
 
     # log choice start (frame-locked start)
@@ -1049,6 +1041,11 @@ def present_block_with_persistent_dots(
         end_time_perf_s=choice_perf + choice_s,
         notes=f"block={block_idx}",
     )
+    try:
+        # Use event timestamps to catch very short tap press/release cycles.
+        mouse.clickReset()
+    except Exception:
+        pass
 
     # Note: click hitboxes are based on stimulus size (not the dot size).
     # Optional scaling can enlarge or shrink selectable area.
@@ -1069,6 +1066,7 @@ def present_block_with_persistent_dots(
     click_registered = False
     click_perf_capture = None
     click_meta = None
+    prev_click_times = [-1.0, -1.0, -1.0]
     poll_interval_s = 0.002
     choice_deadline = choice_perf + max(0.0, choice_s)
     while time.perf_counter() < choice_deadline:
@@ -1078,13 +1076,32 @@ def present_block_with_persistent_dots(
             _core.quit()
             return True, None
 
-        buttons = mouse.getPressed()
-        if not click_registered and any(buttons):
+        buttons = None
+        click_times = None
+        try:
+            buttons, click_times = mouse.getPressed(getTime=True)
+        except Exception:
+            buttons = mouse.getPressed()
+            click_times = []
+
+        has_new_click = False
+        if click_times is not None:
+            for bi, t in enumerate(click_times):
+                try:
+                    tf = float(t)
+                except Exception:
+                    continue
+                if tf > 0.0 and tf > prev_click_times[bi]:
+                    prev_click_times[bi] = tf
+                    has_new_click = True
+        if (not has_new_click) and buttons is not None and any(buttons):
+            # Fallback for backends that don't provide per-click times reliably.
+            has_new_click = True
+
+        if not click_registered and has_new_click:
             click_pos = mouse.getPos()
             # Check each stimulus using rectangular bounding box (better for touch screens)
             chosen_idx = None
-            choice_match_mode = "bbox"
-            nearest_dist_px = None
             for i, ppos in enumerate(pos_list, start=1):
                 try:
                     w, h = stim_sizes[i - 1]
@@ -1106,23 +1123,6 @@ def present_block_with_persistent_dots(
                         chosen_idx = i
                         break
 
-            # Touchscreen fallback: if coordinate mapping jitters, select nearest option
-            # so a single tap still registers promptly.
-            if chosen_idx is None and bool(touchscreen) and len(pos_list) > 0:
-                best_i = None
-                best_d2 = None
-                for i, ppos in enumerate(pos_list, start=1):
-                    dx = click_pos[0] - ppos[0]
-                    dy = click_pos[1] - ppos[1]
-                    d2 = (dx * dx) + (dy * dy)
-                    if best_d2 is None or d2 < best_d2:
-                        best_d2 = d2
-                        best_i = i
-                if best_i is not None:
-                    chosen_idx = int(best_i)
-                    choice_match_mode = "nearest"
-                    nearest_dist_px = float(best_d2 ** 0.5) if best_d2 is not None else None
-
             if chosen_idx is not None:
                 click_perf_capture = time.perf_counter()
                 chosen_info = {
@@ -1132,10 +1132,7 @@ def present_block_with_persistent_dots(
                     "choice_time_perf_s": float(click_perf_capture),
                     "reaction_time_s": float(click_perf_capture - choice_perf),
                     "choice_time_psychopy_s": None,
-                    "notes": (
-                        f"block={block_idx} match={choice_match_mode}"
-                        + (f" nearest_dist_px={nearest_dist_px:.2f}" if nearest_dist_px is not None else "")
-                    ),
+                    "notes": f"block={block_idx}",
                 }
                 logger.log(
                     "choice_made",
@@ -1144,11 +1141,7 @@ def present_block_with_persistent_dots(
                     flip_time_psychopy_s=None,
                     flip_time_perf_s=click_perf_capture,
                     end_time_perf_s=None,
-                    notes=(
-                        f"block={block_idx} idx={chosen_idx} click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f}) "
-                        f"match={choice_match_mode}"
-                        + (f" nearest_dist_px={nearest_dist_px:.2f}" if nearest_dist_px is not None else "")
-                    ),
+                    notes=f"block={block_idx} idx={chosen_idx} click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f})",
                 )
                 click_meta = {"idx": chosen_idx}
                 click_registered = True

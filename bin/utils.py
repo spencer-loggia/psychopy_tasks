@@ -1075,7 +1075,7 @@ def present_block_with_persistent_dots(
         touch_started = touch_down and (not prev_touch_down)
         prev_touch_down = touch_down
 
-        if not click_registered and touch_started:
+        if not click_registered and touch_down:
             click_pos = mouse.getPos()
             # Check each stimulus using rectangular bounding box (better for touch screens)
             chosen_idx = None
@@ -1099,6 +1099,15 @@ def present_block_with_persistent_dots(
                     if dist <= 64.0:
                         chosen_idx = i
                         break
+
+            if touch_started and msg_logger is not None:
+                try:
+                    msg_logger.log(
+                        "INFO",
+                        f"choice_touch_attempt block={block_idx} click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f}) matched_idx={chosen_idx}",
+                    )
+                except Exception:
+                    pass
 
             if chosen_idx is not None:
                 click_perf_capture = time.perf_counter()

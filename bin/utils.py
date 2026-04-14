@@ -8,6 +8,7 @@ Modularity helpers included:
 - make_onset_cue_stim: build a checkerboard ImageStim with a centered 2D Gaussian alpha mask.
 """
 from pathlib import Path
+import datetime as dt
 import random
 from typing import List, Tuple, Optional, Dict, Union, Callable, Any
 import io
@@ -590,6 +591,7 @@ def present_block_with_persistent_dots(
     sequential: bool = True,
     is_memory: bool = True,
     choice_hitbox_scale: float = 1.0,
+    trial_meta: Optional[Dict[str, Any]] = None,
 ):
     """Present stimuli one at a time, leave faint dots at their locations,
     show all dots for `choice_time`, then clear.
@@ -622,6 +624,13 @@ def present_block_with_persistent_dots(
             frames = max(1, frames)
         actual_s = frames * frame_dur
         return frames, actual_s
+
+    def _set_initiation_time(perf_s: Optional[float] = None):
+        if trial_meta is None or "initiation_time_iso" in trial_meta:
+            return
+        trial_meta["initiation_time_iso"] = dt.datetime.now().isoformat(timespec="milliseconds")
+        if perf_s is not None:
+            trial_meta["initiation_time_perf_s"] = float(perf_s)
 
     # If an onset cue is provided, show it and wait for the participant to
     # self-initiate by clicking/tapping the cue. The function will then fade
@@ -712,6 +721,7 @@ def present_block_with_persistent_dots(
                 oc_x, oc_y = getattr(onset_cue, "pos", (0, 0))
                 if abs(click_pos[0] - oc_x) <= oc_w / 2.0 and abs(click_pos[1] - oc_y) <= oc_h / 2.0:
                     click_perf = time.perf_counter()
+                    _set_initiation_time(click_perf)
                     logger.log(
                         "onset_cue_clicked",
                         image_name="onset_cue",
@@ -956,6 +966,7 @@ def present_block_with_persistent_dots(
                     dot_flip = win.flip()
                     if first_flip:
                         dot_on_perf = time.perf_counter()
+                        _set_initiation_time(dot_on_perf)
                         logger.log(
                             "dot_on",
                             image_name=name,
@@ -979,6 +990,7 @@ def present_block_with_persistent_dots(
                 flip_ps = win.flip()
                 if first_flip:
                     flip_perf = time.perf_counter()
+                    _set_initiation_time(flip_perf)
                     logger.log(
                         "stim_on",
                         image_name=name,
@@ -1085,6 +1097,7 @@ def present_block_with_persistent_dots(
                 dot_flip = win.flip()
                 if first_flip:
                     dot_on_perf = time.perf_counter()
+                    _set_initiation_time(dot_on_perf)
                     # log dot_on for each stim
                     for idx, name in enumerate(names, start=1):
                         logger.log(
@@ -1111,6 +1124,7 @@ def present_block_with_persistent_dots(
             flip_ps = win.flip()
             flip_perf = time.perf_counter()
             if first_flip:
+                _set_initiation_time(flip_perf)
                 for idx, name in enumerate(names, start=1):
                     logger.log(
                         "stim_on",

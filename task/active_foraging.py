@@ -163,6 +163,48 @@ def _compute_positions(
     return sampled_positions, positions
 
 
+def _build_behavior_fieldnames(num_afc: int) -> List[str]:
+    fieldnames = ["trial_num", "initiation_time", "reaction_time"]
+    for opt_idx in range(int(num_afc)):
+        fieldnames.extend([f"shape_{opt_idx}", f"color_{opt_idx}", f"lum_{opt_idx}"])
+    fieldnames.extend(
+        [
+            "choice_made_index",
+            "choice_made_color",
+            "choice_made_shape",
+            "choice_made_lum",
+            "reward_level",
+        ]
+    )
+    return fieldnames
+
+
+def _behavior_summary_has_expected_header(
+    path: Path,
+    expected_fieldnames: List[str],
+    current_num_afc: int,
+) -> bool:
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+
+    with path.open("r", encoding="utf-8", newline="") as existing_fh:
+        reader = csv.reader(existing_fh, delimiter="\t")
+        existing_fieldnames = next(reader, None)
+
+    if existing_fieldnames is None:
+        return False
+
+    if existing_fieldnames != expected_fieldnames:
+        raise ValueError(
+            (
+                f"Existing behavior summary header does not match current num_afc={current_num_afc}: {path}. "
+                f"Expected {expected_fieldnames}, found {existing_fieldnames}."
+            )
+        )
+
+    return True
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Active foraging task")
     p.add_argument("--config", help="Path to JSON config file. CLI overrides config keys.")
@@ -276,15 +318,12 @@ def run_task(
     output_dir_path.mkdir(parents=True, exist_ok=True)
     date_tag = dt.date.today().strftime("%Y%m%d")
     behavior_summary_path = output_dir_path / f"active_foraging_behavior_summary_{date_tag}.tsv"
-    behavior_fieldnames = [
-        "trial_time",
-        "block_idx",
-        "reaction_time_s",
-        "options_shown",
-        "option_picked",
-        "reward_level_received",
-    ]
-    behavior_exists = behavior_summary_path.exists()
+    behavior_fieldnames = _build_behavior_fieldnames(num_afc)
+    behavior_exists = _behavior_summary_has_expected_header(
+        behavior_summary_path,
+        behavior_fieldnames,
+        num_afc,
+    )
     behavior_fh = behavior_summary_path.open("a", encoding="utf-8", newline="")
     behavior_writer = csv.DictWriter(behavior_fh, fieldnames=behavior_fieldnames, delimiter="\t")
     if not behavior_exists:
@@ -641,7 +680,8 @@ def run_task(
             block_paths, block_meta, preloaded = _decode_trial_payload(payload)
             if payload.get("type") == "done":
                 break
-            trial_time = dt.datetime.now().isoformat(timespec="seconds")
+            trial_num = int(payload.get("trial_idx", block_idx))
+            trial_start_time = dt.datetime.now().isoformat(timespec="milliseconds")
             
             logger.log("block_start", image_name="", requested_duration_s=None, flip_time_psychopy_s=None, flip_time_perf_s=time.perf_counter(), end_time_perf_s=None, notes=f"block={block_idx}")
 
@@ -680,6 +720,7 @@ def run_task(
                 except Exception:
                     pass
 
+            trial_meta: Dict[str, Any] = {}
             aborted, choice_info = utils.present_block_with_persistent_dots(
                 win=win,
                 preloaded=preloaded,
@@ -705,6 +746,7 @@ def run_task(
                 sequential=sequential,
                 is_memory=is_memory,
                 choice_hitbox_scale=1.25 if touchscreen else 1.0,
+                trial_meta=trial_meta,
             )
             if aborted:
                 break
@@ -837,28 +879,34 @@ def run_task(
                         notes=f"block={block_idx} reward_level={reward_level}",
                     )
 
-            options_shown = "|".join(
-                [f"{i}:{int(sid)}_{int(cid)}" for i, (sid, cid) in enumerate(block_paths, start=1)]
-            )
-            chosen_idx_row = choice_info.get("chosen_index") if choice_info is not None else None
-            chosen_pair_row = block_paths[chosen_idx_row - 1] if chosen_idx_row is not None else None
-            option_picked = (
-                f"{int(chosen_idx_row)}:{int(chosen_pair_row[0])}_{int(chosen_pair_row[1])}"
-                if chosen_pair_row is not None
-                else ""
-            )
+            chosen_idx_row_1based = choice_info.get("chosen_index") if choice_info is not None else None
+            chosen_idx_row = int(chosen_idx_row_1based - 1) if chosen_idx_row_1based is not None else ""
+            chosen_pair_row = block_paths[chosen_idx_row_1based - 1] if chosen_idx_row_1based is not None else None
             reward_level_row = reward_map.get(chosen_pair_row, "") if chosen_pair_row is not None else ""
             rt_row = choice_info.get("reaction_time_s") if choice_info is not None else ""
-            behavior_writer.writerow(
-                {
-                    "trial_time": trial_time,
-                    "block_idx": int(block_idx),
-                    "reaction_time_s": f"{float(rt_row):.6f}" if rt_row != "" and rt_row is not None else "",
-                    "options_shown": options_shown,
-                    "option_picked": option_picked,
-                    "reward_level_received": reward_level_row,
-                }
-            )
+
+            behavior_row: Dict[str, Any] = {
+                "trial_num": trial_num,
+                "initiation_time": trial_meta.get("initiation_time_iso", trial_start_time),
+                "reaction_time": f"{float(rt_row):.6f}" if rt_row != "" and rt_row is not None else "",
+                "choice_made_index": chosen_idx_row,
+                "choice_made_color": "",
+                "choice_made_shape": "",
+                "choice_made_lum": "",
+                "reward_level": reward_level_row,
+            }
+            for opt_idx, (shape_idx, base_color_idx, lum_idx) in enumerate(block_meta):
+                behavior_row[f"shape_{opt_idx}"] = int(shape_idx)
+                behavior_row[f"color_{opt_idx}"] = int(base_color_idx)
+                behavior_row[f"lum_{opt_idx}"] = int(lum_idx)
+
+            if chosen_idx_row_1based is not None:
+                chosen_shape_row, chosen_color_row, chosen_lum_row = block_meta[chosen_idx_row_1based - 1]
+                behavior_row["choice_made_shape"] = int(chosen_shape_row)
+                behavior_row["choice_made_color"] = int(chosen_color_row)
+                behavior_row["choice_made_lum"] = int(chosen_lum_row)
+
+            behavior_writer.writerow(behavior_row)
             behavior_fh.flush()
 
             if ibi and ibi > 0:

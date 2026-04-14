@@ -1054,6 +1054,33 @@ def present_block_with_persistent_dots(
 
     # convert draw positions to a list for easy indexing
     pos_list = list(positions)
+    choice_hit_targets: List[visual.Rect] = []
+    for ppos, stim_size in zip(pos_list, stim_sizes):
+        try:
+            w = max(1.0, float(stim_size[0]) * _hitbox_scale)
+            h = max(1.0, float(stim_size[1]) * _hitbox_scale)
+        except Exception:
+            w, h = (64.0, 64.0)
+        target = visual.Rect(
+            win,
+            width=w,
+            height=h,
+            pos=ppos,
+            units="pix",
+            fillColor=None,
+            lineColor=None,
+            opacity=0.0,
+        )
+        choice_hit_targets.append(target)
+
+    def _match_choice_target(click_pos: Tuple[float, float]) -> Optional[int]:
+        for i, target in enumerate(choice_hit_targets, start=1):
+            try:
+                if target.contains(click_pos):
+                    return i
+            except Exception:
+                pass
+        return None
 
     # During choice, keep the already-flipped frame on screen and poll input
     # at high frequency (like onset cue handling). This improves touch capture
@@ -1063,6 +1090,7 @@ def present_block_with_persistent_dots(
     click_meta = None
     prev_touch_down = False
     poll_interval_s = 0.002
+    touch_acquire_window_s = 0.050
     choice_deadline = choice_perf + max(0.0, choice_s)
     while time.perf_counter() < choice_deadline:
         # Process OS events (including touch events) before reading mouse state
@@ -1082,28 +1110,23 @@ def present_block_with_persistent_dots(
         prev_touch_down = touch_down
 
         if not click_registered and touch_down:
-            # Check each stimulus using rectangular bounding box (better for touch screens)
-            chosen_idx = None
-            for i, ppos in enumerate(pos_list, start=1):
-                try:
-                    w, h = stim_sizes[i - 1]
-                    # Define rectangular hit area from image dimensions,
-                    # optionally enlarged for touch use.
-                    half_w = (w * _hitbox_scale) / 2.0
-                    half_h = (h * _hitbox_scale) / 2.0
-                    # Check if click is within rectangular bounds of this stimulus
-                    if (abs(click_pos[0] - ppos[0]) <= half_w and
-                        abs(click_pos[1] - ppos[1]) <= half_h):
-                        chosen_idx = i
+            touch_onset_perf = time.perf_counter()
+            chosen_idx = _match_choice_target(click_pos)
+
+            # Some touch backends report button-down before the final touch
+            # coordinates are visible through Mouse.getPos(). Allow a brief
+            # acquisition window to pick up the coordinate update for the same tap.
+            if chosen_idx is None and touch_started:
+                acquire_deadline = min(choice_deadline, touch_onset_perf + touch_acquire_window_s)
+                while time.perf_counter() < acquire_deadline:
+                    _event.getKeys([])
+                    click_pos = mouse.getPos()
+                    chosen_idx = _match_choice_target(click_pos)
+                    if chosen_idx is not None:
                         break
-                except Exception:
-                    # Fallback: use circular detection with 64px radius
-                    dx = click_pos[0] - ppos[0]
-                    dy = click_pos[1] - ppos[1]
-                    dist = (dx * dx + dy * dy) ** 0.5
-                    if dist <= 64.0:
-                        chosen_idx = i
-                        break
+                    remaining_acquire = acquire_deadline - time.perf_counter()
+                    if remaining_acquire > 0:
+                        _core.wait(min(poll_interval_s, remaining_acquire))
 
             if touch_started and msg_logger is not None:
                 try:
@@ -1115,7 +1138,7 @@ def present_block_with_persistent_dots(
                     pass
 
             if chosen_idx is not None:
-                click_perf_capture = time.perf_counter()
+                click_perf_capture = touch_onset_perf
                 chosen_info = {
                     "chosen_index": int(chosen_idx),
                     "chosen_pos": tuple(pos_list[chosen_idx - 1]),

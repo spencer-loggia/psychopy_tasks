@@ -1041,12 +1041,6 @@ def present_block_with_persistent_dots(
         end_time_perf_s=choice_perf + choice_s,
         notes=f"block={block_idx}",
     )
-    try:
-        # Use event timestamps to catch very short tap press/release cycles.
-        mouse.clickReset()
-    except Exception:
-        pass
-
     # Note: click hitboxes are based on stimulus size (not the dot size).
     # Optional scaling can enlarge or shrink selectable area.
     # We'll compute per-stim hit radius later when a click candidate is found.
@@ -1066,7 +1060,7 @@ def present_block_with_persistent_dots(
     click_registered = False
     click_perf_capture = None
     click_meta = None
-    prev_click_times = [-1.0, -1.0, -1.0]
+    prev_touch_down = False
     poll_interval_s = 0.002
     choice_deadline = choice_perf + max(0.0, choice_s)
     while time.perf_counter() < choice_deadline:
@@ -1076,29 +1070,12 @@ def present_block_with_persistent_dots(
             _core.quit()
             return True, None
 
-        buttons = None
-        click_times = None
-        try:
-            buttons, click_times = mouse.getPressed(getTime=True)
-        except Exception:
-            buttons = mouse.getPressed()
-            click_times = []
+        buttons = mouse.getPressed()
+        touch_down = any(buttons)
+        touch_started = touch_down and (not prev_touch_down)
+        prev_touch_down = touch_down
 
-        has_new_click = False
-        if click_times is not None:
-            for bi, t in enumerate(click_times):
-                try:
-                    tf = float(t)
-                except Exception:
-                    continue
-                if tf > 0.0 and tf > prev_click_times[bi]:
-                    prev_click_times[bi] = tf
-                    has_new_click = True
-        if (not has_new_click) and buttons is not None and any(buttons):
-            # Fallback for backends that don't provide per-click times reliably.
-            has_new_click = True
-
-        if not click_registered and has_new_click:
+        if not click_registered and touch_started:
             click_pos = mouse.getPos()
             # Check each stimulus using rectangular bounding box (better for touch screens)
             chosen_idx = None

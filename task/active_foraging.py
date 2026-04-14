@@ -704,7 +704,7 @@ def run_task(
                 raspi_pin=trial_start_pin,
                 sequential=sequential,
                 is_memory=is_memory,
-                choice_hitbox_scale=1.5 if touchscreen else 1.0,
+                choice_hitbox_scale=3.0 if touchscreen else 1.0,
             )
             if aborted:
                 break

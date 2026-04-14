@@ -21,6 +21,8 @@ import argparse
 import sys
 import time
 import random
+import csv
+import datetime as dt
 from pathlib import Path
 from typing import Tuple, Optional, List, Dict, Any
 import pandas as pd
@@ -268,6 +270,25 @@ def run_task(
 
     # message logger for warnings/debug/info
     msg_logger = MessageLogger(output_dir, filename="active_foraging_message_log.tsv")
+
+    # Trial-wise behavior summary (append if file exists)
+    output_dir_path = Path(output_dir)
+    output_dir_path.mkdir(parents=True, exist_ok=True)
+    date_tag = dt.date.today().strftime("%Y%m%d")
+    behavior_summary_path = output_dir_path / f"active_foraging_behavior_summary_{date_tag}.tsv"
+    behavior_fieldnames = [
+        "trial_time",
+        "block_idx",
+        "reaction_time_s",
+        "options_shown",
+        "option_picked",
+        "reward_level_received",
+    ]
+    behavior_exists = behavior_summary_path.exists()
+    behavior_fh = behavior_summary_path.open("a", encoding="utf-8", newline="")
+    behavior_writer = csv.DictWriter(behavior_fh, fieldnames=behavior_fieldnames, delimiter="\t")
+    if not behavior_exists:
+        behavior_writer.writeheader()
 
     # Keep TSV order (do not sort): color ordering defines luminance grouping.
     # `colors` excludes the first TSV row, which is used as background.
@@ -620,6 +641,7 @@ def run_task(
             block_paths, block_meta, preloaded = _decode_trial_payload(payload)
             if payload.get("type") == "done":
                 break
+            trial_time = dt.datetime.now().isoformat(timespec="seconds")
             
             logger.log("block_start", image_name="", requested_duration_s=None, flip_time_psychopy_s=None, flip_time_perf_s=time.perf_counter(), end_time_perf_s=None, notes=f"block={block_idx}")
 
@@ -815,6 +837,30 @@ def run_task(
                         notes=f"block={block_idx} reward_level={reward_level}",
                     )
 
+            options_shown = "|".join(
+                [f"{i}:{int(sid)}_{int(cid)}" for i, (sid, cid) in enumerate(block_paths, start=1)]
+            )
+            chosen_idx_row = choice_info.get("chosen_index") if choice_info is not None else None
+            chosen_pair_row = block_paths[chosen_idx_row - 1] if chosen_idx_row is not None else None
+            option_picked = (
+                f"{int(chosen_idx_row)}:{int(chosen_pair_row[0])}_{int(chosen_pair_row[1])}"
+                if chosen_pair_row is not None
+                else ""
+            )
+            reward_level_row = reward_map.get(chosen_pair_row, "") if chosen_pair_row is not None else ""
+            rt_row = choice_info.get("reaction_time_s") if choice_info is not None else ""
+            behavior_writer.writerow(
+                {
+                    "trial_time": trial_time,
+                    "block_idx": int(block_idx),
+                    "reaction_time_s": f"{float(rt_row):.6f}" if rt_row != "" and rt_row is not None else "",
+                    "options_shown": options_shown,
+                    "option_picked": option_picked,
+                    "reward_level_received": reward_level_row,
+                }
+            )
+            behavior_fh.flush()
+
             if ibi and ibi > 0:
                 ibi_frames = int(round(float(ibi) * fps))
                 ibi_frames = max(0, ibi_frames)
@@ -844,6 +890,10 @@ def run_task(
         # Clean up trial buffer manager
         try:
             buffer_mgr.close()
+        except Exception:
+            pass
+        try:
+            behavior_fh.close()
         except Exception:
             pass
 

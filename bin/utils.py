@@ -1118,7 +1118,9 @@ def present_block_with_persistent_dots(
                 chosen_info = {
                     "chosen_index": int(chosen_idx),
                     "chosen_pos": tuple(pos_list[chosen_idx - 1]),
+                    "choice_start_perf_s": float(choice_perf),
                     "choice_time_perf_s": float(click_perf_capture),
+                    "reaction_time_s": float(click_perf_capture - choice_perf),
                     "choice_time_psychopy_s": None,
                     "notes": f"block={block_idx}",
                 }

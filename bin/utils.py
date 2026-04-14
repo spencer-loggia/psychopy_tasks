@@ -700,9 +700,10 @@ def present_block_with_persistent_dots(
                 _core.quit()
                 return True, None
 
+            # Get position first to ensure touchscreen events are processed synchronously
+            click_pos = mouse.getPos()
             buttons = mouse.getPressed()
             if any(buttons):
-                click_pos = mouse.getPos()
                 # determine bounding box from onset_cue.size and pos
                 try:
                     oc_w, oc_h = onset_cue.size
@@ -1064,19 +1065,23 @@ def present_block_with_persistent_dots(
     poll_interval_s = 0.002
     choice_deadline = choice_perf + max(0.0, choice_s)
     while time.perf_counter() < choice_deadline:
-        if _event.getKeys(["escape"]):
+        # Process OS events (including touch events) before reading mouse state
+        keys = _event.getKeys(["escape"])
+        if keys:
             logger.log("abort", image_name="", notes="escape_pressed")
             win.close()
             _core.quit()
             return True, None
 
+        # Get position FIRST (while processing touch events), then check if pressed
+        # This ensures touchscreen coordinate updates are captured before state check
+        click_pos = mouse.getPos()
         buttons = mouse.getPressed()
         touch_down = any(buttons)
         touch_started = touch_down and (not prev_touch_down)
         prev_touch_down = touch_down
 
         if not click_registered and touch_down:
-            click_pos = mouse.getPos()
             # Check each stimulus using rectangular bounding box (better for touch screens)
             chosen_idx = None
             for i, ppos in enumerate(pos_list, start=1):

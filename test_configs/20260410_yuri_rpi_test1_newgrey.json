@@ -27,7 +27,7 @@
   "seed": 42,
   "output_dir": "./logs",
   "refresh_rate": 120,
-  "n": 20,
+  "n": 2000,
   "duration": 0.5,
 
   "fullscreen": true,

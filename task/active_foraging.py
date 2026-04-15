@@ -34,7 +34,12 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from bin import utils
-from bin.logger import EventLogger, MessageLogger
+from bin.logger import (
+    EventLogger,
+    MessageLogger,
+    build_run_log_filename,
+    finalize_output_file,
+)
 import numpy as np
 from bin.config import load_config, validate_config
 
@@ -179,32 +184,6 @@ def _build_behavior_fieldnames(num_afc: int) -> List[str]:
     return fieldnames
 
 
-def _behavior_summary_has_expected_header(
-    path: Path,
-    expected_fieldnames: List[str],
-    current_num_afc: int,
-) -> bool:
-    if not path.exists() or path.stat().st_size == 0:
-        return False
-
-    with path.open("r", encoding="utf-8", newline="") as existing_fh:
-        reader = csv.reader(existing_fh, delimiter="\t")
-        existing_fieldnames = next(reader, None)
-
-    if existing_fieldnames is None:
-        return False
-
-    if existing_fieldnames != expected_fieldnames:
-        raise ValueError(
-            (
-                f"Existing behavior summary header does not match current num_afc={current_num_afc}: {path}. "
-                f"Expected {expected_fieldnames}, found {existing_fieldnames}."
-            )
-        )
-
-    return True
-
-
 def parse_args():
     p = argparse.ArgumentParser(description="Active foraging task")
     p.add_argument("--config", help="Path to JSON config file. CLI overrides config keys.")
@@ -296,6 +275,7 @@ def run_task(
     n_colors_expected: Optional[int] = None,
     n_shapes_expected: Optional[int] = None,
     n_lum_levels: Optional[int] = None,
+    config_name: Optional[str] = None,
     buffer_len_trials: int = 5,
 ):
     # Set debug flag before rasterization if requested
@@ -311,23 +291,31 @@ def run_task(
     bg, colors = utils.split_background_from_palette(colors)
 
     # message logger for warnings/debug/info
-    msg_logger = MessageLogger(output_dir, filename="active_foraging_message_log.tsv")
+    run_started_at = dt.datetime.now()
+    resolved_config_name = str(config_name).strip() if config_name else "active_foraging"
+    msg_logger = MessageLogger(
+        output_dir,
+        filename=build_run_log_filename(
+            resolved_config_name,
+            "active_foraging_message_log",
+            when=run_started_at,
+            in_progress=True,
+        ),
+    )
 
-    # Trial-wise behavior summary (append if file exists)
+    # Trial-wise behavior summary
     output_dir_path = Path(output_dir)
     output_dir_path.mkdir(parents=True, exist_ok=True)
-    date_tag = dt.date.today().strftime("%Y%m%d")
-    behavior_summary_path = output_dir_path / f"active_foraging_behavior_summary_{date_tag}.tsv"
-    behavior_fieldnames = _build_behavior_fieldnames(num_afc)
-    behavior_exists = _behavior_summary_has_expected_header(
-        behavior_summary_path,
-        behavior_fieldnames,
-        num_afc,
+    behavior_summary_path = output_dir_path / build_run_log_filename(
+        resolved_config_name,
+        "behavior_summary",
+        when=run_started_at,
+        in_progress=True,
     )
-    behavior_fh = behavior_summary_path.open("a", encoding="utf-8", newline="")
+    behavior_fieldnames = _build_behavior_fieldnames(num_afc)
+    behavior_fh = behavior_summary_path.open("w", encoding="utf-8", newline="")
     behavior_writer = csv.DictWriter(behavior_fh, fieldnames=behavior_fieldnames, delimiter="\t")
-    if not behavior_exists:
-        behavior_writer.writeheader()
+    behavior_writer.writeheader()
 
     # Keep TSV order (do not sort): color ordering defines luminance grouping.
     # `colors` excludes the first TSV row, which is used as background.
@@ -594,7 +582,15 @@ def run_task(
     # Create background rectangle via utility
     bg_rect = utils.make_bg_rect(win, bg)
 
-    logger = EventLogger(output_dir, filename="active_foraging_log.tsv")
+    logger = EventLogger(
+        output_dir,
+        filename=build_run_log_filename(
+            resolved_config_name,
+            "active_foraging_log",
+            when=run_started_at,
+            in_progress=True,
+        ),
+    )
     pylogging.console.setLevel(pylogging.CRITICAL)
 
     # Initialize lgpio if requested; do not fail the task if lgpio is unavailable.
@@ -946,10 +942,18 @@ def run_task(
             pass
 
     # Task end
+    task_end_dt = dt.datetime.now()
     logger.log("task_end", image_name="", notes="done")
-    logger.close()
+    logger.finalize(build_run_log_filename(resolved_config_name, "active_foraging_log", when=task_end_dt))
     try:
-        msg_logger.close()
+        msg_logger.finalize(build_run_log_filename(resolved_config_name, "active_foraging_message_log", when=task_end_dt))
+    except Exception:
+        pass
+    try:
+        behavior_summary_path = finalize_output_file(
+            behavior_summary_path,
+            build_run_log_filename(resolved_config_name, "behavior_summary", when=task_end_dt),
+        )
     except Exception:
         pass
     win.close()
@@ -961,7 +965,7 @@ def main():
     cfg = {}
     if args.config:
         cfg = load_config(args.config)
-        validate_config(cfg, required=["colors_tsv", "shapes_tsv", "n", "duration"])  # basic
+        validate_config(cfg, required=["config_name", "colors_tsv", "shapes_tsv", "n", "duration"])  # basic
     else:
         missing = []
         if not args.colors_tsv:
@@ -1025,6 +1029,7 @@ def main():
     n_colors_expected = _get("n_colors", cfg.get("n_colors", None))
     n_shapes_expected = _get("n_shapes", cfg.get("n_shapes", None))
     n_lum_levels = _get("n_lum_levels", cfg.get("n_lum_levels", None))
+    config_name = cfg.get("config_name", "active_foraging")
     buffer_len_trials = int(_get("buffer_len_trials", cfg.get("buffer_len_trials", 5)))
     # stroke options were removed to match utils.rasterize_svg_with_color signature
 
@@ -1070,6 +1075,7 @@ def main():
             n_colors_expected=n_colors_expected,
             n_shapes_expected=n_shapes_expected,
             n_lum_levels=n_lum_levels,
+            config_name=config_name,
             buffer_len_trials=buffer_len_trials,
         )
     except Exception as e:

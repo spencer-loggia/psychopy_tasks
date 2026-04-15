@@ -15,6 +15,7 @@ python task/random_image_sequence.py \
   --svg_size 256 256
 """
 import argparse
+import datetime as dt
 import sys
 import time
 from pathlib import Path
@@ -28,7 +29,7 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from bin import utils
-from bin.logger import EventLogger, MessageLogger
+from bin.logger import EventLogger, MessageLogger, build_run_log_filename
 from bin.config import load_config, validate_config
 
 
@@ -71,6 +72,7 @@ def run_task(
     refresh_rate: Optional[float] = None,
     raspi: bool = False,
     raspi_pin: int = 18,
+    config_name: Optional[str] = None,
 ):
     # Enable or disable debug outputs (writing debug PNGs)
     utils.set_debug(debug)
@@ -100,8 +102,26 @@ def run_task(
     bg_rect = utils.make_bg_rect(win, bg)
 
     # Loggers & quiet console
-    logger = EventLogger(output_dir, filename="image_sequence_log.tsv")
-    msg_logger = MessageLogger(output_dir, filename="image_sequence_message_log.tsv")
+    run_started_dt = dt.datetime.now()
+    resolved_config_name = str(config_name).strip() if config_name else "random_image_sequence"
+    logger = EventLogger(
+        output_dir,
+        filename=build_run_log_filename(
+            resolved_config_name,
+            "image_sequence_log",
+            when=run_started_dt,
+            in_progress=True,
+        ),
+    )
+    msg_logger = MessageLogger(
+        output_dir,
+        filename=build_run_log_filename(
+            resolved_config_name,
+            "image_sequence_message_log",
+            when=run_started_dt,
+            in_progress=True,
+        ),
+    )
     pylogging.console.setLevel(pylogging.CRITICAL)
 
     # Initialize lgpio if requested (harmless if not used here)
@@ -262,8 +282,13 @@ def run_task(
         bg_rect.draw()
         win.flip()
 
+    task_end_dt = dt.datetime.now()
     logger.log("task_end", image_name="", notes="done")
-    logger.close()
+    logger.finalize(build_run_log_filename(resolved_config_name, "image_sequence_log", when=task_end_dt))
+    try:
+        msg_logger.finalize(build_run_log_filename(resolved_config_name, "image_sequence_message_log", when=task_end_dt))
+    except Exception:
+        pass
     win.close()
     core.quit()
     print(f"Finished; log written to {Path(output_dir).resolve()}")
@@ -275,7 +300,7 @@ def main():
     cfg = {}
     if args.config:
         cfg = load_config(args.config)
-        validate_config(cfg, required=["images_dir", "output_dir", "duration", "n"])
+        validate_config(cfg, required=["config_name", "images_dir", "output_dir", "duration", "n"])
     else:
         missing = []
         if not args.images_dir:
@@ -312,6 +337,7 @@ def main():
             refresh_rate=_get("refresh_rate", cfg.get("refresh_rate", cfg.get("refrech_rate", None))),
             raspi=_get("raspi", cfg.get("raspi", False)),
             raspi_pin=_get("raspi_pin", cfg.get("raspi_pin", 18)),
+            config_name=cfg.get("config_name", "random_image_sequence"),
         )
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)

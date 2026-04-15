@@ -2,9 +2,66 @@
 Simple TSV event logger for experiments.
 """
 import csv
+import datetime as dt
 from pathlib import Path
-from typing import Any
+import re
+from typing import Any, Optional
 import time
+
+
+def sanitize_filename_component(value: str) -> str:
+    text = str(value).strip()
+    if not text:
+        return "unnamed"
+    text = re.sub(r"\s+", "_", text)
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", text)
+    text = re.sub(r"_+", "_", text)
+    return text.strip("._-") or "unnamed"
+
+
+def build_run_log_filename(
+    config_name: str,
+    log_kind: str,
+    when: Optional[dt.datetime] = None,
+    in_progress: bool = False,
+) -> str:
+    timestamp = when or dt.datetime.now()
+    safe_config = sanitize_filename_component(config_name)
+    safe_kind = sanitize_filename_component(log_kind)
+    base = f"{safe_config}_{safe_kind}_{timestamp:%Y%m%d}_{timestamp:%H_%M_%S}"
+    if in_progress:
+        base = f"{base}_in_progress"
+    return f"{base}.tsv"
+
+
+def _ensure_tsv_path(path: Path) -> Path:
+    if path.suffix.lower() == ".tsv":
+        return path
+    return path.with_suffix(".tsv")
+
+
+def _uniquify_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    parent = path.parent
+    idx = 1
+    while True:
+        candidate = parent / f"{stem}_{idx}{suffix}"
+        if not candidate.exists():
+            return candidate
+        idx += 1
+
+
+def finalize_output_file(path: Path, final_filename: str) -> Path:
+    current_path = Path(path)
+    target_path = _ensure_tsv_path(current_path.parent / final_filename)
+    target_path = _uniquify_path(target_path)
+    if current_path.resolve() == target_path.resolve():
+        return current_path
+    current_path.replace(target_path)
+    return target_path
 
 
 class EventLogger:
@@ -67,6 +124,11 @@ class EventLogger:
     def close(self):
         self._file.close()
 
+    def finalize(self, final_filename: str) -> Path:
+        self.close()
+        self.path = finalize_output_file(self.path, final_filename)
+        return self.path
+
 
 class MessageLogger:
     """Simple TSV logger for textual messages (warnings, debug, info).
@@ -93,3 +155,8 @@ class MessageLogger:
 
     def close(self):
         self._file.close()
+
+    def finalize(self, final_filename: str) -> Path:
+        self.close()
+        self.path = finalize_output_file(self.path, final_filename)
+        return self.path

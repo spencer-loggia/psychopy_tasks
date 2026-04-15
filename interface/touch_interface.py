@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 import tkinter as tk
 from tkinter import messagebox
+import urllib.request, subprocess
+from email.utils import parsedate_to_datetime
 
 
 IDLE_CLEANUP_MS = 30 * 60 * 1000
@@ -130,12 +132,23 @@ class TouchInterfaceApp:
     def _current_page_label(self) -> str:
         labels = [label for label, _page in self.page_stack]
         return " / ".join(labels)
+    
+    def attempt_rectify_timezone(self) -> None:
+        try:
+            with urllib.request.urlopen("https://www.google.com", timeout=5) as r:
+                dt = parsedate_to_datetime(r.headers["Date"])
+            subprocess.run(["sudo", "timedatectl", "set-ntp", "false"], check=False)
+            subprocess.run(["sudo", "date", "-u", "-s", dt.strftime("%Y-%m-%d %H:%M:%S")], check=True)
+        except Exception as e:
+            print(f"Could not sync time: {e}")
 
     def startup(self) -> None:
         os.chdir(self.working_dir)
+        # attempt to rectify system timezone
+        self.attempt_rectify_timezone()
 
     def cleanup(self) -> None:
-        pass
+        self.attempt_rectify_timezone()
 
     def _schedule_idle_cleanup(self) -> None:
         self.root.after(IDLE_CLEANUP_MS, self._run_idle_cleanup_if_needed)

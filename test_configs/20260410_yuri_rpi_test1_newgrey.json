@@ -1,4 +1,6 @@
-{ "n_colors": 36,
+{ 
+  "config_name": "yuri_test",
+  "n_colors": 36,
   "n_shapes": 36, 
   "n_lum_levels": 21,
   "shapes_tsv": "./task/resources/csc2/shape_definitions.tsv",
@@ -44,7 +46,7 @@
 
   "self_initiation": true,
   "ibi": 0.75,
-  "num_afc": 2,
+  "num_afc": 4,
   "choice_time": 2.0,
   "isi": 0.0,
   "fixed_positions": true,

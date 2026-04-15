@@ -23,6 +23,7 @@ python task/afc_block_sequence.py --config test_configs/csc_shape_config
 
 """
 import argparse
+import datetime as dt
 import sys
 import time
 import random
@@ -37,7 +38,7 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from bin import utils
-from bin.logger import EventLogger, MessageLogger
+from bin.logger import EventLogger, MessageLogger, build_run_log_filename
 from bin.config import load_config, validate_config
 
 
@@ -95,6 +96,7 @@ def run_task(
     refresh_rate: Optional[float] = None,
     raspi: bool = False,
     raspi_pin: int = 18,
+    config_name: Optional[str] = None,
 ):
     # Configure debug behavior before any rasterization
     utils.set_debug(debug)
@@ -118,8 +120,26 @@ def run_task(
     bg_rect = utils.make_bg_rect(win, bg)
 
     # Prepare loggers
-    logger = EventLogger(output_dir, filename="afc_block_sequence_log.tsv")
-    msg_logger = MessageLogger(output_dir, filename="afc_block_sequence_message_log.tsv")
+    resolved_config_name = str(config_name).strip() if config_name else "afc_block_sequence"
+    run_started_dt = dt.datetime.now()
+    logger = EventLogger(
+        output_dir,
+        filename=build_run_log_filename(
+            resolved_config_name,
+            "afc_block_sequence_log",
+            when=run_started_dt,
+            in_progress=True,
+        ),
+    )
+    msg_logger = MessageLogger(
+        output_dir,
+        filename=build_run_log_filename(
+            resolved_config_name,
+            "afc_block_sequence_message_log",
+            when=run_started_dt,
+            in_progress=True,
+        ),
+    )
     pylogging.console.setLevel(pylogging.CRITICAL)
 
     # Initialize lgpio if requested
@@ -183,6 +203,7 @@ def run_task(
     logger.log("task_start", image_name="", notes=f"n_blocks={n_blocks} num_afc={num_afc}")
 
     # main block loop
+    aborted_task = False
     for block_idx in range(1, n_blocks + 1):
         logger.log(
             "block_start",
@@ -274,7 +295,8 @@ def run_task(
             raspi_pin=raspi_pin,
         )
         if aborted:
-            return
+            aborted_task = True
+            break
 
         # Choice logging handled within utils.present_block_with_persistent_dots
 
@@ -310,10 +332,11 @@ def run_task(
         logger.log("block_end", image_name="", notes=f"block={block_idx}")
 
     # finished
-    logger.log("task_end", image_name="", notes="done")
-    logger.close()
+    task_end_dt = dt.datetime.now()
+    logger.log("task_end", image_name="", notes="aborted" if aborted_task else "done")
+    logger.finalize(build_run_log_filename(resolved_config_name, "afc_block_sequence_log", when=task_end_dt))
     try:
-        msg_logger.close()
+        msg_logger.finalize(build_run_log_filename(resolved_config_name, "afc_block_sequence_message_log", when=task_end_dt))
     except Exception:
         pass
     win.close()
@@ -326,7 +349,7 @@ def main():
     if args.config:
         cfg = load_config(args.config)
         # validate some required keys for this task
-        validate_config(cfg, required=["images_dir", "output_dir", "duration", "n"])  # basic
+        validate_config(cfg, required=["config_name", "images_dir", "output_dir", "duration", "n"])  # basic
     else:
         missing = []
         if not args.images_dir:
@@ -368,6 +391,7 @@ def main():
     refresh_rate = _get("refresh_rate", cfg.get("refresh_rate", cfg.get("refrech_rate", None)))
     raspi = _get("raspi", cfg.get("raspi", False))
     raspi_pin = int(_get("raspi_pin", cfg.get("raspi_pin", 18)))
+    config_name = cfg.get("config_name", "afc_block_sequence")
 
     try:
         run_task(
@@ -392,6 +416,7 @@ def main():
             refresh_rate=refresh_rate,
             raspi=_get("raspi", cfg.get("raspi", False)),
             raspi_pin=_get("raspi_pin", cfg.get("raspi_pin", 18)),
+            config_name=config_name,
         )
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)

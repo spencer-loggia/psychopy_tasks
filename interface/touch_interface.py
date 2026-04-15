@@ -136,9 +136,14 @@ class TouchInterfaceApp:
     def attempt_rectify_timezone(self) -> None:
         try:
             with urllib.request.urlopen("https://www.google.com", timeout=5) as r:
-                dt = parsedate_to_datetime(r.headers["Date"])
-            subprocess.run(["sudo", "timedatectl", "set-ntp", "false"], check=False)
-            subprocess.run(["sudo", "date", "-u", "-s", dt.strftime("%Y-%m-%d %H:%M:%S")], check=True)
+                dt = parsedate_to_datetime(r.headers["Date"])  # UTC from HTTP Date header
+
+            # Force system clock to that UTC time
+            subprocess.run(
+                ["sudo", "date", "-u", "-s", dt.strftime("%Y-%m-%d %H:%M:%S")],
+                check=True,
+            )
+
         except Exception as e:
             print(f"Could not sync time: {e}")
 

@@ -1,0 +1,26 @@
+{
+    "environment": {
+        "python": "/Users/loggiasr/anaconda3/envs/pyschopy/bin/python",
+        "working_dir": "/Users/loggiasr/Projects/neuro_tasks"
+    },
+    "tasks": {
+        "CSC2": {
+            "classic": {
+                "Yuri": {
+                    "launch": "task/active_foraging.py",
+                    "config": "test_configs/20260410_yuri_rpi_test1_newgrey.json"
+                }
+            }, 
+            "sequential": {},
+            "memory": {}
+        },
+        "setup": {
+            "prime_pump": {
+                "launch": "task/pulse_pump.py"
+        },
+            "buzzer": {
+                "launch": "task/pulse_buzzer.py"
+            }
+        }
+    }
+}

@@ -123,13 +123,15 @@ def play_video_fill_screen(
     bg_rect=None,
     msg_logger=None,
     allow_escape: bool = True,
-    no_audio: bool = False,
 ) -> Dict[str, Any]:
     video_file = Path(video_path)
     if not video_file.exists():
         raise FileNotFoundError(f"Video file not found: {video_file}")
 
-    movie = visual.MovieStim(
+    from psychopy.visual.vlcmoviestim import VlcMovieStim
+
+    backend_used = "vlc"
+    movie = VlcMovieStim(
         win,
         filename=str(video_file),
         units="pix",
@@ -137,7 +139,7 @@ def play_video_fill_screen(
         pos=(0.0, 0.0),
         loop=False,
         autoStart=False,
-        noAudio=bool(no_audio),
+        noAudio=True,
     )
 
     video_size = tuple(movie.videoSize)
@@ -151,7 +153,8 @@ def play_video_fill_screen(
                 "INFO",
                 (
                     f"video_scaling file={video_file.name} "
-                    f"video_size={video_size} win_size={tuple(win.size)} draw_size={target_size}"
+                    f"video_size={video_size} win_size={tuple(win.size)} draw_size={target_size} "
+                    f"backend={backend_used}"
                 ),
             )
         except Exception:
@@ -193,7 +196,7 @@ def play_video_fill_screen(
                         end_time_perf_s=None,
                         notes=(
                             f"video_size={video_size} draw_size=({target_size[0]:.1f},{target_size[1]:.1f}) "
-                            f"dropped_frames=0"
+                            f"dropped_frames=0 backend={backend_used}"
                         ),
                     )
 
@@ -225,6 +228,7 @@ def play_video_fill_screen(
         clear_flip_ps = win.flip()
         end_perf = time.perf_counter()
         if logger is not None:
+            backend_drop_count = getattr(movie, "nDroppedFrames", None)
             logger.log(
                 "video_end",
                 image_name=video_file.name,
@@ -232,7 +236,10 @@ def play_video_fill_screen(
                 flip_time_psychopy_s=clear_flip_ps,
                 flip_time_perf_s=None,
                 end_time_perf_s=end_perf,
-                notes=f"dropped_frames={dropped_frames} aborted={int(aborted)}",
+                notes=(
+                    f"dropped_frames={dropped_frames} aborted={int(aborted)} "
+                    f"backend={backend_used} backend_dropped_frames={backend_drop_count}"
+                ),
             )
     finally:
         try:
@@ -240,7 +247,8 @@ def play_video_fill_screen(
         except Exception:
             pass
         try:
-            movie.unload(log=False)
+            if hasattr(movie, "unload"):
+                movie.unload(log=False)
         except Exception:
             pass
 
@@ -254,6 +262,8 @@ def play_video_fill_screen(
         "aborted": bool(aborted),
         "video_size": tuple(video_size),
         "draw_size": tuple(target_size),
+        "backend_used": backend_used,
+        "backend_dropped_frames": getattr(movie, "nDroppedFrames", None),
     }
 
 

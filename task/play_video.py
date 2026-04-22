@@ -33,7 +33,6 @@ def parse_args():
     parser.add_argument("--win_size", type=int, nargs=2, default=None, help="Window size when not fullscreen")
     parser.add_argument("--bg", type=int, nargs=3, default=None, help="Background RGB color")
     parser.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate (Hz)")
-    parser.add_argument("--no_audio", action="store_true", default=None, help="Disable audio playback")
     return parser.parse_args()
 
 
@@ -45,7 +44,6 @@ def run_task(
     win_size: Optional[Tuple[int, int]] = None,
     bg: Tuple[int, int, int] = (0, 0, 0),
     refresh_rate: Optional[float] = None,
-    no_audio: bool = False,
     config_name: Optional[str] = None,
 ):
     if seed is not None:
@@ -109,7 +107,6 @@ def run_task(
         bg_rect=bg_rect,
         msg_logger=msg_logger,
         allow_escape=True,
-        no_audio=no_audio,
     )
 
     task_end_dt = dt.datetime.now()
@@ -122,7 +119,9 @@ def run_task(
         end_time_perf_s=None,
         notes=(
             f"aborted={int(playback_info['aborted'])} "
-            f"dropped_frames={playback_info['dropped_frames']}"
+            f"dropped_frames={playback_info['dropped_frames']} "
+            f"backend={playback_info['backend_used']} "
+            f"backend_dropped_frames={playback_info['backend_dropped_frames']}"
         ),
     )
     logger.finalize(build_run_log_filename(resolved_config_name, "play_video_log", when=task_end_dt))
@@ -156,7 +155,6 @@ def main():
             win_size=tuple(_get("win_size", cfg.get("win_size", None))) if _get("win_size", None) else None,
             bg=tuple(_get("bg", cfg.get("bg", (0, 0, 0)))),
             refresh_rate=_get("refresh_rate", cfg.get("refresh_rate", cfg.get("refrech_rate", None))),
-            no_audio=bool(_get("no_audio", cfg.get("no_audio", False))),
             config_name=_get("config_name", cfg.get("config_name", "play_video")),
         )
     except Exception as exc:

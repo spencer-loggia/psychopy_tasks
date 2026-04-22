@@ -3,8 +3,9 @@
 Offline preprocessing for experiment videos.
 
 This script crops every input video to a target screen aspect ratio, downsamples
-so the shorter output dimension is 720 pixels, strips audio, converts to BGRA,
-and writes the results into a sibling `cropped_videos` directory by default.
+so the shorter output dimension is 720 pixels, strips audio, re-encodes to
+HEVC/H.265 yuv420p for compact and ffpyplayer-friendly playback, and writes the
+results into a sibling `cropped_videos` directory by default.
 """
 import argparse
 import json
@@ -15,6 +16,18 @@ from pathlib import Path
 
 
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".mpeg", ".mpg", ".m4v", ".wmv"}
+PREFERRED_VIDEO_STREAM_CODEC = "hevc"
+HEVC_ENCODER_NAMES = {
+    "libx265",
+    "hevc_videotoolbox",
+    "hevc_nvenc",
+    "hevc_qsv",
+    "hevc_amf",
+    "hevc_vaapi",
+    "hevc_v4l2m2m",
+    "hevc_rkmpp",
+    "hevc_mf",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,6 +51,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=720,
         help="Target size for the shorter output dimension after cropping",
+    )
+    parser.add_argument("--codec", default="libx265", help="HEVC video codec to use for processed files")
+    parser.add_argument("--preset", default="medium", help="Encoder preset")
+    parser.add_argument("--crf", type=int, default=20, help="Quality level for libx265-style encoders (lower is higher quality)")
+    parser.add_argument(
+        "--tune",
+        default="fastdecode",
+        help="Optional encoder tune for easier playback; use '' to disable",
     )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs")
     parser.add_argument("--ffmpeg", default="ffmpeg", help="Path to ffmpeg executable")
@@ -63,6 +84,11 @@ def compute_target_size(screen_width: int, screen_height: int, short_dim: int) -
         raise ValueError("screen_size values must be positive integers")
     if short_dim <= 0:
         raise ValueError("short_dim must be a positive integer")
+    if short_dim < 64:
+        raise ValueError(
+            f"short_dim={short_dim} is unrealistically small. "
+            "Use a real pixel size such as 720."
+        )
 
     if screen_width <= screen_height:
         out_width = int(short_dim)
@@ -75,6 +101,24 @@ def compute_target_size(screen_width: int, screen_height: int, short_dim: int) -
 
 def _run_checked(cmd: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+
+def warn(message: str) -> None:
+    print(f"WARNING: {message}", file=sys.stderr)
+
+
+def _list_ffmpeg_encoders(ffmpeg_bin: str) -> set[str]:
+    result = _run_checked([ffmpeg_bin, "-hide_banner", "-encoders"])
+    encoders: set[str] = set()
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0][0] in {"V", "A", "S", "."}:
+            encoders.add(parts[1])
+    return encoders
+
+
+def _is_hevc_encoder_name(codec_name: str) -> bool:
+    return str(codec_name).strip() in HEVC_ENCODER_NAMES
 
 
 def probe_video(ffprobe_bin: str, path: Path) -> dict:
@@ -104,13 +148,12 @@ def build_filter(screen_width: int, screen_height: int, out_width: int, out_heig
     crop_h = f"if(gte(iw/ih\\,{aspect:.12f})\\,ih\\,iw/{aspect:.12f})"
     return (
         f"crop={crop_w}:{crop_h}:(iw-ow)/2:(ih-oh)/2,"
-        f"scale={out_width}:{out_height}:flags=lanczos,"
-        "format=bgra"
+        f"scale={out_width}:{out_height}:flags=lanczos"
     )
 
 
 def output_path_for(video_path: Path, output_dir: Path) -> Path:
-    return output_dir / f"{video_path.stem}.mov"
+    return output_dir / f"{video_path.stem}.mp4"
 
 
 def preprocess_video(
@@ -119,7 +162,12 @@ def preprocess_video(
     input_path: Path,
     output_path: Path,
     filter_chain: str,
+    codec: str,
+    preset: str,
+    crf: int,
+    tune: str,
     overwrite: bool,
+    expected_size: tuple[int, int],
 ) -> None:
     if output_path.exists() and not overwrite:
         print(f"Skipping existing file: {output_path}")
@@ -136,23 +184,56 @@ def preprocess_video(
         "-dn",
         "-vf",
         filter_chain,
-        "-pix_fmt",
-        "bgra",
         "-c:v",
-        "qtrle",
-        str(output_path),
+        codec,
+        "-preset",
+        preset,
+        "-crf",
+        str(int(crf)),
+        "-profile:v",
+        "main",
+        "-movflags",
+        "+faststart",
+        "-tag:v",
+        "hvc1",
     ]
+    if tune:
+        cmd.extend(["-tune", tune])
+    cmd.extend([
+        "-pix_fmt",
+        "yuv420p",
+        str(output_path),
+    ])
     _run_checked(cmd)
 
     stream = probe_video(ffprobe_bin, output_path)
-    if stream.get("pix_fmt") != "bgra":
-        raise RuntimeError(f"Processed video is not BGRA: {output_path} ({stream.get('pix_fmt')})")
+    if stream.get("codec_name") != PREFERRED_VIDEO_STREAM_CODEC:
+        raise RuntimeError(
+            f"Processed video is not HEVC/H.265: {output_path} ({stream.get('codec_name')})"
+        )
+    if stream.get("pix_fmt") != "yuv420p":
+        raise RuntimeError(f"Processed video is not yuv420p: {output_path} ({stream.get('pix_fmt')})")
+    if int(stream.get("width", 0)) != int(expected_size[0]) or int(stream.get("height", 0)) != int(expected_size[1]):
+        raise RuntimeError(
+            f"Processed video has unexpected size: {output_path} "
+            f"({stream.get('width')}x{stream.get('height')} vs expected {expected_size[0]}x{expected_size[1]})"
+        )
 
 
 def main() -> None:
     args = parse_args()
     ffmpeg_bin = shutil.which(args.ffmpeg) or args.ffmpeg
     ffprobe_bin = shutil.which(args.ffprobe) or args.ffprobe
+    codec_name = str(args.codec).strip()
+    if not _is_hevc_encoder_name(codec_name):
+        raise ValueError(
+            f"codec={codec_name} is not an allowed HEVC/H.265 encoder. "
+            f"Expected one of: {', '.join(sorted(HEVC_ENCODER_NAMES))}"
+        )
+    available_encoders = _list_ffmpeg_encoders(ffmpeg_bin)
+    if codec_name not in available_encoders:
+        warn(f"requested_hevc_encoder_unavailable codec={codec_name}")
+        raise RuntimeError(f"Requested HEVC encoder is not available in ffmpeg: {codec_name}")
 
     input_dir = Path(args.input_dir).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
@@ -175,13 +256,23 @@ def main() -> None:
             f"{input_stream.get('width')}x{input_stream.get('height')} "
             f"{input_stream.get('codec_name')} {input_stream.get('pix_fmt')}"
         )
+        if str(input_stream.get("codec_name", "")).strip().lower() != PREFERRED_VIDEO_STREAM_CODEC:
+            warn(
+                f"input_video_codec_mismatch file={video_path.name} "
+                f"codec={input_stream.get('codec_name')} expected={PREFERRED_VIDEO_STREAM_CODEC}"
+            )
         preprocess_video(
             ffmpeg_bin=ffmpeg_bin,
             ffprobe_bin=ffprobe_bin,
             input_path=video_path,
             output_path=output_path_for(video_path, output_dir),
             filter_chain=filter_chain,
+            codec=codec_name,
+            preset=str(args.preset),
+            crf=int(args.crf),
+            tune=str(args.tune).strip(),
             overwrite=bool(args.overwrite),
+            expected_size=(out_width, out_height),
         )
 
 

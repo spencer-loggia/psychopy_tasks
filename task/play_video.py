@@ -1,9 +1,9 @@
 """
 Play one randomly selected video from a directory and log playback timing.
 
-By default this task selects from `task/resources/video` and scales the chosen
-video to cover the whole screen, allowing the window bounds to crop the excess
-dimension.
+By default this task selects from `task/resources/cropped_videos`, where clips
+have already been cropped, downsampled, stripped of audio, and converted to a
+playback-friendly BGRA format.
 """
 import argparse
 import datetime as dt
@@ -26,7 +26,7 @@ from bin.logger import EventLogger, MessageLogger, build_run_log_filename
 def parse_args():
     parser = argparse.ArgumentParser(description="Play a random video stimulus")
     parser.add_argument("--config", help="Path to JSON config file. CLI overrides config keys.")
-    parser.add_argument("--videos_dir", default=None, help="Directory containing video files")
+    parser.add_argument("--videos_dir", default=None, help="Directory containing preprocessed video files")
     parser.add_argument("--output_dir", default=None, help="Directory to save logs")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--fullscreen", action="store_true", default=None, help="Run fullscreen")
@@ -148,7 +148,7 @@ def main():
 
     try:
         run_task(
-            videos_dir=_get("videos_dir", "./task/resources/video"),
+            videos_dir=_get("videos_dir", "./task/resources/cropped_videos"),
             output_dir=_get("output_dir", "./logs"),
             seed=_get("seed", None),
             fullscreen=bool(_get("fullscreen", cfg.get("fullscreen", True))),

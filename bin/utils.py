@@ -91,31 +91,6 @@ def setup_window(
     return visual.Window(size=size, fullscr=False, **win_kwargs)
 
 
-def compute_cover_size(
-    content_size: Tuple[float, float],
-    container_size: Tuple[float, float],
-) -> Tuple[float, float]:
-    content_w = float(content_size[0])
-    content_h = float(content_size[1])
-    container_w = float(container_size[0])
-    container_h = float(container_size[1])
-
-    if content_w <= 0 or content_h <= 0:
-        raise ValueError(f"Invalid content size: {content_size}")
-    if container_w <= 0 or container_h <= 0:
-        raise ValueError(f"Invalid container size: {container_size}")
-
-    content_aspect = content_w / content_h
-    container_aspect = container_w / container_h
-    if content_aspect >= container_aspect:
-        target_h = container_h
-        target_w = target_h * content_aspect
-    else:
-        target_w = container_w
-        target_h = target_w / content_aspect
-    return float(target_w), float(target_h)
-
-
 def play_video_fill_screen(
     win: visual.Window,
     video_path: Union[str, Path],
@@ -143,8 +118,6 @@ def play_video_fill_screen(
     )
 
     video_size = tuple(movie.videoSize)
-    target_size = compute_cover_size(video_size, tuple(win.size))
-    movie.size = target_size
     movie.pos = (0.0, 0.0)
 
     if msg_logger is not None:
@@ -152,8 +125,8 @@ def play_video_fill_screen(
             msg_logger.log(
                 "INFO",
                 (
-                    f"video_scaling file={video_file.name} "
-                    f"video_size={video_size} win_size={tuple(win.size)} draw_size={target_size} "
+                    f"video_playback file={video_file.name} "
+                    f"video_size={video_size} win_size={tuple(win.size)} draw_size={video_size} "
                     f"backend={backend_used}"
                 ),
             )
@@ -195,7 +168,7 @@ def play_video_fill_screen(
                         flip_time_perf_s=first_flip_perf,
                         end_time_perf_s=None,
                         notes=(
-                            f"video_size={video_size} draw_size=({target_size[0]:.1f},{target_size[1]:.1f}) "
+                            f"video_size={video_size} draw_size=({video_size[0]:.1f},{video_size[1]:.1f}) "
                             f"dropped_frames=0 backend={backend_used}"
                         ),
                     )
@@ -261,7 +234,7 @@ def play_video_fill_screen(
         "dropped_frames": int(dropped_frames),
         "aborted": bool(aborted),
         "video_size": tuple(video_size),
-        "draw_size": tuple(target_size),
+        "draw_size": tuple(video_size),
         "backend_used": backend_used,
         "backend_dropped_frames": getattr(movie, "nDroppedFrames", None),
     }

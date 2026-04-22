@@ -14,6 +14,9 @@
             "sequential": {},
             "memory": {}
         },
+        "video": {
+            "launch": "task/play_video.py"
+        },
         "setup": {
             "prime_pump": {
                 "launch": "task/pulse_pump.py"

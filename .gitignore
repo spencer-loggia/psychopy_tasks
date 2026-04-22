@@ -5,6 +5,7 @@ logs
 sample_images
 tests/output
 tests/outputs
+task/resources/video
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

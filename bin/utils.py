@@ -36,6 +36,7 @@ def set_debug(value: bool):
 RASTER_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 VECTOR_EXTS = {".svg"}
 IMAGE_EXTS = RASTER_EXTS | VECTOR_EXTS  # for discovery
+VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".mpeg", ".mpg", ".m4v", ".wmv"}
 
 
 def find_image_files(images_dir: str, recursive: bool = False) -> List[Path]:
@@ -46,6 +47,17 @@ def find_image_files(images_dir: str, recursive: bool = False) -> List[Path]:
         files = [f for f in p.rglob("*") if f.suffix.lower() in IMAGE_EXTS]
     else:
         files = [f for f in p.iterdir() if f.is_file() and f.suffix.lower() in IMAGE_EXTS]
+    return sorted(files)
+
+
+def find_video_files(videos_dir: str, recursive: bool = False) -> List[Path]:
+    p = Path(videos_dir)
+    if not p.exists() or not p.is_dir():
+        raise FileNotFoundError(f"Video directory not found: {videos_dir}")
+    if recursive:
+        files = [f for f in p.rglob("*") if f.suffix.lower() in VIDEO_EXTS]
+    else:
+        files = [f for f in p.iterdir() if f.is_file() and f.suffix.lower() in VIDEO_EXTS]
     return sorted(files)
 
 
@@ -77,6 +89,172 @@ def setup_window(
     if size is None:
         size = (1024, 768)
     return visual.Window(size=size, fullscr=False, **win_kwargs)
+
+
+def compute_cover_size(
+    content_size: Tuple[float, float],
+    container_size: Tuple[float, float],
+) -> Tuple[float, float]:
+    content_w = float(content_size[0])
+    content_h = float(content_size[1])
+    container_w = float(container_size[0])
+    container_h = float(container_size[1])
+
+    if content_w <= 0 or content_h <= 0:
+        raise ValueError(f"Invalid content size: {content_size}")
+    if container_w <= 0 or container_h <= 0:
+        raise ValueError(f"Invalid container size: {container_size}")
+
+    content_aspect = content_w / content_h
+    container_aspect = container_w / container_h
+    if content_aspect >= container_aspect:
+        target_h = container_h
+        target_w = target_h * content_aspect
+    else:
+        target_w = container_w
+        target_h = target_w / content_aspect
+    return float(target_w), float(target_h)
+
+
+def play_video_fill_screen(
+    win: visual.Window,
+    video_path: Union[str, Path],
+    logger=None,
+    bg_rect=None,
+    msg_logger=None,
+    allow_escape: bool = True,
+    no_audio: bool = False,
+) -> Dict[str, Any]:
+    video_file = Path(video_path)
+    if not video_file.exists():
+        raise FileNotFoundError(f"Video file not found: {video_file}")
+
+    movie = visual.MovieStim(
+        win,
+        filename=str(video_file),
+        units="pix",
+        size=None,
+        pos=(0.0, 0.0),
+        loop=False,
+        autoStart=False,
+        noAudio=bool(no_audio),
+    )
+
+    video_size = tuple(movie.videoSize)
+    target_size = compute_cover_size(video_size, tuple(win.size))
+    movie.size = target_size
+    movie.pos = (0.0, 0.0)
+
+    if msg_logger is not None:
+        try:
+            msg_logger.log(
+                "INFO",
+                (
+                    f"video_scaling file={video_file.name} "
+                    f"video_size={video_size} win_size={tuple(win.size)} draw_size={target_size}"
+                ),
+            )
+        except Exception:
+            pass
+
+    first_flip_ps = None
+    first_flip_perf = None
+    end_perf = None
+    prev_frame_idx = None
+    dropped_frames = 0
+    aborted = False
+    movie.play(log=False)
+
+    try:
+        while True:
+            if allow_escape and event.getKeys(["escape"]):
+                aborted = True
+                if logger is not None:
+                    logger.log("abort", image_name=video_file.name, notes="escape_pressed_during_video")
+                break
+
+            if bg_rect is not None:
+                bg_rect.draw()
+            movie.draw()
+            flip_ps = win.flip()
+            flip_perf = time.perf_counter()
+            frame_idx = movie.frameIndex
+
+            if first_flip_ps is None:
+                first_flip_ps = flip_ps
+                first_flip_perf = flip_perf
+                if logger is not None:
+                    logger.log(
+                        "video_start",
+                        image_name=video_file.name,
+                        requested_duration_s=movie.duration if movie.duration and movie.duration > 0 else None,
+                        flip_time_psychopy_s=first_flip_ps,
+                        flip_time_perf_s=first_flip_perf,
+                        end_time_perf_s=None,
+                        notes=(
+                            f"video_size={video_size} draw_size=({target_size[0]:.1f},{target_size[1]:.1f}) "
+                            f"dropped_frames=0"
+                        ),
+                    )
+
+            if prev_frame_idx is not None and frame_idx is not None and frame_idx > prev_frame_idx + 1:
+                dropped_now = int(frame_idx - prev_frame_idx - 1)
+                dropped_frames += dropped_now
+                if logger is not None:
+                    logger.log(
+                        "video_frames_dropped",
+                        image_name=video_file.name,
+                        requested_duration_s=None,
+                        flip_time_psychopy_s=flip_ps,
+                        flip_time_perf_s=flip_perf,
+                        end_time_perf_s=None,
+                        notes=(
+                            f"dropped_now={dropped_now} total_dropped={dropped_frames} "
+                            f"prev_frame_idx={prev_frame_idx} frame_idx={frame_idx}"
+                        ),
+                    )
+
+            if frame_idx is not None:
+                prev_frame_idx = int(frame_idx)
+
+            if movie.isFinished:
+                break
+
+        if bg_rect is not None:
+            bg_rect.draw()
+        clear_flip_ps = win.flip()
+        end_perf = time.perf_counter()
+        if logger is not None:
+            logger.log(
+                "video_end",
+                image_name=video_file.name,
+                requested_duration_s=movie.duration if movie.duration and movie.duration > 0 else None,
+                flip_time_psychopy_s=clear_flip_ps,
+                flip_time_perf_s=None,
+                end_time_perf_s=end_perf,
+                notes=f"dropped_frames={dropped_frames} aborted={int(aborted)}",
+            )
+    finally:
+        try:
+            movie.stop(log=False)
+        except Exception:
+            pass
+        try:
+            movie.unload(log=False)
+        except Exception:
+            pass
+
+    return {
+        "video_name": video_file.name,
+        "video_path": video_file,
+        "start_flip_psychopy_s": first_flip_ps,
+        "start_flip_perf_s": first_flip_perf,
+        "end_time_perf_s": end_perf,
+        "dropped_frames": int(dropped_frames),
+        "aborted": bool(aborted),
+        "video_size": tuple(video_size),
+        "draw_size": tuple(target_size),
+    }
 
 
 def detect_frame_rate(win: visual.Window, msg_logger=None) -> Tuple[float, float]:

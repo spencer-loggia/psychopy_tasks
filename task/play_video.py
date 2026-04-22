@@ -33,8 +33,6 @@ def parse_args():
     parser.add_argument("--win_size", type=int, nargs=2, default=None, help="Window size when not fullscreen")
     parser.add_argument("--bg", type=int, nargs=3, default=None, help="Background RGB color")
     parser.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate (Hz)")
-    parser.add_argument("--vcodec", default=None, help="Optional ffpyplayer decoder name to force; HEVC decoders are preferred")
-    parser.add_argument("--ffmpeg", default=None, help="Path to ffmpeg for decoder discovery")
     parser.add_argument("--ffprobe", default=None, help="Path to ffprobe for codec probing")
     return parser.parse_args()
 
@@ -48,8 +46,6 @@ def run_task(
     bg: Tuple[int, int, int] = (0, 0, 0),
     refresh_rate: Optional[float] = None,
     config_name: Optional[str] = None,
-    vcodec: Optional[str] = None,
-    ffmpeg_bin: str = "ffmpeg",
     ffprobe_bin: str = "ffprobe",
 ):
     if seed is not None:
@@ -113,8 +109,6 @@ def run_task(
         bg_rect=bg_rect,
         msg_logger=msg_logger,
         allow_escape=True,
-        preferred_vcodec=vcodec,
-        ffmpeg_bin=ffmpeg_bin,
         ffprobe_bin=ffprobe_bin,
     )
 
@@ -165,8 +159,6 @@ def main():
             bg=tuple(_get("bg", cfg.get("bg", (0, 0, 0)))),
             refresh_rate=_get("refresh_rate", cfg.get("refresh_rate", cfg.get("refrech_rate", None))),
             config_name=_get("config_name", cfg.get("config_name", "play_video")),
-            vcodec=_get("vcodec", cfg.get("vcodec", None)),
-            ffmpeg_bin=_get("ffmpeg", cfg.get("ffmpeg", "ffmpeg")),
             ffprobe_bin=_get("ffprobe", cfg.get("ffprobe", "ffprobe")),
         )
     except Exception as exc:

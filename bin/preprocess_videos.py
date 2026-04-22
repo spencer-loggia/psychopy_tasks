@@ -9,6 +9,7 @@ results into a sibling `cropped_videos` directory by default.
 """
 import argparse
 import json
+import platform
 import shutil
 import subprocess
 import sys
@@ -19,6 +20,16 @@ VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".mpeg", ".mpg", ".m4v", ".wmv"}
 PREFERRED_VIDEO_STREAM_CODEC = "hevc"
 HEVC_ENCODER_NAMES = {
     "libx265",
+    "hevc_videotoolbox",
+    "hevc_nvenc",
+    "hevc_qsv",
+    "hevc_amf",
+    "hevc_vaapi",
+    "hevc_v4l2m2m",
+    "hevc_rkmpp",
+    "hevc_mf",
+}
+HARDWARE_HEVC_ENCODER_NAMES = {
     "hevc_videotoolbox",
     "hevc_nvenc",
     "hevc_qsv",
@@ -52,8 +63,8 @@ def parse_args() -> argparse.Namespace:
         default=720,
         help="Target size for the shorter output dimension after cropping",
     )
-    parser.add_argument("--codec", default="libx265", help="HEVC video codec to use for processed files")
-    parser.add_argument("--preset", default="medium", help="Encoder preset")
+    parser.add_argument("--codec", default="auto", help="HEVC video codec to use, or 'auto' to prefer hardware")
+    parser.add_argument("--preset", default="veryfast", help="Encoder preset used by software HEVC encoders")
     parser.add_argument("--crf", type=int, default=20, help="Quality level for libx265-style encoders (lower is higher quality)")
     parser.add_argument(
         "--tune",
@@ -121,6 +132,42 @@ def _is_hevc_encoder_name(codec_name: str) -> bool:
     return str(codec_name).strip() in HEVC_ENCODER_NAMES
 
 
+def _preferred_hevc_encoder_order() -> list[str]:
+    machine = platform.machine().lower()
+    if sys.platform == "darwin":
+        return ["hevc_videotoolbox", "libx265"]
+    if sys.platform == "linux" and machine in {"aarch64", "arm64", "armv7l", "armv6l"}:
+        # Raspberry Pi 5/Bookworm has a hardware HEVC decoder, not a practical
+        # FFmpeg HEVC encoder path. Prefer software HEVC encoding directly.
+        return ["libx265"]
+    return [
+        "hevc_nvenc",
+        "hevc_qsv",
+        "hevc_vaapi",
+        "hevc_amf",
+        "hevc_mf",
+        "libx265",
+    ]
+
+
+def resolve_hevc_encoder_candidates(requested_codec: str, available_encoders: set[str]) -> list[str]:
+    requested = str(requested_codec).strip()
+    if requested == "auto":
+        candidates = [codec for codec in _preferred_hevc_encoder_order() if codec in available_encoders]
+        if sys.platform == "linux" and platform.machine().lower() in {"aarch64", "arm64", "armv7l", "armv6l"}:
+            warn("pi5_bookworm_expected_encode_path software_hevc_libx265")
+        return candidates
+    if not _is_hevc_encoder_name(requested):
+        raise ValueError(
+            f"codec={requested} is not an allowed HEVC/H.265 encoder. "
+            f"Expected 'auto' or one of: {', '.join(sorted(HEVC_ENCODER_NAMES))}"
+        )
+    if requested not in available_encoders:
+        warn(f"requested_hevc_encoder_unavailable codec={requested}")
+        raise RuntimeError(f"Requested HEVC encoder is not available in ffmpeg: {requested}")
+    return [requested]
+
+
 def probe_video(ffprobe_bin: str, path: Path) -> dict:
     cmd = [
         ffprobe_bin,
@@ -148,7 +195,7 @@ def build_filter(screen_width: int, screen_height: int, out_width: int, out_heig
     crop_h = f"if(gte(iw/ih\\,{aspect:.12f})\\,ih\\,iw/{aspect:.12f})"
     return (
         f"crop={crop_w}:{crop_h}:(iw-ow)/2:(ih-oh)/2,"
-        f"scale={out_width}:{out_height}:flags=lanczos"
+        f"scale={out_width}:{out_height}:flags=fast_bilinear"
     )
 
 
@@ -160,80 +207,113 @@ def preprocess_video(
     ffmpeg_bin: str,
     ffprobe_bin: str,
     input_path: Path,
+    input_codec_name: str,
     output_path: Path,
     filter_chain: str,
-    codec: str,
+    codecs: list[str],
     preset: str,
     crf: int,
     tune: str,
     overwrite: bool,
     expected_size: tuple[int, int],
-) -> None:
+) -> str:
     if output_path.exists() and not overwrite:
         print(f"Skipping existing file: {output_path}")
-        return
+        return "skipped"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        ffmpeg_bin,
-        "-y" if overwrite else "-n",
-        "-i",
-        str(input_path),
-        "-an",
-        "-sn",
-        "-dn",
-        "-vf",
-        filter_chain,
-        "-c:v",
-        codec,
-        "-preset",
-        preset,
-        "-crf",
-        str(int(crf)),
-        "-profile:v",
-        "main",
-        "-movflags",
-        "+faststart",
-        "-tag:v",
-        "hvc1",
-    ]
-    if tune:
-        cmd.extend(["-tune", tune])
-    cmd.extend([
-        "-pix_fmt",
-        "yuv420p",
-        str(output_path),
-    ])
-    _run_checked(cmd)
+    last_error: Exception | None = None
+    for codec in codecs:
+        input_args: list[str] = []
+        # On Pi 5/Bookworm, Raspberry Pi OS ffmpeg can use the HEVC stateless
+        # decoder via `-hwaccel drm`. Only try this for HEVC inputs.
+        if (
+            sys.platform == "linux"
+            and platform.machine().lower() in {"aarch64", "arm64", "armv7l", "armv6l"}
+            and str(input_codec_name).strip().lower() == PREFERRED_VIDEO_STREAM_CODEC
+        ):
+            input_args = ["-hwaccel", "drm"]
 
-    stream = probe_video(ffprobe_bin, output_path)
-    if stream.get("codec_name") != PREFERRED_VIDEO_STREAM_CODEC:
-        raise RuntimeError(
-            f"Processed video is not HEVC/H.265: {output_path} ({stream.get('codec_name')})"
-        )
-    if stream.get("pix_fmt") != "yuv420p":
-        raise RuntimeError(f"Processed video is not yuv420p: {output_path} ({stream.get('pix_fmt')})")
-    if int(stream.get("width", 0)) != int(expected_size[0]) or int(stream.get("height", 0)) != int(expected_size[1]):
-        raise RuntimeError(
-            f"Processed video has unexpected size: {output_path} "
-            f"({stream.get('width')}x{stream.get('height')} vs expected {expected_size[0]}x{expected_size[1]})"
-        )
+        encoder_args = [
+            "-c:v",
+            codec,
+            "-profile:v",
+            "main",
+        ]
+        if codec == "libx265":
+            encoder_args.extend([
+                "-preset",
+                preset,
+                "-crf",
+                str(int(crf)),
+            ])
+            if tune:
+                encoder_args.extend(["-tune", tune])
+        elif codec == "hevc_videotoolbox":
+            encoder_args.extend([
+                "-allow_sw",
+                "0",
+                "-realtime",
+                "1",
+                "-prio_speed",
+                "1",
+            ])
+
+        cmd = [
+            ffmpeg_bin,
+            "-y" if overwrite else "-n",
+            *input_args,
+            "-i",
+            str(input_path),
+            "-an",
+            "-sn",
+            "-dn",
+            "-vf",
+            filter_chain,
+            *encoder_args,
+            "-tag:v",
+            "hvc1",
+            "-pix_fmt",
+            "yuv420p",
+            str(output_path),
+        ]
+
+        try:
+            _run_checked(cmd)
+            stream = probe_video(ffprobe_bin, output_path)
+            if stream.get("codec_name") != PREFERRED_VIDEO_STREAM_CODEC:
+                raise RuntimeError(
+                    f"Processed video is not HEVC/H.265: {output_path} ({stream.get('codec_name')})"
+                )
+            if stream.get("pix_fmt") != "yuv420p":
+                raise RuntimeError(f"Processed video is not yuv420p: {output_path} ({stream.get('pix_fmt')})")
+            if int(stream.get("width", 0)) != int(expected_size[0]) or int(stream.get("height", 0)) != int(expected_size[1]):
+                raise RuntimeError(
+                    f"Processed video has unexpected size: {output_path} "
+                    f"({stream.get('width')}x{stream.get('height')} vs expected {expected_size[0]}x{expected_size[1]})"
+                )
+            return codec
+        except Exception as exc:
+            last_error = exc
+            if output_path.exists():
+                output_path.unlink(missing_ok=True)
+            warn(
+                f"encoder_failed file={input_path.name} codec={codec} "
+                f"hwaccel={'drm' if input_args else 'none'} error={exc}"
+            )
+
+    raise RuntimeError(f"All HEVC encoder attempts failed for {input_path.name}: {last_error}")
 
 
 def main() -> None:
     args = parse_args()
     ffmpeg_bin = shutil.which(args.ffmpeg) or args.ffmpeg
     ffprobe_bin = shutil.which(args.ffprobe) or args.ffprobe
-    codec_name = str(args.codec).strip()
-    if not _is_hevc_encoder_name(codec_name):
-        raise ValueError(
-            f"codec={codec_name} is not an allowed HEVC/H.265 encoder. "
-            f"Expected one of: {', '.join(sorted(HEVC_ENCODER_NAMES))}"
-        )
     available_encoders = _list_ffmpeg_encoders(ffmpeg_bin)
-    if codec_name not in available_encoders:
-        warn(f"requested_hevc_encoder_unavailable codec={codec_name}")
-        raise RuntimeError(f"Requested HEVC encoder is not available in ffmpeg: {codec_name}")
+    codec_candidates = resolve_hevc_encoder_candidates(str(args.codec), available_encoders)
+    if not codec_candidates:
+        raise RuntimeError("No usable HEVC encoder is available in ffmpeg")
+    print(f"Encoder candidates: {', '.join(codec_candidates)}")
 
     input_dir = Path(args.input_dir).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
@@ -259,21 +339,27 @@ def main() -> None:
         if str(input_stream.get("codec_name", "")).strip().lower() != PREFERRED_VIDEO_STREAM_CODEC:
             warn(
                 f"input_video_codec_mismatch file={video_path.name} "
-                f"codec={input_stream.get('codec_name')} expected={PREFERRED_VIDEO_STREAM_CODEC}"
+                f"codec={input_stream.get('codec_name')} expected={PREFERRED_VIDEO_STREAM_CODEC} "
+                f"action=reencode_to_{PREFERRED_VIDEO_STREAM_CODEC}"
             )
-        preprocess_video(
+        used_codec = preprocess_video(
             ffmpeg_bin=ffmpeg_bin,
             ffprobe_bin=ffprobe_bin,
             input_path=video_path,
+            input_codec_name=str(input_stream.get("codec_name", "")),
             output_path=output_path_for(video_path, output_dir),
             filter_chain=filter_chain,
-            codec=codec_name,
+            codecs=codec_candidates,
             preset=str(args.preset),
             crf=int(args.crf),
             tune=str(args.tune).strip(),
             overwrite=bool(args.overwrite),
             expected_size=(out_width, out_height),
         )
+        if used_codec in HARDWARE_HEVC_ENCODER_NAMES:
+            print(f"Encoded {video_path.name} with hardware HEVC encoder {used_codec}")
+        elif used_codec == "libx265":
+            warn(f"software_hevc_encode_in_use file={video_path.name} codec={used_codec}")
 
 
 if __name__ == "__main__":

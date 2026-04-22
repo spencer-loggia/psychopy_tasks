@@ -9,8 +9,6 @@ Modularity helpers included:
 """
 from pathlib import Path
 import datetime as dt
-import json
-import platform
 import random
 import shutil
 import subprocess
@@ -31,7 +29,6 @@ import time
 # Default is False; tasks can enable it via CLI (--debug) or config.
 DEBUG = False
 PREFERRED_VIDEO_STREAM_CODEC = "hevc"
-HEVC_DECODER_FALLBACK = "hevc"
 
 
 def set_debug(value: bool):
@@ -137,31 +134,15 @@ def _probe_video_stream(video_path: Path, ffprobe_bin: str = "ffprobe") -> Dict[
     return streams[0] if streams else {}
 
 
-def _list_ffmpeg_decoders(ffmpeg_bin: str = "ffmpeg") -> set[str]:
-    ffmpeg_path = shutil.which(ffmpeg_bin) or ffmpeg_bin
-    result = _run_subprocess_quiet([ffmpeg_path, "-hide_banner", "-decoders"])
-    if result is None:
-        return set()
-
-    decoders: set[str] = set()
-    for line in result.stdout.splitlines():
-        parts = line.split()
-        if len(parts) >= 2 and parts[0][0] in {"V", "A", "S", "."}:
-            decoders.add(parts[1])
-    return decoders
-
-
 def _is_hevc_codec_name(codec_name: Optional[str]) -> bool:
     return str(codec_name or "").strip().lower() == PREFERRED_VIDEO_STREAM_CODEC
 
 
-def choose_ffpyplayer_vcodec(
+def log_video_codec_expectation(
     video_path: Union[str, Path],
-    preferred_vcodec: Optional[str] = None,
-    ffmpeg_bin: str = "ffmpeg",
     ffprobe_bin: str = "ffprobe",
     msg_logger=None,
-) -> Optional[str]:
+) -> Dict[str, Any]:
     stream = _probe_video_stream(Path(video_path), ffprobe_bin=ffprobe_bin)
     codec_name = str(stream.get("codec_name", "")).strip()
     if codec_name and not _is_hevc_codec_name(codec_name):
@@ -172,147 +153,7 @@ def choose_ffpyplayer_vcodec(
         )
     elif not codec_name:
         _log_message(msg_logger, "WARN", f"video_codec_probe_failed file={Path(video_path).name}")
-
-    if preferred_vcodec:
-        if not _is_hevc_codec_name(preferred_vcodec) and not str(preferred_vcodec).lower().startswith("hevc_"):
-            _log_message(
-                msg_logger,
-                "WARN",
-                f"ffpyplayer_decoder forced_non_hevc_decoder requested={preferred_vcodec}",
-            )
-        return str(preferred_vcodec)
-    if not codec_name:
-        return None
-
-    machine = platform.machine().lower()
-    candidates: List[str] = []
-    if _is_hevc_codec_name(codec_name) and sys.platform == "linux" and machine in {"aarch64", "arm64", "armv7l", "armv6l"}:
-        candidates.extend([
-            "hevc_v4l2m2m",
-            "hevc_rkmpp",
-        ])
-    elif _is_hevc_codec_name(codec_name) and sys.platform == "darwin":
-        candidates.append("hevc_videotoolbox")
-
-    available_decoders = _list_ffmpeg_decoders(ffmpeg_bin=ffmpeg_bin)
-    for candidate in candidates:
-        if candidate in available_decoders:
-            _log_message(msg_logger, "INFO", f"ffpyplayer_decoder selected_vcodec={candidate}")
-            return candidate
-
-    if _is_hevc_codec_name(codec_name):
-        if candidates:
-            _log_message(
-                msg_logger,
-                "WARN",
-                (
-                    f"ffpyplayer_decoder no_hw_hevc_decoder_found codec={codec_name} "
-                    f"candidates={','.join(candidates)} fallback={HEVC_DECODER_FALLBACK}"
-                ),
-            )
-        if HEVC_DECODER_FALLBACK in available_decoders:
-            return HEVC_DECODER_FALLBACK
-        _log_message(
-            msg_logger,
-            "WARN",
-            f"ffpyplayer_decoder hevc_decoder_unavailable file={Path(video_path).name}",
-        )
-        return None
-
-    if codec_name in available_decoders:
-        return codec_name
-
-    _log_message(
-        msg_logger,
-        "WARN",
-        f"ffpyplayer_decoder decoder_unavailable codec={codec_name} file={Path(video_path).name}",
-    )
-    return None
-
-
-def _build_ffpyplayer_options(
-    video_path: Union[str, Path],
-    preferred_vcodec: Optional[str] = None,
-    ffmpeg_bin: str = "ffmpeg",
-    ffprobe_bin: str = "ffprobe",
-    msg_logger=None,
-) -> Tuple[Dict[str, Any], Dict[str, str]]:
-    stream = _probe_video_stream(Path(video_path), ffprobe_bin=ffprobe_bin)
-    codec_name = str(stream.get("codec_name", "")).strip().lower()
-    ff_opts: Dict[str, Any] = {
-        "sync": "video",
-        "paused": True,
-        "autoexit": False,
-        "loop": 1,
-        "an": True,
-        "out_fmt": "rgb24",
-        "fast": True,
-    }
-    lib_opts: Dict[str, str] = {
-        "threads": "auto",
-    }
-
-    selected_vcodec = choose_ffpyplayer_vcodec(
-        video_path=video_path,
-        preferred_vcodec=preferred_vcodec,
-        ffmpeg_bin=ffmpeg_bin,
-        ffprobe_bin=ffprobe_bin,
-        msg_logger=msg_logger,
-    )
-    if selected_vcodec:
-        ff_opts["vcodec"] = selected_vcodec
-    elif codec_name:
-        _log_message(
-            msg_logger,
-            "WARN",
-            f"ffpyplayer_decoder using_default_decoder codec={codec_name} file={Path(video_path).name}",
-        )
-
-    return ff_opts, lib_opts
-
-
-def _ensure_tuned_ffpyplayer_patch() -> None:
-    import psychopy.visual.movies.players.ffpyplayer_player as ffplayer_mod
-
-    if getattr(ffplayer_mod, "_neuro_tasks_tuned_patch", False):
-        return
-
-    original_init = ffplayer_mod.FFPyPlayer.__init__
-
-    def patched_init(self, parent):
-        original_init(self, parent)
-        extra_ff_opts = dict(getattr(parent, "_ffpyplayer_ff_opts", {}) or {})
-        if extra_ff_opts:
-            self._lastPlayerOpts.update(extra_ff_opts)
-        self._lastPlayerLibOpts = dict(getattr(parent, "_ffpyplayer_lib_opts", {}) or {})
-
-    def patched_start(self, log=True):
-        self._lastFrame = None
-        self._frameIndex = -1
-
-        handle = ffplayer_mod.MediaPlayer(
-            self._filename,
-            ff_opts=self._lastPlayerOpts,
-            lib_opts=getattr(self, "_lastPlayerLibOpts", {}),
-        )
-        handle.set_pause(True)
-
-        self._status = ffplayer_mod.NOT_STARTED
-        self._tStream = ffplayer_mod.MovieStreamThreadFFPyPlayer(handle)
-        self._tStream.begin()
-        self.update()
-
-    ffplayer_mod.FFPyPlayer.__init__ = patched_init
-    ffplayer_mod.FFPyPlayer.start = patched_start
-    ffplayer_mod._neuro_tasks_tuned_patch = True
-
-
-class TunedMovieStim(visual.MovieStim):
-    def __init__(self, *args, ffpyplayer_ff_opts=None, ffpyplayer_lib_opts=None, **kwargs):
-        self._ffpyplayer_ff_opts = dict(ffpyplayer_ff_opts or {})
-        self._ffpyplayer_lib_opts = dict(ffpyplayer_lib_opts or {})
-        kwargs["movieLib"] = "ffpyplayer"
-        super().__init__(*args, **kwargs)
+    return stream
 
 
 def play_video_fill_screen(
@@ -322,25 +163,22 @@ def play_video_fill_screen(
     bg_rect=None,
     msg_logger=None,
     allow_escape: bool = True,
-    preferred_vcodec: Optional[str] = None,
-    ffmpeg_bin: str = "ffmpeg",
     ffprobe_bin: str = "ffprobe",
 ) -> Dict[str, Any]:
     video_file = Path(video_path)
     if not video_file.exists():
         raise FileNotFoundError(f"Video file not found: {video_file}")
 
-    _ensure_tuned_ffpyplayer_patch()
-    ffpyplayer_ff_opts, ffpyplayer_lib_opts = _build_ffpyplayer_options(
+    stream = log_video_codec_expectation(
         video_path=video_file,
-        preferred_vcodec=preferred_vcodec,
-        ffmpeg_bin=ffmpeg_bin,
         ffprobe_bin=ffprobe_bin,
         msg_logger=msg_logger,
     )
 
-    backend_used = "ffpyplayer"
-    movie = TunedMovieStim(
+    from psychopy.visual.vlcmoviestim import VlcMovieStim
+
+    backend_used = "vlc"
+    movie = VlcMovieStim(
         win,
         filename=str(video_file),
         units="pix",
@@ -349,8 +187,6 @@ def play_video_fill_screen(
         loop=False,
         autoStart=False,
         noAudio=True,
-        ffpyplayer_ff_opts=ffpyplayer_ff_opts,
-        ffpyplayer_lib_opts=ffpyplayer_lib_opts,
     )
 
     video_size = tuple(movie.videoSize)
@@ -363,7 +199,7 @@ def play_video_fill_screen(
                 (
                     f"video_playback file={video_file.name} "
                     f"video_size={video_size} win_size={tuple(win.size)} draw_size={video_size} "
-                    f"backend={backend_used} ff_opts={ffpyplayer_ff_opts} lib_opts={ffpyplayer_lib_opts}"
+                    f"backend={backend_used} codec={stream.get('codec_name')} pix_fmt={stream.get('pix_fmt')}"
                 ),
             )
         except Exception:

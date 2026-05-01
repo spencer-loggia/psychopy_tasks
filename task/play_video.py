@@ -1,5 +1,5 @@
 """
-Play one randomly selected video from a directory and log playback timing.
+Play randomly selected videos from a directory and log playback timing.
 
 By default this task selects from `task/resources/cropped_videos`, where clips
 have already been cropped, downsampled, stripped of audio, and converted to a
@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Optional, Tuple
 
-from psychopy import core, logging as pylogging
+from psychopy import core, event, logging as pylogging
 
 _project_root = Path(__file__).resolve().parents[1]
 if str(_project_root) not in sys.path:
@@ -55,10 +55,9 @@ def run_task(
     if not video_files:
         raise FileNotFoundError(f"No videos found in {videos_dir}")
 
-    chosen_video = random.choice(video_files)
-
     win = utils.setup_window(bg_rgb_255=bg, fullscreen=fullscreen, size=win_size)
     bg_rect = utils.make_bg_rect(win, bg)
+    mouse = event.Mouse(win=win, visible=False)
 
     run_started_dt = dt.datetime.now()
     resolved_config_name = str(config_name).strip() if config_name else "play_video"
@@ -94,37 +93,55 @@ def run_task(
 
     logger.log(
         "task_start",
-        image_name=chosen_video.name,
+        image_name="",
         requested_duration_s=None,
         flip_time_psychopy_s=None,
         flip_time_perf_s=None,
         end_time_perf_s=None,
-        notes=f"videos_dir={Path(videos_dir).resolve()} fps={fps:.6f}",
+        notes=f"videos_dir={Path(videos_dir).resolve()} fps={fps:.6f} n_videos={len(video_files)}",
     )
 
-    playback_info = utils.play_video_fill_screen(
-        win=win,
-        video_path=chosen_video,
-        logger=logger,
-        bg_rect=bg_rect,
-        msg_logger=msg_logger,
-        allow_escape=True,
-        ffprobe_bin=ffprobe_bin,
-    )
+    event.clearEvents(eventType="mouse")
+    mouse.clickReset()
+    playback_info = None
+    played_videos = 0
+    stop_reason = "mouse_click"
+    while True:
+        if any(mouse.getPressed()):
+            stop_reason = "mouse_click"
+            break
+
+        chosen_video = random.choice(video_files)
+        playback_info = utils.play_video_fill_screen(
+            win=win,
+            video_path=chosen_video,
+            logger=logger,
+            bg_rect=bg_rect,
+            msg_logger=msg_logger,
+            allow_escape=True,
+            stop_on_mouse_click=True,
+            mouse=mouse,
+            ffprobe_bin=ffprobe_bin,
+        )
+        played_videos += 1
+        if playback_info["aborted"]:
+            stop_reason = playback_info.get("abort_reason") or "aborted"
+            break
 
     task_end_dt = dt.datetime.now()
     logger.log(
         "task_end",
-        image_name=chosen_video.name,
+        image_name=(playback_info["video_name"] if playback_info is not None else ""),
         requested_duration_s=None,
         flip_time_psychopy_s=None,
         flip_time_perf_s=None,
         end_time_perf_s=None,
         notes=(
-            f"aborted={int(playback_info['aborted'])} "
-            f"dropped_frames={playback_info['dropped_frames']} "
-            f"backend={playback_info['backend_used']} "
-            f"backend_dropped_frames={playback_info['backend_dropped_frames']}"
+            f"played_videos={played_videos} stop_reason={stop_reason} "
+            f"aborted={int(playback_info['aborted']) if playback_info is not None else 0} "
+            f"dropped_frames={playback_info['dropped_frames'] if playback_info is not None else 0} "
+            f"backend={playback_info['backend_used'] if playback_info is not None else 'n/a'} "
+            f"backend_dropped_frames={playback_info['backend_dropped_frames'] if playback_info is not None else 'n/a'}"
         ),
     )
     logger.finalize(build_run_log_filename(resolved_config_name, "play_video_log", when=task_end_dt))

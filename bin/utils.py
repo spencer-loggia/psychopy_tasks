@@ -12,6 +12,7 @@ import datetime as dt
 import random
 import shutil
 import subprocess
+import json
 from typing import List, Tuple, Optional, Dict, Union, Callable, Any
 import io
 import sys
@@ -163,6 +164,8 @@ def play_video_fill_screen(
     bg_rect=None,
     msg_logger=None,
     allow_escape: bool = True,
+    stop_on_mouse_click: bool = False,
+    mouse: Optional[event.Mouse] = None,
     ffprobe_bin: str = "ffprobe",
 ) -> Dict[str, Any]:
     video_file = Path(video_path)
@@ -182,7 +185,7 @@ def play_video_fill_screen(
         win,
         filename=str(video_file),
         units="pix",
-        size=None,
+        size=tuple(win.size),
         pos=(0.0, 0.0),
         loop=False,
         autoStart=False,
@@ -190,7 +193,19 @@ def play_video_fill_screen(
     )
 
     video_size = tuple(movie.videoSize)
+    draw_size = tuple(win.size)
+    movie.size = draw_size
     movie.pos = (0.0, 0.0)
+    abort_reason = ""
+
+    if stop_on_mouse_click and mouse is None:
+        mouse = event.Mouse(win=win, visible=False)
+    if stop_on_mouse_click and mouse is not None:
+        try:
+            mouse.clickReset()
+        except Exception:
+            pass
+        event.clearEvents(eventType="mouse")
 
     if msg_logger is not None:
         try:
@@ -198,7 +213,7 @@ def play_video_fill_screen(
                 "INFO",
                 (
                     f"video_playback file={video_file.name} "
-                    f"video_size={video_size} win_size={tuple(win.size)} draw_size={video_size} "
+                    f"video_size={video_size} win_size={tuple(win.size)} draw_size={draw_size} "
                     f"backend={backend_used} codec={stream.get('codec_name')} pix_fmt={stream.get('pix_fmt')}"
                 ),
             )
@@ -217,8 +232,16 @@ def play_video_fill_screen(
         while True:
             if allow_escape and event.getKeys(["escape"]):
                 aborted = True
+                abort_reason = "escape_pressed"
                 if logger is not None:
                     logger.log("abort", image_name=video_file.name, notes="escape_pressed_during_video")
+                break
+
+            if stop_on_mouse_click and mouse is not None and any(mouse.getPressed()):
+                aborted = True
+                abort_reason = "mouse_click"
+                if logger is not None:
+                    logger.log("abort", image_name=video_file.name, notes="mouse_clicked_during_video")
                 break
 
             if bg_rect is not None:
@@ -240,7 +263,7 @@ def play_video_fill_screen(
                         flip_time_perf_s=first_flip_perf,
                         end_time_perf_s=None,
                         notes=(
-                            f"video_size={video_size} draw_size=({video_size[0]:.1f},{video_size[1]:.1f}) "
+                            f"video_size={video_size} draw_size=({draw_size[0]:.1f},{draw_size[1]:.1f}) "
                             f"dropped_frames=0 backend={backend_used}"
                         ),
                     )
@@ -283,6 +306,7 @@ def play_video_fill_screen(
                 end_time_perf_s=end_perf,
                 notes=(
                     f"dropped_frames={dropped_frames} aborted={int(aborted)} "
+                    f"abort_reason={abort_reason or 'none'} "
                     f"backend={backend_used} backend_dropped_frames={backend_drop_count}"
                 ),
             )
@@ -305,8 +329,9 @@ def play_video_fill_screen(
         "end_time_perf_s": end_perf,
         "dropped_frames": int(dropped_frames),
         "aborted": bool(aborted),
+        "abort_reason": abort_reason,
         "video_size": tuple(video_size),
-        "draw_size": tuple(video_size),
+        "draw_size": tuple(draw_size),
         "backend_used": backend_used,
         "backend_dropped_frames": getattr(movie, "nDroppedFrames", None),
     }

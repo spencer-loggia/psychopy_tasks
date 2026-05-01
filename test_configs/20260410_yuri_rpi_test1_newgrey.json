@@ -22,8 +22,8 @@
     "3": 0
   },
 
-  "pump_pin": 23,
-  "buzz_pin": 24,
+  "pump_pin": 16,
+  "buzz_pin": 17,
   "trial_start_pin": 18,
 
   "seed": 42,

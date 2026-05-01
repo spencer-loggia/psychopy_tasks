@@ -199,7 +199,7 @@ def play_video_fill_screen(
     abort_reason = ""
 
     if stop_on_mouse_click and mouse is None:
-        mouse = event.Mouse(win=win, visible=False)
+        mouse = event.Mouse(win=win)
     if stop_on_mouse_click and mouse is not None:
         try:
             mouse.clickReset()
@@ -237,12 +237,17 @@ def play_video_fill_screen(
                     logger.log("abort", image_name=video_file.name, notes="escape_pressed_during_video")
                 break
 
-            if stop_on_mouse_click and mouse is not None and any(mouse.getPressed()):
-                aborted = True
-                abort_reason = "mouse_click"
-                if logger is not None:
-                    logger.log("abort", image_name=video_file.name, notes="mouse_clicked_during_video")
-                break
+            if stop_on_mouse_click and mouse is not None:
+                try:
+                    mouse_pressed = any(mouse.getPressed())
+                except Exception:
+                    mouse_pressed = False
+                if mouse_pressed:
+                    aborted = True
+                    abort_reason = "mouse_click"
+                    if logger is not None:
+                        logger.log("abort", image_name=video_file.name, notes="mouse_clicked_during_video")
+                    break
 
             if bg_rect is not None:
                 bg_rect.draw()

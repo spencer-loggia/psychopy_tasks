@@ -57,7 +57,7 @@ def run_task(
 
     win = utils.setup_window(bg_rgb_255=bg, fullscreen=fullscreen, size=win_size)
     bg_rect = utils.make_bg_rect(win, bg)
-    mouse = event.Mouse(win=win, visible=False)
+    mouse = event.Mouse(win=win)
 
     run_started_dt = dt.datetime.now()
     resolved_config_name = str(config_name).strip() if config_name else "play_video"
@@ -101,13 +101,20 @@ def run_task(
         notes=f"videos_dir={Path(videos_dir).resolve()} fps={fps:.6f} n_videos={len(video_files)}",
     )
 
-    event.clearEvents(eventType="mouse")
-    mouse.clickReset()
+    try:
+        event.clearEvents(eventType="mouse")
+        mouse.clickReset()
+    except Exception:
+        pass
     playback_info = None
     played_videos = 0
     stop_reason = "mouse_click"
     while True:
-        if any(mouse.getPressed()):
+        try:
+            is_pressed = any(mouse.getPressed())
+        except Exception:
+            is_pressed = False
+        if is_pressed:
             stop_reason = "mouse_click"
             break
 

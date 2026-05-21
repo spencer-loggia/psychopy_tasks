@@ -210,7 +210,7 @@ def main():
 
     try:
         run_task(
-            videos_dir=_get("videos_dir", "./task/resources/cropped_videos"),
+            videos_dir=_get("videos_dir", "./task/resources/video"),
             output_dir=_get("output_dir", "./logs"),
             seed=_get("seed", None),
             fullscreen=bool(_get("fullscreen", cfg.get("fullscreen", True))),

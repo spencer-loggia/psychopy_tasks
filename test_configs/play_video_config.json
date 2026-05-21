@@ -1,0 +1,11 @@
+{
+  "config_name": "play_video",
+  "videos_dir": "./task/resources/cropped_videos",
+  "output_dir": "./logs",
+  "screens": {
+    "main": null,
+    "experimenter": null
+  },
+  "fullscreen": true,
+  "bg": [0, 0, 0]
+}

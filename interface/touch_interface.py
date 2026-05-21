@@ -14,6 +14,12 @@ from tkinter import messagebox
 import urllib.request, subprocess
 from email.utils import parsedate_to_datetime
 
+_project_root = Path(__file__).resolve().parents[1]
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+
+from bin.screen import load_screen_config, place_tk_window_on_screen, resolve_interface_screen
+
 
 IDLE_CLEANUP_MS = 30 * 60 * 1000
 BUTTON_BG = "#f7f7f7"
@@ -23,6 +29,8 @@ BUTTON_ACTIVE_BG = "#d9d9d9"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Touch launcher for neuro_tasks")
     parser.add_argument("--config", required=True, help="Path to launcher config JSON")
+    parser.add_argument("--main_screen", default=None, help="Main task screen index or output name")
+    parser.add_argument("--experimenter_screen", default=None, help="Experimenter screen index or output name")
     return parser.parse_args()
 
 
@@ -92,11 +100,12 @@ class ScrollableButtonFrame(tk.Frame):
 
 
 class TouchInterfaceApp:
-    def __init__(self, root: tk.Tk, config_path: Path, cfg: Dict[str, Any]):
+    def __init__(self, root: tk.Tk, config_path: Path, cfg: Dict[str, Any], *, screen_info):
         self.root = root
         self.config_path = config_path.resolve()
         self.config_dir = self.config_path.parent
         self.cfg = cfg
+        self.screen_info = screen_info
         self.environment_cfg = _expect_dict(cfg.get("environment"), "environment")
         self.tasks_cfg = _expect_dict(cfg.get("tasks"), "tasks")
         self.working_dir = _get_working_directory(self.environment_cfg, self.config_dir)
@@ -165,11 +174,7 @@ class TouchInterfaceApp:
 
     def _build_ui(self) -> None:
         self.root.title("Task Launcher")
-        screen_width = int(self.root.winfo_screenwidth())
-        screen_height = int(self.root.winfo_screenheight())
-        window_width = max(800, screen_width - 40)
-        window_height = max(600, screen_height - 80)
-        self.root.geometry(f"{window_width}x{window_height}+20+20")
+        place_tk_window_on_screen(self.root, self.screen_info, min_width=800, min_height=600, margin_x=20, margin_y=20)
         self.root.minsize(800, 600)
 
         self.root.configure(bg="#e9ecef")
@@ -325,7 +330,13 @@ def main() -> None:
     cfg = load_launcher_config(config_path)
 
     root = tk.Tk()
-    app = TouchInterfaceApp(root, config_path, cfg)
+    screen_cfg = load_screen_config(
+        cfg,
+        cli_main=args.main_screen,
+        cli_experimenter=args.experimenter_screen,
+    )
+    screen_info = resolve_interface_screen(root, screen_cfg)
+    app = TouchInterfaceApp(root, config_path, cfg, screen_info=screen_info)
     root.mainloop()
 
 

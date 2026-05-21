@@ -13,7 +13,7 @@ import random
 import shutil
 import subprocess
 import json
-from typing import List, Tuple, Optional, Dict, Union, Callable, Any
+from typing import List, Tuple, Optional, Dict, Union, Callable, Any, Sequence
 import io
 import sys
 import multiprocessing as mp
@@ -25,6 +25,8 @@ from PIL import Image
 import threading
 from psychopy import visual, event
 import time
+
+from .screen import get_psychopy_window_kwargs, serialize_preview_image
 
 # Global debug flag: when True, utilities may write debug files (PNG) to logs/
 # Default is False; tasks can enable it via CLI (--debug) or config.
@@ -83,16 +85,14 @@ def setup_window(
     fullscreen: bool = False,
     size: Optional[Tuple[int, int]] = None,
     monitor: Optional[str] = None,
+    screen_info=None,
 ):
     color = rgb255_to_psychopy(bg_rgb_255)
     win_kwargs = dict(color=color, colorSpace="rgb", units="pix", allowStencil=False)
     if monitor:
         win_kwargs["monitor"] = monitor
-    if fullscreen:
-        return visual.Window(fullscr=True, **win_kwargs)
-    if size is None:
-        size = (1024, 768)
-    return visual.Window(size=size, fullscr=False, **win_kwargs)
+    win_kwargs.update(get_psychopy_window_kwargs(screen_info, fullscreen=fullscreen, size=size))
+    return visual.Window(**win_kwargs)
 
 
 def _log_message(msg_logger, level: str, message: str) -> None:
@@ -167,6 +167,7 @@ def play_video_fill_screen(
     stop_on_mouse_click: bool = False,
     mouse: Optional[event.Mouse] = None,
     ffprobe_bin: str = "ffprobe",
+    external_abort_checker: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
     video_file = Path(video_path)
     if not video_file.exists():
@@ -236,6 +237,17 @@ def play_video_fill_screen(
                 if logger is not None:
                     logger.log("abort", image_name=video_file.name, notes="escape_pressed_during_video")
                 break
+
+            if external_abort_checker is not None:
+                try:
+                    if external_abort_checker():
+                        aborted = True
+                        abort_reason = "experimenter_exit"
+                        if logger is not None:
+                            logger.log("abort", image_name=video_file.name, notes="experimenter_exit_during_video")
+                        break
+                except Exception:
+                    pass
 
             if stop_on_mouse_click and mouse is not None:
                 try:
@@ -855,6 +867,9 @@ def present_block_with_persistent_dots(
     is_memory: bool = True,
     choice_hitbox_scale: float = 1.0,
     trial_meta: Optional[Dict[str, Any]] = None,
+    experimenter_preview=None,
+    external_abort_checker: Optional[Callable[[], bool]] = None,
+    scene_main_size: Optional[Sequence[float]] = None,
 ):
     """Present stimuli one at a time, leave faint dots at their locations,
     show all dots for `choice_time`, then clear.
@@ -871,10 +886,12 @@ def present_block_with_persistent_dots(
     from psychopy import core as _core
 
     dots: List[visual.Circle] = []
+    dot_records: List[Dict[str, Any]] = []
     _visual = visual
     stim_sizes: List[Tuple[float, float]] = []
     # stims to potentially keep visible during the choice period when is_memory is False
     stims_for_choice: List[visual.ImageStim] = []
+    stims_for_choice_preview: List[Dict[str, Any]] = []
     # Establish frame timing
     if fps is None:
         fps, frame_dur = detect_frame_rate(win, msg_logger=msg_logger)
@@ -902,6 +919,61 @@ def present_block_with_persistent_dots(
     from psychopy import event as _event
     mouse = _event.Mouse(win=win)
 
+    def _should_abort(notes: str) -> bool:
+        if external_abort_checker is None:
+            return False
+        try:
+            if external_abort_checker():
+                logger.log("abort", image_name="", notes=notes)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _preview_images(items: Sequence[Dict[str, Any]]) -> list[Dict[str, Any]]:
+        return [
+            {
+                "image_payload": item.get("image_payload"),
+                "pos": [float(item["pos"][0]), float(item["pos"][1])],
+                "size": [float(item["size"][0]), float(item["size"][1])],
+            }
+            for item in items
+        ]
+
+    def _preview_dots() -> list[Dict[str, Any]]:
+        return [
+            {
+                "pos": [float(item["pos"][0]), float(item["pos"][1])],
+                "radius": float(item["radius"]),
+                "color": list(item["color"]),
+            }
+            for item in dot_records
+        ]
+
+    def _show_preview(images: Optional[Sequence[Dict[str, Any]]] = None) -> None:
+        if experimenter_preview is None or bg_rgb_255 is None:
+            return
+        fixation_size = None
+        try:
+            fixation_size = float(getattr(fix, "height"))
+        except Exception:
+            fixation_size = None
+        experimenter_preview.show_static_scene(
+            bg_rgb_255=bg_rgb_255,
+            main_size=tuple(scene_main_size) if scene_main_size is not None else tuple(win.size),
+            images=_preview_images(images or []),
+            dots=_preview_dots(),
+            fixation_size=fixation_size,
+            fixation_color=(0, 0, 0),
+        )
+
+    def _make_preview_image_entry(image_obj, stim_obj: visual.ImageStim) -> Dict[str, Any]:
+        return {
+            "image_payload": serialize_preview_image(image_obj),
+            "pos": tuple(float(v) for v in getattr(stim_obj, "pos", (0.0, 0.0))),
+            "size": tuple(float(v) for v in getattr(stim_obj, "size", (64.0, 64.0))),
+        }
+
     if onset_cue is not None:
         # center onset cue by default
         try:
@@ -915,6 +987,18 @@ def present_block_with_persistent_dots(
         onset_cue.draw()
         if fix is not None:
             fix.draw()
+        try:
+            _show_preview(
+                [
+                    {
+                        "image_payload": serialize_preview_image(getattr(onset_cue, "image", None)),
+                        "pos": tuple(float(v) for v in getattr(onset_cue, "pos", (0.0, 0.0))),
+                        "size": tuple(float(v) for v in getattr(onset_cue, "size", (200.0, 200.0))),
+                    }
+                ]
+            )
+        except Exception:
+            pass
         
         # If Raspberry Pi GPIO is requested, register callback to send pulse at flip time.
         # This ensures minimal latency between visual flip and GPIO pulse.
@@ -971,6 +1055,8 @@ def present_block_with_persistent_dots(
                 win.close()
                 _core.quit()
                 return True, None
+            if _should_abort("experimenter_exit_during_onset_cue"):
+                return True, None
 
             # Get position first to ensure touchscreen events are processed synchronously
             click_pos = mouse.getPos()
@@ -1009,6 +1095,7 @@ def present_block_with_persistent_dots(
                         end_time_perf_s=None,
                         notes=f"block={block_idx} click_to_flip_delay_s={(rem_perf - click_perf):.6f}",
                     )
+                    _show_preview([])
                     break
 
             _core.wait(0.01)
@@ -1105,6 +1192,8 @@ def present_block_with_persistent_dots(
     def _poll_choice_until(deadline_perf: float) -> bool:
         nonlocal click_registered, click_perf_capture, click_meta, prev_touch_down, chosen_info
         while time.perf_counter() < deadline_perf and not click_registered:
+            if _should_abort("experimenter_exit_during_choice"):
+                return True
             keys = _event.getKeys(["escape"])
             if keys:
                 logger.log("abort", image_name="", notes="escape_pressed")
@@ -1195,6 +1284,7 @@ def present_block_with_persistent_dots(
             stim.pos = pos
             # keep a reference in case we need to show the stimulus during choice (is_memory False)
             stims_for_choice.append(stim)
+            stims_for_choice_preview.append(_make_preview_image_entry(pil_img, stim))
             # record stimulus pixel size for click hit-testing later
             try:
                 stim_sizes.append(tuple(stim.size))
@@ -1216,11 +1306,15 @@ def present_block_with_persistent_dots(
                 )
                 dot.pos = pos
                 dots.append(dot)
+                dot_records.append({"pos": tuple(pos), "radius": float(dot_size) / 2.0, "color": tuple(cue_color)})
 
                 # Pre-stimulus dot/cue for exactly isi_frames frames
                 first_flip = True
                 dot_on_perf = None
+                _show_preview([])
                 for _f in range(isi_frames if isi_frames > 0 else 0):
+                    if _should_abort("experimenter_exit_during_isi"):
+                        return True, None
                     bg_rect.draw()
                     for d in dots:
                         d.draw()
@@ -1243,7 +1337,11 @@ def present_block_with_persistent_dots(
 
             # Draw background, existing dots, then current stim and fixation
             first_flip = True
+            current_preview_image = [_make_preview_image_entry(pil_img, stim)]
+            _show_preview(current_preview_image)
             for _f in range(stim_frames):
+                if _should_abort("experimenter_exit_during_stimulus"):
+                    return True, None
                 bg_rect.draw()
                 for d in dots:
                     d.draw()
@@ -1271,10 +1369,15 @@ def present_block_with_persistent_dots(
                 # set persistent color
                 last_dot.fillColor = rgb255_to_psychopy(dot_color)
                 last_dot.fillColorSpace = "rgb"
+                dot_records[-1]["color"] = tuple(dot_color)
             elif dots and not is_memory:
                 # remove the last pre-stimulus cue dot so it doesn't persist
                 try:
                     dots.pop()
+                except Exception:
+                    pass
+                try:
+                    dot_records.pop()
                 except Exception:
                     pass
 
@@ -1290,6 +1393,7 @@ def present_block_with_persistent_dots(
                 fix.draw()
             off_perf = time.perf_counter()
             off_flip = win.flip()
+            _show_preview([] if is_memory else stims_for_choice_preview)
             logger.log(
                 "stim_off",
                 image_name=name,
@@ -1309,12 +1413,15 @@ def present_block_with_persistent_dots(
                 win.close()
                 _core.quit()
                 return True, None
+            if _should_abort("experimenter_exit_after_stimulus"):
+                return True, None
 
         # After all stimuli in this block were shown, enter the choice period.
     else:
         # Non-sequential: present all items at once.
         stims = []
         names = []
+        preview_images = []
         for idx, (p, pos) in enumerate(zip(block_paths, positions), start=1):
             if isinstance(p, tuple) and len(p) == 2:
                 sid, cid = p
@@ -1329,6 +1436,7 @@ def present_block_with_persistent_dots(
             stim.pos = pos
             stims.append(stim)
             names.append(name)
+            preview_images.append(_make_preview_image_entry(pil_img, stim))
             try:
                 stim_sizes.append(tuple(stim.size))
             except Exception:
@@ -1348,10 +1456,14 @@ def present_block_with_persistent_dots(
                 )
                 dot.pos = pos
                 dots.append(dot)
+                dot_records.append({"pos": tuple(pos), "radius": float(dot_size) / 2.0, "color": tuple(cue_color)})
 
             first_flip = True
             dot_on_perf = None
+            _show_preview([])
             for _f in range(isi_frames if isi_frames > 0 else 0):
+                if _should_abort("experimenter_exit_during_isi"):
+                    return True, None
                 bg_rect.draw()
                 for d in dots:
                     d.draw()
@@ -1376,7 +1488,10 @@ def present_block_with_persistent_dots(
 
         # Show all stimuli simultaneously for stim_frames
         first_flip = True
+        _show_preview(preview_images)
         for _f in range(stim_frames):
+            if _should_abort("experimenter_exit_during_stimulus"):
+                return True, None
             bg_rect.draw()
             for d in dots:
                 d.draw()
@@ -1426,6 +1541,8 @@ def present_block_with_persistent_dots(
                 for d in dots:
                     d.fillColor = rgb255_to_psychopy(dot_color)
                     d.fillColorSpace = "rgb"
+                for item in dot_records:
+                    item["color"] = tuple(dot_color)
                 # draw background + all dots + fixation and log stim_off for each
                 bg_rect.draw()
                 for d in dots:
@@ -1434,6 +1551,7 @@ def present_block_with_persistent_dots(
                     fix.draw()
                 off_perf = time.perf_counter()
                 win.flip()
+                _show_preview([])
             else:
                 # draw background + all kept stimuli + fixation and log stim_off for each
                 bg_rect.draw()
@@ -1443,6 +1561,7 @@ def present_block_with_persistent_dots(
                     fix.draw()
                 off_perf = time.perf_counter()
                 win.flip()
+                _show_preview(preview_images)
             for idx, name in enumerate(names, start=1):
                 logger.log(
                     "stim_off",
@@ -1459,6 +1578,8 @@ def present_block_with_persistent_dots(
             logger.log("abort", image_name="", notes="escape_pressed")
             win.close()
             _core.quit()
+            return True, None
+        if _should_abort("experimenter_exit_after_stimulus"):
             return True, None
     # If a response window has not started yet, start it on the first frame
     # where the selectable targets for this mode are actually visible.
@@ -1477,6 +1598,7 @@ def present_block_with_persistent_dots(
             choice_perf_now = time.perf_counter()
             _build_choice_hit_targets()
             _start_choice_window(choice_flip, choice_perf_now, choice_s)
+            _show_preview([] if is_memory else (stims_for_choice_preview if sequential else preview_images))
 
         if choice_deadline is not None:
             if _poll_choice_until(choice_deadline):
@@ -1488,6 +1610,7 @@ def present_block_with_persistent_dots(
         if fix is not None:
             fix.draw()
         clr_flip = win.flip()
+        _show_preview([])
         clr_perf = time.perf_counter()
         logger.log(
             "choice_cleared",
@@ -1506,6 +1629,7 @@ def present_block_with_persistent_dots(
         if fix is not None:
             fix.draw()
         clr_flip = win.flip()
+        _show_preview([])
         clr_perf = time.perf_counter()
         logger.log(
             "choice_cleared",

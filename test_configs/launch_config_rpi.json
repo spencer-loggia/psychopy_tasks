@@ -3,6 +3,10 @@
         "python": "/opt/psychopy/PsychoPy-2025.1.1-Python3.10/.venv/bin/python",
         "working_dir": "/home/loggiasr/Projects/psychopy_tasks"
     },
+    "screens": {
+        "main": "HDMI-1",
+        "experimenter": "DSI-1"
+    },
     "tasks": {
         "CSC2": {
             "classic": {
@@ -15,7 +19,8 @@
             "memory": {}
         },
         "video": {
-            "launch": "task/play_video.py"
+            "launch": "task/play_video.py",
+            "config": "test_configs/play_video_config.json"
         },
         "setup": {
             "prime_pump": {

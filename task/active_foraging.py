@@ -42,6 +42,7 @@ from bin.logger import (
 )
 import numpy as np
 from bin.config import load_config, validate_config
+from bin.screen import ExperimenterPreview, load_screen_config, resolve_task_screens, serialize_preview_image
 
 
 def _generate_active_foraging_trial(trial_idx: int, config: dict) -> dict:
@@ -231,6 +232,8 @@ def parse_args():
     p.add_argument("--n_shapes", type=int, default=None, help="Expected number of shapes")
     p.add_argument("--n_lum_levels", type=int, default=None, help="Expected number of luminance levels per base color")
     p.add_argument("--buffer_len_trials", type=int, default=None, help="How many upcoming trials to keep buffered in a background process")
+    p.add_argument("--main_screen", default=None, help="Main task screen index or output name")
+    p.add_argument("--experimenter_screen", default=None, help="Experimenter screen index or output name")
     return p.parse_args()
 
 
@@ -277,6 +280,7 @@ def run_task(
     n_lum_levels: Optional[int] = None,
     config_name: Optional[str] = None,
     buffer_len_trials: int = 5,
+    screen_config: Optional[Dict[str, Any]] = None,
 ):
     # Set debug flag before rasterization if requested
     utils.set_debug(debug)
@@ -517,8 +521,18 @@ def run_task(
     # the full color x shape x luminance combinatoric space.
     preloaded: dict = {}
 
+    main_screen, experimenter_screen = resolve_task_screens(screen_config)
+
     # Window + background + fixation
-    win = utils.setup_window(bg_rgb_255=bg, fullscreen=fullscreen, size=win_size)
+    win = utils.setup_window(bg_rgb_255=bg, fullscreen=fullscreen, size=win_size, screen_info=main_screen)
+    experimenter_preview = None
+    if experimenter_screen is not None:
+        experimenter_preview = ExperimenterPreview(
+            experimenter_screen,
+            task_label=resolved_config_name,
+            start_perf_s=time.perf_counter(),
+            update_interval_s=0.1,
+        )
     if touchscreen:
         try:
             win.mouseVisible = False
@@ -570,6 +584,106 @@ def run_task(
     if fixation_size is None:
         fixation_size = 32
     fix = utils.make_fixation_cross(win, size=fixation_size)
+    reward_counts = {0: 0, 1: 0, 2: 0, 3: 0}
+    main_scene_size = tuple(win_size) if win_size is not None else tuple(win.size)
+
+    def _reward_preview_color(level: int) -> tuple[int, int, int]:
+        palette = {
+            0: (220, 60, 60),
+            1: (0, 0, 0),
+            2: (230, 200, 40),
+            3: (60, 180, 75),
+        }
+        return palette.get(int(level), (255, 255, 255))
+
+    def _show_preview_idle() -> None:
+        if experimenter_preview is None:
+            return
+        preview_fixation_size = int(getattr(fix, "height", 0)) if fix is not None else None
+        experimenter_preview.show_static_scene(
+            bg_rgb_255=bg,
+            main_size=main_scene_size,
+            images=[],
+            dots=[],
+            fixation_size=preview_fixation_size,
+            fixation_color=(0, 0, 0),
+            reward_counts=reward_counts,
+            highlight_box=None,
+        )
+
+    def _preview_choice_feedback(
+        *,
+        preloaded_items: Dict[Tuple[int, int], Any],
+        block_paths_current: List[Tuple[int, int]],
+        positions_current: List[Tuple[float, float]],
+        chosen_index_1based: int,
+        reward_level: int,
+    ) -> None:
+        if experimenter_preview is None:
+            return
+        preview_fixation_size = int(getattr(fix, "height", 0)) if fix is not None else None
+        images = []
+        highlight_box = None
+
+        if is_memory:
+            dots = [
+                {
+                    "pos": [float(pos[0]), float(pos[1])],
+                    "radius": float(dot_size) / 2.0,
+                    "color": list(dot_color),
+                }
+                for pos in positions_current
+            ]
+            chosen_pos = positions_current[chosen_index_1based - 1]
+            highlight_box = {
+                "pos": [float(chosen_pos[0]), float(chosen_pos[1])],
+                "size": [float(dot_size * 2.4), float(dot_size * 2.4)],
+                "color": list(_reward_preview_color(reward_level)),
+                "line_width": 6.0,
+            }
+        else:
+            dots = []
+            highlight_size = (float(dot_size * 2.4), float(dot_size * 2.4))
+            for idx, (pair, pos) in enumerate(zip(block_paths_current, positions_current), start=1):
+                image_obj = preloaded_items.get(pair)
+                payload = serialize_preview_image(image_obj)
+                if payload is None:
+                    continue
+                size_px = _stim_size_from_preloaded(preloaded_items, pair)
+                images.append(
+                    {
+                        "image_payload": payload,
+                        "pos": [float(pos[0]), float(pos[1])],
+                        "size": [float(size_px[0]), float(size_px[1])],
+                    }
+                )
+                if idx == chosen_index_1based:
+                    highlight_size = (float(size_px[0]) * 1.20, float(size_px[1]) * 1.20)
+                    highlight_box = {
+                        "pos": [float(pos[0]), float(pos[1])],
+                        "size": [highlight_size[0], highlight_size[1]],
+                        "color": list(_reward_preview_color(reward_level)),
+                        "line_width": 6.0,
+                    }
+
+        experimenter_preview.show_static_scene(
+            bg_rgb_255=bg,
+            main_size=main_scene_size,
+            images=images,
+            dots=dots,
+            fixation_size=preview_fixation_size,
+            fixation_color=(0, 0, 0),
+            reward_counts=reward_counts,
+            highlight_box=highlight_box,
+        )
+
+    def _wait_or_abort(duration_s: float) -> bool:
+        if duration_s is None or float(duration_s) <= 0:
+            return bool(experimenter_preview is not None and experimenter_preview.poll())
+        if experimenter_preview is not None:
+            return experimenter_preview.wait(duration_s)
+        core.wait(duration_s)
+        return False
 
     # If self-initiation requested, build an onset cue ImageStim via utility
     onset_stim = None
@@ -581,6 +695,7 @@ def run_task(
 
     # Create background rectangle via utility
     bg_rect = utils.make_bg_rect(win, bg)
+    _show_preview_idle()
 
     logger = EventLogger(
         output_dir,
@@ -656,6 +771,7 @@ def run_task(
         buffer_size=buffer_len_trials,
         start_idx=1
     )
+    task_end_notes = "done"
 
     try:
         # Task start
@@ -667,6 +783,10 @@ def run_task(
 
         block_idx = 1
         while True:
+            if experimenter_preview is not None and experimenter_preview.poll():
+                logger.log("abort", image_name="", notes="experimenter_exit")
+                task_end_notes = "experimenter_exit"
+                break
             if (not run_indefinitely) and block_idx > n_blocks:
                 break
 
@@ -717,6 +837,7 @@ def run_task(
                     pass
 
             trial_meta: Dict[str, Any] = {}
+            _show_preview_idle()
             aborted, choice_info = utils.present_block_with_persistent_dots(
                 win=win,
                 preloaded=preloaded,
@@ -743,15 +864,24 @@ def run_task(
                 is_memory=is_memory,
                 choice_hitbox_scale=1.25 if touchscreen else 1.0,
                 trial_meta=trial_meta,
+                experimenter_preview=experimenter_preview,
+                external_abort_checker=(experimenter_preview.poll if experimenter_preview is not None else None),
+                scene_main_size=effective_win_size,
             )
             if aborted:
+                if task_end_notes == "done" and experimenter_preview is not None and experimenter_preview.poll():
+                    task_end_notes = "experimenter_exit"
+                elif task_end_notes == "done":
+                    task_end_notes = "aborted"
                 break
 
             if choice_info is not None:
+                abort_requested = False
                 chosen_idx = choice_info["chosen_index"]
                 chosen_pair = block_paths[chosen_idx - 1]
                 reward_level = reward_map.get(chosen_pair, 0)
                 chosen_shape_idx, chosen_color_idx, chosen_lum_idx = block_meta[chosen_idx - 1]
+                reward_counts[int(reward_level)] = reward_counts.get(int(reward_level), 0) + 1
 
                 logger.log(
                     "reward_determined",
@@ -765,6 +895,13 @@ def run_task(
                         f"base_color_idx={chosen_color_idx} shape_idx={chosen_shape_idx} "
                         f"lum_idx={chosen_lum_idx} reward_level={reward_level}"
                     ),
+                )
+                _preview_choice_feedback(
+                    preloaded_items=preloaded,
+                    block_paths_current=block_paths,
+                    positions_current=positions,
+                    chosen_index_1based=chosen_idx,
+                    reward_level=reward_level,
                 )
 
                 num_pulses = 0
@@ -790,7 +927,10 @@ def run_task(
                             end_time_perf_s=None,
                             notes=f"block={block_idx} reward_level={reward_level} pulse={pulse_num}/{num_pulses}",
                         )
-                        core.wait(pump_pulse_time_seconds)
+                        if _wait_or_abort(pump_pulse_time_seconds):
+                            logger.log("abort", image_name="", notes="experimenter_exit")
+                            task_end_notes = "experimenter_exit"
+                            abort_requested = True
 
                         pulse_end_perf = time.perf_counter()
                         if raspi and gpio_chip is not None:
@@ -809,6 +949,8 @@ def run_task(
                             end_time_perf_s=None,
                             notes=f"block={block_idx} reward_level={reward_level} pulse={pulse_num}/{num_pulses}",
                         )
+                        if abort_requested:
+                            break
 
                         if pulse_num < num_pulses:
                             interval_start_perf = time.perf_counter()
@@ -821,7 +963,10 @@ def run_task(
                                 end_time_perf_s=None,
                                 notes=f"block={block_idx} reward_level={reward_level} after_pulse={pulse_num}/{num_pulses}",
                             )
-                            core.wait(pump_pulse_time_seconds)
+                            if _wait_or_abort(pump_pulse_time_seconds):
+                                logger.log("abort", image_name="", notes="experimenter_exit")
+                                task_end_notes = "experimenter_exit"
+                                abort_requested = True
                             interval_end_perf = time.perf_counter()
                             logger.log(
                                 "pump_inter_pulse_interval_end",
@@ -832,6 +977,11 @@ def run_task(
                                 end_time_perf_s=None,
                                 notes=f"block={block_idx} reward_level={reward_level} after_pulse={pulse_num}/{num_pulses}",
                             )
+                            if abort_requested:
+                                break
+
+                if abort_requested:
+                    break
 
                 apply_timeout = 0
                 if reward_to_timeout_map is not None:
@@ -855,7 +1005,10 @@ def run_task(
                         end_time_perf_s=None,
                         notes=f"block={block_idx} reward_level={reward_level}",
                     )
-                    core.wait(timeout_duration_seconds)
+                    if _wait_or_abort(timeout_duration_seconds):
+                        logger.log("abort", image_name="", notes="experimenter_exit")
+                        task_end_notes = "experimenter_exit"
+                        abort_requested = True
 
                     timeout_end_perf = time.perf_counter()
                     if raspi and gpio_chip is not None:
@@ -874,6 +1027,9 @@ def run_task(
                         end_time_perf_s=None,
                         notes=f"block={block_idx} reward_level={reward_level}",
                     )
+
+                if abort_requested or task_end_notes != "done":
+                    break
 
             chosen_idx_row_1based = choice_info.get("chosen_index") if choice_info is not None else None
             chosen_idx_row = int(chosen_idx_row_1based - 1) if chosen_idx_row_1based is not None else ""
@@ -914,6 +1070,7 @@ def run_task(
                 except Exception:
                     pass
 
+                _show_preview_idle()
                 bg_rect.draw()
                 if fix is not None:
                     fix.draw()
@@ -922,10 +1079,16 @@ def run_task(
                 logger.log("ibi_start", image_name="", requested_duration_s=ibi_s, flip_time_psychopy_s=ibi_flip, flip_time_perf_s=ibi_perf, end_time_perf_s=ibi_perf + ibi_s, notes=f"after_block={block_idx}")
 
                 for _f in range(max(0, ibi_frames - 1)):
+                    if experimenter_preview is not None and experimenter_preview.poll():
+                        logger.log("abort", image_name="", notes="experimenter_exit")
+                        task_end_notes = "experimenter_exit"
+                        break
                     bg_rect.draw()
                     if fix is not None:
                         fix.draw()
                     win.flip()
+                if task_end_notes != "done":
+                    break
 
             logger.log("block_end", image_name="", notes=f"block={block_idx}")
             block_idx += 1
@@ -943,7 +1106,7 @@ def run_task(
 
     # Task end
     task_end_dt = dt.datetime.now()
-    logger.log("task_end", image_name="", notes="done")
+    logger.log("task_end", image_name="", notes=task_end_notes)
     logger.finalize(build_run_log_filename(resolved_config_name, "active_foraging_log", when=task_end_dt))
     try:
         msg_logger.finalize(build_run_log_filename(resolved_config_name, "active_foraging_message_log", when=task_end_dt))
@@ -954,6 +1117,11 @@ def run_task(
             behavior_summary_path,
             build_run_log_filename(resolved_config_name, "behavior_summary", when=task_end_dt),
         )
+    except Exception:
+        pass
+    try:
+        if experimenter_preview is not None:
+            experimenter_preview.close()
     except Exception:
         pass
     win.close()
@@ -985,6 +1153,12 @@ def main():
         if val is not None:
             return val
         return cfg.get(name, default)
+
+    screen_config = load_screen_config(
+        cfg,
+        cli_main=args.main_screen,
+        cli_experimenter=args.experimenter_screen,
+    )
 
     colors_tsv = _get("colors_tsv", cfg.get("colors_tsv"))
     shapes_tsv = _get("shapes_tsv", cfg.get("shapes_tsv"))
@@ -1077,6 +1251,7 @@ def main():
             n_lum_levels=n_lum_levels,
             config_name=config_name,
             buffer_len_trials=buffer_len_trials,
+            screen_config=screen_config,
         )
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)

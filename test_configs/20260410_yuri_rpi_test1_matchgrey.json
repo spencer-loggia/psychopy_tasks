@@ -26,6 +26,10 @@
 
   "seed": 42,
   "output_dir": "./logs",
+  "screens": {
+    "main": null,
+    "experimenter": null
+  },
   "refresh_rate": 120,
   "n": 20,
   "duration": 0.5,

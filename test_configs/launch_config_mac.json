@@ -3,6 +3,10 @@
         "python": "/Users/loggiasr/anaconda3/envs/pyschopy/bin/python",
         "working_dir": "/Users/loggiasr/Projects/neuro_tasks"
     },
+    "screens": {
+        "main": 1,
+        "experimenter": 0
+    },
     "tasks": {
         "CSC2": {
             "classic": {

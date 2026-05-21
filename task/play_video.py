@@ -9,6 +9,7 @@ import argparse
 import datetime as dt
 import random
 import sys
+import time
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -21,6 +22,7 @@ if str(_project_root) not in sys.path:
 from bin import utils
 from bin.config import load_config, validate_config
 from bin.logger import EventLogger, MessageLogger, build_run_log_filename
+from bin.screen import ExperimenterPreview, load_screen_config, resolve_task_screens
 
 
 def parse_args():
@@ -34,6 +36,8 @@ def parse_args():
     parser.add_argument("--bg", type=int, nargs=3, default=None, help="Background RGB color")
     parser.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate (Hz)")
     parser.add_argument("--ffprobe", default=None, help="Path to ffprobe for codec probing")
+    parser.add_argument("--main_screen", default=None, help="Main task screen index or output name")
+    parser.add_argument("--experimenter_screen", default=None, help="Experimenter screen index or output name")
     return parser.parse_args()
 
 
@@ -47,6 +51,7 @@ def run_task(
     refresh_rate: Optional[float] = None,
     config_name: Optional[str] = None,
     ffprobe_bin: str = "ffprobe",
+    screen_config=None,
 ):
     if seed is not None:
         random.seed(seed)
@@ -55,12 +60,22 @@ def run_task(
     if not video_files:
         raise FileNotFoundError(f"No videos found in {videos_dir}")
 
-    win = utils.setup_window(bg_rgb_255=bg, fullscreen=fullscreen, size=win_size)
+    main_screen, experimenter_screen = resolve_task_screens(screen_config)
+    win = utils.setup_window(bg_rgb_255=bg, fullscreen=fullscreen, size=win_size, screen_info=main_screen)
     bg_rect = utils.make_bg_rect(win, bg)
     mouse = event.Mouse(win=win)
+    experimenter_preview = None
 
     run_started_dt = dt.datetime.now()
     resolved_config_name = str(config_name).strip() if config_name else "play_video"
+    if experimenter_screen is not None:
+        experimenter_preview = ExperimenterPreview(
+            experimenter_screen,
+            task_label=resolved_config_name,
+            start_perf_s=time.perf_counter(),
+            update_interval_s=0.1,
+        )
+        experimenter_preview.clear_scene(bg_rgb_255=bg, main_size=tuple(win.size))
     logger = EventLogger(
         output_dir,
         filename=build_run_log_filename(
@@ -110,6 +125,10 @@ def run_task(
     played_videos = 0
     stop_reason = "mouse_click"
     while True:
+        if experimenter_preview is not None and experimenter_preview.poll():
+            stop_reason = "experimenter_exit"
+            logger.log("abort", image_name="", notes="experimenter_exit_before_video")
+            break
         try:
             is_pressed = any(mouse.getPressed())
         except Exception:
@@ -119,6 +138,8 @@ def run_task(
             break
 
         chosen_video = random.choice(video_files)
+        if experimenter_preview is not None:
+            experimenter_preview.play_video(str(chosen_video), bg_rgb_255=bg)
         playback_info = utils.play_video_fill_screen(
             win=win,
             video_path=chosen_video,
@@ -129,8 +150,11 @@ def run_task(
             stop_on_mouse_click=True,
             mouse=mouse,
             ffprobe_bin=ffprobe_bin,
+            external_abort_checker=(experimenter_preview.poll if experimenter_preview is not None else None),
         )
         played_videos += 1
+        if experimenter_preview is not None:
+            experimenter_preview.clear_scene(bg_rgb_255=bg, main_size=tuple(win.size))
         if playback_info["aborted"]:
             stop_reason = playback_info.get("abort_reason") or "aborted"
             break
@@ -156,6 +180,11 @@ def run_task(
         msg_logger.finalize(build_run_log_filename(resolved_config_name, "play_video_message_log", when=task_end_dt))
     except Exception:
         pass
+    try:
+        if experimenter_preview is not None:
+            experimenter_preview.close()
+    except Exception:
+        pass
     win.close()
     core.quit()
 
@@ -173,6 +202,12 @@ def main():
             return val
         return cfg.get(name, default)
 
+    screen_config = load_screen_config(
+        cfg,
+        cli_main=args.main_screen,
+        cli_experimenter=args.experimenter_screen,
+    )
+
     try:
         run_task(
             videos_dir=_get("videos_dir", "./task/resources/cropped_videos"),
@@ -184,6 +219,7 @@ def main():
             refresh_rate=_get("refresh_rate", cfg.get("refresh_rate", cfg.get("refrech_rate", None))),
             config_name=_get("config_name", cfg.get("config_name", "play_video")),
             ffprobe_bin=_get("ffprobe", cfg.get("ffprobe", "ffprobe")),
+            screen_config=screen_config,
         )
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

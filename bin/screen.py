@@ -1,0 +1,1039 @@
+"""
+Shared helpers for resolving monitor selectors and managing experimenter displays.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import io
+import multiprocessing as mp
+import os
+import queue
+import time
+from typing import Any, Dict, Optional, Sequence, Union
+
+import numpy as np
+from PIL import Image
+
+try:
+    from screeninfo import get_monitors
+except ImportError:
+    get_monitors = None
+
+
+ScreenSelector = Optional[Union[int, str]]
+_UNSET = object()
+
+
+@dataclass(frozen=True)
+class ScreenGeometry:
+    index: int
+    x: int
+    y: int
+    width: int
+    height: int
+    name: str = ""
+
+
+def parse_screen_selector(value: Any, name: str) -> ScreenSelector:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"Screen field '{name}' must be a non-negative integer or output name")
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError(f"Screen field '{name}' must be >= 0")
+        return value
+
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        if stripped.isdigit():
+            parsed = int(stripped)
+            if parsed < 0:
+                raise ValueError(f"Screen field '{name}' must be >= 0")
+            return parsed
+        return stripped
+
+    raise ValueError(f"Screen field '{name}' must be a non-negative integer or output name")
+
+
+def load_screen_config(
+    cfg: Dict[str, Any],
+    *,
+    cli_main: ScreenSelector = None,
+    cli_experimenter: ScreenSelector = None,
+) -> Dict[str, ScreenSelector]:
+    screens_cfg = cfg.get("screens", {})
+    if screens_cfg is None:
+        screens_cfg = {}
+    if not isinstance(screens_cfg, dict):
+        raise ValueError("Config field 'screens' must be a JSON object")
+
+    main_value = cli_main
+    if main_value is None:
+        main_value = screens_cfg.get("main", cfg.get("main_screen"))
+
+    experimenter_value = cli_experimenter
+    if experimenter_value is None:
+        experimenter_value = screens_cfg.get("experimenter", cfg.get("experimenter_screen"))
+
+    return {
+        "main": parse_screen_selector(main_value, "screens.main"),
+        "experimenter": parse_screen_selector(experimenter_value, "screens.experimenter"),
+    }
+
+
+def _normalize_screen_name(name: str) -> str:
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
+def _screen_name_aliases(name: str) -> set[str]:
+    raw = name.strip().lower()
+    aliases = {raw, _normalize_screen_name(raw)}
+
+    def _add(text: str) -> None:
+        aliases.add(text)
+        aliases.add(_normalize_screen_name(text))
+
+    if raw.startswith("hdmi-a-"):
+        suffix = raw[len("hdmi-a-") :]
+        _add(f"hdmi-{suffix}")
+        _add(f"hdmi{suffix}")
+        if suffix.isdigit():
+            _add(f"hdmi{int(suffix) - 1}")
+    elif raw.startswith("hdmi-"):
+        suffix = raw[len("hdmi-") :]
+        _add(f"hdmi-a-{suffix}")
+        _add(f"hdmi{suffix}")
+        if suffix.isdigit():
+            _add(f"hdmi{int(suffix) - 1}")
+    elif raw.startswith("hdmi") and raw[len("hdmi") :].isdigit():
+        suffix = str(int(raw[len("hdmi") :]) + 1)
+        _add(f"hdmi-{suffix}")
+        _add(f"hdmi-a-{suffix}")
+
+    if raw.startswith("dsi-"):
+        suffix = raw[len("dsi-") :]
+        _add(f"dsi{suffix}")
+    elif raw.startswith("dsi") and raw[len("dsi") :].isdigit():
+        suffix = raw[len("dsi") :]
+        _add(f"dsi-{suffix}")
+
+    return aliases
+
+
+def get_monitor_screens() -> list[ScreenGeometry]:
+    if get_monitors is None:
+        return []
+    try:
+        monitors = list(get_monitors())
+    except Exception:
+        return []
+    return [
+        ScreenGeometry(
+            index=index,
+            x=int(getattr(monitor, "x", 0)),
+            y=int(getattr(monitor, "y", 0)),
+            width=max(int(getattr(monitor, "width", 0)), 1),
+            height=max(int(getattr(monitor, "height", 0)), 1),
+            name=str(getattr(monitor, "name", "") or ""),
+        )
+        for index, monitor in enumerate(monitors)
+    ]
+
+
+def get_tk_screens(root) -> list[ScreenGeometry]:
+    screens = get_monitor_screens()
+    if screens:
+        return screens
+    return [
+        ScreenGeometry(
+            index=0,
+            x=0,
+            y=0,
+            width=max(int(root.winfo_screenwidth()), 1),
+            height=max(int(root.winfo_screenheight()), 1),
+            name="primary",
+        )
+    ]
+
+
+def select_screen(
+    screens: list[ScreenGeometry],
+    requested_selector: ScreenSelector,
+    *,
+    role: str,
+    default_index: Optional[int] = None,
+    allow_unvalidated_index: bool = False,
+) -> Optional[ScreenGeometry]:
+    if requested_selector is None:
+        if default_index is None:
+            return None
+        if 0 <= default_index < len(screens):
+            return screens[default_index]
+        if allow_unvalidated_index:
+            return ScreenGeometry(index=default_index, x=0, y=0, width=0, height=0, name=f"screen{default_index}")
+        return None
+
+    if isinstance(requested_selector, int):
+        if 0 <= requested_selector < len(screens):
+            return screens[requested_selector]
+        if allow_unvalidated_index and get_monitors is None:
+            return ScreenGeometry(
+                index=requested_selector,
+                x=0,
+                y=0,
+                width=0,
+                height=0,
+                name=f"screen{requested_selector}",
+            )
+        available = ", ".join(str(screen.index) for screen in screens)
+        raise ValueError(
+            f"Requested {role} screen {requested_selector}, but detected only {len(screens)} screen(s) "
+            f"(available indices: {available})."
+        )
+
+    requested_aliases = _screen_name_aliases(str(requested_selector))
+    for screen in screens:
+        if screen.name and requested_aliases & _screen_name_aliases(screen.name):
+            return screen
+
+    detected_names = [screen.name for screen in screens if screen.name]
+    if get_monitors is None:
+        raise RuntimeError(
+            f"Named screen selection for {role} requires the optional 'screeninfo' package. "
+            f"Requested '{requested_selector}'."
+        )
+    raise ValueError(
+        f"Requested {role} screen '{requested_selector}', but detected outputs were: "
+        f"{', '.join(detected_names) if detected_names else 'none'}."
+    )
+
+
+def resolve_task_screens(
+    screen_config: Optional[Dict[str, ScreenSelector]] = None,
+) -> tuple[ScreenGeometry, Optional[ScreenGeometry]]:
+    cfg = screen_config or {}
+    screens = get_monitor_screens()
+    if not screens:
+        screens = [ScreenGeometry(index=0, x=0, y=0, width=0, height=0, name="primary")]
+
+    main_screen = select_screen(
+        screens,
+        cfg.get("main"),
+        role="main",
+        default_index=0,
+        allow_unvalidated_index=True,
+    )
+    if main_screen is None:
+        raise RuntimeError("Unable to resolve a main task screen")
+
+    default_experimenter_index = None
+    for candidate in screens:
+        if candidate.index != main_screen.index:
+            default_experimenter_index = candidate.index
+            break
+
+    experimenter_screen = select_screen(
+        screens,
+        cfg.get("experimenter"),
+        role="experimenter",
+        default_index=default_experimenter_index,
+        allow_unvalidated_index=True,
+    )
+    if experimenter_screen is not None and experimenter_screen.index == main_screen.index:
+        raise ValueError("Main and experimenter screens must resolve to different displays")
+
+    return main_screen, experimenter_screen
+
+
+def resolve_interface_screen(
+    root,
+    screen_config: Optional[Dict[str, ScreenSelector]] = None,
+) -> ScreenGeometry:
+    cfg = screen_config or {}
+    screens = get_tk_screens(root)
+    default_index = 1 if len(screens) > 1 else 0
+    screen_info = select_screen(
+        screens,
+        cfg.get("experimenter"),
+        role="experimenter",
+        default_index=default_index,
+        allow_unvalidated_index=True,
+    )
+    if screen_info is None:
+        raise RuntimeError("Unable to resolve an experimenter interface screen")
+    return screen_info
+
+
+def place_tk_window_on_screen(
+    root,
+    screen_info: ScreenGeometry,
+    *,
+    min_width: int = 800,
+    min_height: int = 600,
+    margin_x: int = 20,
+    margin_y: int = 20,
+) -> tuple[int, int]:
+    screen_width = max(int(screen_info.width), min_width)
+    screen_height = max(int(screen_info.height), min_height)
+    window_width = max(min_width, screen_width - (2 * int(margin_x)))
+    window_height = max(min_height, screen_height - (2 * int(margin_y)) - 40)
+    root.geometry(_format_geometry(window_width, window_height, int(screen_info.x) + int(margin_x), int(screen_info.y) + int(margin_y)))
+    return window_width, window_height
+
+
+def get_psychopy_window_kwargs(
+    screen_info: Optional[ScreenGeometry],
+    *,
+    fullscreen: bool,
+    size: Optional[Sequence[int]] = None,
+) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {}
+    if screen_info is not None:
+        kwargs["screen"] = int(screen_info.index)
+
+    if fullscreen:
+        kwargs["fullscr"] = True
+        return kwargs
+
+    if size is not None:
+        resolved_size = (int(size[0]), int(size[1]))
+    elif screen_info is not None and int(screen_info.width) > 0 and int(screen_info.height) > 0:
+        resolved_size = (int(screen_info.width), int(screen_info.height))
+    else:
+        resolved_size = (1024, 768)
+
+    kwargs["size"] = resolved_size
+    kwargs["fullscr"] = False
+    if screen_info is not None and int(screen_info.width) > 0 and int(screen_info.height) > 0:
+        x = int(screen_info.x) + max(0, (int(screen_info.width) - int(resolved_size[0])) // 2)
+        y = int(screen_info.y) + max(0, (int(screen_info.height) - int(resolved_size[1])) // 2)
+        kwargs["pos"] = (x, y)
+    return kwargs
+
+
+def _preview_to_pil_rgba(image_obj) -> Optional[Image.Image]:
+    if image_obj is None:
+        return None
+    if isinstance(image_obj, Image.Image):
+        return image_obj.convert("RGBA")
+    if isinstance(image_obj, (str, os.PathLike)):
+        try:
+            with Image.open(image_obj) as im:
+                return im.convert("RGBA").copy()
+        except Exception:
+            return None
+    try:
+        arr = np.asarray(image_obj)
+    except Exception:
+        return None
+    if arr.dtype.kind == "f":
+        arr = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
+    elif arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    if arr.ndim == 2:
+        return Image.fromarray(arr, mode="L").convert("RGBA")
+    if arr.ndim == 3 and arr.shape[2] == 3:
+        return Image.fromarray(arr, mode="RGB").convert("RGBA")
+    if arr.ndim == 3 and arr.shape[2] == 4:
+        return Image.fromarray(arr, mode="RGBA")
+    return None
+
+
+def serialize_preview_image(image_obj) -> Optional[Dict[str, Any]]:
+    pil = _preview_to_pil_rgba(image_obj)
+    if pil is None:
+        return None
+    buffer = io.BytesIO()
+    pil.save(buffer, format="PNG")
+    return {
+        "kind": "png",
+        "png_bytes": buffer.getvalue(),
+        "size": [int(pil.size[0]), int(pil.size[1])],
+    }
+
+
+def scale_scene_length(value: float, main_size: Sequence[float], preview_size: Sequence[float]) -> float:
+    main_w = max(float(main_size[0]), 1.0)
+    main_h = max(float(main_size[1]), 1.0)
+    preview_w = max(float(preview_size[0]), 1.0)
+    preview_h = max(float(preview_size[1]), 1.0)
+    scale = min(preview_w / main_w, preview_h / main_h)
+    return float(value) * scale
+
+
+def scale_scene_point(
+    pos: Sequence[float],
+    main_size: Sequence[float],
+    preview_size: Sequence[float],
+) -> tuple[float, float]:
+    scale = scale_scene_length(1.0, main_size, preview_size)
+    return (float(pos[0]) * scale, float(pos[1]) * scale)
+
+
+def scale_scene_size(
+    size: Sequence[float],
+    main_size: Sequence[float],
+    preview_size: Sequence[float],
+) -> tuple[float, float]:
+    scale = scale_scene_length(1.0, main_size, preview_size)
+    return (max(1.0, float(size[0]) * scale), max(1.0, float(size[1]) * scale))
+
+
+def format_elapsed_hms(elapsed_s: float) -> str:
+    total_seconds = max(0, int(elapsed_s))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _format_geometry(width: int, height: int, x: int, y: int) -> str:
+    x_part = f"+{x}" if x >= 0 else f"-{abs(x)}"
+    y_part = f"+{y}" if y >= 0 else f"-{abs(y)}"
+    return f"{width}x{height}{x_part}{y_part}"
+
+
+def _experimenter_panel_process(
+    screen_info: ScreenGeometry,
+    task_label: str,
+    start_perf_s: float,
+    update_interval_ms: int,
+    exit_event,
+    stop_event,
+) -> None:
+    import tkinter as tk
+
+    root = tk.Tk()
+    root.title("Experimenter")
+    root.configure(bg="#e9ecef")
+    root.overrideredirect(True)
+    root.geometry(
+        _format_geometry(
+            max(int(screen_info.width), 800),
+            max(int(screen_info.height), 600),
+            int(screen_info.x),
+            int(screen_info.y),
+        )
+    )
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+
+    time_var = tk.StringVar(value="00:00:00")
+    task_var = tk.StringVar(value=task_label or "")
+
+    container = tk.Frame(root, bg="#e9ecef")
+    container.pack(fill="both", expand=True)
+
+    task_label_widget = tk.Label(
+        container,
+        textvariable=task_var,
+        font=("Helvetica", 20),
+        bg="#e9ecef",
+        fg="#4a4a4a",
+    )
+    task_label_widget.pack(pady=(70, 20))
+
+    timer_label = tk.Label(
+        container,
+        textvariable=time_var,
+        font=("Helvetica", 56, "bold"),
+        bg="#e9ecef",
+        fg="#111111",
+    )
+    timer_label.pack(pady=(20, 60))
+
+    exit_button = tk.Button(
+        container,
+        text="exit",
+        command=exit_event.set,
+        font=("Helvetica", 28, "bold"),
+        width=10,
+        height=2,
+        bg="#c94b4b",
+        activebackground="#a63a3a",
+        fg="#ffffff",
+    )
+    exit_button.pack()
+
+    def _tick() -> None:
+        if stop_event.is_set():
+            root.destroy()
+            return
+        elapsed = time.perf_counter() - float(start_perf_s)
+        time_var.set(format_elapsed_hms(elapsed))
+        root.after(update_interval_ms, _tick)
+
+    root.protocol("WM_DELETE_WINDOW", exit_event.set)
+    root.after(0, _tick)
+    root.mainloop()
+
+
+class ExperimenterControlPanel:
+    def __init__(
+        self,
+        screen_info: ScreenGeometry,
+        *,
+        task_label: str = "",
+        start_perf_s: Optional[float] = None,
+        update_interval_s: float = 0.2,
+    ):
+        self.screen_info = screen_info
+        self.task_label = task_label
+        self.start_perf_s = time.perf_counter() if start_perf_s is None else float(start_perf_s)
+        self.update_interval_s = max(0.1, float(update_interval_s))
+        self.exit_requested = False
+        self._ctx = mp.get_context("spawn")
+        self._exit_event = self._ctx.Event()
+        self._stop_event = self._ctx.Event()
+        self._process = self._ctx.Process(
+            target=_experimenter_panel_process,
+            args=(
+                screen_info,
+                task_label,
+                self.start_perf_s,
+                int(round(self.update_interval_s * 1000.0)),
+                self._exit_event,
+                self._stop_event,
+            ),
+            daemon=True,
+        )
+        self._process.start()
+
+    def elapsed_seconds(self) -> float:
+        return max(0.0, time.perf_counter() - self.start_perf_s)
+
+    def poll(self) -> bool:
+        if self.exit_requested:
+            return True
+        self.exit_requested = bool(self._exit_event.is_set())
+        return self.exit_requested
+
+    def wait(self, duration_s: float, *, step_s: float = 0.05) -> bool:
+        deadline = time.perf_counter() + max(0.0, float(duration_s))
+        while time.perf_counter() < deadline:
+            if self.poll():
+                return True
+            remaining = deadline - time.perf_counter()
+            if remaining > 0:
+                time.sleep(min(max(0.01, step_s), remaining))
+        return self.poll()
+
+    def close(self) -> None:
+        try:
+            self._stop_event.set()
+        except Exception:
+            pass
+        try:
+            if self._process.is_alive():
+                self._process.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            if self._process.is_alive():
+                self._process.terminate()
+        except Exception:
+            pass
+
+
+def _preview_rgb255_to_psychopy(rgb_255: Sequence[int]) -> list[float]:
+    return [max(-1.0, min(1.0, (float(v) / 127.5) - 1.0)) for v in rgb_255]
+
+
+def _build_preview_image_stim(win, payload: Dict[str, Any], *, pos, size):
+    from psychopy import visual
+
+    image_payload = payload.get("image_payload")
+    pil = None
+    if isinstance(image_payload, dict) and image_payload.get("kind") == "png":
+        try:
+            pil = Image.open(io.BytesIO(image_payload["png_bytes"])).convert("RGBA")
+        except Exception:
+            pil = None
+    if pil is None:
+        pil = _preview_to_pil_rgba(payload.get("image"))
+    if pil is None:
+        return None
+
+    alpha = np.asarray(pil.getchannel("A"), dtype=np.float32) / 255.0
+    rgb = pil.convert("RGB")
+    mask_pm1 = (alpha * 2.0) - 1.0
+    return visual.ImageStim(
+        win,
+        image=rgb,
+        mask=mask_pm1,
+        units="pix",
+        pos=pos,
+        size=size,
+        interpolate=False,
+    )
+
+
+def _normalize_reward_counts(value: Any) -> Optional[dict[int, int]]:
+    if value is None:
+        return None
+    out = {0: 0, 1: 0, 2: 0, 3: 0}
+    if isinstance(value, dict):
+        items = value.items()
+    else:
+        try:
+            items = enumerate(list(value))
+        except Exception:
+            return None
+    for key, count in items:
+        try:
+            idx = int(key)
+            if idx in out:
+                out[idx] = max(0, int(count))
+        except Exception:
+            continue
+    return out
+
+
+def _reward_level_color(level: int) -> tuple[int, int, int]:
+    palette = {
+        0: (220, 60, 60),
+        1: (0, 0, 0),
+        2: (230, 200, 40),
+        3: (60, 180, 75),
+    }
+    return palette.get(int(level), (255, 255, 255))
+
+
+def _experimenter_preview_process(
+    screen_info: ScreenGeometry,
+    task_label: str,
+    start_perf_s: float,
+    update_interval_ms: int,
+    command_queue,
+    exit_event,
+    stop_event,
+) -> None:
+    from psychopy import core, event, visual
+    preview_canvas_size = (
+        max(int(screen_info.width), 1024),
+        max(int(screen_info.height), 768),
+    )
+    preview_pos = (int(screen_info.x), int(screen_info.y))
+
+    def _make_bg_rect(bg_rgb_255: Sequence[int]):
+        return visual.Rect(
+            win,
+            width=preview_canvas_size[0],
+            height=preview_canvas_size[1],
+            fillColor=_preview_rgb255_to_psychopy(bg_rgb_255),
+            fillColorSpace="rgb",
+            lineColor=None,
+            units="pix",
+        )
+
+    def _release_movie() -> None:
+        nonlocal movie, movie_bg_rect, last_bg_rgb, static_scene
+        if movie is None:
+            return
+        try:
+            movie.stop(log=False)
+        except Exception:
+            pass
+        try:
+            if hasattr(movie, "unload"):
+                movie.unload(log=False)
+        except Exception:
+            pass
+        movie = None
+        movie_bg_rect = None
+        static_scene = _build_static_scene({"bg_rgb_255": last_bg_rgb, "main_size": preview_canvas_size})
+
+    def _build_static_scene(payload: Dict[str, Any]) -> Dict[str, Any]:
+        bg_rgb_255 = tuple(payload.get("bg_rgb_255", (0, 0, 0)))
+        main_size = tuple(payload.get("main_size") or preview_canvas_size)
+        preview_size = preview_canvas_size
+        bg_rect = _make_bg_rect(bg_rgb_255)
+
+        images = []
+        for item in payload.get("images", []) or []:
+            stim = _build_preview_image_stim(
+                win,
+                item,
+                pos=scale_scene_point(item.get("pos", (0, 0)), main_size, preview_size),
+                size=scale_scene_size(item.get("size", (64, 64)), main_size, preview_size),
+            )
+            if stim is not None:
+                images.append(stim)
+
+        dots = []
+        for item in payload.get("dots", []) or []:
+            radius = max(1.0, scale_scene_length(float(item.get("radius", 4.0)), main_size, preview_size))
+            dot = visual.Circle(
+                win,
+                radius=radius,
+                fillColor=_preview_rgb255_to_psychopy(item.get("color", (255, 255, 255))),
+                fillColorSpace="rgb",
+                lineColor=None,
+                units="pix",
+                pos=scale_scene_point(item.get("pos", (0, 0)), main_size, preview_size),
+            )
+            dots.append(dot)
+
+        fixation = None
+        fixation_size = payload.get("fixation_size", None)
+        if fixation_size is not None and float(fixation_size) > 0:
+            fixation = visual.TextStim(
+                win,
+                text="+",
+                units="pix",
+                height=max(1.0, scale_scene_length(float(fixation_size), main_size, preview_size)),
+                color=_preview_rgb255_to_psychopy(payload.get("fixation_color", (0, 0, 0))),
+                colorSpace="rgb",
+                pos=(0, 0),
+            )
+
+        highlight_box = None
+        highlight_payload = payload.get("highlight_box")
+        if isinstance(highlight_payload, dict):
+            line_color = highlight_payload.get("color", (255, 255, 255))
+            line_width = max(2.0, scale_scene_length(float(highlight_payload.get("line_width", 4.0)), main_size, preview_size))
+            highlight_box = visual.Rect(
+                win,
+                width=max(4.0, scale_scene_size(highlight_payload.get("size", (64, 64)), main_size, preview_size)[0]),
+                height=max(4.0, scale_scene_size(highlight_payload.get("size", (64, 64)), main_size, preview_size)[1]),
+                pos=scale_scene_point(highlight_payload.get("pos", (0, 0)), main_size, preview_size),
+                lineColor=_preview_rgb255_to_psychopy(line_color),
+                lineColorSpace="rgb",
+                lineWidth=line_width,
+                fillColor=None,
+                units="pix",
+            )
+
+        return {
+            "bg_rgb_255": bg_rgb_255,
+            "bg_rect": bg_rect,
+            "images": images,
+            "dots": dots,
+            "fixation": fixation,
+            "highlight_box": highlight_box,
+            "reward_counts": _normalize_reward_counts(payload.get("reward_counts")),
+        }
+
+    def _draw_overlay() -> None:
+        elapsed = time.perf_counter() - float(start_perf_s)
+        timer_text.text = format_elapsed_hms(elapsed)
+        timer_text.draw()
+        reward_counts = static_scene.get("reward_counts")
+        if reward_counts is not None:
+            reward_counts_text.text = (
+                f"R0: {reward_counts.get(0, 0)}\n"
+                f"R1: {reward_counts.get(1, 0)}\n"
+                f"R2: {reward_counts.get(2, 0)}\n"
+                f"R3: {reward_counts.get(3, 0)}"
+            )
+            reward_counts_text.draw()
+        if task_label_text is not None:
+            task_label_text.draw()
+        exit_button_rect.draw()
+        exit_button_text.draw()
+
+    win = visual.Window(
+        size=preview_canvas_size,
+        pos=preview_pos,
+        fullscr=False,
+        screen=int(screen_info.index),
+        units="pix",
+        colorSpace="rgb",
+        color=_preview_rgb255_to_psychopy((0, 0, 0)),
+        allowStencil=False,
+        allowGUI=False,
+    )
+    mouse = event.Mouse(win=win)
+    last_mouse_down = False
+    last_bg_rgb = (0, 0, 0)
+    static_scene = _build_static_scene({"bg_rgb_255": last_bg_rgb, "main_size": preview_canvas_size})
+    movie = None
+    movie_bg_rect = None
+    task_label_text = None
+    current_reward_counts = None
+    current_highlight_box = None
+
+    try:
+        if task_label:
+            task_label_text = visual.TextStim(
+                win,
+                text=task_label,
+                units="pix",
+                height=max(18.0, min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.04),
+                pos=(0.0, -float(preview_canvas_size[1]) * 0.44),
+                color=_preview_rgb255_to_psychopy((230, 230, 230)),
+                colorSpace="rgb",
+            )
+
+        timer_text = visual.TextStim(
+            win,
+            text="00:00:00",
+            units="pix",
+            height=max(24.0, min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.055),
+            pos=(-float(preview_canvas_size[0]) * 0.41, float(preview_canvas_size[1]) * 0.44),
+            alignText="left",
+            anchorHoriz="left",
+            color=_preview_rgb255_to_psychopy((255, 255, 255)),
+            colorSpace="rgb",
+        )
+        reward_counts_text = visual.TextStim(
+            win,
+            text="",
+            units="pix",
+            height=max(18.0, min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.038),
+            pos=(-float(preview_canvas_size[0]) * 0.41, float(preview_canvas_size[1]) * 0.30),
+            alignText="left",
+            anchorHoriz="left",
+            color=_preview_rgb255_to_psychopy((255, 255, 255)),
+            colorSpace="rgb",
+        )
+        exit_button_rect = visual.Rect(
+            win,
+            width=max(120.0, float(preview_canvas_size[0]) * 0.14),
+            height=max(56.0, float(preview_canvas_size[1]) * 0.10),
+            pos=(float(preview_canvas_size[0]) * 0.39, float(preview_canvas_size[1]) * 0.43),
+            fillColor=_preview_rgb255_to_psychopy((201, 75, 75)),
+            fillColorSpace="rgb",
+            lineColor=None,
+            units="pix",
+        )
+        exit_button_text = visual.TextStim(
+            win,
+            text="exit",
+            units="pix",
+            height=max(22.0, min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.05),
+            pos=exit_button_rect.pos,
+            color=_preview_rgb255_to_psychopy((255, 255, 255)),
+            colorSpace="rgb",
+        )
+
+        while not stop_event.is_set():
+            while True:
+                try:
+                    payload = command_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+                try:
+                    command_type = str(payload.get("type", "")).strip().lower()
+                    if "reward_counts" in payload:
+                        current_reward_counts = _normalize_reward_counts(payload.get("reward_counts"))
+                    if "highlight_box" in payload:
+                        current_highlight_box = payload.get("highlight_box")
+                    scene_payload = dict(payload)
+                    scene_payload["reward_counts"] = current_reward_counts
+                    scene_payload["highlight_box"] = current_highlight_box
+                    if command_type == "static_scene":
+                        _release_movie()
+                        last_bg_rgb = tuple(payload.get("bg_rgb_255", last_bg_rgb))
+                        static_scene = _build_static_scene(scene_payload)
+                    elif command_type == "play_video":
+                        _release_movie()
+                        last_bg_rgb = tuple(payload.get("bg_rgb_255", last_bg_rgb))
+                        movie_bg_rect = _make_bg_rect(last_bg_rgb)
+                        from psychopy.visual.vlcmoviestim import VlcMovieStim
+
+                        movie = VlcMovieStim(
+                            win,
+                            filename=str(payload["video_path"]),
+                            units="pix",
+                            size=preview_canvas_size,
+                            pos=(0.0, 0.0),
+                            loop=False,
+                            autoStart=False,
+                            noAudio=True,
+                        )
+                        movie.size = preview_canvas_size
+                        movie.pos = (0.0, 0.0)
+                        movie.play(log=False)
+                    elif command_type == "clear_scene":
+                        _release_movie()
+                        last_bg_rgb = tuple(payload.get("bg_rgb_255", last_bg_rgb))
+                        static_scene = _build_static_scene(scene_payload if scene_payload else {"bg_rgb_255": last_bg_rgb, "main_size": preview_canvas_size})
+                except Exception:
+                    continue
+
+            try:
+                mouse_down = any(mouse.getPressed())
+            except Exception:
+                mouse_down = False
+            if mouse_down and (not last_mouse_down):
+                try:
+                    if exit_button_rect.contains(mouse.getPos()):
+                        exit_event.set()
+                except Exception:
+                    pass
+            last_mouse_down = mouse_down
+
+            try:
+                if movie is not None:
+                    if movie_bg_rect is not None:
+                        movie_bg_rect.draw()
+                    movie.draw()
+                    _draw_overlay()
+                    win.flip()
+                    if bool(getattr(movie, "isFinished", False)):
+                        _release_movie()
+                    continue
+
+                static_scene["bg_rect"].draw()
+                for stim in static_scene["dots"]:
+                    stim.draw()
+                for stim in static_scene["images"]:
+                    stim.draw()
+                if static_scene["fixation"] is not None:
+                    static_scene["fixation"].draw()
+                if static_scene["highlight_box"] is not None:
+                    static_scene["highlight_box"].draw()
+                _draw_overlay()
+                win.flip()
+            except Exception:
+                static_scene = _build_static_scene(
+                    {
+                        "bg_rgb_255": last_bg_rgb,
+                        "main_size": preview_canvas_size,
+                        "reward_counts": current_reward_counts,
+                        "highlight_box": current_highlight_box,
+                    }
+                )
+            core.wait(max(0.02, float(update_interval_ms) / 1000.0))
+    finally:
+        _release_movie()
+        try:
+            win.close()
+        except Exception:
+            pass
+
+
+class ExperimenterPreview:
+    def __init__(
+        self,
+        screen_info: ScreenGeometry,
+        *,
+        task_label: str = "",
+        start_perf_s: Optional[float] = None,
+        update_interval_s: float = 0.1,
+    ):
+        self.screen_info = screen_info
+        self.task_label = task_label
+        self.start_perf_s = time.perf_counter() if start_perf_s is None else float(start_perf_s)
+        self.update_interval_s = max(0.05, float(update_interval_s))
+        self.exit_requested = False
+        self._ctx = mp.get_context("spawn")
+        self._queue = self._ctx.Queue()
+        self._exit_event = self._ctx.Event()
+        self._stop_event = self._ctx.Event()
+        self._process = self._ctx.Process(
+            target=_experimenter_preview_process,
+            args=(
+                screen_info,
+                task_label,
+                self.start_perf_s,
+                int(round(self.update_interval_s * 1000.0)),
+                self._queue,
+                self._exit_event,
+                self._stop_event,
+            ),
+            daemon=True,
+        )
+        self._process.start()
+
+    def poll(self) -> bool:
+        if self.exit_requested:
+            return True
+        self.exit_requested = bool(self._exit_event.is_set())
+        return self.exit_requested
+
+    def wait(self, duration_s: float, *, step_s: float = 0.05) -> bool:
+        deadline = time.perf_counter() + max(0.0, float(duration_s))
+        while time.perf_counter() < deadline:
+            if self.poll():
+                return True
+            remaining = deadline - time.perf_counter()
+            if remaining > 0:
+                time.sleep(min(max(0.01, step_s), remaining))
+        return self.poll()
+
+    def _send(self, payload: Dict[str, Any]) -> None:
+        if self.poll():
+            return
+        try:
+            self._queue.put_nowait(payload)
+        except Exception:
+            pass
+
+    def show_static_scene(
+        self,
+        *,
+        bg_rgb_255: Sequence[int],
+        main_size: Sequence[int],
+        images: Optional[list[Dict[str, Any]]] = None,
+        dots: Optional[list[Dict[str, Any]]] = None,
+        fixation_size: Optional[float] = None,
+        fixation_color: Sequence[int] = (0, 0, 0),
+        reward_counts: Any = _UNSET,
+        highlight_box: Any = _UNSET,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "type": "static_scene",
+            "bg_rgb_255": list(bg_rgb_255),
+            "main_size": [int(main_size[0]), int(main_size[1])],
+            "images": list(images or []),
+            "dots": list(dots or []),
+            "fixation_size": fixation_size,
+            "fixation_color": list(fixation_color),
+        }
+        if reward_counts is not _UNSET:
+            payload["reward_counts"] = dict(reward_counts) if reward_counts is not None else None
+        if highlight_box is not _UNSET:
+            payload["highlight_box"] = dict(highlight_box) if highlight_box is not None else None
+        self._send(payload)
+
+    def clear_scene(
+        self,
+        *,
+        bg_rgb_255: Sequence[int],
+        main_size: Optional[Sequence[int]] = None,
+        reward_counts: Any = _UNSET,
+        highlight_box: Any = _UNSET,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "type": "clear_scene",
+            "bg_rgb_255": list(bg_rgb_255),
+        }
+        if main_size is not None:
+            payload["main_size"] = [int(main_size[0]), int(main_size[1])]
+        if reward_counts is not _UNSET:
+            payload["reward_counts"] = dict(reward_counts) if reward_counts is not None else None
+        if highlight_box is not _UNSET:
+            payload["highlight_box"] = dict(highlight_box) if highlight_box is not None else None
+        self._send(payload)
+
+    def play_video(self, video_path: str, *, bg_rgb_255: Sequence[int]) -> None:
+        self._send(
+            {
+                "type": "play_video",
+                "video_path": str(video_path),
+                "bg_rgb_255": list(bg_rgb_255),
+            }
+        )
+
+    def close(self) -> None:
+        try:
+            self._stop_event.set()
+        except Exception:
+            pass
+        try:
+            if self._process.is_alive():
+                self._process.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            if self._process.is_alive():
+                self._process.terminate()
+        except Exception:
+            pass

@@ -470,8 +470,10 @@ def get_psychopy_window_kwargs(
     kwargs["size"] = resolved_size
     kwargs["fullscr"] = False
     if screen_info is not None and int(screen_info.width) > 0 and int(screen_info.height) > 0:
-        x = int(screen_info.x) + max(0, (int(screen_info.width) - int(resolved_size[0])) // 2)
-        y = int(screen_info.y) + max(0, (int(screen_info.height) - int(resolved_size[1])) // 2)
+        # When `screen` is set, PsychoPy places the window on that physical display.
+        # `pos` should therefore be local to that display, not the virtual desktop.
+        x = max(0, (int(screen_info.width) - int(resolved_size[0])) // 2)
+        y = max(0, (int(screen_info.height) - int(resolved_size[1])) // 2)
         kwargs["pos"] = (x, y)
     return kwargs
 
@@ -492,6 +494,16 @@ def resolve_scene_size(
     if screen_info is not None and int(screen_info.width) > 0 and int(screen_info.height) > 0:
         return (int(screen_info.width), int(screen_info.height))
     return (1024, 768)
+
+
+def resolve_screen_canvas_size(
+    screen_info: Optional[ScreenGeometry],
+    *,
+    fallback: Sequence[int] = (1024, 768),
+) -> tuple[int, int]:
+    if screen_info is not None and int(screen_info.width) > 0 and int(screen_info.height) > 0:
+        return (int(screen_info.width), int(screen_info.height))
+    return (max(int(fallback[0]), 1), max(int(fallback[1]), 1))
 
 
 def _preview_to_pil_rgba(image_obj) -> Optional[Image.Image]:
@@ -804,11 +816,8 @@ def _experimenter_preview_process(
     stop_event,
 ) -> None:
     from psychopy import core, event, visual
-    preview_canvas_size = (
-        max(int(screen_info.width), 1024),
-        max(int(screen_info.height), 768),
-    )
-    preview_pos = (int(screen_info.x), int(screen_info.y))
+    preview_canvas_size = resolve_screen_canvas_size(screen_info)
+    preview_pos = (0, 0)
 
     def _make_bg_rect(bg_rgb_255: Sequence[int]):
         return visual.Rect(

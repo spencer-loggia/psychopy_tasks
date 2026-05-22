@@ -8,6 +8,9 @@ import io
 import multiprocessing as mp
 import os
 import queue
+import re
+import subprocess
+import sys
 import time
 from typing import Any, Dict, Optional, Sequence, Union
 
@@ -123,24 +126,183 @@ def _screen_name_aliases(name: str) -> set[str]:
     return aliases
 
 
-def get_monitor_screens() -> list[ScreenGeometry]:
-    if get_monitors is None:
-        return []
+def _run_monitor_query(cmd: Sequence[str]) -> str:
     try:
-        monitors = list(get_monitors())
-    except Exception:
-        return []
-    return [
-        ScreenGeometry(
-            index=index,
-            x=int(getattr(monitor, "x", 0)),
-            y=int(getattr(monitor, "y", 0)),
-            width=max(int(getattr(monitor, "width", 0)), 1),
-            height=max(int(getattr(monitor, "height", 0)), 1),
-            name=str(getattr(monitor, "name", "") or ""),
+        result = subprocess.run(
+            list(cmd),
+            check=True,
+            capture_output=True,
+            text=True,
         )
-        for index, monitor in enumerate(monitors)
-    ]
+    except Exception:
+        return ""
+    return str(result.stdout or "").strip()
+
+
+def _parse_xrandr_listactivemonitors(output: str) -> list[ScreenGeometry]:
+    screens: list[ScreenGeometry] = []
+    pattern = re.compile(
+        r"^\s*(\d+):\s+\S+\s+(\d+)(?:/\d+)?x(\d+)(?:/\d+)?([+-]\d+)([+-]\d+)\s+(\S+)\s*$"
+    )
+    for line in output.splitlines():
+        match = pattern.match(line)
+        if not match:
+            continue
+        index, width, height, x, y, name = match.groups()
+        screens.append(
+            ScreenGeometry(
+                index=int(index),
+                x=int(x),
+                y=int(y),
+                width=max(int(width), 1),
+                height=max(int(height), 1),
+                name=str(name or ""),
+            )
+        )
+    return screens
+
+
+def _parse_xrandr_query(output: str) -> list[ScreenGeometry]:
+    screens: list[ScreenGeometry] = []
+    pattern = re.compile(
+        r"^(\S+)\s+connected(?:\s+primary)?(?:\s+(\d+)x(\d+)\+(-?\d+)\+(-?\d+))?(?:\s+(normal|left|right|inverted))?"
+    )
+    for line in output.splitlines():
+        match = pattern.match(line.strip())
+        if not match:
+            continue
+        name, width, height, x, y, rotation = match.groups()
+        if not width or not height:
+            continue
+        width_i = max(int(width), 1)
+        height_i = max(int(height), 1)
+        if str(rotation or "").lower() in {"left", "right"} and width_i > height_i:
+            width_i, height_i = height_i, width_i
+        screens.append(
+            ScreenGeometry(
+                index=len(screens),
+                x=int(x),
+                y=int(y),
+                width=width_i,
+                height=height_i,
+                name=str(name or ""),
+            )
+        )
+    return screens
+
+
+def _get_linux_active_screens() -> list[ScreenGeometry]:
+    if not sys.platform.startswith("linux"):
+        return []
+    output = _run_monitor_query(["xrandr", "--listactivemonitors"])
+    screens = _parse_xrandr_listactivemonitors(output)
+    if screens:
+        return screens
+    output = _run_monitor_query(["xrandr", "--query"])
+    return _parse_xrandr_query(output)
+
+
+def _merge_screen_lists(
+    base_screens: list[ScreenGeometry],
+    override_screens: list[ScreenGeometry],
+) -> list[ScreenGeometry]:
+    if not override_screens:
+        return base_screens
+    if not base_screens:
+        return [
+            ScreenGeometry(
+                index=index,
+                x=screen.x,
+                y=screen.y,
+                width=screen.width,
+                height=screen.height,
+                name=screen.name,
+            )
+            for index, screen in enumerate(override_screens)
+        ]
+
+    unmatched_override = list(override_screens)
+    matched_override_ids: set[int] = set()
+    merged: list[ScreenGeometry] = []
+
+    def _take_override(base: ScreenGeometry, ordinal: int) -> Optional[ScreenGeometry]:
+        if base.name:
+            base_aliases = _screen_name_aliases(base.name)
+            for candidate in unmatched_override:
+                if id(candidate) in matched_override_ids:
+                    continue
+                if candidate.name and base_aliases & _screen_name_aliases(candidate.name):
+                    matched_override_ids.add(id(candidate))
+                    return candidate
+        for candidate in unmatched_override:
+            if id(candidate) in matched_override_ids:
+                continue
+            if candidate.x == base.x and candidate.y == base.y:
+                matched_override_ids.add(id(candidate))
+                return candidate
+        remaining = [candidate for candidate in unmatched_override if id(candidate) not in matched_override_ids]
+        if len(remaining) == len(base_screens) - ordinal:
+            candidate = remaining[0]
+            matched_override_ids.add(id(candidate))
+            return candidate
+        return None
+
+    for ordinal, base in enumerate(base_screens):
+        override = _take_override(base, ordinal)
+        if override is None:
+            merged.append(base)
+            continue
+        merged.append(
+            ScreenGeometry(
+                index=base.index,
+                x=override.x,
+                y=override.y,
+                width=override.width if override.width > 0 else base.width,
+                height=override.height if override.height > 0 else base.height,
+                name=base.name or override.name,
+            )
+        )
+
+    next_index = max((screen.index for screen in merged), default=-1) + 1
+    for candidate in unmatched_override:
+        if id(candidate) in matched_override_ids:
+            continue
+        merged.append(
+            ScreenGeometry(
+                index=next_index,
+                x=candidate.x,
+                y=candidate.y,
+                width=candidate.width,
+                height=candidate.height,
+                name=candidate.name,
+            )
+        )
+        next_index += 1
+
+    return merged
+
+
+def get_monitor_screens() -> list[ScreenGeometry]:
+    base_screens: list[ScreenGeometry] = []
+    if get_monitors is not None:
+        try:
+            monitors = list(get_monitors())
+        except Exception:
+            monitors = []
+        base_screens = [
+            ScreenGeometry(
+                index=index,
+                x=int(getattr(monitor, "x", 0)),
+                y=int(getattr(monitor, "y", 0)),
+                width=max(int(getattr(monitor, "width", 0)), 1),
+                height=max(int(getattr(monitor, "height", 0)), 1),
+                name=str(getattr(monitor, "name", "") or ""),
+            )
+            for index, monitor in enumerate(monitors)
+        ]
+
+    linux_active_screens = _get_linux_active_screens()
+    return _merge_screen_lists(base_screens, linux_active_screens)
 
 
 def get_tk_screens(root) -> list[ScreenGeometry]:
@@ -200,10 +362,10 @@ def select_screen(
             return screen
 
     detected_names = [screen.name for screen in screens if screen.name]
-    if get_monitors is None:
+    if not detected_names:
         raise RuntimeError(
-            f"Named screen selection for {role} requires the optional 'screeninfo' package. "
-            f"Requested '{requested_selector}'."
+            f"Named screen selection for {role} requires detected output names. "
+            f"Requested '{requested_selector}', but no screen names were available."
         )
     raise ValueError(
         f"Requested {role} screen '{requested_selector}', but detected outputs were: "
@@ -314,6 +476,24 @@ def get_psychopy_window_kwargs(
     return kwargs
 
 
+def resolve_scene_size(
+    screen_info: Optional[ScreenGeometry],
+    *,
+    fullscreen: bool,
+    requested_size: Optional[Sequence[int]] = None,
+    realized_size: Optional[Sequence[int]] = None,
+) -> tuple[int, int]:
+    if fullscreen and screen_info is not None and int(screen_info.width) > 0 and int(screen_info.height) > 0:
+        return (int(screen_info.width), int(screen_info.height))
+    if (not fullscreen) and requested_size is not None:
+        return (int(requested_size[0]), int(requested_size[1]))
+    if realized_size is not None:
+        return (int(realized_size[0]), int(realized_size[1]))
+    if screen_info is not None and int(screen_info.width) > 0 and int(screen_info.height) > 0:
+        return (int(screen_info.width), int(screen_info.height))
+    return (1024, 768)
+
+
 def _preview_to_pil_rgba(image_obj) -> Optional[Image.Image]:
     if image_obj is None:
         return None
@@ -387,6 +567,17 @@ def format_elapsed_hms(elapsed_s: float) -> str:
     hours, remainder = divmod(total_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def describe_screen(screen_info: Optional[ScreenGeometry]) -> str:
+    if screen_info is None:
+        return "none"
+    label = screen_info.name or f"screen{screen_info.index}"
+    return (
+        f"{label}(index={int(screen_info.index)} "
+        f"size={int(screen_info.width)}x{int(screen_info.height)} "
+        f"pos={int(screen_info.x)},{int(screen_info.y)})"
+    )
 
 
 def _format_geometry(width: int, height: int, x: int, y: int) -> str:

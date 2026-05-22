@@ -22,7 +22,13 @@ if str(_project_root) not in sys.path:
 from bin import utils
 from bin.config import load_config, validate_config
 from bin.logger import EventLogger, MessageLogger, build_run_log_filename
-from bin.screen import ExperimenterPreview, load_screen_config, resolve_task_screens
+from bin.screen import (
+    ExperimenterPreview,
+    describe_screen,
+    load_screen_config,
+    resolve_scene_size,
+    resolve_task_screens,
+)
 
 
 def parse_args():
@@ -65,6 +71,12 @@ def run_task(
     bg_rect = utils.make_bg_rect(win, bg)
     mouse = event.Mouse(win=win)
     experimenter_preview = None
+    main_scene_size = resolve_scene_size(
+        main_screen,
+        fullscreen=bool(fullscreen),
+        requested_size=win_size,
+        realized_size=tuple(win.size),
+    )
 
     run_started_dt = dt.datetime.now()
     resolved_config_name = str(config_name).strip() if config_name else "play_video"
@@ -75,7 +87,7 @@ def run_task(
             start_perf_s=time.perf_counter(),
             update_interval_s=0.1,
         )
-        experimenter_preview.clear_scene(bg_rgb_255=bg, main_size=tuple(win.size))
+        experimenter_preview.clear_scene(bg_rgb_255=bg, main_size=main_scene_size)
     logger = EventLogger(
         output_dir,
         filename=build_run_log_filename(
@@ -95,6 +107,17 @@ def run_task(
         ),
     )
     pylogging.console.setLevel(pylogging.CRITICAL)
+    try:
+        msg_logger.log(
+            "INFO",
+            f"resolved_screens main={describe_screen(main_screen)} experimenter={describe_screen(experimenter_screen)}",
+        )
+        msg_logger.log(
+            "INFO",
+            f"resolved_main_scene_size size={main_scene_size[0]}x{main_scene_size[1]} fullscreen={int(bool(fullscreen))} requested_win_size={win_size} realized_win_size={tuple(win.size)}",
+        )
+    except Exception:
+        pass
 
     if refresh_rate is not None and float(refresh_rate) > 0:
         fps = float(refresh_rate)
@@ -154,7 +177,7 @@ def run_task(
         )
         played_videos += 1
         if experimenter_preview is not None:
-            experimenter_preview.clear_scene(bg_rgb_255=bg, main_size=tuple(win.size))
+            experimenter_preview.clear_scene(bg_rgb_255=bg, main_size=main_scene_size)
         if playback_info["aborted"]:
             stop_reason = playback_info.get("abort_reason") or "aborted"
             break

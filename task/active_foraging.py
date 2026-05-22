@@ -42,7 +42,14 @@ from bin.logger import (
 )
 import numpy as np
 from bin.config import load_config, validate_config
-from bin.screen import ExperimenterPreview, load_screen_config, resolve_task_screens, serialize_preview_image
+from bin.screen import (
+    ExperimenterPreview,
+    describe_screen,
+    load_screen_config,
+    resolve_scene_size,
+    resolve_task_screens,
+    serialize_preview_image,
+)
 
 
 def _generate_active_foraging_trial(trial_idx: int, config: dict) -> dict:
@@ -522,6 +529,13 @@ def run_task(
     preloaded: dict = {}
 
     main_screen, experimenter_screen = resolve_task_screens(screen_config)
+    try:
+        msg_logger.log(
+            "INFO",
+            f"resolved_screens main={describe_screen(main_screen)} experimenter={describe_screen(experimenter_screen)}",
+        )
+    except Exception:
+        pass
 
     # Window + background + fixation
     win = utils.setup_window(bg_rgb_255=bg, fullscreen=fullscreen, size=win_size, screen_info=main_screen)
@@ -585,7 +599,19 @@ def run_task(
         fixation_size = 32
     fix = utils.make_fixation_cross(win, size=fixation_size)
     reward_counts = {0: 0, 1: 0, 2: 0, 3: 0}
-    main_scene_size = tuple(win_size) if win_size is not None else tuple(win.size)
+    main_scene_size = resolve_scene_size(
+        main_screen,
+        fullscreen=bool(fullscreen),
+        requested_size=win_size,
+        realized_size=tuple(win.size),
+    )
+    try:
+        msg_logger.log(
+            "INFO",
+            f"resolved_main_scene_size size={main_scene_size[0]}x{main_scene_size[1]} fullscreen={int(bool(fullscreen))} requested_win_size={win_size} realized_win_size={tuple(win.size)}",
+        )
+    except Exception:
+        pass
 
     def _reward_preview_color(level: int) -> tuple[int, int, int]:
         palette = {
@@ -820,7 +846,12 @@ def run_task(
             first_pair = block_paths[0]
             stim_size = _stim_size_from_preloaded(preloaded, first_pair)
 
-            effective_win_size = tuple(win_size) if win_size is not None else tuple(win.size)
+            effective_win_size = resolve_scene_size(
+                main_screen,
+                fullscreen=bool(fullscreen),
+                requested_size=win_size,
+                realized_size=tuple(win.size),
+            )
             sampled_positions, positions = _compute_positions(
                 fixed_positions=fixed_positions,
                 num_afc=num_afc,

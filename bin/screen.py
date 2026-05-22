@@ -438,11 +438,15 @@ def place_tk_window_on_screen(
     margin_x: int = 20,
     margin_y: int = 20,
 ) -> tuple[int, int]:
-    screen_width = max(int(screen_info.width), min_width)
-    screen_height = max(int(screen_info.height), min_height)
-    window_width = max(min_width, screen_width - (2 * int(margin_x)))
-    window_height = max(min_height, screen_height - (2 * int(margin_y)) - 40)
-    root.geometry(_format_geometry(window_width, window_height, int(screen_info.x) + int(margin_x), int(screen_info.y) + int(margin_y)))
+    screen_width = max(int(screen_info.width), 1)
+    screen_height = max(int(screen_info.height), 1)
+    usable_width = max(1, screen_width - (2 * int(margin_x)))
+    usable_height = max(1, screen_height - (2 * int(margin_y)) - 40)
+    window_width = min(screen_width, max(int(min_width), usable_width))
+    window_height = min(screen_height, max(int(min_height), usable_height))
+    window_x = int(screen_info.x) + max(0, (screen_width - window_width) // 2)
+    window_y = int(screen_info.y) + max(0, (screen_height - window_height) // 2)
+    root.geometry(_format_geometry(window_width, window_height, window_x, window_y))
     return window_width, window_height
 
 

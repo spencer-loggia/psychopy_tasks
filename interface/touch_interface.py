@@ -175,7 +175,9 @@ class TouchInterfaceApp:
     def _build_ui(self) -> None:
         self.root.title("Task Launcher")
         place_tk_window_on_screen(self.root, self.screen_info, min_width=800, min_height=600, margin_x=20, margin_y=20)
-        self.root.minsize(800, 600)
+        min_width = min(800, max(int(getattr(self.screen_info, "width", 800) or 800), 1))
+        min_height = min(600, max(int(getattr(self.screen_info, "height", 600) or 600), 1))
+        self.root.minsize(min_width, min_height)
 
         self.root.configure(bg="#e9ecef")
         self.root.grid_rowconfigure(1, weight=1)

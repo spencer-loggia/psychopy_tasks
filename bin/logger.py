@@ -69,7 +69,7 @@ class EventLogger:
     TSV logger that writes rows with high-resolution timestamps and event info.
     """
 
-    def __init__(self, out_dir: str, filename: str = "image_sequence_log.tsv"):
+    def __init__(self, out_dir: str, filename: str = "image_sequence_log.tsv", auto_flush: bool = True):
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         # ensure .tsv extension
@@ -78,6 +78,8 @@ class EventLogger:
         self.path = self.out_dir / filename
         self._file = open(self.path, "w", newline="", encoding="utf-8")
         self._writer = csv.writer(self._file, delimiter="\t")
+        self.auto_flush = bool(auto_flush)
+        self._pending_rows = []
         self._writer.writerow(
             [
                 "row_idx",
@@ -107,21 +109,30 @@ class EventLogger:
         notes: str = "",
     ):
         self._idx += 1
-        self._writer.writerow(
-            [
-                self._idx,
-                event,
-                image_name,
-                f"{requested_duration_s:.6f}" if requested_duration_s is not None else "",
-                f"{flip_time_psychopy_s:.6f}" if flip_time_psychopy_s is not None else "",
-                f"{flip_time_perf_s:.9f}" if flip_time_perf_s is not None else "",
-                f"{end_time_perf_s:.9f}" if end_time_perf_s is not None else "",
-                notes,
-            ]
-        )
+        row = [
+            self._idx,
+            event,
+            image_name,
+            f"{requested_duration_s:.6f}" if requested_duration_s is not None else "",
+            f"{flip_time_psychopy_s:.6f}" if flip_time_psychopy_s is not None else "",
+            f"{flip_time_perf_s:.9f}" if flip_time_perf_s is not None else "",
+            f"{end_time_perf_s:.9f}" if end_time_perf_s is not None else "",
+            notes,
+        ]
+        if self.auto_flush:
+            self._writer.writerow(row)
+            self._file.flush()
+        else:
+            self._pending_rows.append(row)
+
+    def flush(self):
+        if self._pending_rows:
+            self._writer.writerows(self._pending_rows)
+            self._pending_rows.clear()
         self._file.flush()
 
     def close(self):
+        self.flush()
         self._file.close()
 
     def finalize(self, final_filename: str) -> Path:
@@ -136,7 +147,7 @@ class MessageLogger:
     Columns: row_idx, time_iso, level, message
     """
 
-    def __init__(self, out_dir: str, filename: str = "message_log.tsv"):
+    def __init__(self, out_dir: str, filename: str = "message_log.tsv", auto_flush: bool = True):
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         if not filename.endswith(".tsv"):
@@ -144,16 +155,29 @@ class MessageLogger:
         self.path = self.out_dir / filename
         self._file = open(self.path, "w", newline="", encoding="utf-8")
         self._writer = csv.writer(self._file, delimiter="\t")
+        self.auto_flush = bool(auto_flush)
+        self._pending_rows = []
         self._writer.writerow(["row_idx", "time_iso", "level", "message"])
         self._idx = 0
 
     def log(self, level: str, message: str):
         self._idx += 1
         timestr = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
-        self._writer.writerow([self._idx, timestr, level.upper(), message])
+        row = [self._idx, timestr, level.upper(), message]
+        if self.auto_flush:
+            self._writer.writerow(row)
+            self._file.flush()
+        else:
+            self._pending_rows.append(row)
+
+    def flush(self):
+        if self._pending_rows:
+            self._writer.writerows(self._pending_rows)
+            self._pending_rows.clear()
         self._file.flush()
 
     def close(self):
+        self.flush()
         self._file.close()
 
     def finalize(self, final_filename: str) -> Path:

@@ -34,6 +34,11 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from bin import utils
+from bin.affinity import (
+    build_main_and_worker_affinity_plan,
+    describe_cpu_set,
+    set_process_cpu_affinity,
+)
 from bin.logger import (
     EventLogger,
     MessageLogger,
@@ -312,7 +317,34 @@ def run_task(
             when=run_started_at,
             in_progress=True,
         ),
+        auto_flush=False,
     )
+
+    affinity_plan = build_main_and_worker_affinity_plan(main_core=0)
+    main_cpu_affinity = affinity_plan.get("main_cpu_affinity")
+    worker_cpu_affinity = affinity_plan.get("worker_cpu_affinity")
+    parent_staged_off_main_core = False
+    if affinity_plan.get("supported"):
+        msg_logger.log(
+            "INFO",
+            (
+                "cpu_affinity_plan "
+                f"current=[{describe_cpu_set(affinity_plan['current_affinity'])}] "
+                f"main=[{describe_cpu_set(main_cpu_affinity)}] "
+                f"workers=[{describe_cpu_set(worker_cpu_affinity) if worker_cpu_affinity else ''}]"
+            ),
+        )
+        if affinity_plan.get("warning"):
+            msg_logger.log("WARN", str(affinity_plan["warning"]))
+        if worker_cpu_affinity:
+            staged_ok, staged_detail = set_process_cpu_affinity(worker_cpu_affinity)
+            if staged_ok:
+                parent_staged_off_main_core = True
+                msg_logger.log("INFO", f"cpu_affinity_spawn_phase {staged_detail}")
+            else:
+                msg_logger.log("WARN", f"cpu_affinity_spawn_phase_failed {staged_detail}")
+    else:
+        msg_logger.log("WARN", f"cpu_affinity_unavailable {affinity_plan.get('reason')}")
 
     # Trial-wise behavior summary
     output_dir_path = Path(output_dir)
@@ -731,6 +763,7 @@ def run_task(
             when=run_started_at,
             in_progress=True,
         ),
+        auto_flush=False,
     )
     pylogging.console.setLevel(pylogging.CRITICAL)
 
@@ -795,8 +828,36 @@ def run_task(
         trial_generator_func=_generate_active_foraging_trial,
         config=worker_cfg,
         buffer_size=buffer_len_trials,
-        start_idx=1
+        start_idx=1,
     )
+
+    if main_cpu_affinity:
+        main_ok, main_detail = set_process_cpu_affinity(main_cpu_affinity)
+        if main_ok:
+            msg_logger.log("INFO", f"cpu_affinity_main_phase {main_detail}")
+        else:
+            msg_logger.log("WARN", f"cpu_affinity_main_phase_failed {main_detail}")
+            restore_affinity = affinity_plan.get("current_affinity")
+            if parent_staged_off_main_core and restore_affinity:
+                restore_ok, restore_detail = set_process_cpu_affinity(restore_affinity)
+                if restore_ok:
+                    msg_logger.log("WARN", f"cpu_affinity_restore_after_failure {restore_detail}")
+                else:
+                    msg_logger.log("WARN", f"cpu_affinity_restore_failed {restore_detail}")
+
+    def _flush_between_trials() -> None:
+        try:
+            logger.flush()
+        except Exception:
+            pass
+        try:
+            msg_logger.flush()
+        except Exception:
+            pass
+        try:
+            behavior_fh.flush()
+        except Exception:
+            pass
     task_end_notes = "done"
 
     try:
@@ -1090,7 +1151,6 @@ def run_task(
                 behavior_row["choice_made_lum"] = int(chosen_lum_row)
 
             behavior_writer.writerow(behavior_row)
-            behavior_fh.flush()
 
             if ibi and ibi > 0:
                 ibi_frames = int(round(float(ibi) * fps))
@@ -1122,9 +1182,11 @@ def run_task(
                     break
 
             logger.log("block_end", image_name="", notes=f"block={block_idx}")
+            _flush_between_trials()
             block_idx += 1
 
     finally:
+        _flush_between_trials()
         # Clean up trial buffer manager
         try:
             buffer_mgr.close()

@@ -25,7 +25,6 @@ from PIL import Image
 import threading
 from psychopy import visual, event
 import time
-
 from .screen import get_psychopy_window_kwargs, serialize_preview_image
 
 # Global debug flag: when True, utilities may write debug files (PNG) to logs/
@@ -1747,7 +1746,7 @@ def _trial_buffer_worker_generic(
     config: dict,
     trial_queue: Any,
     stop_event: Any,
-    start_idx: int = 0
+    start_idx: int = 0,
 ):
     """
     Generic worker process that generates trials in the background.
@@ -1827,7 +1826,7 @@ class TrialBufferManager:
         trial_generator_func: Callable[[int, dict], dict],
         config: dict,
         buffer_size: int = 5,
-        start_idx: int = 0
+        start_idx: int = 0,
     ):
         """
         Initialize the trial buffer manager.

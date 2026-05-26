@@ -37,7 +37,18 @@ Notes
   - `flip_time_perf_s` (high-resolution `time.perf_counter()`)
   - `end_time_perf_s` (high-resolution `time.perf_counter()` at end event)
 - If `--n` is greater than available images, sampling is done with replacement.
-- For more precise control (frame-locked scheduling), the code can be extended to use frame counting and scheduled flips instead of `core.wait()`.
+- In `active_foraging` and the current image-sequence presentation paths, timing-critical visual sections already use frame-counted `win.flip()` loops rather than `core.wait()`. Remaining `core.wait()` usage is limited to non-visual polling or housekeeping paths and is not used to schedule stimulus onsets/offsets.
+
+CPU Affinity for `active_foraging`
+----------------------------------
+The `active_foraging` task treats CPU core `0` as the timing-critical presentation core.
+
+- The main `active_foraging` process, including stimulus presentation and touch-event detection, pins itself to CPU `0` before entering the trial loop.
+- Non-timing-critical child processes such as the background trial-generation worker and the experimenter preview process inherit the remaining CPU cores.
+- This is necessary because `multiprocessing` children inherit the parent's CPU affinity by default. To prevent workers from inheriting CPU `0`, the parent process is first moved onto the non-zero worker-core pool, the child processes are spawned, and then the parent is pinned back to CPU `0`.
+- For the intended timing behavior on Linux or Raspberry Pi, CPU `0` should also be isolated from normal OS scheduling at the kernel level, for example with `isolcpus`, `nohz_full`, `rcu_nocbs`, or an equivalent cpuset-based setup.
+- Launch the task from a shell or service whose affinity mask still includes CPU `0` and the worker cores. If the launcher has already removed CPU `0` from the process affinity mask, the task cannot pin the main presentation process onto that core.
+- Event and message logs for `active_foraging` are buffered during the timing-critical portion of a trial and flushed only in the between-trial gap after `block_end`, so synchronous disk flushes do not run while the initiation cue, stimulus presentation, touch detection, and reward delivery are active.
 
 Configuration via JSON (required for tasks)
 -----------------------------------------

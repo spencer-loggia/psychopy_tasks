@@ -49,13 +49,13 @@
 
 
   "self_initiation": true,
-  "ibi": 0.75,
+  "ibi": 0.25,
   "num_afc": 4,
   "choice_time": 2.0,
-  "isi": 0.0,
-  "fixed_positions": true,
-  "sequential": false,
-  "is_memory": false,
+  "isi": 0.25,
+  "fixed_positions": false,
+  "sequential": true,
+  "is_memory": true,
   "raspi": true,
   "touchscreen": true
 }

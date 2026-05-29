@@ -1168,6 +1168,65 @@ def present_block_with_persistent_dots(
                 pass
         return None
 
+    def _acquire_choice_target(
+        click_pos: Tuple[float, float],
+        chosen_idx: Optional[int],
+        touch_onset_perf: float,
+    ) -> Tuple[Tuple[float, float], Optional[int]]:
+        if chosen_idx is not None or choice_deadline is None:
+            return click_pos, chosen_idx
+
+        acquire_deadline = min(choice_deadline, touch_onset_perf + touch_acquire_window_s)
+        while time.perf_counter() < acquire_deadline:
+            _event.getKeys([])
+            click_pos = mouse.getPos()
+            chosen_idx = _match_choice_target(click_pos)
+            if chosen_idx is not None:
+                break
+            remaining_acquire = acquire_deadline - time.perf_counter()
+            if remaining_acquire > 0:
+                _core.wait(min(poll_interval_s, remaining_acquire))
+        return click_pos, chosen_idx
+
+    def _log_choice_touch_attempt(click_pos: Tuple[float, float], chosen_idx: Optional[int], origin: str) -> None:
+        if msg_logger is None:
+            return
+        try:
+            msg_logger.log(
+                "INFO",
+                (
+                    f"choice_touch_attempt block={block_idx} "
+                    f"click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f}) "
+                    f"matched_idx={chosen_idx} origin={origin}"
+                ),
+            )
+        except Exception:
+            pass
+
+    def _commit_choice(chosen_idx: int, click_pos: Tuple[float, float], click_perf: float) -> None:
+        nonlocal click_registered, click_perf_capture, click_meta, chosen_info
+        click_perf_capture = float(click_perf)
+        chosen_info = {
+            "chosen_index": int(chosen_idx),
+            "chosen_pos": tuple(pos_list[chosen_idx - 1]),
+            "choice_start_perf_s": float(choice_perf),
+            "choice_time_perf_s": float(click_perf_capture),
+            "reaction_time_s": float(click_perf_capture - choice_perf),
+            "choice_time_psychopy_s": None,
+            "notes": f"block={block_idx}",
+        }
+        logger.log(
+            "choice_made",
+            image_name=getattr(block_paths[chosen_idx - 1], "name", str(block_paths[chosen_idx - 1])),
+            requested_duration_s=None,
+            flip_time_psychopy_s=None,
+            flip_time_perf_s=click_perf_capture,
+            end_time_perf_s=None,
+            notes=f"block={block_idx} idx={chosen_idx} click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f})",
+        )
+        click_meta = {"idx": chosen_idx}
+        click_registered = True
+
     def _start_choice_window(start_flip_ps, start_perf: float, window_s: float, notes_suffix: str = ""):
         nonlocal choice_started, choice_flip, choice_perf, choice_window_s, choice_deadline, prev_touch_down
         if choice_started:
@@ -1177,6 +1236,7 @@ def present_block_with_persistent_dots(
         choice_perf = float(start_perf)
         choice_window_s = max(0.0, float(window_s))
         choice_deadline = choice_perf + choice_window_s
+        start_click_pos = mouse.getPos()
         prev_touch_down = any(mouse.getPressed())
         logger.log(
             "choice_start",
@@ -1187,6 +1247,22 @@ def present_block_with_persistent_dots(
             end_time_perf_s=choice_deadline,
             notes=f"block={block_idx}{notes_suffix}",
         )
+
+        if prev_touch_down and choice_perf is not None:
+            # Touchscreen backends can report the button-down state on the same
+            # frame the response window opens, before the final coordinates are
+            # visible through getPos(). Treat that contact as a candidate choice
+            # instead of forcing the participant to release and retap.
+            touch_onset_perf = time.perf_counter()
+            chosen_idx = _match_choice_target(start_click_pos)
+            start_click_pos_acquired, chosen_idx = _acquire_choice_target(
+                start_click_pos,
+                chosen_idx,
+                touch_onset_perf,
+            )
+            _log_choice_touch_attempt(start_click_pos_acquired, chosen_idx, origin="choice_start_active_touch")
+            if chosen_idx is not None:
+                _commit_choice(chosen_idx, start_click_pos_acquired, touch_onset_perf)
 
     def _poll_choice_until(deadline_perf: float) -> bool:
         nonlocal click_registered, click_perf_capture, click_meta, prev_touch_down, chosen_info
@@ -1213,49 +1289,14 @@ def present_block_with_persistent_dots(
                 # Some touch backends report button-down before the final touch
                 # coordinates are visible through Mouse.getPos(). Allow a brief
                 # acquisition window to pick up the coordinate update for the same tap.
-                if chosen_idx is None and touch_started and choice_deadline is not None:
-                    acquire_deadline = min(choice_deadline, touch_onset_perf + touch_acquire_window_s)
-                    while time.perf_counter() < acquire_deadline:
-                        _event.getKeys([])
-                        click_pos = mouse.getPos()
-                        chosen_idx = _match_choice_target(click_pos)
-                        if chosen_idx is not None:
-                            break
-                        remaining_acquire = acquire_deadline - time.perf_counter()
-                        if remaining_acquire > 0:
-                            _core.wait(min(poll_interval_s, remaining_acquire))
+                if chosen_idx is None and touch_started:
+                    click_pos, chosen_idx = _acquire_choice_target(click_pos, chosen_idx, touch_onset_perf)
 
-                if touch_started and msg_logger is not None:
-                    try:
-                        msg_logger.log(
-                            "INFO",
-                            f"choice_touch_attempt block={block_idx} click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f}) matched_idx={chosen_idx}",
-                        )
-                    except Exception:
-                        pass
+                if touch_started:
+                    _log_choice_touch_attempt(click_pos, chosen_idx, origin="touch_start")
 
                 if chosen_idx is not None:
-                    click_perf_capture = touch_onset_perf
-                    chosen_info = {
-                        "chosen_index": int(chosen_idx),
-                        "chosen_pos": tuple(pos_list[chosen_idx - 1]),
-                        "choice_start_perf_s": float(choice_perf),
-                        "choice_time_perf_s": float(click_perf_capture),
-                        "reaction_time_s": float(click_perf_capture - choice_perf),
-                        "choice_time_psychopy_s": None,
-                        "notes": f"block={block_idx}",
-                    }
-                    logger.log(
-                        "choice_made",
-                        image_name=getattr(block_paths[chosen_idx - 1], "name", str(block_paths[chosen_idx - 1])),
-                        requested_duration_s=None,
-                        flip_time_psychopy_s=None,
-                        flip_time_perf_s=click_perf_capture,
-                        end_time_perf_s=None,
-                        notes=f"block={block_idx} idx={chosen_idx} click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f})",
-                    )
-                    click_meta = {"idx": chosen_idx}
-                    click_registered = True
+                    _commit_choice(chosen_idx, click_pos, touch_onset_perf)
                     break
 
             remaining = deadline_perf - time.perf_counter()

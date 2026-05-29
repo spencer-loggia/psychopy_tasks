@@ -50,6 +50,31 @@ The `active_foraging` task treats CPU core `0` as the timing-critical presentati
 - Launch the task from a shell or service whose affinity mask still includes CPU `0` and the worker cores. If the launcher has already removed CPU `0` from the process affinity mask, the task cannot pin the main presentation process onto that core.
 - Event and message logs for `active_foraging` are buffered during the timing-critical portion of a trial and flushed only in the between-trial gap after `block_end`, so synchronous disk flushes do not run while the initiation cue, stimulus presentation, touch detection, and reward delivery are active.
 
+Active Foraging Timing
+----------------------
+The `active_foraging` timing parameters are interpreted by the presentation mode, not as abstract global delays. All values are quantized to display frames before use.
+
+- `duration`: stimulus display duration. In simultaneous non-memory mode (`sequential=false`, `is_memory=false`), this is also part of the active response window because choices are accepted as soon as the full array appears. In sequential memory mode (`sequential=true`, `is_memory=true`), this is the on-screen time for each individual stimulus in the sequence and choices are not accepted yet.
+- `isi`: pre-stimulus cue interval, not a between-trial delay. In simultaneous non-memory mode it shows dots at all candidate locations before the full array appears. In sequential memory mode it shows the dot cue for each item before that item is shown.
+- `choice_time`: response-window extension after the stimulus display phase defined by the active mode. In simultaneous non-memory mode the response window starts on the first frame of the full array and lasts `duration + choice_time`, with the full array remaining visible throughout. In sequential memory mode the response window begins only after the full sequence has finished and lasts `choice_time`, with only the remembered dot locations visible.
+- `ibi`: inter-block interval after choice handling. This begins only after reward delivery or timeout handling completes; it is not inserted between stimuli within a block.
+
+Two common `active_foraging` configurations:
+
+- Config A: `sequential=false`, `is_memory=false`
+  - `isi`: all choice-location dots are shown together before the stimuli.
+  - `duration`: all stimuli are shown simultaneously for this long.
+  - `choice_time`: extra time after `duration` while the same full array remains selectable.
+  - Total selectable time: `duration + choice_time`.
+
+- Config B: `sequential=true`, `is_memory=true`
+  - For each option in the block: show that option's dot for `isi`, then show that stimulus for `duration`.
+  - After each stimulus disappears, its location remains as a memory dot.
+  - After the final stimulus, the task enters a dot-only choice period for `choice_time`.
+  - `ibi` starts only after the resulting reward or timeout has finished.
+
+Implementation note: in the current sequential-memory branch, the memory dots are created inside the `isi > 0` path. If `sequential=true`, `is_memory=true`, and `isi=0`, the current code does not create the usual pre-item dot cue / persistent memory dots for that block.
+
 Configuration via JSON (required for tasks)
 -----------------------------------------
 All tasks in this repository must support loading a JSON configuration file as an alternative to specifying parameters via command-line arguments. The config file should allow you to set experiment-level parameters such as:
@@ -58,7 +83,7 @@ All tasks in this repository must support loading a JSON configuration file as a
 - `output_dir` (string): path where logs and metadata will be saved
 - `n` (int): number of stimuli to display
 - `duration` (number): stimulus presentation duration in seconds
-- `isi` (number): inter-stimulus interval in seconds (time between trials)
+- `isi` (number): pre-stimulus / inter-stimulus interval in seconds; exact meaning is task-specific
 - `bg` (array of 3 ints): background RGB values in 0-255
 - `seed` (int, optional): random seed
 - `fullscreen` (bool, optional)

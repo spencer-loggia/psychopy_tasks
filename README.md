@@ -75,6 +75,26 @@ Two common `active_foraging` configurations:
 
 Implementation note: in the current sequential-memory branch, the memory dots are created inside the `isi > 0` path. If `sequential=true`, `is_memory=true`, and `isi=0`, the current code does not create the usual pre-item dot cue / persistent memory dots for that block.
 
+Active Foraging Color TSV
+-------------------------
+`active_foraging` expects `colors_tsv` to be a tab-delimited file with four columns: `id`, `r`, `g`, `b` (column name case is flexible, for example `ID R G B` also works).
+
+- Include a header row.
+- The first data row is treated as the background gray and is not used as a selectable stimulus color.
+- Every later row is one displayable color definition with a unique integer ID and integer RGB values.
+- Row order matters. After the background row, colors must be ordered by luminance blocks: all `n_colors` base colors for luminance level 1, then all `n_colors` base colors for luminance level 2, and so on.
+- The number of non-background color rows must equal `n_colors * n_lum_levels`.
+
+Example:
+
+```tsv
+id	r	g	b
+0	168	169	166
+1	143	115	120
+2	142	116	114
+3	141	117	108
+```
+
 Configuration via JSON (required for tasks)
 -----------------------------------------
 All tasks in this repository must support loading a JSON configuration file as an alternative to specifying parameters via command-line arguments. The config file should allow you to set experiment-level parameters such as:

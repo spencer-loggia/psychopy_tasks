@@ -15,6 +15,7 @@ Config keys required/additional:
 - shapes_tsv: path to TSV file with ID, PATH (SVG)
 - image_size: [W, H]
 - num_afc, n, duration, isi, ibi, choice_time, dot_size, dot_color, init_dot_color
+- pump_delay_time: delay in seconds between a rewarded choice and the first pump pulse
 
 """
 import argparse
@@ -238,6 +239,12 @@ def parse_args():
     p.add_argument("--buzz_pin", type=int, default=None, help="GPIO pin for timeout buzzer")
     p.add_argument("--freq_space_tsv", help="CSV file defining color-shape pair probabilities")
     p.add_argument("--reward_space_tsv", help="CSV file defining reward levels for color-shape pairs")
+    p.add_argument(
+        "--pump_delay_time",
+        type=float,
+        default=None,
+        help="Delay in seconds between a rewarded choice and the first pump pulse",
+    )
     p.add_argument("--pump_pulse_time_seconds", type=float, default=None, help="Duration of pump pulse in seconds")
     p.add_argument("--timeout_duration_seconds", type=float, default=None, help="Duration of timeout period in seconds")
     p.add_argument("--n_colors", type=int, default=None, help="Expected number of base colors (excluding luminance levels)")
@@ -283,6 +290,7 @@ def run_task(
     is_memory: bool = True,
     freq_space_tsv: Optional[str] = None,
     reward_space_tsv: Optional[str] = None,
+    pump_delay_time: float = 0.0,
     pump_pulse_time_seconds: float = 0.25,
     timeout_duration_seconds: float = 3.0,
     reward_to_pulse_map: Optional[Dict[str, int]] = None,
@@ -1001,6 +1009,35 @@ def run_task(
                     num_pulses = reward_to_pulse_map.get(str(reward_level), 0)
 
                 if num_pulses > 0:
+                    if pump_delay_time > 0:
+                        pump_delay_start_perf = time.perf_counter()
+                        logger.log(
+                            "pump_delay_start",
+                            image_name="",
+                            requested_duration_s=pump_delay_time,
+                            flip_time_psychopy_s=None,
+                            flip_time_perf_s=pump_delay_start_perf,
+                            end_time_perf_s=None,
+                            notes=f"block={block_idx} reward_level={reward_level}",
+                        )
+                        if _wait_or_abort(pump_delay_time):
+                            logger.log("abort", image_name="", notes="experimenter_exit")
+                            task_end_notes = "experimenter_exit"
+                            abort_requested = True
+                        pump_delay_end_perf = time.perf_counter()
+                        logger.log(
+                            "pump_delay_end",
+                            image_name="",
+                            requested_duration_s=pump_delay_time,
+                            flip_time_psychopy_s=None,
+                            flip_time_perf_s=pump_delay_end_perf,
+                            end_time_perf_s=None,
+                            notes=f"block={block_idx} reward_level={reward_level}",
+                        )
+
+                    if abort_requested:
+                        break
+
                     for pulse_num in range(1, num_pulses + 1):
                         pulse_start_perf = time.perf_counter()
                         if raspi and gpio_chip is not None:
@@ -1289,6 +1326,7 @@ def main():
     # New reward system parameters
     freq_space_tsv = _get("freq_space_tsv", cfg.get("freq_space_tsv", None))
     reward_space_tsv = _get("reward_space_tsv", cfg.get("reward_space_tsv", None))
+    pump_delay_time = float(_get("pump_delay_time", cfg.get("pump_delay_time", 0.0)))
     pump_pulse_time_seconds = float(_get("pump_pulse_time_seconds", cfg.get("pump_pulse_time_seconds", 0.25)))
     timeout_duration_seconds = float(_get("timeout_duration_seconds", cfg.get("timeout_duration_seconds", 3.0)))
     reward_to_pulse_map = cfg.get("reward_to_pulse_map", None)
@@ -1335,6 +1373,7 @@ def main():
             is_memory=is_memory,
             freq_space_tsv=freq_space_tsv,
             reward_space_tsv=reward_space_tsv,
+            pump_delay_time=pump_delay_time,
             pump_pulse_time_seconds=pump_pulse_time_seconds,
             timeout_duration_seconds=timeout_duration_seconds,
             reward_to_pulse_map=reward_to_pulse_map,

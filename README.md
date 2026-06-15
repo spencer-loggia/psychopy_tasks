@@ -52,12 +52,13 @@ The `active_foraging` task treats CPU core `0` as the timing-critical presentati
 
 Active Foraging Timing
 ----------------------
-The `active_foraging` timing parameters are interpreted by the presentation mode, not as abstract global delays. All values are quantized to display frames before use.
+The main visual timing parameters in `active_foraging` are interpreted by the presentation mode, not as abstract global delays. Those visual timings are quantized to display frames before use. `pump_delay_time` is separate: it is a post-choice reward delay applied in wall-clock seconds before reward delivery begins.
 
 - `duration`: stimulus display duration. In simultaneous non-memory mode (`sequential=false`, `is_memory=false`), this is also part of the active response window because choices are accepted as soon as the full array appears. In sequential memory mode (`sequential=true`, `is_memory=true`), this is the on-screen time for each individual stimulus in the sequence and choices are not accepted yet.
 - `isi`: pre-stimulus cue interval, not a between-trial delay. In simultaneous non-memory mode it shows dots at all candidate locations before the full array appears. In sequential memory mode it shows the dot cue for each item before that item is shown.
 - `choice_time`: response-window extension after the stimulus display phase defined by the active mode. In simultaneous non-memory mode the response window starts on the first frame of the full array and lasts `duration + choice_time`, with the full array remaining visible throughout. In sequential memory mode the response window begins only after the full sequence has finished and lasts `choice_time`, with only the remembered dot locations visible.
 - `ibi`: inter-block interval after choice handling. This begins only after reward delivery or timeout handling completes; it is not inserted between stimuli within a block.
+- `pump_delay_time`: delay in seconds between a rewarded choice being made and the first pump pulse. It applies only on rewarded trials with at least one configured pump pulse, and defaults to `0.0`.
 
 Two common `active_foraging` configurations:
 

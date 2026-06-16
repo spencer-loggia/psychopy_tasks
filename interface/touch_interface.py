@@ -156,13 +156,27 @@ class TouchInterfaceApp:
         except Exception as e:
             print(f"Could not sync time: {e}")
 
+    def pull_latest_code(self) -> None:
+        try:
+            subprocess.run(
+                ["git", "pull"],
+                cwd=self.working_dir,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except Exception as e:
+            print(f"Could not pull latest code: {e}")
+
     def startup(self) -> None:
         os.chdir(self.working_dir)
         # attempt to rectify system timezone
         self.attempt_rectify_timezone()
+        self.pull_latest_code()
 
     def cleanup(self) -> None:
         self.attempt_rectify_timezone()
+        self.pull_latest_code()
 
     def _schedule_idle_cleanup(self) -> None:
         self.root.after(IDLE_CLEANUP_MS, self._run_idle_cleanup_if_needed)

@@ -349,15 +349,7 @@ def run_task(
         auto_flush=False,
     )
 
-    if sequential:
-        if float(duration) <= 0.0:
-            msg = (
-                "Invalid active_foraging timing config: when sequential=true, "
-                f"duration must be > 0, got {float(duration):.6f}"
-            )
-            msg_logger.log("ERROR", msg)
-            raise ValueError(msg)
-    else:
+    if not sequential:
         if float(duration) != 0.0:
             msg = (
                 "Invalid active_foraging timing config: when sequential=false, "
@@ -657,6 +649,10 @@ def run_task(
             "ibi": ibi,
         },
         context="active_foraging",
+        minimum_frames={
+            "choice_time": 1,
+            **({"duration": 1} if sequential else {}),
+        },
         msg_logger=msg_logger,
     )
     try:

@@ -389,6 +389,7 @@ def validate_frame_aligned_timings(
     timings_s: Dict[str, float],
     *,
     context: str = "task",
+    minimum_frames: Optional[Dict[str, int]] = None,
     msg_logger=None,
 ) -> None:
     """Validate that requested visual timings are exact frame multiples.
@@ -402,6 +403,7 @@ def validate_frame_aligned_timings(
     frame_dur = 1.0 / fps
     tolerance_s = max(1e-9, frame_dur * 1e-6)
     invalid_parts: List[str] = []
+    minimum_frames = dict(minimum_frames or {})
 
     for label, seconds in timings_s.items():
         value_s = float(seconds)
@@ -410,6 +412,14 @@ def validate_frame_aligned_timings(
         nearest_frames = int(round(value_s * fps))
         nearest_s = nearest_frames / fps
         if abs(nearest_s - value_s) <= tolerance_s:
+            min_frames = int(minimum_frames.get(label, 0))
+            if nearest_frames < min_frames:
+                invalid_parts.append(
+                    (
+                        f"{label}={value_s:.6f}s "
+                        f"({nearest_frames}fr, requires at least {min_frames}fr={min_frames / fps:.6f}s)"
+                    )
+                )
             continue
         lower_frames = int(math.floor(value_s * fps))
         upper_frames = int(math.ceil(value_s * fps))
@@ -431,7 +441,8 @@ def validate_frame_aligned_timings(
         f"multiples of the frame duration at fps={fps:.6f}Hz "
         f"(frame_dur_s={frame_dur:.9f}). "
         + "; ".join(invalid_parts)
-        + ". Set a frame-aligned value or override refresh_rate to the intended nominal rate."
+        + ". Set a frame-aligned value that also satisfies the minimum-frame requirement, "
+        + "or override refresh_rate to the intended nominal rate."
     )
     if msg_logger is not None:
         try:
@@ -1683,14 +1694,9 @@ def present_block_with_persistent_dots(
                         notes=f"block={block_idx} idx={idx}",
                     )
             else:
-                # draw background + all kept stimuli + fixation and log stim_off for each
-                bg_rect.draw()
-                for s in stims:
-                    s.draw()
-                if fix is not None:
-                    fix.draw()
-                win.flip()
-                _show_preview(preview_images)
+                # The last stimulus flip remains visible until the next flip,
+                # so there is no need to redraw and flip the same frame again
+                # just to hold the array on screen through the choice window.
                 defer_nonsequential_stim_off = True
 
         # small safety: check for abort

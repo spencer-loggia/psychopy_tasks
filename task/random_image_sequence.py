@@ -159,6 +159,7 @@ def run_task(
             "isi": isi,
         },
         context="random_image_sequence",
+        minimum_frames={"duration": 1},
         msg_logger=msg_logger,
     )
 

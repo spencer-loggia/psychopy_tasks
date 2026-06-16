@@ -179,6 +179,10 @@ def run_task(
             "ibi": ibi,
         },
         context="afc_block_sequence",
+        minimum_frames={
+            "duration": 1,
+            "choice_time": 1,
+        },
         msg_logger=msg_logger,
     )
     # Log global quantization for task timing parameters

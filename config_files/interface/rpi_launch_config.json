@@ -1,0 +1,34 @@
+{
+    "environment": {
+        "python": "/opt/psychopy/PsychoPy-2025.1.1-Python3.10/.venv/bin/python",
+        "working_dir": "/home/loggiasr/Projects/psychopy_tasks"
+    },
+    "screens": {
+        "main": "HDMI-1-2",
+        "experimenter": "DSI-2"
+    },
+    "tasks": {
+        "CSC2": {
+            "classic": {
+                "Yuri": {
+                    "launch": "task/active_foraging.py",
+                    "config": "config_files/csc2/yuri_rigtrain_noseq_nomem_20260615.json"
+                }
+            }, 
+            "sequential": {},
+            "memory": {}
+        },
+        "video": {
+            "launch": "task/play_video.py",
+            "config": "test_configs/play_video_config.json"
+        },
+        "setup": {
+            "prime_pump": {
+                "launch": "task/pulse_pump.py"
+        },
+            "buzzer": {
+                "launch": "task/pulse_buzzer.py"
+            }
+        }
+    }
+}

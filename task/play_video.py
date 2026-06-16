@@ -31,6 +31,24 @@ from bin.screen import (
 )
 
 
+def _resolve_videos_dir(videos_dir: str) -> tuple[Path, Optional[str]]:
+    requested = Path(videos_dir)
+    if requested.exists() and requested.is_dir():
+        return requested, None
+
+    # Be tolerant of setups that haven't run preprocessing yet. The checked-in
+    # config and docstring prefer `cropped_videos`, but some local repos still
+    # only have the source `video` directory.
+    if requested.name == "cropped_videos":
+        fallback = requested.with_name("video")
+        if fallback.exists() and fallback.is_dir():
+            return fallback, (
+                f"videos_dir_missing requested={requested} fallback_to={fallback}"
+            )
+
+    raise FileNotFoundError(f"Video directory not found: {videos_dir}")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Play a random video stimulus")
     parser.add_argument("--config", help="Path to JSON config file. CLI overrides config keys.")
@@ -62,9 +80,10 @@ def run_task(
     if seed is not None:
         random.seed(seed)
 
-    video_files = utils.find_video_files(videos_dir, recursive=False)
+    resolved_videos_dir, videos_dir_warning = _resolve_videos_dir(videos_dir)
+    video_files = utils.find_video_files(str(resolved_videos_dir), recursive=False)
     if not video_files:
-        raise FileNotFoundError(f"No videos found in {videos_dir}")
+        raise FileNotFoundError(f"No videos found in {resolved_videos_dir}")
 
     main_screen, experimenter_screen = resolve_task_screens(screen_config)
     win = utils.setup_window(bg_rgb_255=bg, fullscreen=fullscreen, size=win_size, screen_info=main_screen)
@@ -112,6 +131,8 @@ def run_task(
             "INFO",
             f"resolved_screens main={describe_screen(main_screen)} experimenter={describe_screen(experimenter_screen)}",
         )
+        if videos_dir_warning:
+            msg_logger.log("WARN", videos_dir_warning)
         msg_logger.log(
             "INFO",
             f"resolved_main_scene_size size={main_scene_size[0]}x{main_scene_size[1]} fullscreen={int(bool(fullscreen))} requested_win_size={win_size} realized_win_size={tuple(win.size)}",
@@ -136,7 +157,7 @@ def run_task(
         flip_time_psychopy_s=None,
         flip_time_perf_s=None,
         end_time_perf_s=None,
-        notes=f"videos_dir={Path(videos_dir).resolve()} fps={fps:.6f} n_videos={len(video_files)}",
+        notes=f"videos_dir={resolved_videos_dir.resolve()} fps={fps:.6f} n_videos={len(video_files)}",
     )
 
     try:
@@ -233,7 +254,7 @@ def main():
 
     try:
         run_task(
-            videos_dir=_get("videos_dir", "./task/resources/video"),
+            videos_dir=_get("videos_dir", "./task/resources/cropped_videos"),
             output_dir=_get("output_dir", "./logs"),
             seed=_get("seed", None),
             fullscreen=bool(_get("fullscreen", cfg.get("fullscreen", True))),

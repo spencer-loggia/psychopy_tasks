@@ -84,6 +84,10 @@ def _generate_active_foraging_trial(trial_idx: int, config: dict) -> dict:
     shapes = {int(k): Path(v) for k, v in config["shapes"].items()}
     colors = {int(k): tuple(v) for k, v in config["colors"].items()}
     seed = config.get("seed", None)
+    stroke_width = config.get("stroke_width", None)
+    stroke_color = tuple(config["stroke_color"]) if config.get("stroke_color") is not None else None
+    stroke_linejoin = config.get("stroke_linejoin", None)
+    stroke_linecap = config.get("stroke_linecap", None)
     
     # Initialize RNG (use seed + trial_idx for reproducibility per trial)
     rng_seed = None if seed is None else int(seed) + trial_idx
@@ -119,6 +123,10 @@ def _generate_active_foraging_trial(trial_idx: int, config: dict) -> dict:
                 size_px=image_size,
                 color_rgb_255=colors[cid],
                 bg_rgb_255=bg,
+                stroke_rgb_255=stroke_color,
+                stroke_width_px=stroke_width,
+                stroke_linejoin=stroke_linejoin,
+                stroke_linecap=stroke_linecap,
             )
             rendered[pair] = np.asarray(pil)
     
@@ -251,6 +259,10 @@ def parse_args():
     p.add_argument("--n_shapes", type=int, default=None, help="Expected number of shapes")
     p.add_argument("--n_lum_levels", type=int, default=None, help="Expected number of luminance levels per base color")
     p.add_argument("--buffer_len_trials", type=int, default=None, help="How many upcoming trials to keep buffered in a background process")
+    p.add_argument("--stroke_width", type=float, default=None, help="Optional SVG stroke width override in output pixels")
+    p.add_argument("--stroke_color", type=int, nargs=3, default=None, help="Optional SVG stroke RGB override 0-255")
+    p.add_argument("--stroke_linejoin", default=None, help="Optional SVG stroke-linejoin override: miter, round, or bevel")
+    p.add_argument("--stroke_linecap", default=None, help="Optional SVG stroke-linecap override: butt, round, or square")
     p.add_argument("--main_screen", default=None, help="Main task screen index or output name")
     p.add_argument("--experimenter_screen", default=None, help="Experimenter screen index or output name")
     return p.parse_args()
@@ -300,6 +312,10 @@ def run_task(
     n_lum_levels: Optional[int] = None,
     config_name: Optional[str] = None,
     buffer_len_trials: int = 5,
+    stroke_width: Optional[float] = None,
+    stroke_color: Optional[Tuple[int, int, int]] = None,
+    stroke_linejoin: Optional[str] = None,
+    stroke_linecap: Optional[str] = None,
     screen_config: Optional[Dict[str, Any]] = None,
 ):
     # Set debug flag before rasterization if requested
@@ -829,6 +845,10 @@ def run_task(
         "shapes": {str(k): str(v) for k, v in shapes.items()},
         "colors": {str(k): list(v) for k, v in colors.items()},
         "seed": seed,
+        "stroke_width": stroke_width,
+        "stroke_color": list(stroke_color) if stroke_color is not None else None,
+        "stroke_linejoin": stroke_linejoin,
+        "stroke_linecap": stroke_linecap,
     }
 
     # Initialize TrialBufferManager for background trial generation
@@ -1336,7 +1356,12 @@ def main():
     n_lum_levels = _get("n_lum_levels", cfg.get("n_lum_levels", None))
     config_name = cfg.get("config_name", "active_foraging")
     buffer_len_trials = int(_get("buffer_len_trials", cfg.get("buffer_len_trials", 5)))
-    # stroke options were removed to match utils.rasterize_svg_with_color signature
+    stroke_width = _get("stroke_width", cfg.get("stroke_width", None))
+    stroke_width = float(stroke_width) if stroke_width is not None else None
+    stroke_color_val = _get("stroke_color", cfg.get("stroke_color", None))
+    stroke_color = tuple(stroke_color_val) if stroke_color_val is not None else None
+    stroke_linejoin = _get("stroke_linejoin", cfg.get("stroke_linejoin", None))
+    stroke_linecap = _get("stroke_linecap", cfg.get("stroke_linecap", None))
 
     try:
         run_task(
@@ -1383,6 +1408,10 @@ def main():
             n_lum_levels=n_lum_levels,
             config_name=config_name,
             buffer_len_trials=buffer_len_trials,
+            stroke_width=stroke_width,
+            stroke_color=stroke_color,
+            stroke_linejoin=stroke_linejoin,
+            stroke_linecap=stroke_linecap,
             screen_config=screen_config,
         )
     except Exception as e:

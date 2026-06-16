@@ -499,6 +499,8 @@ def rasterize_svg_with_color(
     bg_rgb_255: Optional[Tuple[int, int, int]] = None,
     stroke_rgb_255: Optional[Tuple[int, int, int]] = None,
     stroke_width_px: Optional[float] = None,
+    stroke_linejoin: Optional[str] = None,
+    stroke_linecap: Optional[str] = None,
 ) -> Image.Image:
     """Rasterize an SVG and force its fill color to `color_rgb_255`.
 
@@ -511,6 +513,8 @@ def rasterize_svg_with_color(
       defaults to black (0,0,0) per project convention.
     - stroke_width_px: optional stroke width in pixels. If None the SVG's
       original stroke-width is left unchanged.
+    - stroke_linejoin: optional SVG/CSS line join override such as "round".
+    - stroke_linecap: optional SVG/CSS line cap override such as "round".
     """
     try:
         import cairosvg  # type: ignore
@@ -545,6 +549,14 @@ def rasterize_svg_with_color(
         except Exception:
             # ignore invalid stroke width and leave it unspecified
             pass
+    if stroke_linejoin is not None:
+        join = str(stroke_linejoin).strip().lower()
+        if join in {"miter", "round", "bevel"}:
+            style_rules.append(f"stroke-linejoin:{join} !important")
+    if stroke_linecap is not None:
+        cap = str(stroke_linecap).strip().lower()
+        if cap in {"butt", "round", "square"}:
+            style_rules.append(f"stroke-linecap:{cap} !important")
 
     style_block = f"<style>path,rect,circle,polygon,ellipse,g,polyline{{{';'.join(style_rules)}}}</style>"
 

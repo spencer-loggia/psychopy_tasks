@@ -23,8 +23,8 @@
     "3": 0
   },
 
-  "pump_pin": 16,
-  "buzz_pin": 17,
+  "pump_pin": 24,
+  "buzz_pin": 23,
   "trial_start_pin": 18,
 
   "seed": null,
@@ -43,9 +43,11 @@
   "dot_color": [50, 50, 50],
   "init_dot_color": [50, 50, 50],
   "margin": 200,
-  "stroke_width": 0.50,
+  "stroke_width": 0.2,
   "stroke_color": [0, 0, 0],
-  "image_size": [300, 300],
+  "stroke_linejoin": "round",
+  "stroke_linecap": "round",
+  "image_size": [200, 200],
 
 
   "self_initiation": true,
@@ -54,7 +56,7 @@
   "num_afc": 4,
   "choice_time": 0.5,
   "isi": 0.05,
-  "fixed_positions": true,
+  "fixed_positions": false,
   "sequential": false,
   "is_memory": false,
   "raspi": true,

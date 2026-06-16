@@ -66,18 +66,38 @@ def main() -> None:
         help="Path to task config JSON",
     )
     parser.add_argument(
-        "--lum-level",
-        type=int,
-        default=21,
-        help="1-based luminance level to render (default: 21)",
-    )
-    parser.add_argument(
         "--tile-size",
         type=int,
         nargs=2,
         default=[160, 160],
         metavar=("W", "H"),
         help="Rendered stimulus tile size in pixels",
+    )
+    parser.add_argument(
+        "--stroke-width",
+        type=float,
+        default=None,
+        help="Optional SVG stroke width override in output pixels; defaults to config stroke_width",
+    )
+    parser.add_argument(
+        "--stroke-color",
+        type=int,
+        nargs=3,
+        default=None,
+        metavar=("R", "G", "B"),
+        help="Optional SVG stroke RGB override; defaults to config stroke_color",
+    )
+    parser.add_argument(
+        "--stroke-linejoin",
+        type=str,
+        default=None,
+        help="Optional SVG stroke-linejoin override; defaults to config stroke_linejoin",
+    )
+    parser.add_argument(
+        "--stroke-linecap",
+        type=str,
+        default=None,
+        help="Optional SVG stroke-linecap override; defaults to config stroke_linecap",
     )
     parser.add_argument(
         "--output-image",
@@ -99,7 +119,7 @@ def main() -> None:
     n_colors = int(cfg["n_colors"])
     n_shapes = int(cfg["n_shapes"])
     n_lum_levels = int(cfg["n_lum_levels"])
-    lum_level = int(args.lum_level)
+    lum_level = int(cfg["n_lum_levels"])
     if lum_level < 1 or lum_level > n_lum_levels:
         raise ValueError(f"lum-level must be in [1, {n_lum_levels}] but got {lum_level}")
 
@@ -122,6 +142,13 @@ def main() -> None:
 
     color_id_matrix = _build_color_id_matrix(color_ids, n_colors, n_lum_levels)
     reward_matrix = _build_reward_matrix(reward_space_tsv, n_colors, n_shapes)
+    stroke_width = args.stroke_width if args.stroke_width is not None else cfg.get("stroke_width", None)
+    stroke_width = float(stroke_width) if stroke_width is not None else None
+    stroke_color = tuple(args.stroke_color) if args.stroke_color is not None else None
+    if stroke_color is None and cfg.get("stroke_color", None) is not None:
+        stroke_color = tuple(cfg["stroke_color"])
+    stroke_linejoin = args.stroke_linejoin if args.stroke_linejoin is not None else cfg.get("stroke_linejoin", None)
+    stroke_linecap = args.stroke_linecap if args.stroke_linecap is not None else cfg.get("stroke_linecap", None)
 
     lum_idx = lum_level - 1
     tile_w, tile_h = int(args.tile_size[0]), int(args.tile_size[1])
@@ -151,6 +178,10 @@ def main() -> None:
                 size_px=(tile_w, tile_h),
                 color_rgb_255=rgb,
                 bg_rgb_255=(255, 255, 255),
+                stroke_rgb_255=stroke_color,
+                stroke_width_px=stroke_width,
+                stroke_linejoin=stroke_linejoin,
+                stroke_linecap=stroke_linecap,
             ).convert("RGB")
 
             r = shape_idx

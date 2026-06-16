@@ -26,7 +26,7 @@ def main():
 
     # GPIO pin to use (BCM numbering)
     PIN = 23
-    PULSE_DURATION_S = 8.0
+    PULSE_DURATION_S = 2.0
 
     print(f"Opening GPIO chip...")
     try:

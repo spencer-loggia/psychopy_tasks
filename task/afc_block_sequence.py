@@ -170,6 +170,17 @@ def run_task(
             pass
     else:
         fps, frame_dur = utils.detect_frame_rate(win, msg_logger=msg_logger)
+    utils.validate_frame_aligned_timings(
+        fps,
+        {
+            "duration": duration,
+            "isi": isi,
+            "choice_time": choice_time,
+            "ibi": ibi,
+        },
+        context="afc_block_sequence",
+        msg_logger=msg_logger,
+    )
     # Log global quantization for task timing parameters
     try:
         def _q(seconds: float, at_least_one: bool = False):

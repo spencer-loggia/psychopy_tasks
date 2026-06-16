@@ -9,6 +9,7 @@ Modularity helpers included:
 """
 from pathlib import Path
 import datetime as dt
+import math
 import random
 import shutil
 import subprocess
@@ -381,6 +382,63 @@ def detect_frame_rate(win: visual.Window, msg_logger=None) -> Tuple[float, float
         except Exception:
             pass
     return float(fps), float(frame_dur)
+
+
+def validate_frame_aligned_timings(
+    fps: float,
+    timings_s: Dict[str, float],
+    *,
+    context: str = "task",
+    msg_logger=None,
+) -> None:
+    """Validate that requested visual timings are exact frame multiples.
+
+    Raises ValueError if any provided timing cannot be represented as an
+    integer number of frames at the given fps.
+    """
+    fps = float(fps)
+    if fps <= 0:
+        raise ValueError(f"fps must be > 0, got {fps}")
+    frame_dur = 1.0 / fps
+    tolerance_s = max(1e-9, frame_dur * 1e-6)
+    invalid_parts: List[str] = []
+
+    for label, seconds in timings_s.items():
+        value_s = float(seconds)
+        if value_s < 0.0:
+            continue
+        nearest_frames = int(round(value_s * fps))
+        nearest_s = nearest_frames / fps
+        if abs(nearest_s - value_s) <= tolerance_s:
+            continue
+        lower_frames = int(math.floor(value_s * fps))
+        upper_frames = int(math.ceil(value_s * fps))
+        lower_s = lower_frames / fps
+        upper_s = upper_frames / fps
+        invalid_parts.append(
+            (
+                f"{label}={value_s:.6f}s "
+                f"(nearest lower {lower_frames}fr={lower_s:.6f}s, "
+                f"upper {upper_frames}fr={upper_s:.6f}s)"
+            )
+        )
+
+    if not invalid_parts:
+        return
+
+    msg = (
+        f"Invalid frame-aligned timing for {context}: requested visual timings must be exact "
+        f"multiples of the frame duration at fps={fps:.6f}Hz "
+        f"(frame_dur_s={frame_dur:.9f}). "
+        + "; ".join(invalid_parts)
+        + ". Set a frame-aligned value or override refresh_rate to the intended nominal rate."
+    )
+    if msg_logger is not None:
+        try:
+            msg_logger.log("ERROR", msg)
+        except Exception:
+            pass
+    raise ValueError(msg)
 
 
 def make_fixation_cross(win: visual.Window, size: int = 40, color: Tuple[int, int, int] = (0, 0, 0)):
@@ -1112,8 +1170,13 @@ def present_block_with_persistent_dots(
             _core.wait(0.01)
 
 
-    # Quantize durations to frames and log rounding in message logger
-    stim_frames, stim_s = _q_to_frames(duration, at_least_one=True)
+    # Quantize durations to frames and log rounding in message logger.
+    # In simultaneous presentation (`sequential=False`), `duration` is expected
+    # to be exactly 0 and does not create a separate timed display phase.
+    if sequential:
+        stim_frames, stim_s = _q_to_frames(duration, at_least_one=True)
+    else:
+        stim_frames, stim_s = (0, 0.0)
     isi_frames, isi_s = _q_to_frames(isi, at_least_one=False)
     choice_frames, choice_s = _q_to_frames(choice_time, at_least_one=False)
     if msg_logger is not None:
@@ -1146,6 +1209,7 @@ def present_block_with_persistent_dots(
     stims: List[visual.ImageStim] = []
     names: List[str] = []
     choice_hit_targets: List[visual.Rect] = []
+    defer_nonsequential_stim_off = False
 
     def _build_choice_hit_targets():
         if choice_hit_targets:
@@ -1538,10 +1602,11 @@ def present_block_with_persistent_dots(
                         )
                     first_flip = False
 
-        # Show all stimuli simultaneously for stim_frames
+        # Show all stimuli on the first frame, then leave them visible through
+        # the simultaneous choice window when is_memory is False.
         first_flip = True
         _show_preview(preview_images)
-        for _f in range(stim_frames):
+        for _f in range(1):
             if _should_abort("experimenter_exit_during_stimulus"):
                 return True, None
             bg_rect.draw()
@@ -1567,7 +1632,7 @@ def present_block_with_persistent_dots(
                     )
                 if not is_memory:
                     _build_choice_hit_targets()
-                    _start_choice_window(flip_ps, flip_perf, stim_s + choice_s, notes_suffix=" response_from=stim_on")
+                    _start_choice_window(flip_ps, flip_perf, choice_s, notes_suffix=" response_from=stim_on")
                 first_flip = False
             if choice_started and choice_deadline is not None:
                 if _poll_choice_until(min(choice_deadline, flip_perf + frame_dur)):
@@ -1577,17 +1642,20 @@ def present_block_with_persistent_dots(
 
         # After stimuli: either persist dots (memory) or keep stimuli visible
         if click_registered:
-            off_perf = click_perf_capture if click_perf_capture is not None else time.perf_counter()
-            for idx, name in enumerate(names, start=1):
-                logger.log(
-                    "stim_off",
-                    image_name=name,
-                    requested_duration_s=stim_s,
-                    flip_time_psychopy_s=None,
-                    flip_time_perf_s=None,
-                    end_time_perf_s=off_perf,
-                    notes=f"block={block_idx} idx={idx} early_choice=1",
-                )
+            if is_memory:
+                off_perf = click_perf_capture if click_perf_capture is not None else time.perf_counter()
+                for idx, name in enumerate(names, start=1):
+                    logger.log(
+                        "stim_off",
+                        image_name=name,
+                        requested_duration_s=stim_s,
+                        flip_time_psychopy_s=None,
+                        flip_time_perf_s=None,
+                        end_time_perf_s=off_perf,
+                        notes=f"block={block_idx} idx={idx} early_choice=1",
+                    )
+            else:
+                defer_nonsequential_stim_off = True
         else:
             if is_memory:
                 for d in dots:
@@ -1604,6 +1672,16 @@ def present_block_with_persistent_dots(
                 off_perf = time.perf_counter()
                 win.flip()
                 _show_preview([])
+                for idx, name in enumerate(names, start=1):
+                    logger.log(
+                        "stim_off",
+                        image_name=name,
+                        requested_duration_s=stim_s,
+                        flip_time_psychopy_s=None,
+                        flip_time_perf_s=None,
+                        end_time_perf_s=off_perf,
+                        notes=f"block={block_idx} idx={idx}",
+                    )
             else:
                 # draw background + all kept stimuli + fixation and log stim_off for each
                 bg_rect.draw()
@@ -1611,19 +1689,9 @@ def present_block_with_persistent_dots(
                     s.draw()
                 if fix is not None:
                     fix.draw()
-                off_perf = time.perf_counter()
                 win.flip()
                 _show_preview(preview_images)
-            for idx, name in enumerate(names, start=1):
-                logger.log(
-                    "stim_off",
-                    image_name=name,
-                    requested_duration_s=stim_s,
-                    flip_time_psychopy_s=None,
-                    flip_time_perf_s=None,
-                    end_time_perf_s=off_perf,
-                    notes=f"block={block_idx} idx={idx}",
-                )
+                defer_nonsequential_stim_off = True
 
         # small safety: check for abort
         if event.getKeys(["escape"]):
@@ -1664,6 +1732,17 @@ def present_block_with_persistent_dots(
         clr_flip = win.flip()
         _show_preview([])
         clr_perf = time.perf_counter()
+        if defer_nonsequential_stim_off:
+            for idx, name in enumerate(names, start=1):
+                logger.log(
+                    "stim_off",
+                    image_name=name,
+                    requested_duration_s=stim_s,
+                    flip_time_psychopy_s=None,
+                    flip_time_perf_s=None,
+                    end_time_perf_s=clr_perf,
+                    notes=f"block={block_idx} idx={idx} visible_through_choice=1",
+                )
         logger.log(
             "choice_cleared",
             image_name="",
@@ -1683,6 +1762,17 @@ def present_block_with_persistent_dots(
         clr_flip = win.flip()
         _show_preview([])
         clr_perf = time.perf_counter()
+        if defer_nonsequential_stim_off:
+            for idx, name in enumerate(names, start=1):
+                logger.log(
+                    "stim_off",
+                    image_name=name,
+                    requested_duration_s=stim_s,
+                    flip_time_psychopy_s=None,
+                    flip_time_perf_s=None,
+                    end_time_perf_s=clr_perf,
+                    notes=f"block={block_idx} idx={idx} visible_through_choice=1",
+                )
         logger.log(
             "choice_cleared",
             image_name="",

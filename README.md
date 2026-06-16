@@ -54,9 +54,11 @@ Active Foraging Timing
 ----------------------
 The main visual timing parameters in `active_foraging` are interpreted by the presentation mode, not as abstract global delays. Those visual timings are quantized to display frames before use. `pump_delay_time` is separate: it is a post-choice reward delay applied in wall-clock seconds before reward delivery begins.
 
-- `duration`: stimulus display duration. In simultaneous non-memory mode (`sequential=false`, `is_memory=false`), this is also part of the active response window because choices are accepted as soon as the full array appears. In sequential memory mode (`sequential=true`, `is_memory=true`), this is the on-screen time for each individual stimulus in the sequence and choices are not accepted yet.
+`active_foraging` now validates requested visual timings against the active frame rate before the task starts. If `duration`, `isi`, `choice_time`, or `ibi` is not an exact multiple of the frame duration, the task logs an error and exits instead of silently rounding. If you want nominal frame-based timings such as `0.050` at `120 Hz`, set `refresh_rate` explicitly to the intended rate.
+
+- `duration`: stimulus display duration for sequential presentation. When `sequential=false`, `duration` must be exactly `0`; there is no separate timed stimulus-display phase in that mode. Instead, the full array appears on the first choice frame and remains visible for `choice_time` only. In sequential memory mode (`sequential=true`, `is_memory=true`), `duration` is the on-screen time for each individual stimulus in the sequence and choices are not accepted yet.
 - `isi`: pre-stimulus cue interval, not a between-trial delay. In simultaneous non-memory mode it shows dots at all candidate locations before the full array appears. In sequential memory mode it shows the dot cue for each item before that item is shown.
-- `choice_time`: response-window extension after the stimulus display phase defined by the active mode. In simultaneous non-memory mode the response window starts on the first frame of the full array and lasts `duration + choice_time`, with the full array remaining visible throughout. In sequential memory mode the response window begins only after the full sequence has finished and lasts `choice_time`, with only the remembered dot locations visible.
+- `choice_time`: response-window extension after the stimulus display phase defined by the active mode. In simultaneous non-memory mode the response window starts on the first frame of the full array and lasts `choice_time`, with the full array remaining visible throughout. In sequential memory mode the response window begins only after the full sequence has finished and lasts `choice_time`, with only the remembered dot locations visible.
 - `ibi`: inter-block interval after choice handling. This begins only after reward delivery or timeout handling completes; it is not inserted between stimuli within a block.
 - `pump_delay_time`: delay in seconds between a rewarded choice being made and the first pump pulse. It applies only on rewarded trials with at least one configured pump pulse, and defaults to `0.0`.
 
@@ -64,9 +66,9 @@ Two common `active_foraging` configurations:
 
 - Config A: `sequential=false`, `is_memory=false`
   - `isi`: all choice-location dots are shown together before the stimuli.
-  - `duration`: all stimuli are shown simultaneously for this long.
-  - `choice_time`: extra time after `duration` while the same full array remains selectable.
-  - Total selectable time: `duration + choice_time`.
+  - `duration`: must be `0`.
+  - `choice_time`: the full array appears on the first choice frame and remains selectable for this long.
+  - Total selectable time: `choice_time`.
 
 - Config B: `sequential=true`, `is_memory=true`
   - For each option in the block: show that option's dot for `isi`, then show that stimulus for `duration`.
@@ -103,7 +105,7 @@ All tasks in this repository must support loading a JSON configuration file as a
 - `images_dir` (string): path to image resources
 - `output_dir` (string): path where logs and metadata will be saved
 - `n` (int): number of stimuli to display
-- `duration` (number): stimulus presentation duration in seconds
+- `duration` (number): stimulus presentation duration in seconds. For `active_foraging`, when `sequential=false`, this must be `0`.
 - `isi` (number): pre-stimulus / inter-stimulus interval in seconds; exact meaning is task-specific
 - `bg` (array of 3 ints): background RGB values in 0-255
 - `seed` (int, optional): random seed

@@ -219,7 +219,12 @@ def parse_args():
     p.add_argument("--shapes_tsv", help="Path to shapes TSV (overrides config)")
     p.add_argument("--n", type=int, default=None, help="Number of blocks (overrides config n)")
     p.add_argument("--num_afc", type=int, default=None, help="Number of stimuli per block")
-    p.add_argument("--duration", type=float, default=None, help="Stimulus duration (s)")
+    p.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help="Stimulus duration (s). Must be 0 when sequential=false.",
+    )
     p.add_argument("--choice_time", type=float, default=None, help="Choice display time after block (s)")
     p.add_argument("--ibi", type=float, default=None, help="Inter-block interval (s)")
     p.add_argument("--isi", type=float, default=None, help="Pre-block fixation delay before first stim")
@@ -343,6 +348,24 @@ def run_task(
         ),
         auto_flush=False,
     )
+
+    if sequential:
+        if float(duration) <= 0.0:
+            msg = (
+                "Invalid active_foraging timing config: when sequential=true, "
+                f"duration must be > 0, got {float(duration):.6f}"
+            )
+            msg_logger.log("ERROR", msg)
+            raise ValueError(msg)
+    else:
+        if float(duration) != 0.0:
+            msg = (
+                "Invalid active_foraging timing config: when sequential=false, "
+                f"duration must be exactly 0, got {float(duration):.6f}. "
+                "In this mode the stimuli appear on the first choice frame and remain visible for choice_time only."
+            )
+            msg_logger.log("ERROR", msg)
+            raise ValueError(msg)
 
     affinity_plan = build_main_and_worker_affinity_plan(main_core=0)
     main_cpu_affinity = affinity_plan.get("main_cpu_affinity")
@@ -625,6 +648,17 @@ def run_task(
             pass
     else:
         fps, frame_dur = utils.detect_frame_rate(win, msg_logger=msg_logger)
+    utils.validate_frame_aligned_timings(
+        fps,
+        {
+            "duration": duration,
+            "isi": isi,
+            "choice_time": choice_time,
+            "ibi": ibi,
+        },
+        context="active_foraging",
+        msg_logger=msg_logger,
+    )
     try:
         # Log global timing quantization once based on detected fps
         def _q(seconds: float, at_least_one: bool = False):
@@ -633,7 +667,10 @@ def run_task(
                 frames = max(1, frames)
             return frames, frames / float(fps)
 
-        dur_fr, dur_s = _q(duration, at_least_one=True)
+        if sequential:
+            dur_fr, dur_s = _q(duration, at_least_one=True)
+        else:
+            dur_fr, dur_s = (0, 0.0)
         isi_fr, isi_s = _q(isi, at_least_one=False)
         ch_fr, ch_s = _q(choice_time, at_least_one=False)
         ibi_fr, ibi_s = _q(ibi, at_least_one=False)
@@ -1283,7 +1320,11 @@ def main():
     cfg = {}
     if args.config:
         cfg = load_config(args.config)
-        validate_config(cfg, required=["config_name", "colors_tsv", "shapes_tsv", "n", "duration"])  # basic
+        validate_config(
+            cfg,
+            required=["config_name", "colors_tsv", "shapes_tsv", "n"],
+            allow_zero_duration=True,
+        )  # basic
     else:
         missing = []
         if not args.colors_tsv:
@@ -1314,7 +1355,11 @@ def main():
     shapes_tsv = _get("shapes_tsv", cfg.get("shapes_tsv"))
     n_blocks = int(_get("n", cfg.get("n")))
     num_afc = int(_get("num_afc", cfg.get("num_afc", 4)))
-    duration = float(_get("duration", cfg.get("duration")))
+    duration_raw = _get("duration", cfg.get("duration", None))
+    if duration_raw is None:
+        print("ERROR: missing required args: --duration or config", file=sys.stderr)
+        sys.exit(2)
+    duration = float(duration_raw)
     choice_time = float(_get("choice_time", cfg.get("choice_time", 0.75)))
     ibi = float(_get("ibi", cfg.get("ibi", 1.0)))
     isi = float(_get("isi", cfg.get("isi", 0.5)))

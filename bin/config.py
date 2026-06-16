@@ -40,7 +40,12 @@ def _expect_key(cfg: Dict[str, Any], key: str):
         raise KeyError(f"Missing required config key: '{key}'")
 
 
-def validate_config(cfg: Dict[str, Any], required: Optional[List[str]] = None) -> Dict[str, Any]:
+def validate_config(
+    cfg: Dict[str, Any],
+    required: Optional[List[str]] = None,
+    *,
+    allow_zero_duration: bool = False,
+) -> Dict[str, Any]:
     """
     Very small validator that ensures required keys exist and some basic checks.
 
@@ -60,8 +65,14 @@ def validate_config(cfg: Dict[str, Any], required: Optional[List[str]] = None) -
         if not isinstance(cfg["n"], int) or cfg["n"] < 1:
             raise ValueError("Config 'n' must be an integer >= 1")
     if "duration" in cfg:
-        if not (isinstance(cfg["duration"], int) or isinstance(cfg["duration"], float)) or cfg["duration"] <= 0:
-            raise ValueError("Config 'duration' must be a positive number (seconds)")
+        if not (isinstance(cfg["duration"], int) or isinstance(cfg["duration"], float)):
+            raise ValueError("Config 'duration' must be a number (seconds)")
+        if allow_zero_duration:
+            if cfg["duration"] < 0:
+                raise ValueError("Config 'duration' must be a non-negative number (seconds)")
+        else:
+            if cfg["duration"] <= 0:
+                raise ValueError("Config 'duration' must be a positive number (seconds)")
     if "isi" in cfg:
         if not (isinstance(cfg["isi"], int) or isinstance(cfg["isi"], float)) or cfg["isi"] < 0:
             raise ValueError("Config 'isi' must be a non-negative number (seconds)")

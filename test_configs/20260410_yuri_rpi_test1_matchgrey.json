@@ -32,7 +32,7 @@
   },
   "refresh_rate": 120,
   "n": 20,
-  "duration": 0.5,
+  "duration": 0.0,
 
   "fullscreen": true,
   "win_size": [2560, 1600],

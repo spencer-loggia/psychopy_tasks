@@ -52,7 +52,7 @@
 
   "self_initiation": true,
   "ibi": 0.5,
-  "duration": 0.25,
+  "duration": 0.0,
   "num_afc": 4,
   "choice_time": 1.0,
   "isi": 0.00,

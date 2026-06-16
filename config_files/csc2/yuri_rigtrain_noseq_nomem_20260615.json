@@ -51,11 +51,11 @@
 
 
   "self_initiation": true,
-  "ibi": 1.0,
+  "ibi": 0.5,
   "duration": 0.25,
   "num_afc": 4,
-  "choice_time": 0.5,
-  "isi": 0.05,
+  "choice_time": 1.0,
+  "isi": 0.00,
   "fixed_positions": false,
   "sequential": false,
   "is_memory": false,

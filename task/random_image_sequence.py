@@ -15,7 +15,6 @@ python task/random_image_sequence.py \
   --svg_size 256 256
 """
 import argparse
-import datetime as dt
 import sys
 import time
 from pathlib import Path
@@ -29,7 +28,7 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from bin import utils
-from bin.logger import EventLogger, MessageLogger, build_run_log_filename
+from bin.logger import SessionLogBundle
 from bin.config import load_config, validate_config
 
 
@@ -101,28 +100,23 @@ def run_task(
     # textures if nothing is drawn).
     bg_rect = utils.make_bg_rect(win, bg)
 
-    # Loggers & quiet console
-    run_started_dt = dt.datetime.now()
     resolved_config_name = str(config_name).strip() if config_name else "random_image_sequence"
-    logger = EventLogger(
-        output_dir,
-        filename=build_run_log_filename(
-            resolved_config_name,
-            "image_sequence_log",
-            when=run_started_dt,
-            in_progress=True,
-        ),
+    session_logs = SessionLogBundle(
+        output_root=output_dir,
+        task_name="random_image_sequence",
+        config_name=resolved_config_name,
+        behavior_fieldnames=["trial_num", "stimulus_name", "requested_duration"],
     )
-    msg_logger = MessageLogger(
-        output_dir,
-        filename=build_run_log_filename(
-            resolved_config_name,
-            "image_sequence_message_log",
-            when=run_started_dt,
-            in_progress=True,
-        ),
-    )
+    logger = session_logs.event_logger
+    msg_logger = session_logs.message_logger
+    behavior_logger = session_logs.behavior_logger
+    if behavior_logger is None:
+        raise RuntimeError("random_image_sequence requires a behavior logger")
     pylogging.console.setLevel(pylogging.CRITICAL)
+    msg_logger.log(
+        "INFO",
+        f"session_start task=random_image_sequence config_name={resolved_config_name} session_dir={session_logs.session_dir}",
+    )
 
     # Initialize lgpio if requested (harmless if not used here)
     pigpio_pi = None  # naming kept for compatibility with presenter API
@@ -213,19 +207,15 @@ def run_task(
             isi_flip_ps = win.flip()
             if first_flip:
                 isi_perf = time.perf_counter()
-                logger.log(
-                    "isi_start",
-                    image_name="",
-                    requested_duration_s=isi_s,
-                    flip_time_psychopy_s=isi_flip_ps,
-                    flip_time_perf_s=isi_perf,
-                    end_time_perf_s=isi_perf + isi_s,
-                    notes="pre-sequence ISI",
+                logger.log_frame_flip(
+                    trial_num=None,
+                    event="gray_pre_sequence",
+                    timestamp_perf_s=isi_perf,
+                    requested_duration=isi_s,
                 )
                 first_flip = False
 
-    # Task start
-    logger.log("task_start", image_name="", notes=f"n={n}")
+    aborted = False
 
     # Main loop
     for idx, (img_name, stim) in enumerate(image_stims, start=1):
@@ -237,71 +227,74 @@ def run_task(
             flip_time_ps = win.flip()
             if first_flip:
                 flip_time_perf = time.perf_counter()
-                logger.log(
-                    "image_on",
-                    image_name=img_name,
-                    requested_duration_s=stim_s,
-                    flip_time_psychopy_s=flip_time_ps,
-                    flip_time_perf_s=flip_time_perf,
-                    end_time_perf_s=None,
-                    notes=f"index={idx}",
+                logger.log_frame_flip(
+                    trial_num=idx,
+                    event="stimulus_on",
+                    timestamp_perf_s=flip_time_perf,
+                    requested_duration=stim_s,
                 )
+                msg_logger.log("INFO", f"stimulus_presented trial_num={idx} stimulus_name={img_name}")
                 first_flip = False
             # Abort?
             if event.getKeys(["escape"]):
-                logger.log("abort", image_name="", notes="escape_pressed")
+                msg_logger.log("WARN", f"escape_pressed trial_num={idx}")
+                aborted = True
                 break
+        if aborted:
+            break
         # Clear the screen to background (fixation on top) and log image_off
         bg_rect.draw()
         if fix is not None:
             fix.draw()
         win.flip()
         end_time_perf = time.perf_counter()
-        logger.log(
-            "image_off",
-            image_name=img_name,
-            requested_duration_s=stim_s,
-            flip_time_psychopy_s=None,
-            flip_time_perf_s=None,
-            end_time_perf_s=end_time_perf,
-            notes=f"index={idx}",
+        is_last_stimulus = idx == len(image_stims)
+        if is_last_stimulus:
+            logger.log_frame_flip(
+                trial_num=idx,
+                event="gray_final_fixation",
+                timestamp_perf_s=end_time_perf,
+                requested_duration=final_fix_s,
+            )
+        elif isi_frames > 0:
+            logger.log_frame_flip(
+                trial_num=idx,
+                event="gray_inter_stimulus",
+                timestamp_perf_s=end_time_perf,
+                requested_duration=isi_s,
+            )
+        behavior_logger.writerow(
+            {
+                "trial_num": idx,
+                "stimulus_name": img_name,
+                "requested_duration": f"{stim_s:.9f}",
+            }
         )
         # ISI between images
-        for _f in range(isi_frames):
+        for _f in range(isi_frames if not is_last_stimulus else 0):
             bg_rect.draw()
             if fix is not None:
                 fix.draw()
             win.flip()
         # Abort?
         if event.getKeys(["escape"]):
-            logger.log("abort", image_name="", notes="escape_pressed")
+            msg_logger.log("WARN", f"escape_pressed trial_num={idx}")
+            aborted = True
             break
 
     # Final fixation and cleanup
-    if fix is not None:
-        fix.draw()
-    final_flip_ps = win.flip()
-    final_perf = time.perf_counter()
-    # Frame-locked post-sequence fixation
-    logger.log("fixation_post_start", image_name="", requested_duration_s=final_fix_s,
-               flip_time_psychopy_s=final_flip_ps, flip_time_perf_s=final_perf,
-               end_time_perf_s=final_perf + final_fix_s, notes="post-sequence fixation")
-    for _f in range(max(0, final_fix_frames - 1)):
-        if fix is not None:
-            fix.draw()
-        bg_rect.draw()
-        win.flip()
+    if not aborted:
+        for _f in range(max(0, final_fix_frames - 1)):
+            bg_rect.draw()
+            if fix is not None:
+                fix.draw()
+            win.flip()
 
-    task_end_dt = dt.datetime.now()
-    logger.log("task_end", image_name="", notes="done")
-    logger.finalize(build_run_log_filename(resolved_config_name, "image_sequence_log", when=task_end_dt))
-    try:
-        msg_logger.finalize(build_run_log_filename(resolved_config_name, "image_sequence_message_log", when=task_end_dt))
-    except Exception:
-        pass
+    msg_logger.log("INFO", f"session_end status={'aborted' if aborted else 'done'}")
+    session_logs.close()
     win.close()
     core.quit()
-    print(f"Finished; log written to {Path(output_dir).resolve()}")
+    print(f"Finished; logs written to {session_logs.session_dir.resolve()}")
 
 
 def main():

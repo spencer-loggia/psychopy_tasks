@@ -816,6 +816,7 @@ def _experimenter_preview_process(
     start_perf_s: float,
     update_interval_ms: int,
     command_queue,
+    reward_event,
     exit_event,
     stop_event,
 ) -> None:
@@ -937,6 +938,8 @@ def _experimenter_preview_process(
             reward_counts_text.draw()
         if task_label_text is not None:
             task_label_text.draw()
+        reward_button_rect.draw()
+        reward_button_text.draw()
         exit_button_rect.draw()
         exit_button_text.draw()
 
@@ -978,7 +981,7 @@ def _experimenter_preview_process(
             text="00:00:00",
             units="pix",
             height=max(24.0, min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.055),
-            pos=(-float(preview_canvas_size[0]) * 0.41, float(preview_canvas_size[1]) * 0.44),
+            pos=(-float(preview_canvas_size[0]) * 0.35, float(preview_canvas_size[1]) * 0.44),
             alignText="left",
             anchorHoriz="left",
             color=_preview_rgb255_to_psychopy((255, 255, 255)),
@@ -989,9 +992,33 @@ def _experimenter_preview_process(
             text="",
             units="pix",
             height=max(18.0, min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.038),
-            pos=(-float(preview_canvas_size[0]) * 0.41, float(preview_canvas_size[1]) * 0.30),
+            pos=(-float(preview_canvas_size[0]) * 0.35, float(preview_canvas_size[1]) * 0.30),
             alignText="left",
             anchorHoriz="left",
+            color=_preview_rgb255_to_psychopy((255, 255, 255)),
+            colorSpace="rgb",
+        )
+        reward_button_width = max(72.0, float(preview_canvas_size[0]) * 0.08)
+        reward_button_height = max(42.0, float(preview_canvas_size[1]) * 0.065)
+        reward_button_rect = visual.Rect(
+            win,
+            width=reward_button_width,
+            height=reward_button_height,
+            pos=(
+                -float(preview_canvas_size[0]) * 0.5 + reward_button_width * 0.5 + 18.0,
+                float(preview_canvas_size[1]) * 0.5 - reward_button_height * 0.5 - 18.0,
+            ),
+            fillColor=_preview_rgb255_to_psychopy((68, 128, 88)),
+            fillColorSpace="rgb",
+            lineColor=None,
+            units="pix",
+        )
+        reward_button_text = visual.TextStim(
+            win,
+            text="rew.",
+            units="pix",
+            height=max(18.0, min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.032),
+            pos=reward_button_rect.pos,
             color=_preview_rgb255_to_psychopy((255, 255, 255)),
             colorSpace="rgb",
         )
@@ -1067,7 +1094,10 @@ def _experimenter_preview_process(
                 mouse_down = False
             if mouse_down and (not last_mouse_down):
                 try:
-                    if exit_button_rect.contains(mouse.getPos()):
+                    mouse_pos = mouse.getPos()
+                    if reward_button_rect.contains(mouse_pos):
+                        reward_event.set()
+                    elif exit_button_rect.contains(mouse_pos):
                         exit_event.set()
                 except Exception:
                     pass
@@ -1129,6 +1159,7 @@ class ExperimenterPreview:
         self.exit_requested = False
         self._ctx = mp.get_context("spawn")
         self._queue = self._ctx.Queue()
+        self._reward_event = self._ctx.Event()
         self._exit_event = self._ctx.Event()
         self._stop_event = self._ctx.Event()
         self._process = self._ctx.Process(
@@ -1139,6 +1170,7 @@ class ExperimenterPreview:
                 self.start_perf_s,
                 int(round(self.update_interval_s * 1000.0)),
                 self._queue,
+                self._reward_event,
                 self._exit_event,
                 self._stop_event,
             ),
@@ -1161,6 +1193,12 @@ class ExperimenterPreview:
             if remaining > 0:
                 time.sleep(min(max(0.01, step_s), remaining))
         return self.poll()
+
+    def consume_manual_reward_request(self) -> bool:
+        if not self._reward_event.is_set():
+            return False
+        self._reward_event.clear()
+        return True
 
     def _send(self, payload: Dict[str, Any]) -> None:
         if self.poll():

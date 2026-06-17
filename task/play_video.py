@@ -6,7 +6,6 @@ have already been cropped, downsampled, stripped of audio, and converted to a
 playback-friendly HEVC/H.265 yuv420p format.
 """
 import argparse
-import datetime as dt
 import random
 import sys
 import time
@@ -21,7 +20,7 @@ if str(_project_root) not in sys.path:
 
 from bin import utils
 from bin.config import load_config, validate_config
-from bin.logger import EventLogger, MessageLogger, build_run_log_filename
+from bin.logger import SessionLogBundle
 from bin.screen import (
     ExperimenterPreview,
     describe_screen,
@@ -97,8 +96,18 @@ def run_task(
         realized_size=tuple(win.size),
     )
 
-    run_started_dt = dt.datetime.now()
     resolved_config_name = str(config_name).strip() if config_name else "play_video"
+    session_logs = SessionLogBundle(
+        output_root=output_dir,
+        task_name="play_video",
+        config_name=resolved_config_name,
+        behavior_fieldnames=["trial_num", "video_name", "expected_duration", "aborted", "stop_reason", "dropped_frames"],
+    )
+    logger = session_logs.event_logger
+    msg_logger = session_logs.message_logger
+    behavior_logger = session_logs.behavior_logger
+    if behavior_logger is None:
+        raise RuntimeError("play_video requires a behavior logger")
     if experimenter_screen is not None:
         experimenter_preview = ExperimenterPreview(
             experimenter_screen,
@@ -107,26 +116,12 @@ def run_task(
             update_interval_s=0.1,
         )
         experimenter_preview.clear_scene(bg_rgb_255=bg, main_size=main_scene_size)
-    logger = EventLogger(
-        output_dir,
-        filename=build_run_log_filename(
-            resolved_config_name,
-            "play_video_log",
-            when=run_started_dt,
-            in_progress=True,
-        ),
-    )
-    msg_logger = MessageLogger(
-        output_dir,
-        filename=build_run_log_filename(
-            resolved_config_name,
-            "play_video_message_log",
-            when=run_started_dt,
-            in_progress=True,
-        ),
-    )
     pylogging.console.setLevel(pylogging.CRITICAL)
     try:
+        msg_logger.log(
+            "INFO",
+            f"session_start task=play_video config_name={resolved_config_name} session_dir={session_logs.session_dir}",
+        )
         msg_logger.log(
             "INFO",
             f"resolved_screens main={describe_screen(main_screen)} experimenter={describe_screen(experimenter_screen)}",
@@ -149,16 +144,7 @@ def run_task(
             pass
     else:
         fps, frame_dur = utils.detect_frame_rate(win, msg_logger=msg_logger)
-
-    logger.log(
-        "task_start",
-        image_name="",
-        requested_duration_s=None,
-        flip_time_psychopy_s=None,
-        flip_time_perf_s=None,
-        end_time_perf_s=None,
-        notes=f"videos_dir={resolved_videos_dir.resolve()} fps={fps:.6f} n_videos={len(video_files)}",
-    )
+    msg_logger.log("INFO", f"task_ready videos_dir={resolved_videos_dir.resolve()} fps={fps:.6f} n_videos={len(video_files)}")
 
     try:
         event.clearEvents(eventType="mouse")
@@ -171,7 +157,7 @@ def run_task(
     while True:
         if experimenter_preview is not None and experimenter_preview.poll():
             stop_reason = "experimenter_exit"
-            logger.log("abort", image_name="", notes="experimenter_exit_before_video")
+            msg_logger.log("WARN", "experimenter_exit_before_video")
             break
         try:
             is_pressed = any(mouse.getPressed())
@@ -195,35 +181,38 @@ def run_task(
             mouse=mouse,
             ffprobe_bin=ffprobe_bin,
             external_abort_checker=(experimenter_preview.poll if experimenter_preview is not None else None),
+            trial_num=played_videos + 1,
         )
         played_videos += 1
+        behavior_logger.writerow(
+            {
+                "trial_num": played_videos,
+                "video_name": playback_info["video_name"],
+                "expected_duration": (
+                    f"{float(playback_info['expected_duration_s']):.9f}"
+                    if playback_info.get("expected_duration_s") is not None
+                    else ""
+                ),
+                "aborted": int(playback_info["aborted"]),
+                "stop_reason": playback_info.get("abort_reason") or "completed",
+                "dropped_frames": playback_info["dropped_frames"],
+            }
+        )
         if experimenter_preview is not None:
             experimenter_preview.clear_scene(bg_rgb_255=bg, main_size=main_scene_size)
         if playback_info["aborted"]:
             stop_reason = playback_info.get("abort_reason") or "aborted"
             break
 
-    task_end_dt = dt.datetime.now()
-    logger.log(
-        "task_end",
-        image_name=(playback_info["video_name"] if playback_info is not None else ""),
-        requested_duration_s=None,
-        flip_time_psychopy_s=None,
-        flip_time_perf_s=None,
-        end_time_perf_s=None,
-        notes=(
-            f"played_videos={played_videos} stop_reason={stop_reason} "
-            f"aborted={int(playback_info['aborted']) if playback_info is not None else 0} "
-            f"dropped_frames={playback_info['dropped_frames'] if playback_info is not None else 0} "
-            f"backend={playback_info['backend_used'] if playback_info is not None else 'n/a'} "
-            f"backend_dropped_frames={playback_info['backend_dropped_frames'] if playback_info is not None else 'n/a'}"
+    msg_logger.log(
+        "INFO",
+        (
+            f"session_end status={stop_reason} played_videos={played_videos} "
+            f"stop_reason={stop_reason} "
+            f"last_video={playback_info['video_name'] if playback_info is not None else ''}"
         ),
     )
-    logger.finalize(build_run_log_filename(resolved_config_name, "play_video_log", when=task_end_dt))
-    try:
-        msg_logger.finalize(build_run_log_filename(resolved_config_name, "play_video_message_log", when=task_end_dt))
-    except Exception:
-        pass
+    session_logs.close()
     try:
         if experimenter_preview is not None:
             experimenter_preview.close()

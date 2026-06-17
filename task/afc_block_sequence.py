@@ -23,7 +23,6 @@ python task/afc_block_sequence.py --config test_configs/csc_shape_config
 
 """
 import argparse
-import datetime as dt
 import sys
 import time
 import random
@@ -38,7 +37,7 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from bin import utils
-from bin.logger import EventLogger, MessageLogger, build_run_log_filename
+from bin.logger import SessionLogBundle
 from bin.config import load_config, validate_config
 
 
@@ -119,28 +118,29 @@ def run_task(
     fix = utils.make_fixation_cross(win, size=32)
     bg_rect = utils.make_bg_rect(win, bg)
 
-    # Prepare loggers
     resolved_config_name = str(config_name).strip() if config_name else "afc_block_sequence"
-    run_started_dt = dt.datetime.now()
-    logger = EventLogger(
-        output_dir,
-        filename=build_run_log_filename(
-            resolved_config_name,
-            "afc_block_sequence_log",
-            when=run_started_dt,
-            in_progress=True,
-        ),
+    behavior_fieldnames = ["trial_num"] + [f"stimulus_{idx}" for idx in range(int(num_afc))] + [
+        "choice_made_index",
+        "choice_touch_x",
+        "choice_touch_y",
+        "choice_reaction_time",
+    ]
+    session_logs = SessionLogBundle(
+        output_root=output_dir,
+        task_name="afc_block_sequence",
+        config_name=resolved_config_name,
+        behavior_fieldnames=behavior_fieldnames,
     )
-    msg_logger = MessageLogger(
-        output_dir,
-        filename=build_run_log_filename(
-            resolved_config_name,
-            "afc_block_sequence_message_log",
-            when=run_started_dt,
-            in_progress=True,
-        ),
-    )
+    logger = session_logs.event_logger
+    msg_logger = session_logs.message_logger
+    behavior_logger = session_logs.behavior_logger
+    if behavior_logger is None:
+        raise RuntimeError("afc_block_sequence requires a behavior logger")
     pylogging.console.setLevel(pylogging.CRITICAL)
+    msg_logger.log(
+        "INFO",
+        f"session_start task=afc_block_sequence config_name={resolved_config_name} session_dir={session_logs.session_dir}",
+    )
 
     # Initialize lgpio if requested
     pigpio_pi = None  # naming kept for compatibility with presenter API
@@ -214,43 +214,31 @@ def run_task(
     # replacement within the block). Blocks are independent.
     blocks = utils.sample_blocks(image_files, num_afc, n_blocks, seed=seed)
 
-    # Task start
-    logger.log("task_start", image_name="", notes=f"n_blocks={n_blocks} num_afc={num_afc}")
+    msg_logger.log("INFO", f"task_ready n_blocks={n_blocks} num_afc={num_afc}")
 
     # main block loop
     aborted_task = False
     for block_idx in range(1, n_blocks + 1):
-        logger.log(
-            "block_start",
-            image_name="",
-            requested_duration_s=None,
-            flip_time_psychopy_s=None,
-            flip_time_perf_s=time.perf_counter(),
-            end_time_perf_s=None,
-            notes=f"block={block_idx}",
-        )
-
-        # Block-start fixation cue: draw fixation on background `isi` seconds
-        # before the first stimulus of the block so the subject has a cue.
         if isi and isi > 0:
             bg_rect.draw()
             if fix is not None:
                 fix.draw()
             cue_flip = win.flip()
             cue_perf = time.perf_counter()
-            logger.log(
-                "block_cue",
-                image_name="",
-                requested_duration_s=isi,
-                flip_time_psychopy_s=cue_flip,
-                flip_time_perf_s=cue_perf,
-                end_time_perf_s=cue_perf + isi,
-                notes=f"block={block_idx}",
+            logger.log_frame_flip(
+                trial_num=block_idx,
+                event="block_cue",
+                timestamp_perf_s=cue_perf,
+                requested_duration=isi_s,
             )
-            core.wait(isi)
+            for _ in range(max(0, isi_fr - 1)):
+                bg_rect.draw()
+                if fix is not None:
+                    fix.draw()
+                win.flip()
 
-        # choose num_afc unique stimuli for this block (pre-sampled)
         block_paths = blocks[block_idx - 1]
+        msg_logger.log("INFO", f"trial_loaded trial_num={block_idx} stimuli={[p.name for p in block_paths]}")
 
         # compute native stim size from preloaded images (we will use same size for all)
         first_p = block_paths[0]
@@ -279,14 +267,9 @@ def run_task(
                 img = block_paths[i - 1].name if i - 1 < len(block_paths) else ""
             except Exception:
                 img = ""
-            try:
-                msg_logger.log("INFO", f"position_assigned block={block_idx} idx={i} image={img} sampled={spos} clamped={cpos}")
-            except Exception:
-                pass
+            msg_logger.log("INFO", f"position_assigned block={block_idx} idx={i} image={img} sampled={spos} clamped={cpos}")
 
-        # Present stimuli for this block using the shared utility which
-        # draws stimuli one-at-a-time, leaves persistent dots, shows the
-        # choice period, and handles abort via escape.
+        trial_meta = {}
         aborted, choice_info = utils.present_block_with_persistent_dots(
             win=win,
             preloaded=preloaded,
@@ -308,52 +291,49 @@ def run_task(
             raspi=bool(raspi and pigpio_pi is not None),
             pigpio_pi=pigpio_pi,
             raspi_pin=raspi_pin,
+            trial_meta=trial_meta,
         )
         if aborted:
             aborted_task = True
+            msg_logger.log("WARN", f"trial_aborted trial_num={block_idx}")
             break
 
-        # Choice logging handled within utils.present_block_with_persistent_dots
-
-        # Inter-block interval (frame-locked)
-        if ibi and ibi > 0:
-            ibi_frames = int(round(float(ibi) * fps))
-            ibi_frames = max(0, ibi_frames)
-            ibi_s = ibi_frames / fps
-            try:
-                msg_logger.log("INFO", f"timing_quantization block={block_idx} ibi={ibi:.6f}s-> {ibi_frames}fr({ibi_s:.6f}s)")
-            except Exception:
-                pass
-            bg_rect.draw()
-            if fix is not None:
-                fix.draw()
-            ibi_flip = win.flip()
-            ibi_perf = time.perf_counter()
-            logger.log(
-                "ibi_start",
-                image_name="",
-                requested_duration_s=ibi_s,
-                flip_time_psychopy_s=ibi_flip,
-                flip_time_perf_s=ibi_perf,
-                end_time_perf_s=ibi_perf + ibi_s,
-                notes=f"after_block={block_idx}",
+        gray_start_perf = trial_meta.get("gray_flip_perf_s", None)
+        if gray_start_perf is not None:
+            logger.log_frame_flip(
+                trial_num=block_idx,
+                event="gray_inter_trial_interval",
+                timestamp_perf_s=float(gray_start_perf),
+                requested_duration=ibi_s if ibi_s > 0 else None,
             )
-            for _f in range(max(0, ibi_frames - 1)):
+
+        behavior_row = {"trial_num": block_idx}
+        for idx, path in enumerate(block_paths):
+            behavior_row[f"stimulus_{idx}"] = path.name
+        chosen_idx = choice_info.get("chosen_index") if choice_info is not None else None
+        behavior_row["choice_made_index"] = int(chosen_idx - 1) if chosen_idx is not None else ""
+        behavior_row["choice_touch_x"] = (
+            f"{float(choice_info['touch_x']):.9f}" if choice_info is not None and choice_info.get("touch_x") is not None else ""
+        )
+        behavior_row["choice_touch_y"] = (
+            f"{float(choice_info['touch_y']):.9f}" if choice_info is not None and choice_info.get("touch_y") is not None else ""
+        )
+        behavior_row["choice_reaction_time"] = (
+            f"{float(choice_info['reaction_time_s']):.9f}" if choice_info is not None and choice_info.get("reaction_time_s") is not None else ""
+        )
+        behavior_logger.writerow(behavior_row)
+
+        if ibi and ibi > 0:
+            msg_logger.log("INFO", f"timing_quantization block={block_idx} ibi={ibi:.6f}s-> {ibi_fr}fr({ibi_s:.6f}s)")
+            for _f in range(max(0, ibi_fr - 1)):
                 bg_rect.draw()
                 if fix is not None:
                     fix.draw()
                 win.flip()
 
-        logger.log("block_end", image_name="", notes=f"block={block_idx}")
-
     # finished
-    task_end_dt = dt.datetime.now()
-    logger.log("task_end", image_name="", notes="aborted" if aborted_task else "done")
-    logger.finalize(build_run_log_filename(resolved_config_name, "afc_block_sequence_log", when=task_end_dt))
-    try:
-        msg_logger.finalize(build_run_log_filename(resolved_config_name, "afc_block_sequence_message_log", when=task_end_dt))
-    except Exception:
-        pass
+    msg_logger.log("INFO", f"session_end status={'aborted' if aborted_task else 'done'}")
+    session_logs.close()
     win.close()
     core.quit()
 

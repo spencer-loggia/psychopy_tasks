@@ -29,15 +29,102 @@ python task/random_image_sequence.py \
 
 Notes
 - Images are preloaded into RAM with `load_image_arrays()` before any flips, then converted into `ImageStim`s tied to the active `Window`. This minimizes disk I/O during timing-critical presentation.
-- Logs are TSV (tab-delimited) at `./logs/image_sequence_log.tsv`. Each row includes:
-  - event name (image_on, image_off, fixation_pre_start, fixation_post_start, abort)
-  - image name
-  - requested duration
-  - `flip_time_psychopy_s` (value returned by `win.flip()`)
-  - `flip_time_perf_s` (high-resolution `time.perf_counter()`)
-  - `end_time_perf_s` (high-resolution `time.perf_counter()` at end event)
 - If `--n` is greater than available images, sampling is done with replacement.
-- In `active_foraging` and the current image-sequence presentation paths, timing-critical visual sections already use frame-counted `win.flip()` loops rather than `core.wait()`. Remaining `core.wait()` usage is limited to non-visual polling or housekeeping paths and is not used to schedule stimulus onsets/offsets.
+- In `active_foraging` and the current image-sequence presentation paths, timing-critical visual sections use frame-counted `win.flip()` loops rather than `core.wait()`. Remaining `core.wait()` usage is limited to non-visual polling or housekeeping paths and is not used to schedule stimulus onsets/offsets.
+
+Logging Output
+--------------
+All tasks now write session outputs into a dedicated run directory under the configured `output_dir` (normally `./logs`):
+
+`L_[YYYYMMDDHHMMSS]_[task_name]_[config_name]`
+
+Each session directory contains:
+
+- `event_log.tsv`
+- `message_log.tsv`
+- `behavior_log.tsv`
+- `event_code_library.json`
+
+The repo also includes a shared checked-in `event_name_library.json`. It is the repo-wide source of truth for event names, codes, event types, and descriptions across tasks. Not every event in that file is used by every task.
+
+`event_log.tsv` is the deployment-facing timing log shared across tasks. Columns:
+
+- `trial_num`
+- `time_since_session_start`
+- `event`
+- `event_code`
+- `event_type`
+- `requested_duration`
+
+Common event-log rules:
+
+- `time_since_session_start` is measured from session start using high-resolution real time (`time.perf_counter()`), not separate PsychoPy and perf-counter columns.
+- `event_type` is one of `frame_flip`, `interaction`, or `signal`.
+- Frame-flip events are logged at the real flip time for the frame that changed the main display.
+- Interaction events are logged as close as possible to the touch / click / key / eye-tracker event itself.
+- Signal events are logged as close as possible to the GPIO or external signal send.
+- Events that have no visible effect or a programmatic zero-duration no-op should not be logged.
+- `requested_duration` is filled only when the code requested a fixed duration for that state or signal. Variable windows such as `choice_start` leave it blank.
+
+`event_code_library.json` is generated per session as the minimal subset of `event_name_library.json` that was actually used in that run. It includes:
+
+- integer event code
+- event name
+- event type
+- verbose description
+
+`message_log.tsv` is the non-timing log shared across tasks. Columns:
+
+- `time_since_session_start`
+- `level`
+- `message`
+
+Allowed levels are `INFO`, `WARN`, and `ERROR`.
+
+`behavior_log.tsv` is task-specific. Every behavior log includes `trial_num` so behavior rows can be aligned with the event log.
+
+Task-Specific Logging
+---------------------
+`active_foraging` is the most fully specified task and defines the current repo-wide target for event semantics.
+
+Active-foraging event naming:
+
+- Sequential runs (`sequential=true`) log option-specific frame-flip events such as `option_1_dot` and `option_1_on`.
+- Simultaneous runs (`sequential=false`) log combined frame-flip events such as `options_dot` and `options_on`.
+- `choice_start` marks the first frame where a choice can be made.
+- `grey_inter_trial_interval` marks the flip to the gray post-choice / inter-trial screen.
+- `cue_touch` and `option_touch` are the current touch interaction events.
+- `trial_start_signal_on/off`, `pump_on/off`, and `buzzer_on/off` are the current signal events.
+- `event_name_library.json` is shared across tasks. For active-foraging sequential runs it defines `option_{n}_dot` and `option_{n}_on` through templates rather than duplicating a separate static entry for each possible option index.
+
+Active-foraging behavior log columns:
+
+- `trial_num`
+- `initiation_time`
+- `reaction_time`
+- `shape_0 ... shape_(k-1)`
+- `color_0 ... color_(k-1)`
+- `lum_0 ... lum_(k-1)`
+- `choice_made_index`
+- `choice_made_color`
+- `choice_made_shape`
+- `choice_made_lum`
+- `reward_level`
+- `choice_touch_x`
+- `choice_touch_y`
+- `choice_reaction_time`
+
+For `active_foraging`:
+
+- `choice_made_index` is zero-based.
+- `reaction_time` is the time from `choice_start` until `option_touch`.
+- `choice_reaction_time` is currently the same quantity as `reaction_time`, retained because it is part of the requested task-specific schema.
+
+Other tasks use the same session packaging and shared schemas but simpler task-specific behavior rows:
+
+- `random_image_sequence` logs one behavior row per presented image.
+- `afc_block_sequence` logs one behavior row per block, including the selected item list and any choice touch.
+- `play_video` logs one behavior row per played clip and only logs video clip start / expected duration / end in the event log, not every frame.
 
 CPU Affinity for `active_foraging`
 ----------------------------------
@@ -48,7 +135,7 @@ The `active_foraging` task treats CPU core `0` as the timing-critical presentati
 - This is necessary because `multiprocessing` children inherit the parent's CPU affinity by default. To prevent workers from inheriting CPU `0`, the parent process is first moved onto the non-zero worker-core pool, the child processes are spawned, and then the parent is pinned back to CPU `0`.
 - For the intended timing behavior on Linux or Raspberry Pi, CPU `0` should also be isolated from normal OS scheduling at the kernel level, for example with `isolcpus`, `nohz_full`, `rcu_nocbs`, or an equivalent cpuset-based setup.
 - Launch the task from a shell or service whose affinity mask still includes CPU `0` and the worker cores. If the launcher has already removed CPU `0` from the process affinity mask, the task cannot pin the main presentation process onto that core.
-- Event and message logs for `active_foraging` are buffered during the timing-critical portion of a trial and flushed only in the between-trial gap after `block_end`, so synchronous disk flushes do not run while the initiation cue, stimulus presentation, touch detection, and reward delivery are active.
+- Event, message, and behavior logs for `active_foraging` are buffered during the timing-critical portion of a trial and flushed only in the between-trial gap, so synchronous disk flushes do not run while the initiation cue, stimulus presentation, touch detection, and reward delivery are active.
 
 Active Foraging Timing
 ----------------------
@@ -75,8 +162,6 @@ Two common `active_foraging` configurations:
   - After each stimulus disappears, its location remains as a memory dot.
   - After the final stimulus, the task enters a dot-only choice period for `choice_time`.
   - `ibi` starts only after the resulting reward or timeout has finished.
-
-Implementation note: in the current sequential-memory branch, the memory dots are created inside the `isi > 0` path. If `sequential=true`, `is_memory=true`, and `isi=0`, the current code does not create the usual pre-item dot cue / persistent memory dots for that block.
 
 Active Foraging Color TSV
 -------------------------

@@ -22,8 +22,6 @@ import argparse
 import sys
 import time
 import random
-import csv
-import datetime as dt
 from pathlib import Path
 from typing import Tuple, Optional, List, Dict, Any
 import pandas as pd
@@ -40,12 +38,7 @@ from bin.affinity import (
     describe_cpu_set,
     set_process_cpu_affinity,
 )
-from bin.logger import (
-    EventLogger,
-    MessageLogger,
-    build_run_log_filename,
-    finalize_output_file,
-)
+from bin.logger import SessionLogBundle
 import numpy as np
 from bin.config import load_config, validate_config
 from bin.screen import (
@@ -201,6 +194,9 @@ def _build_behavior_fieldnames(num_afc: int) -> List[str]:
             "choice_made_shape",
             "choice_made_lum",
             "reward_level",
+            "choice_touch_x",
+            "choice_touch_y",
+            "choice_reaction_time",
         ]
     )
     return fieldnames
@@ -335,18 +331,27 @@ def run_task(
     # First row of colors_tsv is reserved for background gray.
     bg, colors = utils.split_background_from_palette(colors)
 
-    # message logger for warnings/debug/info
-    run_started_at = dt.datetime.now()
     resolved_config_name = str(config_name).strip() if config_name else "active_foraging"
-    msg_logger = MessageLogger(
-        output_dir,
-        filename=build_run_log_filename(
-            resolved_config_name,
-            "active_foraging_message_log",
-            when=run_started_at,
-            in_progress=True,
-        ),
+    behavior_fieldnames = _build_behavior_fieldnames(num_afc)
+    session_logs = SessionLogBundle(
+        output_root=output_dir,
+        task_name="active_foraging",
+        config_name=resolved_config_name,
+        behavior_fieldnames=behavior_fieldnames,
         auto_flush=False,
+    )
+    logger = session_logs.event_logger
+    msg_logger = session_logs.message_logger
+    behavior_logger = session_logs.behavior_logger
+    if behavior_logger is None:
+        raise RuntimeError("active_foraging requires a behavior logger")
+
+    msg_logger.log(
+        "INFO",
+        (
+            f"session_start task=active_foraging config_name={resolved_config_name} "
+            f"session_dir={session_logs.session_dir}"
+        ),
     )
 
     if not sequential:
@@ -384,20 +389,6 @@ def run_task(
                 msg_logger.log("WARN", f"cpu_affinity_spawn_phase_failed {staged_detail}")
     else:
         msg_logger.log("WARN", f"cpu_affinity_unavailable {affinity_plan.get('reason')}")
-
-    # Trial-wise behavior summary
-    output_dir_path = Path(output_dir)
-    output_dir_path.mkdir(parents=True, exist_ok=True)
-    behavior_summary_path = output_dir_path / build_run_log_filename(
-        resolved_config_name,
-        "behavior_summary",
-        when=run_started_at,
-        in_progress=True,
-    )
-    behavior_fieldnames = _build_behavior_fieldnames(num_afc)
-    behavior_fh = behavior_summary_path.open("w", encoding="utf-8", newline="")
-    behavior_writer = csv.DictWriter(behavior_fh, fieldnames=behavior_fieldnames, delimiter="\t")
-    behavior_writer.writeheader()
 
     # Keep TSV order (do not sort): color ordering defines luminance grouping.
     # `colors` excludes the first TSV row, which is used as background.
@@ -794,9 +785,16 @@ def run_task(
 
     def _wait_or_abort(duration_s: float) -> bool:
         if duration_s is None or float(duration_s) <= 0:
-            return bool(experimenter_preview is not None and experimenter_preview.poll())
+            return _poll_experimenter_controls()
         if experimenter_preview is not None:
-            return experimenter_preview.wait(duration_s)
+            deadline = time.perf_counter() + max(0.0, float(duration_s))
+            while time.perf_counter() < deadline:
+                if _poll_experimenter_controls():
+                    return True
+                remaining = deadline - time.perf_counter()
+                if remaining > 0:
+                    time.sleep(min(0.05, remaining))
+            return _poll_experimenter_controls()
         core.wait(duration_s)
         return False
 
@@ -811,17 +809,6 @@ def run_task(
     # Create background rectangle via utility
     bg_rect = utils.make_bg_rect(win, bg)
     _show_preview_idle()
-
-    logger = EventLogger(
-        output_dir,
-        filename=build_run_log_filename(
-            resolved_config_name,
-            "active_foraging_log",
-            when=run_started_at,
-            in_progress=True,
-        ),
-        auto_flush=False,
-    )
     pylogging.console.setLevel(pylogging.CRITICAL)
 
     # Initialize lgpio if requested; do not fail the task if lgpio is unavailable.
@@ -848,6 +835,43 @@ def run_task(
                 pass
     else:
         msg_logger.log("INFO", "raspi=False; GPIO pin signals will not be sent (events will be logged only)")
+
+    def _set_pump_pin(value: int, *, context: str) -> None:
+        if raspi and gpio_chip is not None:
+            try:
+                import lgpio
+
+                lgpio.gpio_write(gpio_chip, pump_pin, int(value))
+            except Exception as e:
+                msg_logger.log("ERROR", f"Failed to set pump_pin {'high' if value else 'low'} during {context}: {e}")
+
+    def _deliver_manual_reward() -> None:
+        pulse_duration = max(0.0, float(pump_pulse_time_seconds))
+        start_perf = time.perf_counter()
+        _set_pump_pin(1, context="manual_reward")
+        logger.log_signal(
+            trial_num=None,
+            event="pump_on",
+            timestamp_perf_s=start_perf,
+            requested_duration=pulse_duration,
+            description="manual_reward",
+        )
+        core.wait(pulse_duration)
+        end_perf = time.perf_counter()
+        _set_pump_pin(0, context="manual_reward")
+        logger.log_signal(
+            trial_num=None,
+            event="pump_off",
+            timestamp_perf_s=end_perf,
+            description="manual_reward",
+        )
+
+    def _poll_experimenter_controls() -> bool:
+        if experimenter_preview is None:
+            return False
+        if experimenter_preview.consume_manual_reward_request():
+            _deliver_manual_reward()
+        return bool(experimenter_preview is not None and experimenter_preview.poll())
 
     # Base color-shape probabilities (luminance sampled uniformly after base pair draw).
     flat_probs = np.array([likelihood[color_idx, shape_idx] for (shape_idx, color_idx) in base_pairs], dtype=float)
@@ -908,62 +932,45 @@ def run_task(
 
     def _flush_between_trials() -> None:
         try:
-            logger.flush()
-        except Exception:
-            pass
-        try:
-            msg_logger.flush()
-        except Exception:
-            pass
-        try:
-            behavior_fh.flush()
+            session_logs.flush()
         except Exception:
             pass
     task_end_notes = "done"
+    ibi_frames = max(0, int(round(float(ibi) * fps)))
+    ibi_s = ibi_frames / fps
+
+    def _fmt_optional(value: Any) -> str:
+        if value == "" or value is None:
+            return ""
+        return f"{float(value):.9f}"
 
     try:
-        # Task start
-        logger.log(
-            "task_start",
-            image_name="",
-            notes=f"n_blocks={n_blocks} num_afc={num_afc} run_indefinitely={run_indefinitely} buffer_len_trials={buffer_len_trials}",
+        msg_logger.log(
+            "INFO",
+            (
+                f"task_ready n_blocks={n_blocks} num_afc={num_afc} "
+                f"run_indefinitely={int(run_indefinitely)} buffer_len_trials={buffer_len_trials}"
+            ),
         )
 
         block_idx = 1
         while True:
-            if experimenter_preview is not None and experimenter_preview.poll():
-                logger.log("abort", image_name="", notes="experimenter_exit")
+            if _poll_experimenter_controls():
                 task_end_notes = "experimenter_exit"
+                msg_logger.log("WARN", "experimenter_exit_before_trial_start")
                 break
             if (not run_indefinitely) and block_idx > n_blocks:
                 break
 
-            # Get next trial from buffer
             payload = buffer_mgr.get_next_trial()
-
             block_paths, block_meta, preloaded = _decode_trial_payload(payload)
             if payload.get("type") == "done":
                 break
             trial_num = int(payload.get("trial_idx", block_idx))
-            trial_start_time = dt.datetime.now().isoformat(timespec="milliseconds")
-            
-            logger.log("block_start", image_name="", requested_duration_s=None, flip_time_psychopy_s=None, flip_time_perf_s=time.perf_counter(), end_time_perf_s=None, notes=f"block={block_idx}")
-
-            # No separate pre-block fixation/ISI wait: per-stimulus pre-dot ISI is handled inside the utility.
-            for opt_idx, ((shape_id, color_id), (shape_idx, base_color_idx, lum_idx)) in enumerate(zip(block_paths, block_meta), start=1):
-                logger.log(
-                    "stimulus_selected",
-                    image_name=str((shape_id, color_id)),
-                    requested_duration_s=None,
-                    flip_time_psychopy_s=None,
-                    flip_time_perf_s=time.perf_counter(),
-                    end_time_perf_s=None,
-                    notes=(
-                        f"block={block_idx} idx={opt_idx} shape_id={shape_id} shape_idx={shape_idx} "
-                        f"color_id={color_id} base_color_idx={base_color_idx} "
-                        f"luminance_level={lum_idx + 1} lum_idx={lum_idx}"
-                    ),
-                )
+            msg_logger.log(
+                "INFO",
+                f"trial_loaded trial_num={trial_num} block_idx={block_idx} block_meta={block_meta}",
+            )
 
             first_pair = block_paths[0]
             stim_size = _stim_size_from_preloaded(preloaded, first_pair)
@@ -984,10 +991,7 @@ def run_task(
             )
 
             for i, (spos, cpos) in enumerate(zip(sampled_positions, positions), start=1):
-                try:
-                    msg_logger.log("INFO", f"position_assigned block={block_idx} idx={i} sampled={spos} clamped={cpos}")
-                except Exception:
-                    pass
+                msg_logger.log("INFO", f"position_assigned block={block_idx} idx={i} sampled={spos} clamped={cpos}")
 
             trial_meta: Dict[str, Any] = {}
             _show_preview_idle()
@@ -1018,15 +1022,25 @@ def run_task(
                 choice_hitbox_scale=1.25 if touchscreen else 1.0,
                 trial_meta=trial_meta,
                 experimenter_preview=experimenter_preview,
-                external_abort_checker=(experimenter_preview.poll if experimenter_preview is not None else None),
+                external_abort_checker=_poll_experimenter_controls,
                 scene_main_size=effective_win_size,
+                event_profile="active_foraging",
             )
             if aborted:
-                if task_end_notes == "done" and experimenter_preview is not None and experimenter_preview.poll():
+                if task_end_notes == "done" and _poll_experimenter_controls():
                     task_end_notes = "experimenter_exit"
+                    msg_logger.log("WARN", f"experimenter_exit_during_trial trial_num={trial_num}")
                 elif task_end_notes == "done":
                     task_end_notes = "aborted"
+                    msg_logger.log("WARN", f"trial_aborted trial_num={trial_num}")
                 break
+
+            chosen_idx_row_1based = choice_info.get("chosen_index") if choice_info is not None else None
+            chosen_idx_row = int(chosen_idx_row_1based - 1) if chosen_idx_row_1based is not None else ""
+            chosen_pair_row = block_paths[chosen_idx_row_1based - 1] if chosen_idx_row_1based is not None else None
+            reward_level_row = reward_map.get(chosen_pair_row, "") if chosen_pair_row is not None else ""
+            num_pulses = 0
+            apply_timeout = 0
 
             if choice_info is not None:
                 abort_requested = False
@@ -1034,17 +1048,12 @@ def run_task(
                 chosen_pair = block_paths[chosen_idx - 1]
                 reward_level = reward_map.get(chosen_pair, 0)
                 chosen_shape_idx, chosen_color_idx, chosen_lum_idx = block_meta[chosen_idx - 1]
+                reward_level_row = reward_level
                 reward_counts[int(reward_level)] = reward_counts.get(int(reward_level), 0) + 1
-
-                logger.log(
-                    "reward_determined",
-                    image_name=str(chosen_pair),
-                    requested_duration_s=None,
-                    flip_time_psychopy_s=None,
-                    flip_time_perf_s=time.perf_counter(),
-                    end_time_perf_s=None,
-                    notes=(
-                        f"block={block_idx} idx={chosen_idx} pair={chosen_pair} "
+                msg_logger.log(
+                    "INFO",
+                    (
+                        f"choice_registered trial_num={trial_num} idx={chosen_idx} pair={chosen_pair} "
                         f"base_color_idx={chosen_color_idx} shape_idx={chosen_shape_idx} "
                         f"lum_idx={chosen_lum_idx} reward_level={reward_level}"
                     ),
@@ -1057,117 +1066,74 @@ def run_task(
                     reward_level=reward_level,
                 )
 
-                num_pulses = 0
                 if reward_to_pulse_map is not None:
                     num_pulses = reward_to_pulse_map.get(str(reward_level), 0)
+                if reward_to_timeout_map is not None:
+                    apply_timeout = reward_to_timeout_map.get(str(reward_level), 0)
 
+                gray_duration_requested = ibi_s
                 if num_pulses > 0:
-                    if pump_delay_time > 0:
-                        pump_delay_start_perf = time.perf_counter()
-                        logger.log(
-                            "pump_delay_start",
-                            image_name="",
-                            requested_duration_s=pump_delay_time,
-                            flip_time_psychopy_s=None,
-                            flip_time_perf_s=pump_delay_start_perf,
-                            end_time_perf_s=None,
-                            notes=f"block={block_idx} reward_level={reward_level}",
-                        )
-                        if _wait_or_abort(pump_delay_time):
-                            logger.log("abort", image_name="", notes="experimenter_exit")
-                            task_end_notes = "experimenter_exit"
-                            abort_requested = True
-                        pump_delay_end_perf = time.perf_counter()
-                        logger.log(
-                            "pump_delay_end",
-                            image_name="",
-                            requested_duration_s=pump_delay_time,
-                            flip_time_psychopy_s=None,
-                            flip_time_perf_s=pump_delay_end_perf,
-                            end_time_perf_s=None,
-                            notes=f"block={block_idx} reward_level={reward_level}",
-                        )
+                    gray_duration_requested += max(0.0, float(pump_delay_time))
+                    gray_duration_requested += float(num_pulses * pump_pulse_time_seconds)
+                    gray_duration_requested += float(max(0, num_pulses - 1) * pump_pulse_time_seconds)
+                if apply_timeout > 0:
+                    gray_duration_requested += float(timeout_duration_seconds)
+            else:
+                abort_requested = False
+                gray_duration_requested = ibi_s
 
-                    if abort_requested:
-                        break
+            gray_start_perf = trial_meta.get("gray_flip_perf_s", None)
+            if gray_start_perf is not None:
+                logger.log_frame_flip(
+                    trial_num=trial_num,
+                    event="grey_inter_trial_interval",
+                    timestamp_perf_s=float(gray_start_perf),
+                    requested_duration=gray_duration_requested if gray_duration_requested > 0 else None,
+                )
 
-                    for pulse_num in range(1, num_pulses + 1):
-                        pulse_start_perf = time.perf_counter()
-                        if raspi and gpio_chip is not None:
-                            try:
-                                import lgpio
-                                lgpio.gpio_write(gpio_chip, pump_pin, 1)
-                            except Exception as e:
-                                msg_logger.log("ERROR", f"Failed to set pump_pin high: {e}")
-
-                        logger.log(
-                            "pump_pulse_start",
-                            image_name="",
-                            requested_duration_s=pump_pulse_time_seconds,
-                            flip_time_psychopy_s=None,
-                            flip_time_perf_s=pulse_start_perf,
-                            end_time_perf_s=None,
-                            notes=f"block={block_idx} reward_level={reward_level} pulse={pulse_num}/{num_pulses}",
-                        )
-                        if _wait_or_abort(pump_pulse_time_seconds):
-                            logger.log("abort", image_name="", notes="experimenter_exit")
-                            task_end_notes = "experimenter_exit"
-                            abort_requested = True
-
-                        pulse_end_perf = time.perf_counter()
-                        if raspi and gpio_chip is not None:
-                            try:
-                                import lgpio
-                                lgpio.gpio_write(gpio_chip, pump_pin, 0)
-                            except Exception as e:
-                                msg_logger.log("ERROR", f"Failed to set pump_pin low: {e}")
-
-                        logger.log(
-                            "pump_pulse_end",
-                            image_name="",
-                            requested_duration_s=pump_pulse_time_seconds,
-                            flip_time_psychopy_s=None,
-                            flip_time_perf_s=pulse_end_perf,
-                            end_time_perf_s=None,
-                            notes=f"block={block_idx} reward_level={reward_level} pulse={pulse_num}/{num_pulses}",
-                        )
-                        if abort_requested:
-                            break
-
-                        if pulse_num < num_pulses:
-                            interval_start_perf = time.perf_counter()
-                            logger.log(
-                                "pump_inter_pulse_interval_start",
-                                image_name="",
-                                requested_duration_s=pump_pulse_time_seconds,
-                                flip_time_psychopy_s=None,
-                                flip_time_perf_s=interval_start_perf,
-                                end_time_perf_s=None,
-                                notes=f"block={block_idx} reward_level={reward_level} after_pulse={pulse_num}/{num_pulses}",
-                            )
-                            if _wait_or_abort(pump_pulse_time_seconds):
-                                logger.log("abort", image_name="", notes="experimenter_exit")
-                                task_end_notes = "experimenter_exit"
-                                abort_requested = True
-                            interval_end_perf = time.perf_counter()
-                            logger.log(
-                                "pump_inter_pulse_interval_end",
-                                image_name="",
-                                requested_duration_s=pump_pulse_time_seconds,
-                                flip_time_psychopy_s=None,
-                                flip_time_perf_s=interval_end_perf,
-                                end_time_perf_s=None,
-                                notes=f"block={block_idx} reward_level={reward_level} after_pulse={pulse_num}/{num_pulses}",
-                            )
-                            if abort_requested:
-                                break
+            if choice_info is not None:
+                if num_pulses > 0 and pump_delay_time > 0:
+                    if _wait_or_abort(pump_delay_time):
+                        task_end_notes = "experimenter_exit"
+                        msg_logger.log("WARN", f"experimenter_exit_during_pump_delay trial_num={trial_num}")
+                        abort_requested = True
 
                 if abort_requested:
                     break
 
-                apply_timeout = 0
-                if reward_to_timeout_map is not None:
-                    apply_timeout = reward_to_timeout_map.get(str(reward_level), 0)
+                for pulse_num in range(1, num_pulses + 1):
+                    pulse_start_perf = time.perf_counter()
+                    _set_pump_pin(1, context="task_reward")
+                    logger.log_signal(
+                        trial_num=trial_num,
+                        event="pump_on",
+                        timestamp_perf_s=pulse_start_perf,
+                        requested_duration=pump_pulse_time_seconds,
+                    )
+                    if _wait_or_abort(pump_pulse_time_seconds):
+                        task_end_notes = "experimenter_exit"
+                        msg_logger.log("WARN", f"experimenter_exit_during_pump trial_num={trial_num} pulse={pulse_num}")
+                        abort_requested = True
+
+                    pulse_end_perf = time.perf_counter()
+                    _set_pump_pin(0, context="task_reward")
+                    logger.log_signal(
+                        trial_num=trial_num,
+                        event="pump_off",
+                        timestamp_perf_s=pulse_end_perf,
+                    )
+                    if abort_requested:
+                        break
+
+                    if pulse_num < num_pulses:
+                        if _wait_or_abort(pump_pulse_time_seconds):
+                            task_end_notes = "experimenter_exit"
+                            msg_logger.log("WARN", f"experimenter_exit_during_inter_pulse_interval trial_num={trial_num} pulse={pulse_num}")
+                            abort_requested = True
+                            break
+
+                if abort_requested:
+                    break
 
                 if apply_timeout > 0:
                     timeout_start_perf = time.perf_counter()
@@ -1177,19 +1143,15 @@ def run_task(
                             lgpio.gpio_write(gpio_chip, buzz_pin, 1)
                         except Exception as e:
                             msg_logger.log("ERROR", f"Failed to set buzz_pin high: {e}")
-
-                    logger.log(
-                        "timeout_start",
-                        image_name="",
-                        requested_duration_s=timeout_duration_seconds,
-                        flip_time_psychopy_s=None,
-                        flip_time_perf_s=timeout_start_perf,
-                        end_time_perf_s=None,
-                        notes=f"block={block_idx} reward_level={reward_level}",
+                    logger.log_signal(
+                        trial_num=trial_num,
+                        event="buzzer_on",
+                        timestamp_perf_s=timeout_start_perf,
+                        requested_duration=timeout_duration_seconds,
                     )
                     if _wait_or_abort(timeout_duration_seconds):
-                        logger.log("abort", image_name="", notes="experimenter_exit")
                         task_end_notes = "experimenter_exit"
+                        msg_logger.log("WARN", f"experimenter_exit_during_timeout trial_num={trial_num}")
                         abort_requested = True
 
                     timeout_end_perf = time.perf_counter()
@@ -1199,35 +1161,32 @@ def run_task(
                             lgpio.gpio_write(gpio_chip, buzz_pin, 0)
                         except Exception as e:
                             msg_logger.log("ERROR", f"Failed to set buzz_pin low: {e}")
-
-                    logger.log(
-                        "timeout_end",
-                        image_name="",
-                        requested_duration_s=timeout_duration_seconds,
-                        flip_time_psychopy_s=None,
-                        flip_time_perf_s=timeout_end_perf,
-                        end_time_perf_s=None,
-                        notes=f"block={block_idx} reward_level={reward_level}",
+                    logger.log_signal(
+                        trial_num=trial_num,
+                        event="buzzer_off",
+                        timestamp_perf_s=timeout_end_perf,
                     )
 
                 if abort_requested or task_end_notes != "done":
                     break
 
-            chosen_idx_row_1based = choice_info.get("chosen_index") if choice_info is not None else None
-            chosen_idx_row = int(chosen_idx_row_1based - 1) if chosen_idx_row_1based is not None else ""
-            chosen_pair_row = block_paths[chosen_idx_row_1based - 1] if chosen_idx_row_1based is not None else None
-            reward_level_row = reward_map.get(chosen_pair_row, "") if chosen_pair_row is not None else ""
-            rt_row = choice_info.get("reaction_time_s") if choice_info is not None else ""
+            if _poll_experimenter_controls():
+                task_end_notes = "experimenter_exit"
+                msg_logger.log("WARN", f"experimenter_exit_before_behavior_log trial_num={trial_num}")
+                break
 
             behavior_row: Dict[str, Any] = {
                 "trial_num": trial_num,
-                "initiation_time": trial_meta.get("initiation_time_iso", trial_start_time),
-                "reaction_time": f"{float(rt_row):.6f}" if rt_row != "" and rt_row is not None else "",
+                "initiation_time": _fmt_optional(trial_meta.get("initiation_time_s")),
+                "reaction_time": _fmt_optional(choice_info.get("reaction_time_s") if choice_info is not None else ""),
                 "choice_made_index": chosen_idx_row,
                 "choice_made_color": "",
                 "choice_made_shape": "",
                 "choice_made_lum": "",
                 "reward_level": reward_level_row,
+                "choice_touch_x": _fmt_optional(choice_info.get("touch_x") if choice_info is not None else ""),
+                "choice_touch_y": _fmt_optional(choice_info.get("touch_y") if choice_info is not None else ""),
+                "choice_reaction_time": _fmt_optional(choice_info.get("reaction_time_s") if choice_info is not None else ""),
             }
             for opt_idx, (shape_idx, base_color_idx, lum_idx) in enumerate(block_meta):
                 behavior_row[f"shape_{opt_idx}"] = int(shape_idx)
@@ -1240,29 +1199,16 @@ def run_task(
                 behavior_row["choice_made_color"] = int(chosen_color_row)
                 behavior_row["choice_made_lum"] = int(chosen_lum_row)
 
-            behavior_writer.writerow(behavior_row)
+            behavior_logger.writerow(behavior_row)
 
-            if ibi and ibi > 0:
-                ibi_frames = int(round(float(ibi) * fps))
-                ibi_frames = max(0, ibi_frames)
-                ibi_s = ibi_frames / fps
-                try:
-                    msg_logger.log("INFO", f"timing_quantization block={block_idx} ibi={ibi:.6f}s-> {ibi_frames}fr({ibi_s:.6f}s)")
-                except Exception:
-                    pass
-
+            if ibi_frames > 0:
+                post_choice_delay_present = (choice_info is not None) and ((num_pulses > 0) or (apply_timeout > 0))
+                hold_frames = ibi_frames if post_choice_delay_present else max(0, ibi_frames - 1)
                 _show_preview_idle()
-                bg_rect.draw()
-                if fix is not None:
-                    fix.draw()
-                ibi_flip = win.flip()
-                ibi_perf = time.perf_counter()
-                logger.log("ibi_start", image_name="", requested_duration_s=ibi_s, flip_time_psychopy_s=ibi_flip, flip_time_perf_s=ibi_perf, end_time_perf_s=ibi_perf + ibi_s, notes=f"after_block={block_idx}")
-
-                for _f in range(max(0, ibi_frames - 1)):
-                    if experimenter_preview is not None and experimenter_preview.poll():
-                        logger.log("abort", image_name="", notes="experimenter_exit")
+                for _ in range(hold_frames):
+                    if _poll_experimenter_controls():
                         task_end_notes = "experimenter_exit"
+                        msg_logger.log("WARN", f"experimenter_exit_during_ibi trial_num={trial_num}")
                         break
                     bg_rect.draw()
                     if fix is not None:
@@ -1271,35 +1217,19 @@ def run_task(
                 if task_end_notes != "done":
                     break
 
-            logger.log("block_end", image_name="", notes=f"block={block_idx}")
             _flush_between_trials()
             block_idx += 1
 
     finally:
         _flush_between_trials()
-        # Clean up trial buffer manager
         try:
             buffer_mgr.close()
         except Exception:
             pass
-        try:
-            behavior_fh.close()
-        except Exception:
-            pass
 
-    # Task end
-    task_end_dt = dt.datetime.now()
-    logger.log("task_end", image_name="", notes=task_end_notes)
-    logger.finalize(build_run_log_filename(resolved_config_name, "active_foraging_log", when=task_end_dt))
+    msg_logger.log("INFO", f"session_end status={task_end_notes}")
     try:
-        msg_logger.finalize(build_run_log_filename(resolved_config_name, "active_foraging_message_log", when=task_end_dt))
-    except Exception:
-        pass
-    try:
-        behavior_summary_path = finalize_output_file(
-            behavior_summary_path,
-            build_run_log_filename(resolved_config_name, "behavior_summary", when=task_end_dt),
-        )
+        session_logs.close()
     except Exception:
         pass
     try:

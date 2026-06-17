@@ -849,22 +849,22 @@ def run_task(
         pulse_duration = max(0.0, float(pump_pulse_time_seconds))
         start_perf = time.perf_counter()
         _set_pump_pin(1, context="manual_reward")
-        logger.log_signal(
-            trial_num=None,
-            event="pump_on",
-            timestamp_perf_s=start_perf,
-            requested_duration=pulse_duration,
-            description="manual_reward",
-        )
-        core.wait(pulse_duration)
-        end_perf = time.perf_counter()
-        _set_pump_pin(0, context="manual_reward")
-        logger.log_signal(
-            trial_num=None,
-            event="pump_off",
-            timestamp_perf_s=end_perf,
-            description="manual_reward",
-        )
+        try:
+            logger.log_signal(
+                trial_num=None,
+                event="pump_on",
+                timestamp_perf_s=start_perf,
+                requested_duration=pulse_duration,
+            )
+            core.wait(pulse_duration)
+        finally:
+            end_perf = time.perf_counter()
+            _set_pump_pin(0, context="manual_reward")
+            logger.log_signal(
+                trial_num=None,
+                event="pump_off",
+                timestamp_perf_s=end_perf,
+            )
 
     def _poll_experimenter_controls() -> bool:
         if experimenter_preview is None:

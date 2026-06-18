@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 import tkinter as tk
 from tkinter import messagebox
-import urllib.request, subprocess
+import urllib.request
 from email.utils import parsedate_to_datetime
 
 _project_root = Path(__file__).resolve().parents[1]
@@ -24,6 +24,8 @@ from bin.screen import load_screen_config, place_tk_window_on_screen, resolve_in
 IDLE_CLEANUP_MS = 30 * 60 * 1000
 BUTTON_BG = "#f7f7f7"
 BUTTON_ACTIVE_BG = "#d9d9d9"
+SHUTDOWN_BUTTON_BG = "#b91c1c"
+SHUTDOWN_BUTTON_ACTIVE_BG = "#7f1d1d"
 
 
 def parse_args() -> argparse.Namespace:
@@ -255,6 +257,8 @@ class TouchInterfaceApp:
 
         if len(self.page_stack) == 1:
             self._create_desktop_button(row_idx)
+            row_idx += 1
+            self._create_shutdown_button(row_idx)
         else:
             self._create_back_button(row_idx)
 
@@ -285,6 +289,24 @@ class TouchInterfaceApp:
         )
         button.grid(row=row_idx, column=0, sticky="ew", pady=10, padx=10)
 
+    def _create_shutdown_button(self, row_idx: int) -> None:
+        button_kwargs = self._button_kwargs()
+        button_kwargs.update(
+            {
+                "bg": SHUTDOWN_BUTTON_BG,
+                "fg": "white",
+                "activebackground": SHUTDOWN_BUTTON_ACTIVE_BG,
+                "activeforeground": "white",
+            }
+        )
+        button = tk.Button(
+            self.button_container,
+            text="Shutdown",
+            command=self._shutdown_system,
+            **button_kwargs,
+        )
+        button.grid(row=row_idx, column=0, sticky="ew", pady=10, padx=10)
+
     def _create_back_button(self, row_idx: int) -> None:
         button = tk.Button(
             self.button_container,
@@ -293,6 +315,41 @@ class TouchInterfaceApp:
             **self._button_kwargs(),
         )
         button.grid(row=row_idx, column=0, sticky="ew", pady=10, padx=10)
+
+    def _shutdown_command(self) -> list[str]:
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            return ["shutdown", "-h", "now"]
+        return ["sudo", "-n", "shutdown", "-h", "now"]
+
+    def _shutdown_system(self) -> None:
+        if self.task_active:
+            self.status_var.set("Cannot shut down while a task is running")
+            return
+
+        self.status_var.set("Cleaning up before shutdown...")
+        self.root.update_idletasks()
+
+        try:
+            self.cleanup()
+            subprocess.run(
+                self._shutdown_command(),
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or str(exc)).strip()
+            self.status_var.set("Shutdown failed")
+            messagebox.showerror("Shutdown Error", detail)
+            return
+        except Exception as exc:
+            self.status_var.set("Shutdown failed")
+            messagebox.showerror("Shutdown Error", str(exc))
+            return
+
+        self.status_var.set("Shutdown requested")
+        self.root.after(1000, self.root.destroy)
 
     def _build_command(self, task_name: str, task_cfg: Dict[str, Any]) -> subprocess.CompletedProcess:
         launch_value = task_cfg.get("launch")

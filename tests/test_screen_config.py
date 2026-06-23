@@ -7,6 +7,7 @@ from bin.screen import (
     SECONDARY_SCREEN_ENV,
     ScreenGeometry,
     compute_centered_aspect_fit,
+    get_psychopy_window_kwargs,
     load_screen_config,
     scale_scene_point,
     select_screen,
@@ -75,6 +76,26 @@ class ScreenConfigTests(unittest.TestCase):
 
         self.assertEqual(select_screen(screens, "HDMI-1", role="main").index, 0)
         self.assertEqual(select_screen(screens, "HDMI-2", role="experimenter").index, 1)
+
+    def test_linux_psychopy_window_uses_virtual_desktop_position(self):
+        screen = ScreenGeometry(index=1, x=800, y=0, width=2560, height=1600, name="HDMI-A-2")
+
+        with patch("bin.screen.sys.platform", "linux"):
+            kwargs = get_psychopy_window_kwargs(screen, fullscreen=True)
+
+        self.assertNotIn("screen", kwargs)
+        self.assertEqual(kwargs["fullscr"], False)
+        self.assertEqual(kwargs["size"], (2560, 1600))
+        self.assertEqual(kwargs["pos"], (800, 0))
+        self.assertEqual(kwargs["allowGUI"], False)
+
+    def test_non_linux_psychopy_fullscreen_uses_screen_index(self):
+        screen = ScreenGeometry(index=1, x=800, y=0, width=2560, height=1600, name="HDMI-A-2")
+
+        with patch("bin.screen.sys.platform", "darwin"):
+            kwargs = get_psychopy_window_kwargs(screen, fullscreen=True)
+
+        self.assertEqual(kwargs, {"screen": 1, "fullscr": True})
 
     def test_centered_aspect_fit_preserves_main_aspect_ratio(self):
         layout = compute_centered_aspect_fit((1920, 1080), (1000, 500))

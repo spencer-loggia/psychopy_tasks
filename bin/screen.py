@@ -481,27 +481,36 @@ def get_psychopy_window_kwargs(
     size: Optional[Sequence[int]] = None,
 ) -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {}
-    if screen_info is not None:
+    has_geometry = (
+        screen_info is not None
+        and int(screen_info.width) > 0
+        and int(screen_info.height) > 0
+    )
+    use_virtual_position = bool(has_geometry and sys.platform.startswith("linux"))
+    if screen_info is not None and not use_virtual_position:
         kwargs["screen"] = int(screen_info.index)
-
-    if fullscreen:
-        kwargs["fullscr"] = True
-        return kwargs
 
     if size is not None:
         resolved_size = (int(size[0]), int(size[1]))
-    elif screen_info is not None and int(screen_info.width) > 0 and int(screen_info.height) > 0:
+    elif has_geometry:
         resolved_size = (int(screen_info.width), int(screen_info.height))
     else:
         resolved_size = (1024, 768)
 
+    if fullscreen and not use_virtual_position:
+        kwargs["fullscr"] = True
+        return kwargs
+
     kwargs["size"] = resolved_size
     kwargs["fullscr"] = False
-    if screen_info is not None and int(screen_info.width) > 0 and int(screen_info.height) > 0:
-        # When `screen` is set, PsychoPy places the window on that physical display.
-        # `pos` should therefore be local to that display, not the virtual desktop.
+    if fullscreen and use_virtual_position:
+        kwargs["allowGUI"] = False
+    if has_geometry:
         x = max(0, (int(screen_info.width) - int(resolved_size[0])) // 2)
         y = max(0, (int(screen_info.height) - int(resolved_size[1])) // 2)
+        if use_virtual_position:
+            x += int(screen_info.x)
+            y += int(screen_info.y)
         kwargs["pos"] = (x, y)
     return kwargs
 
@@ -868,7 +877,6 @@ def _experimenter_preview_process(
 ) -> None:
     from psychopy import core, event, visual
     preview_canvas_size = resolve_screen_canvas_size(screen_info)
-    preview_pos = (0, 0)
     outside_bg_rgb = (30, 30, 30)
     preview_outline_rgb = (150, 150, 150)
 
@@ -1083,10 +1091,7 @@ def _experimenter_preview_process(
         exit_button_text.draw()
 
     win = visual.Window(
-        size=preview_canvas_size,
-        pos=preview_pos,
-        fullscr=False,
-        screen=int(screen_info.index),
+        **get_psychopy_window_kwargs(screen_info, fullscreen=False, size=preview_canvas_size),
         units="pix",
         colorSpace="rgb",
         color=_preview_rgb255_to_psychopy((0, 0, 0)),

@@ -4,6 +4,7 @@ from interface.rig_mode import (
     PORTABLE_MODE_VALUE,
     RIG_MODE_VALUE,
     mode_button_label,
+    mode_command_for_target_mode,
     mode_script_for_target_mode,
     normalize_is_rig,
     target_mode_for_current_mode,
@@ -29,6 +30,12 @@ class TouchInterfaceModeTests(unittest.TestCase):
     def test_target_mode_selects_expected_desktop_script(self):
         self.assertEqual(mode_script_for_target_mode(RIG_MODE_VALUE).name, "switch_to_rig_mode.sh")
         self.assertEqual(mode_script_for_target_mode(PORTABLE_MODE_VALUE).name, "switch_to_portable_mode.sh")
+
+    def test_target_mode_runs_script_with_sudo(self):
+        command = mode_command_for_target_mode(RIG_MODE_VALUE)
+
+        self.assertEqual(command[:3], ["sudo", "-n", "bash"])
+        self.assertEqual(command[3].split("/")[-1], "switch_to_rig_mode.sh")
 
 
 if __name__ == "__main__":

@@ -36,3 +36,7 @@ def mode_script_for_target_mode(target_mode: str) -> Path:
     if target_mode == PORTABLE_MODE_VALUE:
         return SWITCH_TO_PORTABLE_SCRIPT
     raise ValueError(f"Unknown rig mode value: {target_mode}")
+
+
+def mode_command_for_target_mode(target_mode: str) -> list[str]:
+    return ["sudo", "-n", "bash", str(mode_script_for_target_mode(target_mode))]

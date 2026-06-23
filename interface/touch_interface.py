@@ -30,6 +30,7 @@ from interface.rig_mode import (
     PORTABLE_MODE_VALUE,
     SWITCH_TO_PORTABLE_SCRIPT,
     mode_button_label,
+    mode_command_for_target_mode,
     mode_script_for_target_mode,
     normalize_is_rig,
     target_mode_for_current_mode,
@@ -232,7 +233,7 @@ class TouchInterfaceApp:
 
         try:
             subprocess.run(
-                ["bash", str(script_path)],
+                mode_command_for_target_mode(target_mode),
                 check=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

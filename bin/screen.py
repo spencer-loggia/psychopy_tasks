@@ -76,16 +76,24 @@ def load_screen_config(
         raise ValueError("Config field 'screens' must be a JSON object")
 
     main_value = cli_main
+    main_is_null = False
     if main_value is None:
+        main_is_null = "main" in screens_cfg and screens_cfg["main"] is None
         main_value = screens_cfg.get("main", cfg.get("main_screen"))
     if main_value is None:
         main_value = os.environ.get(MAIN_SCREEN_ENV)
+        if main_is_null and (main_value is None or not str(main_value).strip()):
+            raise ValueError(f"screens.main is null, but {MAIN_SCREEN_ENV} is not set")
 
     experimenter_value = cli_experimenter
+    experimenter_is_null = False
     if experimenter_value is None:
+        experimenter_is_null = "experimenter" in screens_cfg and screens_cfg["experimenter"] is None
         experimenter_value = screens_cfg.get("experimenter", cfg.get("experimenter_screen"))
     if experimenter_value is None:
         experimenter_value = os.environ.get(SECONDARY_SCREEN_ENV)
+        if experimenter_is_null and (experimenter_value is None or not str(experimenter_value).strip()):
+            raise ValueError(f"screens.experimenter is null, but {SECONDARY_SCREEN_ENV} is not set")
 
     return {
         "main": parse_screen_selector(main_value, "screens.main"),

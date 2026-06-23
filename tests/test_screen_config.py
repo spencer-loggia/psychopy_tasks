@@ -37,6 +37,12 @@ class ScreenConfigTests(unittest.TestCase):
         ):
             self.assertEqual(load_screen_config(cfg), {"main": 1, "experimenter": "DSI-2"})
 
+    def test_null_screen_values_require_environment(self):
+        cfg = {"screens": {"main": None, "experimenter": None}}
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(ValueError):
+                load_screen_config(cfg)
+
     def test_centered_aspect_fit_preserves_main_aspect_ratio(self):
         layout = compute_centered_aspect_fit((1920, 1080), (1000, 500))
 

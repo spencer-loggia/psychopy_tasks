@@ -6,9 +6,11 @@ from bin.screen import (
     MAIN_SCREEN_ENV,
     SECONDARY_SCREEN_ENV,
     ScreenGeometry,
+    _parse_xrandr_query,
     compute_centered_aspect_fit,
     get_psychopy_window_kwargs,
     load_screen_config,
+    resolve_scene_size,
     scale_scene_point,
     select_screen,
 )
@@ -96,6 +98,34 @@ class ScreenConfigTests(unittest.TestCase):
             kwargs = get_psychopy_window_kwargs(screen, fullscreen=True)
 
         self.assertEqual(kwargs, {"screen": 1, "fullscr": True})
+
+    def test_xrandr_query_preserves_rotation_and_native_size(self):
+        screens = _parse_xrandr_query(
+            "HDMI-2 connected primary 1600x2560+0+0 right "
+            "(normal left inverted right x axis y axis) 256mm x 160mm\n"
+            "HDMI-1 connected 1920x1080+1600+0 "
+            "(normal left inverted right x axis y axis) 531mm x 299mm\n"
+        )
+
+        main = select_screen(screens, "HDMI-2", role="main")
+        self.assertEqual((main.width, main.height), (1600, 2560))
+        self.assertEqual(main.rotation, "right")
+        self.assertEqual((main.native_width, main.native_height), (2560, 1600))
+
+    def test_fullscreen_scene_size_uses_native_rotated_panel_size(self):
+        screen = ScreenGeometry(
+            index=0,
+            x=0,
+            y=0,
+            width=1600,
+            height=2560,
+            name="HDMI-2",
+            rotation="right",
+            native_width=2560,
+            native_height=1600,
+        )
+
+        self.assertEqual(resolve_scene_size(screen, fullscreen=True), (2560, 1600))
 
     def test_centered_aspect_fit_preserves_main_aspect_ratio(self):
         layout = compute_centered_aspect_fit((1920, 1080), (1000, 500))

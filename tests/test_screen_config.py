@@ -5,9 +5,11 @@ from unittest.mock import patch
 from bin.screen import (
     MAIN_SCREEN_ENV,
     SECONDARY_SCREEN_ENV,
+    ScreenGeometry,
     compute_centered_aspect_fit,
     load_screen_config,
     scale_scene_point,
+    select_screen,
 )
 
 
@@ -42,6 +44,37 @@ class ScreenConfigTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(ValueError):
                 load_screen_config(cfg)
+
+    def test_secondary_alias_inherits_secondary_screen_environment(self):
+        cfg = {"screens": {"main": None, "secondary": None}}
+        with patch.dict(
+            os.environ,
+            {
+                MAIN_SCREEN_ENV: "HDMI-2",
+                SECONDARY_SCREEN_ENV: "HDMI-1",
+            },
+        ):
+            self.assertEqual(
+                load_screen_config(cfg),
+                {"main": "HDMI-2", "experimenter": "HDMI-1"},
+            )
+
+    def test_top_level_secondary_screen_alias_matches_experimenter_screen(self):
+        cfg = {"main_screen": "HDMI-2", "secondary_screen": "HDMI-1"}
+
+        self.assertEqual(
+            load_screen_config(cfg),
+            {"main": "HDMI-2", "experimenter": "HDMI-1"},
+        )
+
+    def test_hdmi_names_do_not_cross_match_by_off_by_one_alias(self):
+        screens = [
+            ScreenGeometry(index=0, x=0, y=0, width=800, height=480, name="HDMI-A-1"),
+            ScreenGeometry(index=1, x=800, y=0, width=800, height=480, name="HDMI-A-2"),
+        ]
+
+        self.assertEqual(select_screen(screens, "HDMI-1", role="main").index, 0)
+        self.assertEqual(select_screen(screens, "HDMI-2", role="experimenter").index, 1)
 
     def test_centered_aspect_fit_preserves_main_aspect_ratio(self):
         layout = compute_centered_aspect_fit((1920, 1080), (1000, 500))

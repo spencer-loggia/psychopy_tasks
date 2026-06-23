@@ -88,8 +88,12 @@ def load_screen_config(
     experimenter_value = cli_experimenter
     experimenter_is_null = False
     if experimenter_value is None:
-        experimenter_is_null = "experimenter" in screens_cfg and screens_cfg["experimenter"] is None
-        experimenter_value = screens_cfg.get("experimenter", cfg.get("experimenter_screen"))
+        experimenter_key = "experimenter" if "experimenter" in screens_cfg else "secondary"
+        experimenter_is_null = experimenter_key in screens_cfg and screens_cfg[experimenter_key] is None
+        experimenter_value = screens_cfg.get(
+            experimenter_key,
+            cfg.get("experimenter_screen", cfg.get("secondary_screen")),
+        )
     if experimenter_value is None:
         experimenter_value = os.environ.get(SECONDARY_SCREEN_ENV)
         if experimenter_is_null and (experimenter_value is None or not str(experimenter_value).strip()):
@@ -117,16 +121,12 @@ def _screen_name_aliases(name: str) -> set[str]:
         suffix = raw[len("hdmi-a-") :]
         _add(f"hdmi-{suffix}")
         _add(f"hdmi{suffix}")
-        if suffix.isdigit():
-            _add(f"hdmi{int(suffix) - 1}")
     elif raw.startswith("hdmi-"):
         suffix = raw[len("hdmi-") :]
         _add(f"hdmi-a-{suffix}")
         _add(f"hdmi{suffix}")
-        if suffix.isdigit():
-            _add(f"hdmi{int(suffix) - 1}")
     elif raw.startswith("hdmi") and raw[len("hdmi") :].isdigit():
-        suffix = str(int(raw[len("hdmi") :]) + 1)
+        suffix = raw[len("hdmi") :]
         _add(f"hdmi-{suffix}")
         _add(f"hdmi-a-{suffix}")
 
@@ -370,7 +370,17 @@ def select_screen(
             f"(available indices: {available})."
         )
 
-    requested_aliases = _screen_name_aliases(str(requested_selector))
+    requested_name = str(requested_selector).strip()
+    requested_normalized = _normalize_screen_name(requested_name)
+    for screen in screens:
+        screen_name = str(screen.name or "").strip()
+        if screen_name and (
+            screen_name.lower() == requested_name.lower()
+            or _normalize_screen_name(screen_name) == requested_normalized
+        ):
+            return screen
+
+    requested_aliases = _screen_name_aliases(requested_name)
     for screen in screens:
         if screen.name and requested_aliases & _screen_name_aliases(screen.name):
             return screen

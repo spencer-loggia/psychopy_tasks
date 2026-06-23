@@ -29,6 +29,38 @@ MAIN_SCREEN_ENV = "MAIN_SCREEN"
 SECONDARY_SCREEN_ENV = "SECONDARY_SCREEN"
 
 
+def set_window_mouse_visible(win, visible: bool) -> bool:
+    """Set cursor visibility across PsychoPy backend variants."""
+    applied = False
+    visible_bool = bool(visible)
+
+    try:
+        win.mouseVisible = visible_bool
+        applied = True
+    except Exception:
+        pass
+
+    for method_name in ("setMouseVisible", "setMouseVisibility"):
+        try:
+            method = getattr(win, method_name, None)
+            if callable(method):
+                method(visible_bool)
+                applied = True
+        except Exception:
+            pass
+
+    handle = getattr(win, "winHandle", None)
+    try:
+        method = getattr(handle, "set_mouse_visible", None)
+        if callable(method):
+            method(visible_bool)
+            applied = True
+    except Exception:
+        pass
+
+    return applied
+
+
 @dataclass(frozen=True)
 class ScreenGeometry:
     index: int
@@ -879,6 +911,7 @@ def _experimenter_preview_process(
     command_queue,
     reward_event,
     exit_event,
+    mouse_visible: Optional[bool],
     stop_event,
 ) -> None:
     from psychopy import core, event, visual
@@ -1104,6 +1137,9 @@ def _experimenter_preview_process(
         allowStencil=False,
         allowGUI=False,
     )
+    last_cursor_apply_s = 0.0
+    if mouse_visible is not None:
+        set_window_mouse_visible(win, bool(mouse_visible))
     mouse = event.Mouse(win=win)
     last_mouse_down = False
     last_bg_rgb = (0, 0, 0)
@@ -1200,6 +1236,10 @@ def _experimenter_preview_process(
         )
 
         while not stop_event.is_set():
+            if mouse_visible is not None and time.perf_counter() - last_cursor_apply_s >= 0.5:
+                set_window_mouse_visible(win, bool(mouse_visible))
+                last_cursor_apply_s = time.perf_counter()
+
             while True:
                 try:
                     payload = command_queue.get_nowait()
@@ -1328,6 +1368,7 @@ class ExperimenterPreview:
         task_label: str = "",
         start_perf_s: Optional[float] = None,
         update_interval_s: float = 0.1,
+        mouse_visible: Optional[bool] = True,
     ):
         self.screen_info = screen_info
         self.task_label = task_label
@@ -1349,6 +1390,7 @@ class ExperimenterPreview:
                 self._queue,
                 self._reward_event,
                 self._exit_event,
+                mouse_visible,
                 self._stop_event,
             ),
             daemon=True,

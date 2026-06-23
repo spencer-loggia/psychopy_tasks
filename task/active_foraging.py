@@ -19,6 +19,7 @@ Config keys required/additional:
 
 """
 import argparse
+import os
 import sys
 import time
 import random
@@ -48,7 +49,9 @@ from bin.screen import (
     resolve_scene_size,
     resolve_task_screens,
     serialize_preview_image,
+    set_window_mouse_visible,
 )
+from interface.rig_mode import IS_RIG_ENV_VAR, experimenter_cursor_visible_for_touchscreen
 
 
 def _generate_active_foraging_trial(trial_idx: int, config: dict) -> dict:
@@ -601,6 +604,11 @@ def run_task(
 
     # Window + background + fixation
     win = utils.setup_window(bg_rgb_255=bg, fullscreen=fullscreen, size=win_size, screen_info=main_screen)
+    is_rig_raw = os.environ.get(IS_RIG_ENV_VAR)
+    experimenter_mouse_visible = experimenter_cursor_visible_for_touchscreen(
+        touchscreen=bool(touchscreen),
+        is_rig=is_rig_raw,
+    )
     experimenter_preview = None
     if experimenter_screen is not None:
         experimenter_preview = ExperimenterPreview(
@@ -608,17 +616,22 @@ def run_task(
             task_label=resolved_config_name,
             start_perf_s=time.perf_counter(),
             update_interval_s=0.1,
+            mouse_visible=experimenter_mouse_visible,
         )
     if touchscreen:
+        set_window_mouse_visible(win, False)
         try:
-            win.mouseVisible = False
-        except Exception:
-            try:
-                win.setMouseVisible(False)
-            except Exception:
-                pass
-        try:
-            msg_logger.log("INFO", "touchscreen=True; mouse cursor hidden")
+            exp_cursor_state = "none"
+            if experimenter_preview is not None:
+                exp_cursor_state = "visible" if experimenter_mouse_visible else "hidden"
+            msg_logger.log(
+                "INFO",
+                (
+                    "touchscreen=True; main mouse cursor hidden "
+                    f"experimenter_cursor={exp_cursor_state} "
+                    f"{IS_RIG_ENV_VAR}={is_rig_raw if is_rig_raw is not None else 'unset'}"
+                ),
+            )
         except Exception:
             pass
     # Measure or override frame rate once per task

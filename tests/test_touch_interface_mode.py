@@ -3,6 +3,8 @@ import unittest
 from interface.rig_mode import (
     PORTABLE_MODE_VALUE,
     RIG_MODE_VALUE,
+    experimenter_cursor_visible_for_touchscreen,
+    is_rig_mode,
     mode_button_label,
     mode_command_for_target_mode,
     mode_script_for_target_mode,
@@ -18,6 +20,18 @@ class TouchInterfaceModeTests(unittest.TestCase):
         self.assertIsNone(normalize_is_rig(None))
         self.assertIsNone(normalize_is_rig(""))
         self.assertIsNone(normalize_is_rig("true"))
+
+    def test_is_rig_mode_accepts_only_rig_value(self):
+        self.assertFalse(is_rig_mode(PORTABLE_MODE_VALUE))
+        self.assertTrue(is_rig_mode(RIG_MODE_VALUE))
+        self.assertFalse(is_rig_mode(None))
+        self.assertFalse(is_rig_mode("true"))
+
+    def test_touchscreen_experimenter_cursor_policy_depends_on_rig_mode(self):
+        self.assertTrue(experimenter_cursor_visible_for_touchscreen(False, PORTABLE_MODE_VALUE))
+        self.assertFalse(experimenter_cursor_visible_for_touchscreen(True, PORTABLE_MODE_VALUE))
+        self.assertTrue(experimenter_cursor_visible_for_touchscreen(True, RIG_MODE_VALUE))
+        self.assertFalse(experimenter_cursor_visible_for_touchscreen(True, None))
 
     def test_button_label_advertises_target_mode(self):
         self.assertEqual(mode_button_label(PORTABLE_MODE_VALUE), "rig mode")

@@ -18,6 +18,16 @@ def normalize_is_rig(value: Optional[str]) -> Optional[str]:
     return None
 
 
+def is_rig_mode(value: Optional[str]) -> bool:
+    return normalize_is_rig(value) == RIG_MODE_VALUE
+
+
+def experimenter_cursor_visible_for_touchscreen(touchscreen: bool, is_rig: Optional[str]) -> bool:
+    if not touchscreen:
+        return True
+    return is_rig_mode(is_rig)
+
+
 def mode_button_label(is_rig: str) -> str:
     if is_rig == RIG_MODE_VALUE:
         return "portable mode"

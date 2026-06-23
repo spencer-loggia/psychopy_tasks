@@ -38,8 +38,6 @@ class ScreenGeometry:
     height: int
     name: str = ""
     rotation: str = "normal"
-    native_width: int = 0
-    native_height: int = 0
 
 
 def parse_screen_selector(value: Any, name: str) -> ScreenSelector:
@@ -194,14 +192,6 @@ def _parse_xrandr_query(output: str) -> list[ScreenGeometry]:
         width_i = max(int(width), 1)
         height_i = max(int(height), 1)
         rotation_i = str(rotation or "normal").lower()
-        if rotation_i in {"left", "right"}:
-            if width_i > height_i:
-                width_i, height_i = height_i, width_i
-            native_width = height_i
-            native_height = width_i
-        else:
-            native_width = width_i
-            native_height = height_i
         screens.append(
             ScreenGeometry(
                 index=len(screens),
@@ -211,8 +201,6 @@ def _parse_xrandr_query(output: str) -> list[ScreenGeometry]:
                 height=height_i,
                 name=str(name or ""),
                 rotation=rotation_i,
-                native_width=native_width,
-                native_height=native_height,
             )
         )
     return screens
@@ -244,8 +232,6 @@ def _merge_screen_lists(
                 height=screen.height,
                 name=screen.name,
                 rotation=screen.rotation,
-                native_width=screen.native_width,
-                native_height=screen.native_height,
             )
             for index, screen in enumerate(override_screens)
         ]
@@ -290,8 +276,6 @@ def _merge_screen_lists(
                 height=override.height if override.height > 0 else base.height,
                 name=base.name or override.name,
                 rotation=override.rotation or base.rotation,
-                native_width=override.native_width or base.native_width,
-                native_height=override.native_height or base.native_height,
             )
         )
 
@@ -308,8 +292,6 @@ def _merge_screen_lists(
                 height=candidate.height,
                 name=candidate.name,
                 rotation=candidate.rotation,
-                native_width=candidate.native_width,
-                native_height=candidate.native_height,
             )
         )
         next_index += 1
@@ -511,7 +493,9 @@ def get_psychopy_window_kwargs(
     if screen_info is not None and not use_virtual_position:
         kwargs["screen"] = int(screen_info.index)
 
-    if size is not None:
+    if fullscreen and has_geometry:
+        resolved_size = (int(screen_info.width), int(screen_info.height))
+    elif size is not None:
         resolved_size = (int(size[0]), int(size[1]))
     elif has_geometry:
         resolved_size = (int(screen_info.width), int(screen_info.height))
@@ -536,12 +520,6 @@ def get_psychopy_window_kwargs(
     return kwargs
 
 
-def _screen_scene_dimensions(screen_info: ScreenGeometry) -> tuple[int, int]:
-    if int(screen_info.native_width) > 0 and int(screen_info.native_height) > 0:
-        return (int(screen_info.native_width), int(screen_info.native_height))
-    return (int(screen_info.width), int(screen_info.height))
-
-
 def resolve_scene_size(
     screen_info: Optional[ScreenGeometry],
     *,
@@ -550,13 +528,13 @@ def resolve_scene_size(
     realized_size: Optional[Sequence[int]] = None,
 ) -> tuple[int, int]:
     if fullscreen and screen_info is not None and int(screen_info.width) > 0 and int(screen_info.height) > 0:
-        return _screen_scene_dimensions(screen_info)
+        return (int(screen_info.width), int(screen_info.height))
     if (not fullscreen) and requested_size is not None:
         return (int(requested_size[0]), int(requested_size[1]))
     if realized_size is not None:
         return (int(realized_size[0]), int(realized_size[1]))
     if screen_info is not None and int(screen_info.width) > 0 and int(screen_info.height) > 0:
-        return _screen_scene_dimensions(screen_info)
+        return (int(screen_info.width), int(screen_info.height))
     return (1024, 768)
 
 
@@ -671,13 +649,11 @@ def describe_screen(screen_info: Optional[ScreenGeometry]) -> str:
     if screen_info is None:
         return "none"
     label = screen_info.name or f"screen{screen_info.index}"
-    native = ""
-    if int(screen_info.native_width) > 0 and int(screen_info.native_height) > 0:
-        native = f" native={int(screen_info.native_width)}x{int(screen_info.native_height)} rotation={screen_info.rotation}"
+    rotation = "" if screen_info.rotation == "normal" else f" rotation={screen_info.rotation}"
     return (
         f"{label}(index={int(screen_info.index)} "
         f"size={int(screen_info.width)}x{int(screen_info.height)} "
-        f"pos={int(screen_info.x)},{int(screen_info.y)}{native})"
+        f"pos={int(screen_info.x)},{int(screen_info.y)}{rotation})"
     )
 
 

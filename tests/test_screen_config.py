@@ -99,7 +99,7 @@ class ScreenConfigTests(unittest.TestCase):
 
         self.assertEqual(kwargs, {"screen": 1, "fullscr": True})
 
-    def test_xrandr_query_preserves_rotation_and_native_size(self):
+    def test_xrandr_query_uses_rotated_framebuffer_size(self):
         screens = _parse_xrandr_query(
             "HDMI-2 connected primary 1600x2560+0+0 right "
             "(normal left inverted right x axis y axis) 256mm x 160mm\n"
@@ -110,9 +110,8 @@ class ScreenConfigTests(unittest.TestCase):
         main = select_screen(screens, "HDMI-2", role="main")
         self.assertEqual((main.width, main.height), (1600, 2560))
         self.assertEqual(main.rotation, "right")
-        self.assertEqual((main.native_width, main.native_height), (2560, 1600))
 
-    def test_fullscreen_scene_size_uses_native_rotated_panel_size(self):
+    def test_fullscreen_scene_size_uses_rotated_framebuffer_size(self):
         screen = ScreenGeometry(
             index=0,
             x=0,
@@ -121,11 +120,12 @@ class ScreenConfigTests(unittest.TestCase):
             height=2560,
             name="HDMI-2",
             rotation="right",
-            native_width=2560,
-            native_height=1600,
         )
 
-        self.assertEqual(resolve_scene_size(screen, fullscreen=True), (2560, 1600))
+        self.assertEqual(
+            resolve_scene_size(screen, fullscreen=True, requested_size=(2560, 1600)),
+            (1600, 2560),
+        )
 
     def test_centered_aspect_fit_preserves_main_aspect_ratio(self):
         layout = compute_centered_aspect_fit((1920, 1080), (1000, 500))

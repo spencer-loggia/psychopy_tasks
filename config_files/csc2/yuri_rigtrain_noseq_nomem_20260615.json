@@ -33,7 +33,7 @@
     "main": null,
     "experimenter": null
   },
-  "refresh_rate": 120,
+  "refresh_rate": 60,
   "n": 2000,
 
   "fullscreen": true,

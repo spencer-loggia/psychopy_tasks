@@ -557,6 +557,28 @@ def serialize_preview_image(image_obj) -> Optional[Dict[str, Any]]:
     }
 
 
+def compute_centered_aspect_fit(
+    container_size: Sequence[float],
+    content_size: Sequence[float],
+) -> Dict[str, Any]:
+    container_w = max(float(container_size[0]), 1.0)
+    container_h = max(float(container_size[1]), 1.0)
+    content_w = max(float(content_size[0]), 1.0)
+    content_h = max(float(content_size[1]), 1.0)
+    scale = min(container_w / content_w, container_h / content_h)
+    box_w = content_w * scale
+    box_h = content_h * scale
+    return {
+        "box_center": (0.0, 0.0),
+        "box_size": (box_w, box_h),
+        "scale": scale,
+        "left_margin": max(0.0, (container_w - box_w) * 0.5),
+        "right_margin": max(0.0, (container_w - box_w) * 0.5),
+        "top_margin": max(0.0, (container_h - box_h) * 0.5),
+        "bottom_margin": max(0.0, (container_h - box_h) * 0.5),
+    }
+
+
 def scale_scene_length(value: float, main_size: Sequence[float], preview_size: Sequence[float]) -> float:
     main_w = max(float(main_size[0]), 1.0)
     main_h = max(float(main_size[1]), 1.0)
@@ -829,6 +851,8 @@ def _experimenter_preview_process(
     from psychopy import core, event, visual
     preview_canvas_size = resolve_screen_canvas_size(screen_info)
     preview_pos = (0, 0)
+    outside_bg_rgb = (30, 30, 30)
+    preview_outline_rgb = (150, 150, 150)
 
     def _make_bg_rect(bg_rgb_255: Sequence[int]):
         return visual.Rect(
@@ -842,7 +866,7 @@ def _experimenter_preview_process(
         )
 
     def _release_movie() -> None:
-        nonlocal movie, movie_bg_rect, last_bg_rgb, static_scene
+        nonlocal movie, movie_bg_rect, movie_outline_rect, movie_layout, last_bg_rgb, static_scene
         if movie is None:
             return
         try:
@@ -856,20 +880,49 @@ def _experimenter_preview_process(
             pass
         movie = None
         movie_bg_rect = None
+        movie_outline_rect = None
+        movie_layout = None
         static_scene = _build_static_scene({"bg_rgb_255": last_bg_rgb, "main_size": preview_canvas_size})
 
     def _build_static_scene(payload: Dict[str, Any]) -> Dict[str, Any]:
         bg_rgb_255 = tuple(payload.get("bg_rgb_255", (0, 0, 0)))
         main_size = tuple(payload.get("main_size") or preview_canvas_size)
-        preview_size = preview_canvas_size
-        bg_rect = _make_bg_rect(bg_rgb_255)
+        layout = compute_centered_aspect_fit(preview_canvas_size, main_size)
+        preview_size = layout["box_size"]
+        box_center = layout["box_center"]
+        canvas_bg_rect = _make_bg_rect(outside_bg_rgb)
+        preview_bg_rect = visual.Rect(
+            win,
+            width=preview_size[0],
+            height=preview_size[1],
+            pos=box_center,
+            fillColor=_preview_rgb255_to_psychopy(bg_rgb_255),
+            fillColorSpace="rgb",
+            lineColor=None,
+            units="pix",
+        )
+        preview_outline_rect = visual.Rect(
+            win,
+            width=preview_size[0],
+            height=preview_size[1],
+            pos=box_center,
+            fillColor=None,
+            lineColor=_preview_rgb255_to_psychopy(preview_outline_rgb),
+            lineColorSpace="rgb",
+            lineWidth=2,
+            units="pix",
+        )
+
+        def _map_pos(pos: Sequence[float]) -> tuple[float, float]:
+            scaled = scale_scene_point(pos, main_size, preview_size)
+            return (float(box_center[0]) + scaled[0], float(box_center[1]) + scaled[1])
 
         images = []
         for item in payload.get("images", []) or []:
             stim = _build_preview_image_stim(
                 win,
                 item,
-                pos=scale_scene_point(item.get("pos", (0, 0)), main_size, preview_size),
+                pos=_map_pos(item.get("pos", (0, 0))),
                 size=scale_scene_size(item.get("size", (64, 64)), main_size, preview_size),
             )
             if stim is not None:
@@ -885,7 +938,7 @@ def _experimenter_preview_process(
                 fillColorSpace="rgb",
                 lineColor=None,
                 units="pix",
-                pos=scale_scene_point(item.get("pos", (0, 0)), main_size, preview_size),
+                pos=_map_pos(item.get("pos", (0, 0))),
             )
             dots.append(dot)
 
@@ -899,7 +952,7 @@ def _experimenter_preview_process(
                 height=max(1.0, scale_scene_length(float(fixation_size), main_size, preview_size)),
                 color=_preview_rgb255_to_psychopy(payload.get("fixation_color", (0, 0, 0))),
                 colorSpace="rgb",
-                pos=(0, 0),
+                pos=_map_pos((0, 0)),
             )
 
         highlight_box = None
@@ -911,7 +964,7 @@ def _experimenter_preview_process(
                 win,
                 width=max(4.0, scale_scene_size(highlight_payload.get("size", (64, 64)), main_size, preview_size)[0]),
                 height=max(4.0, scale_scene_size(highlight_payload.get("size", (64, 64)), main_size, preview_size)[1]),
-                pos=scale_scene_point(highlight_payload.get("pos", (0, 0)), main_size, preview_size),
+                pos=_map_pos(highlight_payload.get("pos", (0, 0))),
                 lineColor=_preview_rgb255_to_psychopy(line_color),
                 lineColorSpace="rgb",
                 lineWidth=line_width,
@@ -921,15 +974,77 @@ def _experimenter_preview_process(
 
         return {
             "bg_rgb_255": bg_rgb_255,
-            "bg_rect": bg_rect,
+            "canvas_bg_rect": canvas_bg_rect,
+            "preview_bg_rect": preview_bg_rect,
+            "preview_outline_rect": preview_outline_rect,
             "images": images,
             "dots": dots,
             "fixation": fixation,
             "highlight_box": highlight_box,
             "reward_counts": _normalize_reward_counts(payload.get("reward_counts")),
+            "layout": layout,
         }
 
-    def _draw_overlay() -> None:
+    def _place_overlay_controls(layout: Optional[Dict[str, Any]]) -> None:
+        if not layout:
+            layout = compute_centered_aspect_fit(preview_canvas_size, preview_canvas_size)
+        canvas_w = float(preview_canvas_size[0])
+        canvas_h = float(preview_canvas_size[1])
+        canvas_left = -canvas_w * 0.5
+        canvas_right = canvas_w * 0.5
+        canvas_top = canvas_h * 0.5
+        canvas_bottom = -canvas_h * 0.5
+        margin = max(10.0, min(canvas_w, canvas_h) * 0.018)
+        box_center = layout.get("box_center", (0.0, 0.0))
+        box_size = layout.get("box_size", preview_canvas_size)
+        box_left = float(box_center[0]) - (float(box_size[0]) * 0.5)
+        box_right = float(box_center[0]) + (float(box_size[0]) * 0.5)
+        box_top = float(box_center[1]) + (float(box_size[1]) * 0.5)
+        box_bottom = float(box_center[1]) - (float(box_size[1]) * 0.5)
+        left_space = max(0.0, box_left - canvas_left)
+        right_space = max(0.0, canvas_right - box_right)
+        top_space = max(0.0, canvas_top - box_top)
+        bottom_space = max(0.0, box_bottom - canvas_bottom)
+        button_h = max(float(reward_button_height), float(exit_button_height))
+
+        if left_space >= reward_button_width + (2.0 * margin) and right_space >= exit_button_width + (2.0 * margin):
+            reward_pos = (canvas_left + (left_space * 0.5), canvas_top - margin - (reward_button_height * 0.5))
+            exit_pos = (canvas_right - (right_space * 0.5), canvas_top - margin - (exit_button_height * 0.5))
+            timer_pos = (canvas_left + margin, reward_pos[1] - (reward_button_height * 0.5) - timer_text_height)
+            counts_pos = (canvas_left + margin, timer_pos[1] - max(56.0, reward_counts_text_height * 3.2))
+            label_pos = (float(box_center[0]), box_bottom + margin + (task_label_height * 0.5))
+        elif top_space >= button_h + (2.0 * margin):
+            y = box_top + (top_space * 0.5)
+            reward_pos = (canvas_left + margin + (reward_button_width * 0.5), y)
+            exit_pos = (canvas_right - margin - (exit_button_width * 0.5), y)
+            timer_pos = (float(box_center[0]) - (timer_text_height * 2.2), y)
+            counts_pos = (canvas_left + margin, y - max(40.0, reward_counts_text_height * 2.0))
+            label_pos = (float(box_center[0]), box_bottom + margin + (task_label_height * 0.5))
+        elif bottom_space >= button_h + (2.0 * margin):
+            y = canvas_bottom + (bottom_space * 0.5)
+            reward_pos = (canvas_left + margin + (reward_button_width * 0.5), y)
+            exit_pos = (canvas_right - margin - (exit_button_width * 0.5), y)
+            timer_pos = (canvas_left + margin, canvas_top - margin - timer_text_height)
+            counts_pos = (canvas_left + margin, timer_pos[1] - max(56.0, reward_counts_text_height * 3.2))
+            label_pos = (float(box_center[0]), y)
+        else:
+            reward_pos = (canvas_left + margin + (reward_button_width * 0.5), canvas_top - margin - (reward_button_height * 0.5))
+            exit_pos = (canvas_right - margin - (exit_button_width * 0.5), canvas_top - margin - (exit_button_height * 0.5))
+            timer_pos = (canvas_left + margin, reward_pos[1] - (reward_button_height * 0.5) - timer_text_height)
+            counts_pos = (canvas_left + margin, timer_pos[1] - max(56.0, reward_counts_text_height * 3.2))
+            label_pos = (float(box_center[0]), box_bottom + margin + (task_label_height * 0.5))
+
+        reward_button_rect.pos = reward_pos
+        reward_button_text.pos = reward_pos
+        exit_button_rect.pos = exit_pos
+        exit_button_text.pos = exit_pos
+        timer_text.pos = timer_pos
+        reward_counts_text.pos = counts_pos
+        if task_label_text is not None:
+            task_label_text.pos = label_pos
+
+    def _draw_overlay(layout: Optional[Dict[str, Any]] = None) -> None:
+        _place_overlay_controls(layout or static_scene.get("layout"))
         elapsed = time.perf_counter() - float(start_perf_s)
         timer_text.text = format_elapsed_hms(elapsed)
         timer_text.draw()
@@ -966,6 +1081,8 @@ def _experimenter_preview_process(
     static_scene = _build_static_scene({"bg_rgb_255": last_bg_rgb, "main_size": preview_canvas_size})
     movie = None
     movie_bg_rect = None
+    movie_outline_rect = None
+    movie_layout = None
     task_label_text = None
     current_reward_counts = None
     current_highlight_box = None
@@ -976,17 +1093,20 @@ def _experimenter_preview_process(
                 win,
                 text=task_label,
                 units="pix",
-                height=max(18.0, min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.04),
+                height=max(18.0, min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.032),
                 pos=(0.0, -float(preview_canvas_size[1]) * 0.44),
                 color=_preview_rgb255_to_psychopy((230, 230, 230)),
                 colorSpace="rgb",
             )
 
+        task_label_height = max(18.0, min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.032)
+        timer_text_height = max(22.0, min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.04)
+        reward_counts_text_height = max(16.0, min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.028)
         timer_text = visual.TextStim(
             win,
             text="00:00:00",
             units="pix",
-            height=max(24.0, min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.055),
+            height=timer_text_height,
             pos=(-float(preview_canvas_size[0]) * 0.35, float(preview_canvas_size[1]) * 0.44),
             alignText="left",
             anchorHoriz="left",
@@ -997,15 +1117,17 @@ def _experimenter_preview_process(
             win,
             text="",
             units="pix",
-            height=max(18.0, min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.038),
+            height=reward_counts_text_height,
             pos=(-float(preview_canvas_size[0]) * 0.35, float(preview_canvas_size[1]) * 0.30),
             alignText="left",
             anchorHoriz="left",
             color=_preview_rgb255_to_psychopy((255, 255, 255)),
             colorSpace="rgb",
         )
-        reward_button_width = max(72.0, float(preview_canvas_size[0]) * 0.08)
-        reward_button_height = max(42.0, float(preview_canvas_size[1]) * 0.065)
+        reward_button_width = max(84.0, min(140.0, float(preview_canvas_size[0]) * 0.08))
+        reward_button_height = max(44.0, min(64.0, float(preview_canvas_size[1]) * 0.065))
+        exit_button_width = max(96.0, min(150.0, float(preview_canvas_size[0]) * 0.10))
+        exit_button_height = reward_button_height
         reward_button_rect = visual.Rect(
             win,
             width=reward_button_width,
@@ -1023,15 +1145,15 @@ def _experimenter_preview_process(
             win,
             text="rew.",
             units="pix",
-            height=max(18.0, min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.032),
+            height=max(18.0, reward_button_height * 0.42),
             pos=reward_button_rect.pos,
             color=_preview_rgb255_to_psychopy((255, 255, 255)),
             colorSpace="rgb",
         )
         exit_button_rect = visual.Rect(
             win,
-            width=max(120.0, float(preview_canvas_size[0]) * 0.14),
-            height=max(56.0, float(preview_canvas_size[1]) * 0.10),
+            width=exit_button_width,
+            height=exit_button_height,
             pos=(float(preview_canvas_size[0]) * 0.39, float(preview_canvas_size[1]) * 0.43),
             fillColor=_preview_rgb255_to_psychopy((201, 75, 75)),
             fillColorSpace="rgb",
@@ -1042,7 +1164,7 @@ def _experimenter_preview_process(
             win,
             text="exit",
             units="pix",
-            height=max(22.0, min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.05),
+            height=max(18.0, exit_button_height * 0.42),
             pos=exit_button_rect.pos,
             color=_preview_rgb255_to_psychopy((255, 255, 255)),
             colorSpace="rgb",
@@ -1071,21 +1193,36 @@ def _experimenter_preview_process(
                     elif command_type == "play_video":
                         _release_movie()
                         last_bg_rgb = tuple(payload.get("bg_rgb_255", last_bg_rgb))
-                        movie_bg_rect = _make_bg_rect(last_bg_rgb)
+                        movie_layout = compute_centered_aspect_fit(
+                            preview_canvas_size,
+                            tuple(payload.get("main_size") or preview_canvas_size),
+                        )
+                        movie_bg_rect = _make_bg_rect(outside_bg_rgb)
+                        movie_outline_rect = visual.Rect(
+                            win,
+                            width=movie_layout["box_size"][0],
+                            height=movie_layout["box_size"][1],
+                            pos=movie_layout["box_center"],
+                            fillColor=None,
+                            lineColor=_preview_rgb255_to_psychopy(preview_outline_rgb),
+                            lineColorSpace="rgb",
+                            lineWidth=2,
+                            units="pix",
+                        )
                         from psychopy.visual.vlcmoviestim import VlcMovieStim
 
                         movie = VlcMovieStim(
                             win,
                             filename=str(payload["video_path"]),
                             units="pix",
-                            size=preview_canvas_size,
-                            pos=(0.0, 0.0),
+                            size=movie_layout["box_size"],
+                            pos=movie_layout["box_center"],
                             loop=False,
                             autoStart=False,
                             noAudio=True,
                         )
-                        movie.size = preview_canvas_size
-                        movie.pos = (0.0, 0.0)
+                        movie.size = movie_layout["box_size"]
+                        movie.pos = movie_layout["box_center"]
                         movie.play(log=False)
                     elif command_type == "clear_scene":
                         _release_movie()
@@ -1100,6 +1237,7 @@ def _experimenter_preview_process(
                 mouse_down = False
             if mouse_down and (not last_mouse_down):
                 try:
+                    _place_overlay_controls(movie_layout if movie is not None else static_scene.get("layout"))
                     mouse_pos = mouse.getPos()
                     if reward_button_rect.contains(mouse_pos):
                         reward_event.set()
@@ -1114,13 +1252,16 @@ def _experimenter_preview_process(
                     if movie_bg_rect is not None:
                         movie_bg_rect.draw()
                     movie.draw()
-                    _draw_overlay()
+                    if movie_outline_rect is not None:
+                        movie_outline_rect.draw()
+                    _draw_overlay(movie_layout)
                     win.flip()
                     if bool(getattr(movie, "isFinished", False)):
                         _release_movie()
                     continue
 
-                static_scene["bg_rect"].draw()
+                static_scene["canvas_bg_rect"].draw()
+                static_scene["preview_bg_rect"].draw()
                 for stim in static_scene["dots"]:
                     stim.draw()
                 for stim in static_scene["images"]:
@@ -1129,6 +1270,7 @@ def _experimenter_preview_process(
                     static_scene["fixation"].draw()
                 if static_scene["highlight_box"] is not None:
                     static_scene["highlight_box"].draw()
+                static_scene["preview_outline_rect"].draw()
                 _draw_overlay()
                 win.flip()
             except Exception:
@@ -1261,14 +1403,21 @@ class ExperimenterPreview:
             payload["highlight_box"] = dict(highlight_box) if highlight_box is not None else None
         self._send(payload)
 
-    def play_video(self, video_path: str, *, bg_rgb_255: Sequence[int]) -> None:
-        self._send(
-            {
-                "type": "play_video",
-                "video_path": str(video_path),
-                "bg_rgb_255": list(bg_rgb_255),
-            }
-        )
+    def play_video(
+        self,
+        video_path: str,
+        *,
+        bg_rgb_255: Sequence[int],
+        main_size: Optional[Sequence[int]] = None,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "type": "play_video",
+            "video_path": str(video_path),
+            "bg_rgb_255": list(bg_rgb_255),
+        }
+        if main_size is not None:
+            payload["main_size"] = [int(main_size[0]), int(main_size[1])]
+        self._send(payload)
 
     def close(self) -> None:
         try:

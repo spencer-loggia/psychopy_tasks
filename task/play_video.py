@@ -169,7 +169,7 @@ def run_task(
 
         chosen_video = random.choice(video_files)
         if experimenter_preview is not None:
-            experimenter_preview.play_video(str(chosen_video), bg_rgb_255=bg)
+            experimenter_preview.play_video(str(chosen_video), bg_rgb_255=bg, main_size=main_scene_size)
         playback_info = utils.play_video_fill_screen(
             win=win,
             video_path=chosen_video,

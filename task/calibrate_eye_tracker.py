@@ -36,7 +36,13 @@ from bin.eye_tracking import (
     fraction_to_pixels,
 )
 from bin.logger import SessionLogBundle
-from bin.screen import describe_screen, load_screen_config, resolve_scene_size, resolve_task_screens
+from bin.screen import (
+    compute_centered_aspect_fit,
+    describe_screen,
+    load_screen_config,
+    resolve_scene_size,
+    resolve_task_screens,
+)
 
 
 class Slider:
@@ -224,31 +230,24 @@ def _draw_button(button) -> None:
 
 def _compute_preview_layout(exp_size: Sequence[int], main_size: Sequence[int]) -> dict:
     exp_w, exp_h = max(float(exp_size[0]), 1.0), max(float(exp_size[1]), 1.0)
-    main_w, main_h = max(float(main_size[0]), 1.0), max(float(main_size[1]), 1.0)
-
-    left_controls = max(86.0, exp_w * 0.10)
-    right_pad = max(22.0, exp_w * 0.025)
-    top_controls = max(74.0, exp_h * 0.11)
-    bottom_controls = max(86.0, exp_h * 0.13)
-    usable_w = max(100.0, exp_w - left_controls - right_pad)
-    usable_h = max(100.0, exp_h - top_controls - bottom_controls)
-
-    box_aspect = main_w / main_h
-    box_w = usable_w
-    box_h = box_w / box_aspect
-    if box_h > usable_h:
-        box_h = usable_h
-        box_w = box_h * box_aspect
-
-    usable_center_x = -exp_w * 0.5 + left_controls + (usable_w * 0.5)
-    usable_center_y = -exp_h * 0.5 + bottom_controls + (usable_h * 0.5)
+    fit = compute_centered_aspect_fit((exp_w, exp_h), main_size)
+    box_center = fit["box_center"]
+    box_size = fit["box_size"]
+    box_left = float(box_center[0]) - (float(box_size[0]) * 0.5)
+    box_right = float(box_center[0]) + (float(box_size[0]) * 0.5)
+    box_top = float(box_center[1]) + (float(box_size[1]) * 0.5)
+    box_bottom = float(box_center[1]) - (float(box_size[1]) * 0.5)
     return {
-        "box_center": (usable_center_x, usable_center_y),
-        "box_size": (box_w, box_h),
-        "left_controls": left_controls,
-        "right_pad": right_pad,
-        "top_controls": top_controls,
-        "bottom_controls": bottom_controls,
+        "box_center": box_center,
+        "box_size": box_size,
+        "left_margin": fit["left_margin"],
+        "right_margin": fit["right_margin"],
+        "top_margin": fit["top_margin"],
+        "bottom_margin": fit["bottom_margin"],
+        "box_left": box_left,
+        "box_right": box_right,
+        "box_top": box_top,
+        "box_bottom": box_bottom,
     }
 
 
@@ -493,7 +492,7 @@ def run_task(
             pos=box_center,
             fillColor=utils.rgb255_to_psychopy(bg),
             fillColorSpace="rgb",
-            lineColor=utils.rgb255_to_psychopy((230, 230, 230)),
+            lineColor=utils.rgb255_to_psychopy((150, 150, 150)),
             lineColorSpace="rgb",
             lineWidth=2,
             units="pix",
@@ -520,26 +519,75 @@ def run_task(
             units="pix",
         )
 
-        button_w = max(68.0, float(exp_size[0]) * 0.08)
-        button_h = max(42.0, float(exp_size[1]) * 0.07)
+        exp_w, exp_h = max(float(exp_size[0]), 1.0), max(float(exp_size[1]), 1.0)
+        screen_left = -exp_w * 0.5
+        screen_right = exp_w * 0.5
+        screen_top = exp_h * 0.5
+        screen_bottom = -exp_h * 0.5
+        box_left = float(layout["box_left"])
+        box_right = float(layout["box_right"])
+        box_top = float(layout["box_top"])
+        box_bottom = float(layout["box_bottom"])
+        left_margin = float(layout["left_margin"])
+        right_margin = float(layout["right_margin"])
+        top_margin = float(layout["top_margin"])
+        bottom_margin = float(layout["bottom_margin"])
+        control_margin = max(12.0, min(exp_w, exp_h) * 0.018)
+
+        button_w = max(68.0, min(150.0, exp_w * 0.08))
+        button_h = max(42.0, min(66.0, exp_h * 0.07))
+        if left_margin >= button_w + (2.0 * control_margin) and right_margin >= button_w + (2.0 * control_margin):
+            reward_pos = (screen_left + (left_margin * 0.5), screen_top - control_margin - (button_h * 0.5))
+            exit_pos = (screen_right - (right_margin * 0.5), screen_top - control_margin - (button_h * 0.5))
+            zero_pos = (screen_left + (left_margin * 0.5), screen_bottom + control_margin + 26.0)
+        elif top_margin >= button_h + (2.0 * control_margin):
+            y_pos = box_top + (top_margin * 0.5)
+            reward_pos = (screen_left + control_margin + (button_w * 0.5), y_pos)
+            exit_pos = (screen_right - control_margin - (button_w * 0.5), y_pos)
+            zero_pos = (screen_left + control_margin + 26.0, screen_bottom + control_margin + 26.0)
+        elif bottom_margin >= button_h + (2.0 * control_margin):
+            y_pos = screen_bottom + (bottom_margin * 0.5)
+            reward_pos = (screen_left + control_margin + (button_w * 0.5), y_pos)
+            exit_pos = (screen_right - control_margin - (button_w * 0.5), y_pos)
+            zero_pos = (screen_left + control_margin + 26.0, y_pos)
+        else:
+            reward_pos = (screen_left + control_margin + (button_w * 0.5), screen_top - control_margin - (button_h * 0.5))
+            exit_pos = (screen_right - control_margin - (button_w * 0.5), screen_top - control_margin - (button_h * 0.5))
+            zero_pos = (screen_left + control_margin + 26.0, screen_bottom + control_margin + 26.0)
+
+        if bottom_margin >= 74.0:
+            x_slider_pos = (box_center[0], screen_bottom + (bottom_margin * 0.5))
+        else:
+            x_slider_pos = (box_center[0], box_bottom + 34.0)
+        if left_margin >= 82.0:
+            y_slider_pos = (screen_left + (left_margin * 0.5), box_center[1])
+        else:
+            y_slider_pos = (box_left + 38.0, box_center[1])
+        if top_margin >= 36.0:
+            status_pos = (box_center[0], box_top + (top_margin * 0.5))
+        elif bottom_margin >= 36.0:
+            status_pos = (box_center[0], screen_bottom + (bottom_margin * 0.5))
+        else:
+            status_pos = (box_center[0], screen_top - button_h - 28.0)
+
         reward_button = _make_button(
             exp_win,
             text="reward",
-            pos=(-float(exp_size[0]) * 0.5 + button_w * 0.5 + 18.0, float(exp_size[1]) * 0.5 - button_h * 0.5 - 18.0),
+            pos=reward_pos,
             size=(button_w, button_h),
             color_rgb=(50, 150, 80),
         )
         exit_button = _make_button(
             exp_win,
             text="exit",
-            pos=(float(exp_size[0]) * 0.5 - button_w * 0.5 - 18.0, float(exp_size[1]) * 0.5 - button_h * 0.5 - 18.0),
+            pos=exit_pos,
             size=(button_w, button_h),
             color_rgb=(200, 55, 55),
         )
         zero_button = _make_button(
             exp_win,
             text="x",
-            pos=(-float(exp_size[0]) * 0.5 + 44.0, -float(exp_size[1]) * 0.5 + 44.0),
+            pos=zero_pos,
             size=(52.0, 52.0),
             color_rgb=(75, 75, 75),
         )
@@ -547,7 +595,7 @@ def run_task(
         x_slider = Slider(
             exp_win,
             orientation="horizontal",
-            pos=(box_center[0], -float(exp_size[1]) * 0.5 + max(34.0, layout["bottom_controls"] * 0.42)),
+            pos=x_slider_pos,
             length=box_size[0],
             value_min=x_scale_limits[0],
             value_max=x_scale_limits[1],
@@ -557,7 +605,7 @@ def run_task(
         y_slider = Slider(
             exp_win,
             orientation="vertical",
-            pos=(-float(exp_size[0]) * 0.5 + max(38.0, layout["left_controls"] * 0.42), box_center[1]),
+            pos=y_slider_pos,
             length=box_size[1],
             value_min=y_scale_limits[0],
             value_max=y_scale_limits[1],
@@ -569,7 +617,7 @@ def run_task(
             text="",
             units="pix",
             height=18.0,
-            pos=(box_center[0], float(exp_size[1]) * 0.5 - button_h - 28.0),
+            pos=status_pos,
             color=utils.rgb255_to_psychopy((245, 245, 245)),
             colorSpace="rgb",
         )

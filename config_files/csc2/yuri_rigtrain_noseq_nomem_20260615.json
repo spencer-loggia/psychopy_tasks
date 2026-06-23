@@ -30,8 +30,8 @@
   "seed": null,
   "output_dir": "./logs",
   "screens": {
-    "main": "HDMI-1-2",
-    "experimenter": "DSI-2"
+    "main": null,
+    "experimenter": null
   },
   "refresh_rate": 120,
   "n": 2000,

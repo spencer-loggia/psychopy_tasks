@@ -25,6 +25,8 @@ except ImportError:
 
 ScreenSelector = Optional[Union[int, str]]
 _UNSET = object()
+MAIN_SCREEN_ENV = "MAIN_SCREEN"
+SECONDARY_SCREEN_ENV = "SECONDARY_SCREEN"
 
 
 @dataclass(frozen=True)
@@ -76,10 +78,14 @@ def load_screen_config(
     main_value = cli_main
     if main_value is None:
         main_value = screens_cfg.get("main", cfg.get("main_screen"))
+    if main_value is None:
+        main_value = os.environ.get(MAIN_SCREEN_ENV)
 
     experimenter_value = cli_experimenter
     if experimenter_value is None:
         experimenter_value = screens_cfg.get("experimenter", cfg.get("experimenter_screen"))
+    if experimenter_value is None:
+        experimenter_value = os.environ.get(SECONDARY_SCREEN_ENV)
 
     return {
         "main": parse_screen_selector(main_value, "screens.main"),

@@ -4,8 +4,8 @@
         "working_dir": "/home/loggiasr/Projects/psychopy_tasks"
     },
     "screens": {
-        "main": "HDMI-1-2",
-        "experimenter": "DSI-2"
+        "main": null,
+        "experimenter": null
     },
     "tasks": {
         "CSC2": {
@@ -23,6 +23,10 @@
             "config": "test_configs/play_video_config.json"
         },
         "setup": {
+            "calibrate_eye_tracker": {
+                "launch": "task/calibrate_eye_tracker.py",
+                "config": "test_configs/eye_calibration_config.json"
+            },
             "prime_pump": {
                 "launch": "task/pulse_pump.py"
         },

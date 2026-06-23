@@ -1,0 +1,41 @@
+{
+  "config_name": "eye_calibration",
+  "output_dir": "logs",
+  "fullscreen": true,
+  "win_size": [1024, 768],
+  "experimenter_win_size": [1024, 768],
+  "screens": {
+    "main": 0,
+    "experimenter": 1
+  },
+  "bg": [128, 128, 128],
+  "fixation_color": [0, 0, 0],
+  "fixation_cross_size": 42,
+  "fixation_cross_weight": 6,
+  "daq": {
+    "address": 0,
+    "x_channel": 0,
+    "y_channel": 1,
+    "sample_rate_hz": 240,
+    "voltage_min": -10.0,
+    "voltage_max": 10.0,
+    "simulate": false
+  },
+  "eye_filter": {
+    "ema_gamma": 0.98,
+    "reject_blink_artifacts": true,
+    "max_voltage_step": 8.0
+  },
+  "initial_x_scale": 0.05,
+  "initial_y_scale": 0.05,
+  "initial_x_offset": 0.0,
+  "initial_y_offset": 0.0,
+  "x_scale_limits": [-0.2, 0.2],
+  "y_scale_limits": [-0.2, 0.2],
+  "fix_diameter": 0.05,
+  "fix_accept_percent": 0.95,
+  "fix_accept_time": 2.0,
+  "raspi": false,
+  "pump_pin": 17,
+  "pump_pulse_time_seconds": 0.25
+}

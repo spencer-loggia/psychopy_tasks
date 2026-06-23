@@ -18,7 +18,22 @@ _project_root = Path(__file__).resolve().parents[1]
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from bin.screen import load_screen_config, place_tk_window_on_screen, resolve_interface_screen
+from bin.screen import (
+    MAIN_SCREEN_ENV,
+    SECONDARY_SCREEN_ENV,
+    load_screen_config,
+    place_tk_window_on_screen,
+    resolve_interface_screen,
+)
+from interface.rig_mode import (
+    IS_RIG_ENV_VAR,
+    PORTABLE_MODE_VALUE,
+    SWITCH_TO_PORTABLE_SCRIPT,
+    mode_button_label,
+    mode_script_for_target_mode,
+    normalize_is_rig,
+    target_mode_for_current_mode,
+)
 
 
 IDLE_CLEANUP_MS = 30 * 60 * 1000
@@ -119,6 +134,7 @@ class TouchInterfaceApp:
         self.status_var = tk.StringVar(value="Ready")
         self.page_title_var = tk.StringVar(value="Task Launcher")
         self.page_stack: list[tuple[str, Dict[str, Any]]] = []
+        self.is_rig = self._initialize_is_rig_mode()
 
         self.startup()
         self._build_ui()
@@ -179,6 +195,78 @@ class TouchInterfaceApp:
     def cleanup(self) -> None:
         self.attempt_rectify_timezone()
         self.pull_latest_code()
+
+    def _initialize_is_rig_mode(self) -> str:
+        raw_mode = os.environ.get(IS_RIG_ENV_VAR)
+        current_mode = normalize_is_rig(raw_mode)
+        if current_mode is not None:
+            return current_mode
+
+        mode_problem = "not set" if raw_mode is None else f"set to invalid value {raw_mode!r}"
+        self._run_mode_script(
+            PORTABLE_MODE_VALUE,
+            missing_message=(
+                f"{IS_RIG_ENV_VAR} is {mode_problem}, and {SWITCH_TO_PORTABLE_SCRIPT} does not exist."
+            ),
+            failure_message=(
+                f"Could not initialize {IS_RIG_ENV_VAR} from {mode_problem} with {SWITCH_TO_PORTABLE_SCRIPT}."
+            ),
+        )
+        return normalize_is_rig(os.environ.get(IS_RIG_ENV_VAR)) or PORTABLE_MODE_VALUE
+
+    def _run_mode_script(
+        self,
+        target_mode: str,
+        *,
+        missing_message: Optional[str] = None,
+        failure_message: Optional[str] = None,
+    ) -> bool:
+        script_path = mode_script_for_target_mode(target_mode)
+        if not script_path.exists():
+            self.status_var.set("Mode switch unavailable")
+            messagebox.showwarning(
+                "Mode Switch Warning",
+                missing_message or f"Script does not exist: {script_path}",
+            )
+            return False
+
+        try:
+            subprocess.run(
+                ["bash", str(script_path)],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or str(exc)).strip()
+            self.status_var.set("Mode switch failed")
+            messagebox.showwarning(
+                "Mode Switch Warning",
+                f"{failure_message or 'Mode switch script failed.'}\n\n{detail}",
+            )
+            return False
+        except Exception as exc:
+            self.status_var.set("Mode switch failed")
+            messagebox.showwarning(
+                "Mode Switch Warning",
+                f"{failure_message or 'Mode switch script failed.'}\n\n{exc}",
+            )
+            return False
+
+        os.environ[IS_RIG_ENV_VAR] = target_mode
+        self.is_rig = target_mode
+        self.status_var.set(f"{IS_RIG_ENV_VAR}={target_mode}")
+        return True
+
+    def _switch_rig_mode(self) -> None:
+        if self.task_active:
+            self.status_var.set("Cannot switch modes while a task is running")
+            return
+
+        target_mode = target_mode_for_current_mode(self.is_rig)
+        if self._run_mode_script(target_mode):
+            self._render_current_page()
 
     def _schedule_idle_cleanup(self) -> None:
         self.root.after(IDLE_CLEANUP_MS, self._run_idle_cleanup_if_needed)
@@ -256,6 +344,8 @@ class TouchInterfaceApp:
             row_idx += 1
 
         if len(self.page_stack) == 1:
+            self._create_rig_mode_button(row_idx)
+            row_idx += 1
             self._create_desktop_button(row_idx)
             row_idx += 1
             self._create_shutdown_button(row_idx)
@@ -279,6 +369,15 @@ class TouchInterfaceApp:
         )
         button.grid(row=row_idx, column=0, sticky="ew", pady=10, padx=10)
         self.button_container.grid_columnconfigure(0, weight=1)
+
+    def _create_rig_mode_button(self, row_idx: int) -> None:
+        button = tk.Button(
+            self.button_container,
+            text=mode_button_label(self.is_rig),
+            command=self._switch_rig_mode,
+            **self._button_kwargs(),
+        )
+        button.grid(row=row_idx, column=0, sticky="ew", pady=10, padx=10)
 
     def _create_desktop_button(self, row_idx: int) -> None:
         button = tk.Button(
@@ -409,6 +508,10 @@ def main() -> None:
         cli_experimenter=args.experimenter_screen,
     )
     screen_info = resolve_interface_screen(root, screen_cfg)
+    if screen_cfg["main"] is not None:
+        os.environ[MAIN_SCREEN_ENV] = str(screen_cfg["main"])
+    if screen_cfg["experimenter"] is not None:
+        os.environ[SECONDARY_SCREEN_ENV] = str(screen_cfg["experimenter"])
     app = TouchInterfaceApp(root, config_path, cfg, screen_info=screen_info)
     root.mainloop()
 

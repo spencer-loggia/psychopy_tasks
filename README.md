@@ -126,6 +126,54 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
 - `afc_block_sequence` logs one behavior row per block, including the selected item list and any choice touch.
 - `play_video` logs one behavior row per played clip and only logs video clip start / expected duration / end in the event log, not every frame.
 
+Screen Selection
+----------------
+Multi-screen tasks use `screens.main` for the subject display and `screens.experimenter` for the secondary display.
+Each value can be a detected screen index or an output name such as `HDMI-1` or `DSI-1`.
+Set either value to `null` to inherit the process environment defaults: `screens.main` reads `MAIN_SCREEN`, and
+`screens.experimenter` reads `SECONDARY_SCREEN`. The touch launcher exports its resolved global `screens` values
+to those environment variables for launched tasks.
+
+Eye Tracker Calibration
+-----------------------
+`task/calibrate_eye_tracker.py` calibrates two analog eye-position voltages from a Pi-Plates DAQC2plate.
+The reusable implementation lives in `bin/eye_tracking.py` so other tasks can consume the same smoothed,
+calibrated eye position.
+
+Run with a config:
+
+```bash
+python task/calibrate_eye_tracker.py --config test_configs/eye_calibration_config.json
+```
+
+Important config keys:
+
+- `screens.main` and `screens.experimenter`: main subject display and experimenter display, using the same selector rules as `active_foraging`.
+- `daq.address`, `daq.x_channel`, `daq.y_channel`: DAQC2plate address and analog input channels. The bundled DAQC2plate guide documents `piplates.DAQC2plate.getADC(addr, channel)` for channels `0` through `7`; channel `8` is the board supply readback and is not used for eye position.
+- `daq.sample_rate_hz`: analog sampling rate, default `240`.
+- `daq.voltage_min` and `daq.voltage_max`: expected valid eye-position voltage range, default `-10.0` to `10.0`.
+- `eye_filter.ema_gamma`: exponential moving-average gamma, default `0.98`.
+- `eye_filter.max_voltage_step`: optional per-sample jump threshold for blink/artifact rejection. Set to `null` to disable step rejection.
+- `initial_x_scale`, `initial_y_scale`, `initial_x_offset`, `initial_y_offset`: starting voltage-to-screen mapping parameters.
+- `fix_diameter`: fixation acceptance diameter, as a fraction of the shorter main-screen dimension. Default `0.05`.
+- `fix_accept_percent`: proportion of recent frame samples that must be inside the fixation window before automatic reward. Defaults to `0.95`; values like `95` are also accepted.
+- `fix_accept_time`: rolling acceptance-window duration in seconds. Default `2.0`.
+- `pump_pin` and `pump_pulse_time_seconds`: manual reward output controlled by the green experimenter-screen button.
+
+The eye tracker reports centered screen fractions relative to the real main screen dimensions:
+`x=-0.5` is the left edge, `x=0.5` is the right edge, `y=-0.5` is the bottom edge, and `y=0.5` is the top edge.
+The experimenter screen draws a gray preview box with the same aspect ratio as the main screen; the blue eye dot
+and fixation cross are mapped into that box. Clicking inside the box moves the fixation cross on both screens.
+The bottom slider changes `x_scale`, the left slider changes `y_scale`, and the lower-left `x` button sets the
+offsets so the current smoothed eye position maps to the current fixation position.
+When the smoothed eye position stays within `fix_diameter` of the fixation cross for at least `fix_accept_percent`
+of the past `fix_accept_time`, the task delivers one automatic `pump_pulse_time_seconds` reward. That automatic
+reward re-arms only after fixation is broken or the fixation/calibration target is changed.
+
+On exit, the task writes `[YYYYMMDDHHMMSS]_eye_calibration.json` directly under `output_dir` with `x_scale`,
+`y_scale`, `x_offset`, and `y_offset`, plus DAQ/filter metadata. A normal session log directory is also created
+under `output_dir` for messages and pump signal events.
+
 CPU Affinity for `active_foraging`
 ----------------------------------
 The `active_foraging` task treats CPU core `0` as the timing-critical presentation core.

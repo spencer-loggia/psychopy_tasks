@@ -138,6 +138,10 @@
       "video_clip_start",
       "video_clip_end"
     ],
+    "calibrate_eye_tracker": [
+      "pump_on",
+      "pump_off"
+    ],
     "active_foraging": [
       "onset_cue_on",
       "choice_start",

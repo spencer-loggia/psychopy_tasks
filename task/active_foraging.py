@@ -16,6 +16,7 @@ Config keys required/additional:
 - image_size: [W, H]
 - num_afc, n, duration, isi, ibi, choice_time, dot_size, dot_color, init_dot_color
 - pump_delay_time: delay in seconds between a rewarded choice and the first pump pulse
+- inter_pump_interval: optional delay in seconds between pump pulses; defaults to pump_pulse_time_seconds
 
 """
 import argparse
@@ -258,6 +259,12 @@ def parse_args():
         help="Delay in seconds between a rewarded choice and the first pump pulse",
     )
     p.add_argument("--pump_pulse_time_seconds", type=float, default=None, help="Duration of pump pulse in seconds")
+    p.add_argument(
+        "--inter_pump_interval",
+        type=float,
+        default=None,
+        help="Delay in seconds between pump pulses; defaults to pump_pulse_time_seconds",
+    )
     p.add_argument("--timeout_duration_seconds", type=float, default=None, help="Duration of timeout period in seconds")
     p.add_argument("--n_colors", type=int, default=None, help="Expected number of base colors (excluding luminance levels)")
     p.add_argument("--n_shapes", type=int, default=None, help="Expected number of shapes")
@@ -308,6 +315,7 @@ def run_task(
     reward_space_tsv: Optional[str] = None,
     pump_delay_time: float = 0.0,
     pump_pulse_time_seconds: float = 0.25,
+    inter_pump_interval: Optional[float] = None,
     timeout_duration_seconds: float = 3.0,
     reward_to_pulse_map: Optional[Dict[str, int]] = None,
     reward_to_timeout_map: Optional[Dict[str, int]] = None,
@@ -327,6 +335,11 @@ def run_task(
 
     if seed is not None:
         random.seed(seed)
+
+    inter_pump_interval_seconds = max(
+        0.0,
+        float(pump_pulse_time_seconds if inter_pump_interval is None else inter_pump_interval),
+    )
 
     colors = utils.load_color_palette(Path(colors_tsv))
     shapes = utils.load_shape_definitions(Path(shapes_tsv))
@@ -1088,7 +1101,7 @@ def run_task(
                 if num_pulses > 0:
                     gray_duration_requested += max(0.0, float(pump_delay_time))
                     gray_duration_requested += float(num_pulses * pump_pulse_time_seconds)
-                    gray_duration_requested += float(max(0, num_pulses - 1) * pump_pulse_time_seconds)
+                    gray_duration_requested += float(max(0, num_pulses - 1) * inter_pump_interval_seconds)
                 if apply_timeout > 0:
                     gray_duration_requested += float(timeout_duration_seconds)
             else:
@@ -1139,7 +1152,7 @@ def run_task(
                         break
 
                     if pulse_num < num_pulses:
-                        if _wait_or_abort(pump_pulse_time_seconds):
+                        if _wait_or_abort(inter_pump_interval_seconds):
                             task_end_notes = "experimenter_exit"
                             msg_logger.log("WARN", f"experimenter_exit_during_inter_pulse_interval trial_num={trial_num} pulse={pulse_num}")
                             abort_requested = True
@@ -1332,6 +1345,8 @@ def main():
     reward_space_tsv = _get("reward_space_tsv", cfg.get("reward_space_tsv", None))
     pump_delay_time = float(_get("pump_delay_time", cfg.get("pump_delay_time", 0.0)))
     pump_pulse_time_seconds = float(_get("pump_pulse_time_seconds", cfg.get("pump_pulse_time_seconds", 0.25)))
+    inter_pump_interval_val = _get("inter_pump_interval", cfg.get("inter_pump_interval", None))
+    inter_pump_interval = float(inter_pump_interval_val) if inter_pump_interval_val is not None else None
     timeout_duration_seconds = float(_get("timeout_duration_seconds", cfg.get("timeout_duration_seconds", 3.0)))
     reward_to_pulse_map = cfg.get("reward_to_pulse_map", None)
     reward_to_timeout_map = cfg.get("reward_to_timeout_map", None)
@@ -1384,6 +1399,7 @@ def main():
             reward_space_tsv=reward_space_tsv,
             pump_delay_time=pump_delay_time,
             pump_pulse_time_seconds=pump_pulse_time_seconds,
+            inter_pump_interval=inter_pump_interval,
             timeout_duration_seconds=timeout_duration_seconds,
             reward_to_pulse_map=reward_to_pulse_map,
             reward_to_timeout_map=reward_to_timeout_map,

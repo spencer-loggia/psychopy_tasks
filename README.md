@@ -196,6 +196,8 @@ The main visual timing parameters in `active_foraging` are interpreted by the pr
 - `choice_time`: response-window extension after the stimulus display phase defined by the active mode. In simultaneous non-memory mode the response window starts on the first frame of the full array and lasts `choice_time`, with the full array remaining visible throughout. In sequential memory mode the response window begins only after the full sequence has finished and lasts `choice_time`, with only the remembered dot locations visible.
 - `ibi`: inter-block interval after choice handling. This begins only after reward delivery or timeout handling completes; it is not inserted between stimuli within a block.
 - `pump_delay_time`: delay in seconds between a rewarded choice being made and the first pump pulse. It applies only on rewarded trials with at least one configured pump pulse, and defaults to `0.0`.
+- `pump_pulse_time_seconds`: duration in seconds that the pump output remains on for each reward pulse.
+- `inter_pump_interval`: delay in seconds between repeated pump pulses. When omitted, it defaults to `pump_pulse_time_seconds`, preserving the previous behavior.
 
 Two common `active_foraging` configurations:
 

@@ -7,8 +7,9 @@
   "colors_tsv": "./task/resources/csc2/mt2_062026_amoledB_colors.tsv",
   "freq_space_tsv": "./task/resources/csc2/freq_space_TY.csv",
   "reward_space_tsv": "./task/resources/csc2/reward_space_TY.csv",
-  "pump_delay_time_seconds": 0.1,
+  "pump_delay_time": 0.0,
   "pump_pulse_time_seconds": 0.5,
+  "inter_pump_interval": 0.1, 
   "timeout_duration_seconds": 3.0,
   "reward_to_pulse_map": {
     "0": 0,
@@ -47,7 +48,7 @@
   "stroke_color": [0, 0, 0],
   "stroke_linejoin": "round",
   "stroke_linecap": "round",
-  "image_size": [200, 200],
+  "image_size": [300, 300],
 
 
   "self_initiation": false,

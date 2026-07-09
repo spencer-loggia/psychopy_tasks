@@ -20,6 +20,7 @@ Config keys required/additional:
 
 """
 import argparse
+import math
 import os
 import sys
 import time
@@ -163,28 +164,133 @@ def _stim_size_from_preloaded(preloaded: Dict[Tuple[int, int], Any], first_pair:
     return item.size
 
 
+def _resolve_stimulus_circle(
+    center_point: Optional[Tuple[float, float]],
+    stim_range_radius: Optional[float],
+    effective_win_size: Tuple[int, int],
+) -> Tuple[Tuple[float, float], float]:
+    width_px, height_px = float(effective_win_size[0]), float(effective_win_size[1])
+    if width_px <= 0 or height_px <= 0:
+        raise ValueError(f"Invalid main screen size for stimulus circle: {effective_win_size}")
+
+    if center_point is None:
+        center_px = (width_px / 2.0, height_px / 2.0)
+    else:
+        if len(center_point) != 2:
+            raise ValueError("center_point must contain exactly two pixel coordinates")
+        center_px = (float(center_point[0]), float(center_point[1]))
+
+    if not (0.0 <= center_px[0] <= width_px and 0.0 <= center_px[1] <= height_px):
+        raise ValueError(
+            f"center_point={center_px} is outside the main screen bounds {effective_win_size}"
+        )
+
+    # Default radius is half the distance from the chosen center to the closest screen edge.
+    closest_edge_px = min(center_px[0], width_px - center_px[0], center_px[1], height_px - center_px[1])
+    radius_px = closest_edge_px / 2.0 if stim_range_radius is None else float(stim_range_radius)
+    if radius_px <= 0.0:
+        raise ValueError("stim_range_radius must be greater than 0 pixels")
+    if radius_px > closest_edge_px:
+        raise ValueError(
+            "stim_range_radius places the stimulus circle outside the main screen bounds"
+        )
+    return center_px, radius_px
+
+
+def _screen_px_to_psychopy(
+    position_px: Tuple[float, float],
+    effective_win_size: Tuple[int, int],
+) -> Tuple[float, float]:
+    width_px, height_px = float(effective_win_size[0]), float(effective_win_size[1])
+    return position_px[0] - (width_px / 2.0), (height_px / 2.0) - position_px[1]
+
+
+def _circle_point(
+    center_px: Tuple[float, float],
+    radius_px: float,
+    angle_rad: float,
+) -> Tuple[float, float]:
+    # Screen-pixel coordinates use +y downward, so pi/2 is the point directly below center.
+    return (
+        center_px[0] + radius_px * math.cos(angle_rad),
+        center_px[1] + radius_px * math.sin(angle_rad),
+    )
+
+
+def _has_overlap(
+    position_px: Tuple[float, float],
+    placed_px: List[Tuple[float, float]],
+    stim_size: Tuple[int, int],
+) -> bool:
+    stim_w, stim_h = float(stim_size[0]), float(stim_size[1])
+    for placed_x, placed_y in placed_px:
+        if abs(position_px[0] - placed_x) < stim_w and abs(position_px[1] - placed_y) < stim_h:
+            return True
+    return False
+
+
+def _assert_non_overlapping_circle_positions(
+    positions_px: List[Tuple[float, float]],
+    stim_size: Tuple[int, int],
+) -> None:
+    placed_px: List[Tuple[float, float]] = []
+    for position_px in positions_px:
+        if _has_overlap(position_px, placed_px, stim_size):
+            raise ValueError(
+                "Fixed stimulus circle positions overlap; increase stim_range_radius or reduce stimulus size"
+            )
+        placed_px.append(position_px)
+
+
+def _sample_non_overlapping_circle_positions(
+    count: int,
+    center_px: Tuple[float, float],
+    radius_px: float,
+    stim_size: Tuple[int, int],
+    max_attempts: int = 2000,
+) -> List[Tuple[float, float]]:
+    positions_px: List[Tuple[float, float]] = []
+    attempts = 0
+    while len(positions_px) < count and attempts < max_attempts:
+        attempts += 1
+        candidate_px = _circle_point(center_px, radius_px, random.uniform(0.0, 2.0 * math.pi))
+        if not _has_overlap(candidate_px, positions_px, stim_size):
+            positions_px.append(candidate_px)
+
+    if len(positions_px) < count:
+        raise RuntimeError(f"Could not place {count} non-overlapping stimuli on the stimulus circle")
+    return positions_px
+
+
 def _compute_positions(
     fixed_positions: bool,
     num_afc: int,
-    position_spacing: Optional[int],
+    center_point: Optional[Tuple[float, float]],
+    stim_range_radius: Optional[float],
     stim_size: Tuple[int, int],
     effective_win_size: Tuple[int, int],
-    margin: int,
 ) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+    center_px, radius_px = _resolve_stimulus_circle(center_point, stim_range_radius, effective_win_size)
     if fixed_positions:
-        if num_afc not in (2, 4):
-            raise ValueError("fixed_positions only supported for num_afc == 2 or num_afc == 4")
-        spacing = int(position_spacing) if position_spacing is not None else 300
-        if num_afc == 2:
-            sampled_positions = [(-spacing, 0), (spacing, 0)]
-        else:
-            sampled_positions = [(-spacing, spacing), (spacing, spacing), (-spacing, -spacing), (spacing, -spacing)]
-        positions = utils.clamp_positions(sampled_positions, stim_size, effective_win_size, margin=margin)
-        return sampled_positions, positions
+        # Fixed positions are evenly spaced, offset by half a spacing from the point directly below center.
+        spacing_angle = (2.0 * math.pi) / float(num_afc)
+        start_angle = (math.pi / 2.0) + (spacing_angle / 2.0)
+        sampled_positions_px = [
+            _circle_point(center_px, radius_px, start_angle + (idx * spacing_angle))
+            for idx in range(num_afc)
+        ]
+        _assert_non_overlapping_circle_positions(sampled_positions_px, stim_size)
+    else:
+        # Random positions stay on the circle and use the same axis-aligned overlap rule as the old sampler.
+        sampled_positions_px = _sample_non_overlapping_circle_positions(
+            num_afc,
+            center_px,
+            radius_px,
+            stim_size,
+        )
 
-    sampled_positions = utils.sample_non_overlapping_positions(num_afc, stim_size, effective_win_size, margin=margin)
-    positions = utils.clamp_positions(sampled_positions, stim_size, effective_win_size, margin=margin)
-    return sampled_positions, positions
+    positions = [_screen_px_to_psychopy(pos_px, effective_win_size) for pos_px in sampled_positions_px]
+    return sampled_positions_px, positions
 
 
 def _build_behavior_fieldnames(num_afc: int) -> List[str]:
@@ -240,8 +346,9 @@ def parse_args():
     p.add_argument("--debug", action="store_true", default=None, help="Enable debug outputs (write debug images to logs/)")
     p.add_argument("--self_initiation", action="store_true", default=None, help="Require participant to self-initiate each block by clicking an onset cue")
     p.add_argument("--fixation_size", type=int, default=None, help="Fixation cross size in pixels; 0 disables fixation")
-    p.add_argument("--fixed_positions", action="store_true", default=None, help="Fix option positions to fixed locations (only supported for 2 or 4 options)")
-    p.add_argument("--position_spacing", type=int, default=None, help="Spacing (pixels) to use for fixed positions; ignored if --fixed_positions not set")
+    p.add_argument("--fixed_positions", action="store_true", default=None, help="Fix option positions to evenly spaced locations on the stimulus circle")
+    p.add_argument("--center_point", type=int, nargs=2, default=None, help="Stimulus circle center in main-screen pixels: X Y")
+    p.add_argument("--stim_range_radius", type=int, default=None, help="Stimulus circle radius in pixels")
     p.add_argument("--is_memory", action="store_true", default=None, help="If set, items are removed and replaced by dots for the choice period (memory task). If not set, config value or default True is used")
     p.add_argument("--sequential", action="store_true", default=None, help="Present stimuli sequentially (one at a time). If not set, config value or default True is used")
     p.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate (Hz); skip auto-detection if provided")
@@ -296,7 +403,6 @@ def run_task(
     fullscreen: bool = False,
     win_size: Optional[Tuple[int, int]] = None,
     image_size: Optional[Tuple[int, int]] = None,
-    margin: int = 50,
     debug: bool = False,
     likelihood_tsv: Optional[str] = None,
     self_initiation: bool = False,
@@ -308,7 +414,8 @@ def run_task(
     pump_pin: int = 17,
     buzz_pin: int = 16,
     fixed_positions: bool = False,
-    position_spacing: Optional[int] = None,
+    center_point: Optional[Tuple[float, float]] = None,
+    stim_range_radius: Optional[float] = None,
     sequential: bool = True,
     is_memory: bool = True,
     freq_space_tsv: Optional[str] = None,
@@ -606,7 +713,7 @@ def run_task(
     # the full color x shape x luminance combinatoric space.
     preloaded: dict = {}
 
-    main_screen, experimenter_screen = resolve_task_screens(screen_config)
+    main_screen, experimenter_screen = resolve_task_screens(screen_config, allow_same_screen=True)
     try:
         msg_logger.log(
             "INFO",
@@ -1010,14 +1117,14 @@ def run_task(
             sampled_positions, positions = _compute_positions(
                 fixed_positions=fixed_positions,
                 num_afc=num_afc,
-                position_spacing=position_spacing,
+                center_point=center_point,
+                stim_range_radius=stim_range_radius,
                 stim_size=stim_size,
                 effective_win_size=effective_win_size,
-                margin=margin,
             )
 
             for i, (spos, cpos) in enumerate(zip(sampled_positions, positions), start=1):
-                msg_logger.log("INFO", f"position_assigned block={block_idx} idx={i} sampled={spos} clamped={cpos}")
+                msg_logger.log("INFO", f"position_assigned block={block_idx} idx={i} screen_px={spos} psychopy_pos={cpos}")
 
             trial_meta: Dict[str, Any] = {}
             _show_preview_idle()
@@ -1323,7 +1430,6 @@ def main():
     fullscreen = bool(_get("fullscreen", cfg.get("fullscreen", False)))
     win_size = tuple(_get("win_size", cfg.get("win_size", None))) if _get("win_size", None) else None
     image_size = tuple(_get("image_size", cfg.get("image_size", None))) if _get("image_size", None) else None
-    margin = int(_get("margin", cfg.get("margin", 50)))
     debug = bool(_get("debug", cfg.get("debug", False)))
     likelihood_tsv = _get("likelihood_tsv", cfg.get("likelihood_tsv", None))
     # Accept both 'refresh_rate' and the common misspelling 'refrech_rate' from config
@@ -1334,9 +1440,10 @@ def main():
     pump_pin = int(_get("pump_pin", cfg.get("pump_pin", 17)))
     buzz_pin = int(_get("buzz_pin", cfg.get("buzz_pin", 16)))
     fixed_positions = bool(_get("fixed_positions", cfg.get("fixed_positions", False)))
-    # position_spacing may be omitted; leave as None to let run_task choose a default
-    pos_spacing_val = _get("position_spacing", cfg.get("position_spacing", None))
-    position_spacing = int(pos_spacing_val) if pos_spacing_val is not None else None
+    center_point_val = _get("center_point", cfg.get("center_point", None))
+    center_point = tuple(center_point_val) if center_point_val is not None else None
+    stim_range_radius_val = _get("stim_range_radius", cfg.get("stim_range_radius", None))
+    stim_range_radius = float(stim_range_radius_val) if stim_range_radius_val is not None else None
     sequential = bool(_get("sequential", cfg.get("sequential", True)))
     is_memory = bool(_get("is_memory", cfg.get("is_memory", True)))
     
@@ -1380,7 +1487,6 @@ def main():
             fullscreen=fullscreen,
             win_size=win_size,
             image_size=image_size,
-            margin=margin,
             debug=debug,
             self_initiation=_get("self_initiation", cfg.get("self_initiation", False)),
             fixation_size=_get("fixation_size", cfg.get("fixation_size", None)),
@@ -1392,7 +1498,8 @@ def main():
             pump_pin=pump_pin,
             buzz_pin=buzz_pin,
             fixed_positions=fixed_positions,
-            position_spacing=position_spacing,
+            center_point=center_point,
+            stim_range_radius=stim_range_radius,
             sequential=sequential,
             is_memory=is_memory,
             freq_space_tsv=freq_space_tsv,

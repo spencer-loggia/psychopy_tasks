@@ -1,11 +1,15 @@
-{ "n_colors": 36,
+{ 
+  "config_name": "yuri_rigtrain_20260615",
+  "n_colors": 36,
   "n_shapes": 36, 
-  "n_lum_levels": 21,
+  "n_lum_levels": 11,
   "shapes_tsv": "./task/resources/csc2/shape_definitions.tsv",
-  "colors_tsv": "./task/resources/csc2/test_color_definitions.tsv",
+  "colors_tsv": "./task/resources/csc2/mt2_062026_amoledB_colors.tsv",
   "freq_space_tsv": "./task/resources/csc2/freq_space_TY.csv",
   "reward_space_tsv": "./task/resources/csc2/reward_space_TY.csv",
-  "pump_pulse_time_seconds": 0.25,
+  "pump_delay_time": 0.0,
+  "pump_pulse_time_seconds": 0.6,
+  "inter_pump_interval": 0.1, 
   "timeout_duration_seconds": 3.0,
   "reward_to_pulse_map": {
     "0": 0,
@@ -20,15 +24,18 @@
     "3": 0
   },
 
-  "pump_pin": 23,
-  "buzz_pin": 24,
+  "pump_pin": 24,
+  "buzz_pin": 23,
   "trial_start_pin": 18,
 
-  "seed": 42,
+  "seed": null,
   "output_dir": "./logs",
-  "refresh_rate": 120,
-  "n": 20,
-  "duration": 0.0,
+  "screens": {
+    "main": null,
+    "experimenter": null
+  },
+  "refresh_rate": 60,
+  "n": 2000,
 
   "fullscreen": true,
   "win_size": [2560, 1600],
@@ -38,18 +45,22 @@
   "init_dot_color": [50, 50, 50],
   "center_point": null,
   "stim_range_radius": null,
-  "stroke_width": 0.50,
+  "stroke_width": 0.2,
   "stroke_color": [0, 0, 0],
-  "image_size": [100, 100],
+  "stroke_linejoin": "round",
+  "stroke_linecap": "round",
+  "image_size": [300, 300],
 
 
   "self_initiation": true,
   "ibi": 0.75,
-  "num_afc": 2,
+  "duration": 0.0,
+  "num_afc": 4,
   "choice_time": 2.0,
-  "isi": 0.0,
+  "isi": 0.00,
   "fixed_positions": true,
   "sequential": false,
   "is_memory": false,
-  "raspi": true
+  "raspi": true,
+  "touchscreen": true
 }

@@ -10,6 +10,7 @@ from bin.screen import (
     compute_centered_aspect_fit,
     get_psychopy_window_kwargs,
     load_screen_config,
+    resolve_task_screens,
     resolve_scene_size,
     scale_scene_point,
     select_screen,
@@ -69,6 +70,31 @@ class ScreenConfigTests(unittest.TestCase):
             load_screen_config(cfg),
             {"main": "HDMI-2", "experimenter": "HDMI-1"},
         )
+
+    def test_resolve_task_screens_rejects_same_display_by_default(self):
+        screens = [
+            ScreenGeometry(index=0, x=0, y=0, width=800, height=480, name="HDMI-1"),
+            ScreenGeometry(index=1, x=800, y=0, width=800, height=480, name="HDMI-2"),
+        ]
+
+        with patch("bin.screen.get_monitor_screens", return_value=screens):
+            with self.assertRaises(ValueError):
+                resolve_task_screens({"main": 0, "experimenter": 0})
+
+    def test_resolve_task_screens_can_collapse_same_display_to_main_only(self):
+        screens = [
+            ScreenGeometry(index=0, x=0, y=0, width=800, height=480, name="HDMI-1"),
+            ScreenGeometry(index=1, x=800, y=0, width=800, height=480, name="HDMI-2"),
+        ]
+
+        with patch("bin.screen.get_monitor_screens", return_value=screens):
+            main_screen, experimenter_screen = resolve_task_screens(
+                {"main": "HDMI-1", "experimenter": "HDMI-1"},
+                allow_same_screen=True,
+            )
+
+        self.assertEqual(main_screen.index, 0)
+        self.assertIsNone(experimenter_screen)
 
     def test_hdmi_names_do_not_cross_match_by_off_by_one_alias(self):
         screens = [

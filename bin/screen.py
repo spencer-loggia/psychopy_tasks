@@ -434,6 +434,8 @@ def select_screen(
 
 def resolve_task_screens(
     screen_config: Optional[Dict[str, ScreenSelector]] = None,
+    *,
+    allow_same_screen: bool = False,
 ) -> tuple[ScreenGeometry, Optional[ScreenGeometry]]:
     cfg = screen_config or {}
     screens = get_monitor_screens()
@@ -464,6 +466,9 @@ def resolve_task_screens(
         allow_unvalidated_index=True,
     )
     if experimenter_screen is not None and experimenter_screen.index == main_screen.index:
+        if allow_same_screen:
+            # Same-screen mode intentionally suppresses the secondary preview window.
+            return main_screen, None
         raise ValueError("Main and experimenter screens must resolve to different displays")
 
     return main_screen, experimenter_screen

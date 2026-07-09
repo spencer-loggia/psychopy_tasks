@@ -133,6 +133,8 @@ Each value can be a detected screen index or an output name such as `HDMI-1` or 
 Set either value to `null` to inherit the process environment defaults: `screens.main` reads `MAIN_SCREEN`, and
 `screens.experimenter` reads `SECONDARY_SCREEN`. The touch launcher exports its resolved global `screens` values
 to those environment variables for launched tasks.
+For `active_foraging`, setting `screens.main` and `screens.experimenter` to the same display is allowed and disables
+the experimenter preview, so only the main task content is shown.
 
 Eye Tracker Calibration
 -----------------------
@@ -213,6 +215,14 @@ Two common `active_foraging` configurations:
   - After the final stimulus, the task enters a dot-only choice period for `choice_time`.
   - `ibi` starts only after the resulting reward or timeout has finished.
 
+Active Foraging Positioning
+---------------------------
+`active_foraging` places every stimulus center on a stimulus circle in main-screen pixel coordinates. `center_point` is `[x, y]` with origin at the upper-left of the main screen. When `center_point` is `null`, it defaults to the exact middle of the main screen. `stim_range_radius` is the circle radius in pixels. When it is `null`, it defaults to half the distance from `center_point` to the closest screen edge.
+
+- `fixed_positions=true`: locations are evenly spaced around the circle. The spacing angle is `2*pi / num_afc`, and the first location is offset by half that spacing from the point directly below `center_point`.
+- `fixed_positions=false`: locations are random points on the circle, with rejected draws when stimulus bounding boxes would overlap.
+- Custom `center_point` and `stim_range_radius` values can be provided in JSON or as `--center_point X Y --stim_range_radius R`.
+
 Active Foraging Color TSV
 -------------------------
 `active_foraging` expects `colors_tsv` to be a tab-delimited file with four columns: `id`, `r`, `g`, `b` (column name case is flexible, for example `ID R G B` also works).
@@ -248,6 +258,8 @@ All tasks in this repository must support loading a JSON configuration file as a
 - `win_size` (array of 2 ints, optional)
 - `fixation_size` (int, optional)
 - `image_size` (array of 2 ints, optional)
+- `center_point` (array of 2 ints or null, optional): `active_foraging` stimulus circle center in main-screen pixels
+- `stim_range_radius` (int or null, optional): `active_foraging` stimulus circle radius in pixels
 
 Tasks must validate the config when loaded and raise a helpful error if required keys are missing or types are invalid. Command-line arguments should override values in the config file when both are provided.
 

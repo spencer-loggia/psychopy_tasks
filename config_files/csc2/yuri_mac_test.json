@@ -1,5 +1,5 @@
 { 
-  "config_name": "yuri_rigtrain_20260615",
+  "config_name": "mac_test_files",
   "n_colors": 36,
   "n_shapes": 36, 
   "n_lum_levels": 11,
@@ -43,23 +43,24 @@
   "dot_size": 40,
   "dot_color": [50, 50, 50],
   "init_dot_color": [50, 50, 50],
-  "margin": 200,
+  "center_point": null,
+  "stim_range_radius": null,
   "stroke_width": 0.2,
   "stroke_color": [0, 0, 0],
   "stroke_linejoin": "round",
   "stroke_linecap": "round",
-  "image_size": [300, 300],
+  "image_size": [200, 200],
 
 
   "self_initiation": true,
   "ibi": 0.75,
   "duration": 0.0,
-  "num_afc": 4,
+  "num_afc": 3,
   "choice_time": 2.0,
   "isi": 0.00,
-  "fixed_positions": true,
+  "fixed_positions": false,
   "sequential": false,
   "is_memory": false,
-  "raspi": true,
-  "touchscreen": true
+  "raspi": false,
+  "touchscreen": false
 }

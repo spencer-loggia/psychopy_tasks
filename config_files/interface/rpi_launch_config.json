@@ -12,11 +12,29 @@
             "classic": {
                 "Wooster": {
                     "launch": "task/afc_csc1.py",
-                    "config": "config_files/csc2/wooster_rigtrain_nodelay.json"
+                    "config": "config_files/csc1/wooster_rigtrain_nodelay.json"
                 }, 
                 "Jeeves": {
                     "launch": "task/afc_csc1.py",
-                    "config": "config_files/csc2/jeeves_rigtrain_nodelay.json"
+                    "config": "config_files/csc1/jeeves_rigtrain_nodelay.json"
+                }, 
+                "Debug": {
+                    "launch": "task/afc_csc1.py",
+                    "config": "config_files/csc1/human_raspi_test_nodelay.json"
+                }
+            }, 
+            "delay": {
+                "Wooster": {
+                    "launch": "task/afc_csc1.py",
+                    "config": "config_files/csc1/wooster_rigtrain_delay.json"
+                },
+                "Jeeves": {
+                    "launch": "task/afc_csc1.py",
+                    "config": "config_files/csc1/jeeves_rigtrain_delay.json"
+                }, 
+                "Debug": {
+                    "launch": "task/afc_csc1.py",
+                    "config": "config_files/csc1/human_raspi_test_delay.json"
                 }
             }
         },

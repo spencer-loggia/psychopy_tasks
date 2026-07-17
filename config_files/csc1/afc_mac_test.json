@@ -1,0 +1,35 @@
+{
+  "config_name": "afc_csc1_mac_test",
+  "colors_tsv": "task/resources/csc1/csc1_colors/csc1_color_definition.tsv",
+  "shapes_tsv": "task/resources/csc1/csc1_shapes/shape_definitions_csc1.tsv",
+  "output_dir": "./logs",
+
+  "n": 10,
+  "num_afc": 4,
+
+  "cue_time": 1,
+  "delay_time": 1,
+  "choice_time": 5,
+  "ibi": 1.0,
+  "isi": 0.0,
+
+  "image_size": [128, 128],
+  "win_size": [1200, 900],
+  "fullscreen": false,
+  "fixed_positions": true,
+  
+
+  "refresh_rate": 60,
+  "bg": [128, 128, 128],
+  "dot_size": 10,
+  "dot_color": [155, 155, 155],
+
+  "trial_type": "random",
+  "pairing_mode": "matched",
+  "colors_tsv_has_bg_row": true,
+
+  "self_initiation": false,
+  "raspi": false,
+  "touchscreen": false,
+  "debug": false
+}

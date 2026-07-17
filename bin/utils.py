@@ -570,6 +570,8 @@ def rasterize_svg_with_color(
     stroke_width_px: Optional[float] = None,
     stroke_linejoin: Optional[str] = None,
     stroke_linecap: Optional[str] = None,
+    flip: bool = False,
+    outline_only: bool = False,
 ) -> Image.Image:
     """Rasterize an SVG and force its fill color to `color_rgb_255`.
 
@@ -609,7 +611,10 @@ def rasterize_svg_with_color(
     # we set the requested color; if stroke_width_px is provided we also set
     # stroke-width. If stroke_width_px is None, the SVG's original stroke
     # width is preserved.
-    style_rules = [f"fill:rgb({r},{g},{b}) !important", f"stroke:rgb({sr},{sg},{sb}) !important"]
+    if outline_only: 
+        style_rules = ["fill:none !important", f"stroke:rgb({sr},{sg},{sb}) !important"]
+    else: 
+        style_rules = [f"fill:rgb({r},{g},{b}) !important", f"stroke:rgb({sr},{sg},{sb}) !important"]
     if stroke_width_px is not None:
         # ensure numeric formatting
         try:
@@ -657,6 +662,10 @@ def rasterize_svg_with_color(
     )
 
     im = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+
+    if flip:
+        im = im.transpose(Image.FLIP_TOP_BOTTOM)
+    
     try:
         if DEBUG:
             logs_dir = Path("logs")
@@ -1869,3 +1878,497 @@ class TrialBufferManager:
     def __del__(self):
         """Destructor to ensure cleanup happens even if close() not called."""
         self.close()
+
+
+def make_color_gaussian_image(
+    color_rgb_255: Tuple[int, int, int],
+    size_px: Tuple[int, int],
+    sigma_frac: float = 0.22,
+    zero_threshold: int = 1,
+) -> Image.Image:
+    """Create an RGBA color patch with a centered 2D Gaussian alpha mask."""
+    if not size_px or len(size_px) != 2 or size_px[0] <= 0 or size_px[1] <= 0:
+        raise ValueError("size_px must be a (width, height) tuple of positive ints")
+
+    w, h = int(size_px[0]), int(size_px[1])
+    rgb = tuple(int(c) for c in color_rgb_255)
+    im = Image.new("RGB", (w, h), color=rgb)
+
+    cx = (w - 1) / 2.0
+    cy = (h - 1) / 2.0
+    sigma = max(2.0, min(w, h) * float(sigma_frac))
+    yy, xx = np.mgrid[0:h, 0:w]
+    gauss = np.exp(-0.5 * (((xx - cx) / sigma) ** 2 + ((yy - cy) / sigma) ** 2))
+    mask_u8 = np.clip(gauss * 255.0, 0, 255).astype(np.uint8)
+    if zero_threshold is not None and zero_threshold > 0:
+        mask_u8[mask_u8 <= int(zero_threshold)] = 0
+    im.putalpha(Image.fromarray(mask_u8, mode="L"))
+    return im
+
+
+def _csc1_feature_id(pair: Tuple[int, int], feature: str) -> int:
+    sid, cid = pair
+    if feature == "shape":
+        return int(sid)
+    if feature == "color":
+        return int(cid)
+    raise ValueError(f"Unknown feature type: {feature}")
+
+
+def _csc1_feature_key(pair: Tuple[int, int], feature: str) -> Tuple[str, int]:
+    return (f"{feature}_only", _csc1_feature_id(pair, feature))
+
+
+def _csc1_choice_mapping(trial_type: str) -> Tuple[str, str]:
+    if trial_type == "shape_to_color":
+        return "shape", "color"
+    if trial_type == "color_to_shape":
+        return "color", "shape"
+    raise ValueError("trial_type must be 'shape_to_color' or 'color_to_shape'")
+
+
+def present_delayed_afc_trial(
+    *,
+    win: visual.Window,
+    preloaded: Dict[Any, Image.Image],
+    block_paths: List[Tuple[int, int]],
+    positions: List[Tuple[float, float]],
+    cue_time: float,
+    delay_time: float,
+    choice_time: float,
+    bg_rect,
+    fix,
+    logger,
+    block_idx: int,
+    target_index: int,
+    trial_type: str = "shape_to_color",
+    isi: float = 0.0,
+    bg_rgb_255: Optional[Tuple[int, int, int]] = None,
+    onset_cue: Optional[visual.ImageStim] = None,
+    msg_logger=None,
+    fps: Optional[float] = None,
+    choice_hitbox_scale: float = 1.0,
+    trial_meta: Optional[Dict[str, Any]] = None,
+    cue_pos: Tuple[float, float] = (0.0, 0.0),
+    raspi: bool = False,
+    pigpio_pi=None,
+    raspi_pin: int = 18,
+    external_abort_checker=None,
+    show_fixation: bool = False,
+) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    """Present one delayed AFC trial with frame-locked cue/delay/choice timing.
+
+    Sequence:
+        checkerboard onset cue click/touch -> optional pre-cue ISI -> feature cue -> delay -> choices -> grey
+
+    The AFC cue sequence always begins only after the participant clicks/touches
+    the ``make_onset_cue_stim`` checkerboard stimulus.
+    """
+    from psychopy import core as _core
+
+    if len(block_paths) != len(positions):
+        raise ValueError("block_paths and positions must have the same length")
+    if target_index < 1 or target_index > len(block_paths):
+        raise ValueError("target_index must be 1-based and within block_paths")
+    if onset_cue is None:
+        raise ValueError("present_delayed_afc_trial requires an onset_cue made by make_onset_cue_stim")
+
+    if fps is None:
+        fps, frame_dur = detect_frame_rate(win, msg_logger=msg_logger)
+    else:
+        fps = float(fps)
+        frame_dur = 1.0 / fps
+
+    def _q_to_frames(seconds: float, at_least_one: bool = False) -> Tuple[int, float]:
+        frames = int(round(max(0.0, float(seconds)) * fps))
+        if at_least_one:
+            frames = max(1, frames)
+        return frames, frames * frame_dur
+
+    isi_frames, isi_s = _q_to_frames(isi, at_least_one=False)
+    cue_frames, cue_s = _q_to_frames(cue_time, at_least_one=True)
+    delay_frames, delay_s = _q_to_frames(delay_time, at_least_one=False)
+    choice_frames, choice_s = _q_to_frames(choice_time, at_least_one=True)
+
+    _log_message(
+        msg_logger,
+        "INFO",
+        (
+            f"timing_quantization block={block_idx} "
+            f"isi={float(isi):.6f}s-> {isi_frames}fr({isi_s:.6f}s) "
+            f"cue_time={float(cue_time):.6f}s-> {cue_frames}fr({cue_s:.6f}s) "
+            f"delay_time={float(delay_time):.6f}s-> {delay_frames}fr({delay_s:.6f}s) "
+            f"choice_time={float(choice_time):.6f}s-> {choice_frames}fr({choice_s:.6f}s)"
+        ),
+    )
+
+    cue_feature, choice_feature = _csc1_choice_mapping(trial_type)
+    target_pair = tuple(block_paths[target_index - 1])
+    cue_img = preloaded.get(_csc1_feature_key(target_pair, cue_feature))
+    if cue_img is None:
+        cue_img = preloaded.get(target_pair)
+    if cue_img is None:
+        raise KeyError(f"Missing cue image for {target_pair} feature={cue_feature}")
+
+    cue_stim = make_image_stim_from_array(win, cue_img, size=None, bg_rgb_255=bg_rgb_255)
+    cue_stim.pos = cue_pos
+
+    choice_stims: List[visual.ImageStim] = []
+    choice_hit_targets: List[visual.Rect] = []
+    for pair, pos in zip(block_paths, positions):
+        pair = tuple(pair)
+        choice_img = preloaded.get(_csc1_feature_key(pair, choice_feature))
+        if choice_img is None:
+            choice_img = preloaded.get(pair)
+        if choice_img is None:
+            raise KeyError(f"Missing choice image for {pair} feature={choice_feature}")
+        stim = make_image_stim_from_array(win, choice_img, size=None, bg_rgb_255=bg_rgb_255)
+        stim.pos = pos
+        choice_stims.append(stim)
+        try:
+            w, h = stim.size
+        except Exception:
+            w, h = (64.0, 64.0)
+        choice_hit_targets.append(
+            visual.Rect(
+                win,
+                width=max(1.0, float(w) * float(choice_hitbox_scale)),
+                height=max(1.0, float(h) * float(choice_hitbox_scale)),
+                pos=pos,
+                units="pix",
+                fillColor=None,
+                lineColor=None,
+                opacity=0.0,
+            )
+        )
+
+    mouse = event.Mouse(win=win)
+    try:
+        mouse.clickReset()
+    except Exception:
+        pass
+    try:
+        event.clearEvents(eventType="mouse")
+    except Exception:
+        pass
+
+    trial_start_signal_armed_s: Optional[float] = None
+    trial_start_signal_sent = False
+
+    def _set_initiation_time(perf_s: Optional[float] = None) -> None:
+        if trial_meta is None or "initiation_time_s" in trial_meta:
+            return
+        perf_now = float(perf_s) if perf_s is not None else time.perf_counter()
+        try:
+            trial_meta["initiation_time_s"] = logger.seconds_since_session_start(perf_now)
+        except Exception:
+            trial_meta["initiation_time_s"] = ""
+
+    def _record_gray_flip(perf_s: float) -> None:
+        if trial_meta is not None:
+            trial_meta["gray_flip_perf_s"] = float(perf_s)
+
+    def _abort_from_input(reason: str) -> bool:
+        if event.getKeys(["escape"]):
+            _log_message(msg_logger, "WARN", f"escape_pressed block={block_idx} reason={reason}")
+            return True
+        if external_abort_checker is not None:
+            try:
+                if external_abort_checker():
+                    _log_message(msg_logger, "WARN", f"external_abort block={block_idx} reason={reason}")
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _draw_fixation_if_requested() -> None:
+        if show_fixation and fix is not None:
+            fix.draw()
+
+    def _draw_blank() -> None:
+        bg_rect.draw()
+        _draw_fixation_if_requested()
+
+    def _arm_trial_start_signal() -> bool:
+        nonlocal trial_start_signal_armed_s, trial_start_signal_sent
+        if trial_start_signal_sent or trial_start_signal_armed_s is not None:
+            return True
+        if not raspi or pigpio_pi is None:
+            return True
+        try:
+            _, pulse_s = _q_to_frames(0.25, at_least_one=True)
+            duration_us = int(pulse_s * 1_000_000)
+            win.callOnFlip(_send_led_pulse_on_flip, pigpio_pi, raspi_pin, duration_us)
+            trial_start_signal_armed_s = pulse_s
+            _log_message(msg_logger, "INFO", f"raspi_pulse_registered block={block_idx} duration_s={pulse_s:.6f}")
+            return True
+        except Exception as e:
+            _log_message(msg_logger, "ERROR", f"trial_start_signal_registration_failed block={block_idx} error={e}")
+            return False
+
+    def _commit_trial_start_signal(flip_perf_s: float) -> None:
+        nonlocal trial_start_signal_armed_s, trial_start_signal_sent
+        if trial_start_signal_armed_s is None:
+            return
+        logger.log_signal(
+            trial_num=block_idx,
+            event="trial_start_signal_on",
+            timestamp_perf_s=flip_perf_s,
+            requested_duration=trial_start_signal_armed_s,
+        )
+        logger.log_signal(
+            trial_num=block_idx,
+            event="trial_start_signal_off",
+            timestamp_perf_s=flip_perf_s + trial_start_signal_armed_s,
+        )
+        trial_start_signal_sent = True
+        trial_start_signal_armed_s = None
+
+    # Mandatory self-initiation cue: show the checkerboard cue and wait for a *new*
+    # click/touch inside its bounds before beginning the AFC cue/delay/choice sequence.
+    
+    try:
+        onset_cue.pos = (0, 0)
+        onset_cue.opacity = 1.0
+    except Exception:
+        pass
+    bg_rect.draw()
+    onset_cue.draw()
+    win.flip()
+    oc_perf = time.perf_counter()
+    logger.log_frame_flip(
+        trial_num=block_idx,
+        event="onset_cue_on",
+        timestamp_perf_s=oc_perf,
+    )
+    try:
+        event.clearEvents(eventType="mouse")
+        mouse.clickReset()
+    except Exception:
+        pass
+    prev_touch_down = any(mouse.getPressed())
+    while True:
+        if _abort_from_input("during_onset_cue"):
+            return True, None
+        click_pos = tuple(float(v) for v in mouse.getPos())
+        touch_down = any(mouse.getPressed())
+        touch_started = touch_down and not prev_touch_down
+        prev_touch_down = touch_down
+        if touch_started:
+            try:
+                oc_w, oc_h = onset_cue.size
+            except Exception:
+                oc_w, oc_h = (200, 200)
+            oc_x, oc_y = getattr(onset_cue, "pos", (0, 0))
+            if abs(click_pos[0] - oc_x) <= oc_w / 2.0 and abs(click_pos[1] - oc_y) <= oc_h / 2.0:
+                click_perf = time.perf_counter()
+                _set_initiation_time(click_perf)
+                logger.log_interaction(
+                    trial_num=block_idx,
+                    event="cue_touch",
+                    timestamp_perf_s=click_perf,
+                )
+                _log_message(
+                    msg_logger,
+                    "INFO",
+                    (
+                        f"checkerboard_onset_cue_touch block={block_idx} "
+                        f"click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f})"
+                    ),
+                )
+                # Prevent the onset-cue press from carrying into the choice window.
+                while any(mouse.getPressed()):
+                    if _abort_from_input("waiting_for_onset_cue_release"):
+                        return True, None
+                    _core.wait(0.005)
+                try:
+                    mouse.clickReset()
+                    event.clearEvents(eventType="mouse")
+                except Exception:
+                    pass
+                break
+        _core.wait(0.01)
+
+    if isi_frames > 0:
+        first_flip = True
+        for _ in range(isi_frames):
+            if _abort_from_input("during_pre_cue_isi"):
+                return True, None
+            _draw_blank()
+            win.flip()
+            if first_flip:
+                _log_message(msg_logger, "INFO", f"pre_cue_interval block={block_idx} duration_s={isi_s:.6f}")
+                first_flip = False
+
+    first_flip = True
+    if not _arm_trial_start_signal():
+        return True, None
+    for _ in range(cue_frames):
+        if _abort_from_input("during_cue"):
+            return True, None
+        bg_rect.draw()
+        cue_stim.draw()
+        _draw_fixation_if_requested()
+        win.flip()
+        if first_flip:
+            cue_perf = time.perf_counter()
+            _commit_trial_start_signal(cue_perf)
+            _set_initiation_time(cue_perf)
+            if trial_meta is not None:
+                trial_meta["cue_flip_perf_s"] = float(cue_perf)
+                trial_meta["cue_feature"] = cue_feature
+                trial_meta["choice_feature"] = choice_feature
+            logger.log_frame_flip(
+                trial_num=block_idx,
+                event="options_on",
+                timestamp_perf_s=cue_perf,
+                requested_duration=cue_s,
+            )
+            first_flip = False
+
+    if delay_frames > 0:
+        first_flip = True
+        for _ in range(delay_frames):
+            if _abort_from_input("during_delay"):
+                return True, None
+            _draw_blank()
+            win.flip()
+            if first_flip:
+                delay_perf = time.perf_counter()
+                if trial_meta is not None:
+                    trial_meta["delay_flip_perf_s"] = float(delay_perf)
+                logger.log_frame_flip(
+                    trial_num=block_idx,
+                    event="delay_start",
+                    timestamp_perf_s=delay_perf,
+                    requested_duration=delay_s,
+                )
+                first_flip = False
+
+    def _match_choice(click_pos: Tuple[float, float]) -> Optional[int]:
+        for idx, target in enumerate(choice_hit_targets, start=1):
+            try:
+                if target.contains(click_pos):
+                    return idx
+            except Exception:
+                pass
+        return None
+
+    bg_rect.draw()
+    for stim in choice_stims:
+        stim.draw()
+    _draw_fixation_if_requested()
+    win.flip()
+    choice_perf = time.perf_counter()
+    if trial_meta is not None:
+        trial_meta["choice_start_perf_s"] = float(choice_perf)
+    logger.log_frame_flip(
+        trial_num=block_idx,
+        event="choice_start",
+        timestamp_perf_s=choice_perf,
+        requested_duration=choice_s,
+    )
+
+    choice_deadline = choice_perf + float(choice_s)
+    choice_info: Optional[Dict[str, Any]] = None
+    prev_touch_down = any(mouse.getPressed())
+
+    if prev_touch_down:
+        start_pos = tuple(float(v) for v in mouse.getPos())
+        immediate_idx = _match_choice(start_pos)
+        if immediate_idx is not None:
+            click_perf = time.perf_counter()
+            correct = immediate_idx == int(target_index)
+            logger.log_interaction(
+                trial_num=block_idx,
+                event="option_touch",
+                timestamp_perf_s=click_perf,
+            )
+            choice_info = {
+                "chosen_index": int(immediate_idx),
+                "chosen_pos": tuple(positions[immediate_idx - 1]),
+                "choice_start_perf_s": float(choice_perf),
+                "choice_time_perf_s": float(click_perf),
+                "reaction_time_s": float(click_perf - choice_perf),
+                "touch_x": float(start_pos[0]),
+                "touch_y": float(start_pos[1]),
+                "is_correct": bool(correct),
+                "target_index": int(target_index),
+                "target_pair": target_pair,
+                "trial_type": trial_type,
+                "cue_feature": cue_feature,
+                "choice_feature": choice_feature,
+            }
+
+    poll_interval_s = 0.002
+    while time.perf_counter() < choice_deadline and choice_info is None:
+        if _abort_from_input("during_choice"):
+            return True, None
+        click_pos = tuple(float(v) for v in mouse.getPos())
+        touch_down = any(mouse.getPressed())
+        touch_started = touch_down and not prev_touch_down
+        prev_touch_down = touch_down
+        if touch_started:
+            chosen_idx = _match_choice(click_pos)
+            _log_message(
+                msg_logger,
+                "INFO",
+                (
+                    f"choice_touch_attempt block={block_idx} "
+                    f"click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f}) matched_idx={chosen_idx}"
+                ),
+            )
+            if chosen_idx is not None:
+                click_perf = time.perf_counter()
+                correct = chosen_idx == int(target_index)
+                logger.log_interaction(
+                    trial_num=block_idx,
+                    event="option_touch",
+                    timestamp_perf_s=click_perf,
+                )
+                choice_info = {
+                    "chosen_index": int(chosen_idx),
+                    "chosen_pos": tuple(positions[chosen_idx - 1]),
+                    "choice_start_perf_s": float(choice_perf),
+                    "choice_time_perf_s": float(click_perf),
+                    "reaction_time_s": float(click_perf - choice_perf),
+                    "touch_x": float(click_pos[0]),
+                    "touch_y": float(click_pos[1]),
+                    "is_correct": bool(correct),
+                    "target_index": int(target_index),
+                    "target_pair": target_pair,
+                    "trial_type": trial_type,
+                    "cue_feature": cue_feature,
+                    "choice_feature": choice_feature,
+                }
+                break
+        remaining = choice_deadline - time.perf_counter()
+        if remaining > 0:
+            _core.wait(min(poll_interval_s, remaining))
+
+    _draw_blank()
+    win.flip()
+    gray_perf = time.perf_counter()
+    _record_gray_flip(gray_perf)
+
+    if choice_info is None:
+        _log_message(
+            msg_logger,
+            "INFO",
+            (
+                f"choice_timeout block={block_idx} trial_type={trial_type} "
+                f"target_index={target_index} target_pair={target_pair}"
+            ),
+        )
+    else:
+        _log_message(
+            msg_logger,
+            "INFO",
+            (
+                f"choice_registered block={block_idx} idx={choice_info['chosen_index']} "
+                f"correct={int(choice_info['is_correct'])} trial_type={trial_type} "
+                f"target_index={target_index} target_pair={target_pair}"
+            ),
+        )
+
+    return False, choice_info

@@ -1,0 +1,49 @@
+{ 
+  "config_name": "jeeves_rigtrain_nodelay",
+  "shapes_tsv": "./task/resources/csc1/csc1_shapes/shape_definitions_csc1.tsv",
+  "colors_tsv": "./task/resources/csc1/csc1/colors/csc1_color_definition.tsv",
+  "pump_delay_time": 0.0,
+  "pump_pulse_time_seconds": 0.6,
+  "inter_pump_interval": 0.1, 
+  "timeout_duration_seconds": 3.0,
+ 
+
+  "pump_pin": 24,
+  "buzz_pin": 23,
+  "trial_start_pin": 18,
+
+  "seed": null,
+  "output_dir": "./logs",
+  "screens": {
+    "main": null,
+    "experimenter": null
+  },
+  "refresh_rate": 60,
+  "n": 3000,
+
+  "fullscreen": true,
+  "win_size": [2560, 1600],
+  "fixation_size": 0,
+  "dot_size": 40,
+  "dot_color": [50, 50, 50],
+  "init_dot_color": [50, 50, 50],
+  "center_point": null,
+  "stim_range_radius": null,
+  "stroke_width": 0.2,
+  "stroke_color": [0, 0, 0],
+  "stroke_linejoin": "round",
+  "stroke_linecap": "round",
+  "image_size": [300, 300],
+
+
+  "self_initiation": true,
+  "ibi": 0.75,
+  "duration": 0.0,
+  "num_afc": 4,
+  "delay_time": 0.5,
+  "choice_time": 3.0,
+  "isi": 0.00,
+  "fixed_positions": true,
+  "raspi": true,
+  "touchscreen": true
+}

@@ -18,9 +18,7 @@
                     "launch": "task/afc_csc1.py",
                     "config": "config_files/csc2/jeeves_rigtrain_nodelay.json"
                 }
-            }, 
-            "sequential": {},
-            "memory": {}
+            }
         },
         "CSC2": {
             "classic": {

@@ -1,7 +1,7 @@
 { 
   "config_name": "jeeves_rigtrain_delay",
   "shapes_tsv": "./task/resources/csc1/csc1_shapes/shape_definitions_csc1.tsv",
-  "colors_tsv": "./task/resources/csc1/csc1/colors/csc1_color_definition.tsv",
+  "colors_tsv": "./task/resources/csc1/csc1_colors/csc1_color_definition.tsv",
   "pump_delay_time": 0.0,
   "pump_pulse_time_seconds": 0.6,
   "inter_pump_interval": 0.1, 

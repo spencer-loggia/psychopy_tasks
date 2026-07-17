@@ -6,6 +6,8 @@ sample_images
 tests/output
 tests/outputs
 task/resources/video
+task/passive_viewing_csc1.py
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

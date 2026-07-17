@@ -38,7 +38,7 @@
 
   "self_initiation": true,
   "ibi": 0.75,
-  "duration": 0.0,
+  "cue_time": 1.0,
   "num_afc": 4,
   "delay_time": 0.0,
   "choice_time": 3.0,

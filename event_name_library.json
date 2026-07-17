@@ -76,6 +76,11 @@
       "event_type": "frame_flip",
       "description": "The display transitioned away from the video clip."
     },
+    "delay_start": {
+      "code": 114,
+      "event_type": "frame_flip",
+      "description": "The delay period began after cue offset and before choices appeared."
+    }, 
     "cue_touch": {
       "code": 200,
       "event_type": "interaction",
@@ -156,6 +161,20 @@
       "buzzer_off",
       "options_dot",
       "options_on"
+    ], 
+    "afc_csc1": [
+      "onset_cue_on",
+      "choice_start",
+      "gray_inter_trial_interval",
+      "cue_touch",
+      "option_touch",
+      "trial_start_signal_on",
+      "trial_start_signal_off",
+      "pump_on",
+      "pump_off",
+      "options_dot",
+      "options_on",
+      "delay_start"
     ]
   },
   "event_templates": {

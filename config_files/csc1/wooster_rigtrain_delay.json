@@ -1,5 +1,5 @@
 { 
-  "config_name": "wooster_rigtrain_nodelay",
+  "config_name": "wooster_rigtrain_delay",
   "shapes_tsv": "./task/resources/csc1/csc1_shapes/shape_definitions_csc1.tsv",
   "colors_tsv": "./task/resources/csc1/csc1/colors/csc1_color_definition.tsv",
   "pump_delay_time": 0.0,

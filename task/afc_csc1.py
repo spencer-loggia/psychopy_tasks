@@ -416,7 +416,7 @@ def run_task(
     # Pre-render only the feature-level images used by this delayed AFC task.
     preloaded: Dict[Any, Any] = {}
     for sid in shape_ids:
-        preloaded[("shape_only", int(sid))] = utils.rasterize_svg_with_color_csc1(
+        preloaded[("shape_only", int(sid))] = utils.rasterize_svg_with_color(
             shapes[int(sid)],
             size_px=image_size,
             color_rgb_255=tuple(shape_cue_color),

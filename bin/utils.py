@@ -570,6 +570,8 @@ def rasterize_svg_with_color(
     stroke_width_px: Optional[float] = None,
     stroke_linejoin: Optional[str] = None,
     stroke_linecap: Optional[str] = None,
+    flip: bool = False,
+    outline_only: bool = False,
 ) -> Image.Image:
     """Rasterize an SVG and force its fill color to `color_rgb_255`.
 
@@ -609,7 +611,10 @@ def rasterize_svg_with_color(
     # we set the requested color; if stroke_width_px is provided we also set
     # stroke-width. If stroke_width_px is None, the SVG's original stroke
     # width is preserved.
-    style_rules = [f"fill:rgb({r},{g},{b}) !important", f"stroke:rgb({sr},{sg},{sb}) !important"]
+    if outline_only: 
+        style_rules = ["fill:none !important", f"stroke:rgb({sr},{sg},{sb}) !important"]
+    else: 
+        style_rules = [f"fill:rgb({r},{g},{b}) !important", f"stroke:rgb({sr},{sg},{sb}) !important"]
     if stroke_width_px is not None:
         # ensure numeric formatting
         try:
@@ -657,6 +662,10 @@ def rasterize_svg_with_color(
     )
 
     im = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+
+    if flip:
+        im = im.transpose(Image.FLIP_TOP_BOTTOM)
+    
     try:
         if DEBUG:
             logs_dir = Path("logs")
@@ -1869,112 +1878,6 @@ class TrialBufferManager:
     def __del__(self):
         """Destructor to ensure cleanup happens even if close() not called."""
         self.close()
-
-
-def rasterize_svg_with_color_csc1(
-    svg_path: Path,
-    size_px: Tuple[int, int],
-    color_rgb_255: Tuple[int, int, int],
-    bg_rgb_255: Optional[Tuple[int, int, int]] = None,
-    stroke_rgb_255: Optional[Tuple[int, int, int]] = None,
-    stroke_width_px: Optional[float] = None,
-    stroke_linejoin: Optional[str] = None,
-    stroke_linecap: Optional[str] = None,
-    outline_only: bool = False,
-    flip : bool = False, 
-) -> Image.Image:
-    """Rasterize an SVG for CSC1 stimuli, optionally drawing only the outline.
-
-    This is the CSC1-specific companion to the existing ``rasterize_svg_with_color``.
-    It keeps the original shared function intact while adding ``outline_only=True``
-    for shape-only cues/choices in delayed AFC trials.
-    """
-    try:
-        import cairosvg  # type: ignore
-    except Exception as e:
-        raise ImportError("SVG support requires 'cairosvg'. Install with: pip install cairosvg") from e
-
-    if not size_px or len(size_px) != 2 or size_px[0] <= 0 or size_px[1] <= 0:
-        raise ValueError("size_px must be a (width, height) tuple of positive ints")
-
-    svg_path = Path(svg_path)
-    svg_text = svg_path.read_text(encoding="utf-8")
-
-    r, g, b = (int(c) for c in color_rgb_255)
-    if stroke_rgb_255 is None:
-        sr, sg, sb = (0, 0, 0)
-    else:
-        sr, sg, sb = (int(c) for c in stroke_rgb_255)
-
-    if outline_only:
-        style_rules = [
-            "fill:none !important",
-            f"stroke:rgb({sr},{sg},{sb}) !important",
-        ]
-    else:
-        style_rules = [
-            f"fill:rgb({r},{g},{b}) !important",
-            f"stroke:rgb({sr},{sg},{sb}) !important",
-        ]
-
-    if stroke_width_px is not None:
-        try:
-            style_rules.append(f"stroke-width:{float(stroke_width_px)}px !important")
-        except Exception:
-            pass
-    if stroke_linejoin is not None:
-        join = str(stroke_linejoin).strip().lower()
-        if join in {"miter", "round", "bevel"}:
-            style_rules.append(f"stroke-linejoin:{join} !important")
-    if stroke_linecap is not None:
-        cap = str(stroke_linecap).strip().lower()
-        if cap in {"butt", "round", "square"}:
-            style_rules.append(f"stroke-linecap:{cap} !important")
-
-    style_block = (
-        "<style>"
-        "path,rect,circle,polygon,ellipse,g,polyline"
-        f"{{{';'.join(style_rules)}}}"
-        "</style>"
-    )
-
-    idx = svg_text.find("<svg")
-    if idx == -1:
-        mod_svg = style_block + svg_text
-    else:
-        gt = svg_text.find(">", idx)
-        if gt == -1:
-            mod_svg = style_block + svg_text
-        else:
-            mod_svg = svg_text[: gt + 1] + style_block + svg_text[gt + 1 :]
-
-    if bg_rgb_255 is not None:
-        bg_token = f"rgb({int(bg_rgb_255[0])},{int(bg_rgb_255[1])},{int(bg_rgb_255[2])})"
-    else:
-        bg_token = "rgba(0,0,0,0)"
-
-    png_bytes = cairosvg.svg2png(
-        bytestring=mod_svg.encode("utf-8"),
-        output_width=int(size_px[0]),
-        output_height=int(size_px[1]),
-        background_color=bg_token,
-    )
-
-    im = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
-
-    if flip:
-        im = im.transpose(Image.FLIP_TOP_BOTTOM)
-
-    try:
-        if DEBUG:
-            logs_dir = Path("logs")
-            logs_dir.mkdir(parents=True, exist_ok=True)
-            suffix = "outline" if outline_only else f"{r}_{g}_{b}"
-            im.save(logs_dir / f"debug_rasterized_svg_csc1_{svg_path.stem}_{suffix}.png")
-    except Exception:
-        pass
-
-    return im
 
 
 def make_color_gaussian_image(

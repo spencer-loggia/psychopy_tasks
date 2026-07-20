@@ -22,7 +22,7 @@
   "n": 100,
 
   "fullscreen": true,
-  "win_size": [2560, 1600],
+  "win_size": null,
   "fixation_size": 0,
   "dot_size": 40,
   "dot_color": [50, 50, 50],

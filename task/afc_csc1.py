@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import os
 import random
 import sys
 import time
@@ -38,6 +39,16 @@ if str(_project_root) not in sys.path:
 from bin import utils
 from bin.config import load_config, validate_config
 from bin.logger import SessionLogBundle
+from bin.screen import (
+    ExperimenterPreview,
+    describe_screen,
+    load_screen_config,
+    resolve_scene_size,
+    resolve_task_screens,
+    serialize_preview_image,
+    set_window_mouse_visible,
+)
+from interface.rig_mode import IS_RIG_ENV_VAR, experimenter_cursor_visible_for_touchscreen
 
 
 def parse_args():
@@ -82,8 +93,11 @@ def parse_args():
     p.add_argument("--margin", type=int, default=None, help="Margin for random placement")
     p.add_argument("--choice_hitbox_scale", type=float, default=None, help="Scale choice hitboxes relative to stimulus size")
     p.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate")
+    p.add_argument("--touchscreen", action="store_true", default=None, help="Enable touchscreen mode and hide the main-screen cursor")
     p.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi GPIO trial-start pulses")
     p.add_argument("--raspi_pin", type=int, default=None, help="GPIO pin for trial-start pulses")
+    p.add_argument("--main_screen", default=None, help="Main task screen index or output name")
+    p.add_argument("--experimenter_screen", default=None, help="Experimenter screen index or output name")
     return p.parse_args()
 
 
@@ -334,6 +348,7 @@ def run_task(
     fixation_size: Optional[int] = None,
     show_fixation: bool = False,
     refresh_rate: Optional[float] = None,
+    touchscreen: bool = False,
     raspi: bool = False,
     raspi_pin: int = 18,
     fixed_positions: bool = False,
@@ -344,6 +359,7 @@ def run_task(
     reward_inter_pulse_time: float = 0.0,
     choice_hitbox_scale: float = 1.0,
     config_name: Optional[str] = None,
+    screen_config: Optional[Dict[str, Any]] = None,
 ) -> None:
     utils.set_debug(debug)
     if seed is not None:
@@ -434,14 +450,293 @@ def run_task(
 
     win = None
     pigpio_pi = None
+    experimenter_preview = None
     task_end_notes = "done"
+
+    main_screen, experimenter_screen = resolve_task_screens(screen_config, allow_same_screen=True)
     try:
-        win = utils.setup_window(bg_rgb_255=bg_rgb, fullscreen=fullscreen, size=win_size)
+        msg_logger.log(
+            "INFO",
+            f"resolved_screens main={describe_screen(main_screen)} experimenter={describe_screen(experimenter_screen)}",
+        )
+    except Exception:
+        pass
+
+    afc_counts: Dict[str, int] = {
+        "total": 0,
+        "correct": 0,
+        "incorrect": 0,
+        "no_choice": 0,
+        "s2c": 0,
+        "c2s": 0,
+    }
+    last_trial_summary: Dict[str, Any] = {}
+
+    try:
+        win = utils.setup_window(
+            bg_rgb_255=bg_rgb,
+            fullscreen=fullscreen,
+            size=win_size,
+            screen_info=main_screen,
+        )
+
+        is_rig_raw = os.environ.get(IS_RIG_ENV_VAR)
+        experimenter_mouse_visible = experimenter_cursor_visible_for_touchscreen(
+            touchscreen=bool(touchscreen),
+            is_rig=is_rig_raw,
+        )
+        if experimenter_screen is not None:
+            experimenter_preview = ExperimenterPreview(
+                experimenter_screen,
+                task_label=resolved_config_name,
+                start_perf_s=time.perf_counter(),
+                update_interval_s=0.1,
+                mouse_visible=experimenter_mouse_visible,
+            )
+        if touchscreen:
+            set_window_mouse_visible(win, False)
+            try:
+                exp_cursor_state = "none"
+                if experimenter_preview is not None:
+                    exp_cursor_state = "visible" if experimenter_mouse_visible else "hidden"
+                msg_logger.log(
+                    "INFO",
+                    (
+                        "touchscreen=True; main mouse cursor hidden "
+                        f"experimenter_cursor={exp_cursor_state} "
+                        f"{IS_RIG_ENV_VAR}={is_rig_raw if is_rig_raw is not None else 'unset'}"
+                    ),
+                )
+            except Exception:
+                pass
+
         if fixation_size is None:
             fixation_size = 32
         fix = utils.make_fixation_cross(win, size=int(fixation_size)) if bool(show_fixation) else None
         bg_rect = utils.make_bg_rect(win, bg_rgb)
         pylogging.console.setLevel(pylogging.CRITICAL)
+
+        main_scene_size = resolve_scene_size(
+            main_screen,
+            fullscreen=bool(fullscreen),
+            requested_size=win_size,
+            realized_size=tuple(win.size),
+        )
+        try:
+            msg_logger.log(
+                "INFO",
+                (
+                    f"resolved_main_scene_size size={main_scene_size[0]}x{main_scene_size[1]} "
+                    f"fullscreen={int(bool(fullscreen))} requested_win_size={win_size} "
+                    f"realized_win_size={tuple(win.size)}"
+                ),
+            )
+        except Exception:
+            pass
+
+        def _feature_key(pair: Tuple[int, int], feature: str) -> Tuple[str, int]:
+            sid, cid = pair
+            if feature == "shape":
+                return ("shape_only", int(sid))
+            if feature == "color":
+                return ("color_only", int(cid))
+            raise ValueError(f"Unknown AFC feature: {feature}")
+
+        def _choice_mapping_for_preview(ttype: str) -> Tuple[str, str]:
+            if ttype == "shape_to_color":
+                return "shape", "color"
+            if ttype == "color_to_shape":
+                return "color", "shape"
+            raise ValueError(f"Unknown AFC trial_type: {ttype}")
+
+        def _make_stats_panel_image(*, phase: str = "idle"):
+            from PIL import Image, ImageDraw, ImageFont
+
+            panel_w, panel_h = 420, 285
+            img = Image.new("RGBA", (panel_w, panel_h), (245, 245, 245, 235))
+            draw = ImageDraw.Draw(img)
+            try:
+                font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", 22)
+                font_body = ImageFont.truetype("DejaVuSans.ttf", 18)
+                font_small = ImageFont.truetype("DejaVuSans.ttf", 15)
+            except Exception:
+                font_title = ImageFont.load_default()
+                font_body = ImageFont.load_default()
+                font_small = ImageFont.load_default()
+
+            total = int(afc_counts.get("total", 0))
+            planned = int(n_blocks)
+            remaining = max(0, planned - total)
+            correct = int(afc_counts.get("correct", 0))
+            incorrect = int(afc_counts.get("incorrect", 0))
+            no_choice = int(afc_counts.get("no_choice", 0))
+            pct = (100.0 * correct / total) if total > 0 else 0.0
+            y = 14
+            draw.text((16, y), "AFC CSC1", fill=(0, 0, 0, 255), font=font_title)
+            y += 34
+            draw.text((16, y), f"phase: {phase}", fill=(40, 40, 40, 255), font=font_small)
+            y += 30
+            draw.text((16, y), f"trials: {total}/{planned}   remaining: {remaining}", fill=(0, 0, 0, 255), font=font_body)
+            y += 24
+            draw.text((16, y), f"correct: {correct}   incorrect: {incorrect}", fill=(0, 0, 0, 255), font=font_body)
+            y += 24
+            draw.text((16, y), f"accuracy: {pct:.1f}%   no choice: {no_choice}", fill=(0, 0, 0, 255), font=font_body)
+            y += 24
+            draw.text((16, y), f"S2C: {afc_counts.get('s2c', 0)}   C2S: {afc_counts.get('c2s', 0)}", fill=(0, 0, 0, 255), font=font_body)
+            y += 31
+            if last_trial_summary:
+                draw.text((16, y), "last trial", fill=(0, 0, 0, 255), font=font_title)
+                y += 28
+                draw.text(
+                    (16, y),
+                    f"#{last_trial_summary.get('trial_num', '')} {last_trial_summary.get('trial_type', '')}",
+                    fill=(40, 40, 40, 255),
+                    font=font_small,
+                )
+                y += 22
+                draw.text(
+                    (16, y),
+                    f"target: {last_trial_summary.get('target_index', '')}  chosen: {last_trial_summary.get('chosen_index', '')}",
+                    fill=(40, 40, 40, 255),
+                    font=font_small,
+                )
+                y += 22
+                draw.text(
+                    (16, y),
+                    f"result: {last_trial_summary.get('result', '')}",
+                    fill=(40, 40, 40, 255),
+                    font=font_small,
+                )
+            else:
+                draw.text((16, y), "last trial: none yet", fill=(40, 40, 40, 255), font=font_small)
+            return img
+
+        def _status_panel_item(phase: str) -> Optional[Dict[str, Any]]:
+            if experimenter_preview is None:
+                return None
+            panel_img = _make_stats_panel_image(phase=phase)
+            payload = serialize_preview_image(panel_img)
+            if payload is None:
+                return None
+            panel_w, panel_h = panel_img.size
+            return {
+                "image_payload": payload,
+                "pos": [
+                    float(-main_scene_size[0] / 2.0 + panel_w / 2.0 + 20.0),
+                    float(main_scene_size[1] / 2.0 - panel_h / 2.0 - 20.0),
+                ],
+                "size": [float(panel_w), float(panel_h)],
+            }
+
+        def _show_preview_afc_scene(
+            *,
+            phase: str,
+            block_paths_current: Optional[List[Tuple[int, int]]] = None,
+            positions_current: Optional[List[Tuple[float, float]]] = None,
+            trial_type_current: Optional[str] = None,
+            target_index_current: Optional[int] = None,
+            chosen_index_current: Optional[int] = None,
+            is_correct_current: Optional[bool] = None,
+        ) -> None:
+            if experimenter_preview is None:
+                return
+
+            preview_fixation_size = int(getattr(fix, "height", 0)) if fix is not None else None
+            images: List[Dict[str, Any]] = []
+            panel = _status_panel_item(phase)
+            if panel is not None:
+                images.append(panel)
+
+            highlight_box = None
+            if block_paths_current and positions_current and trial_type_current:
+                cue_feature, choice_feature = _choice_mapping_for_preview(trial_type_current)
+                if target_index_current is not None:
+                    try:
+                        target_pair = tuple(block_paths_current[int(target_index_current) - 1])
+                        cue_obj = preloaded.get(_feature_key(target_pair, cue_feature))
+                        cue_payload = serialize_preview_image(cue_obj) if cue_obj is not None else None
+                        if cue_payload is not None:
+                            cue_w, cue_h = tuple(image_size)
+                            images.append(
+                                {
+                                    "image_payload": cue_payload,
+                                    "pos": [0.0, 0.0],
+                                    "size": [float(cue_w), float(cue_h)],
+                                }
+                            )
+                    except Exception:
+                        pass
+
+                for idx, (pair, pos) in enumerate(zip(block_paths_current, positions_current), start=1):
+                    pair = tuple(pair)
+                    image_obj = preloaded.get(_feature_key(pair, choice_feature))
+                    payload = serialize_preview_image(image_obj) if image_obj is not None else None
+                    if payload is None:
+                        continue
+                    images.append(
+                        {
+                            "image_payload": payload,
+                            "pos": [float(pos[0]), float(pos[1])],
+                            "size": [float(image_size[0]), float(image_size[1])],
+                        }
+                    )
+
+                highlight_index = chosen_index_current or target_index_current
+                if highlight_index is not None and 1 <= int(highlight_index) <= len(positions_current):
+                    hpos = positions_current[int(highlight_index) - 1]
+                    if chosen_index_current is None:
+                        color = (240, 220, 60)
+                    elif bool(is_correct_current):
+                        color = (60, 180, 75)
+                    else:
+                        color = (220, 60, 60)
+                    highlight_box = {
+                        "pos": [float(hpos[0]), float(hpos[1])],
+                        "size": [float(image_size[0]) * 1.15, float(image_size[1]) * 1.15],
+                        "color": list(color),
+                        "line_width": 6.0,
+                    }
+
+            experimenter_preview.show_static_scene(
+                bg_rgb_255=bg_rgb,
+                main_size=main_scene_size,
+                images=images,
+                dots=[],
+                fixation_size=preview_fixation_size,
+                fixation_color=(0, 0, 0),
+                reward_counts={},
+                highlight_box=highlight_box,
+            )
+
+        def _poll_experimenter_controls() -> bool:
+            if experimenter_preview is None:
+                return False
+            try:
+                if experimenter_preview.consume_manual_reward_request():
+                    msg_logger.log("INFO", "manual_reward_request_ignored task=afc_csc1")
+            except Exception:
+                pass
+            try:
+                return bool(experimenter_preview.poll())
+            except Exception:
+                return False
+
+        def _wait_or_abort(duration_s: float) -> bool:
+            if duration_s is None or float(duration_s) <= 0:
+                return _poll_experimenter_controls()
+            if experimenter_preview is not None:
+                deadline = time.perf_counter() + max(0.0, float(duration_s))
+                while time.perf_counter() < deadline:
+                    if _poll_experimenter_controls():
+                        return True
+                    remaining = deadline - time.perf_counter()
+                    if remaining > 0:
+                        time.sleep(min(0.05, remaining))
+                return _poll_experimenter_controls()
+            core.wait(float(duration_s))
+            return False
+
+        _show_preview_afc_scene(phase="ready")
 
         if raspi:
             try:
@@ -511,6 +806,11 @@ def run_task(
         msg_logger.log("INFO", f"task_ready n_blocks={n_blocks} num_afc={num_afc} delay_time={delay_time:.6f}")
 
         for trial_num in range(1, int(n_blocks) + 1):
+            if _poll_experimenter_controls():
+                task_end_notes = "experimenter_exit"
+                msg_logger.log("WARN", "experimenter_exit_before_trial_start")
+                break
+
             if trial_type == "random":
                 block_trial_type = random.choice(["shape_to_color", "color_to_shape"])
             else:
@@ -536,7 +836,12 @@ def run_task(
             )
 
             stim_size = tuple(image_size)
-            effective_win_size = tuple(win_size) if win_size is not None else tuple(win.size)
+            effective_win_size = resolve_scene_size(
+                main_screen,
+                fullscreen=bool(fullscreen),
+                requested_size=win_size,
+                realized_size=tuple(win.size),
+            )
             sampled_positions, positions = _compute_positions(
                 num_afc=int(num_afc),
                 stim_size=stim_size,
@@ -552,6 +857,13 @@ def run_task(
                 )
 
             trial_meta: Dict[str, Any] = {}
+            _show_preview_afc_scene(
+                phase="awaiting initiation",
+                block_paths_current=block_paths,
+                positions_current=positions,
+                trial_type_current=block_trial_type,
+                target_index_current=target_index,
+            )
             aborted, choice_info = utils.present_delayed_afc_trial(
                 win=win,
                 preloaded=preloaded,
@@ -571,21 +883,61 @@ def run_task(
                 onset_cue=onset_stim,
                 msg_logger=msg_logger,
                 fps=fps,
-                choice_hitbox_scale=float(choice_hitbox_scale),
+                choice_hitbox_scale=(float(choice_hitbox_scale) * (1.25 if touchscreen else 1.0)),
                 trial_meta=trial_meta,
                 raspi=bool(raspi and pigpio_pi is not None),
                 pigpio_pi=pigpio_pi,
                 raspi_pin=int(raspi_pin),
+                external_abort_checker=_poll_experimenter_controls,
                 show_fixation=bool(show_fixation),
             )
             if aborted:
-                task_end_notes = "aborted"
-                msg_logger.log("WARN", f"trial_aborted trial_num={trial_num}")
+                if task_end_notes == "done" and _poll_experimenter_controls():
+                    task_end_notes = "experimenter_exit"
+                    msg_logger.log("WARN", f"experimenter_exit_during_trial trial_num={trial_num}")
+                elif task_end_notes == "done":
+                    task_end_notes = "aborted"
+                    msg_logger.log("WARN", f"trial_aborted trial_num={trial_num}")
                 break
 
             chosen_idx_1based = choice_info.get("chosen_index") if choice_info is not None else None
             chosen_idx_zero_based = int(chosen_idx_1based - 1) if chosen_idx_1based is not None else ""
             is_correct = bool(choice_info.get("is_correct")) if choice_info is not None else False
+
+            afc_counts["total"] += 1
+            if block_trial_type == "shape_to_color":
+                afc_counts["s2c"] += 1
+            elif block_trial_type == "color_to_shape":
+                afc_counts["c2s"] += 1
+            if is_correct:
+                afc_counts["correct"] += 1
+                trial_result = "correct"
+            else:
+                afc_counts["incorrect"] += 1
+                if choice_info is None:
+                    afc_counts["no_choice"] += 1
+                    trial_result = "no_choice"
+                else:
+                    trial_result = "incorrect"
+            last_trial_summary.clear()
+            last_trial_summary.update(
+                {
+                    "trial_num": int(trial_num),
+                    "trial_type": block_trial_type,
+                    "target_index": int(target_index - 1),
+                    "chosen_index": chosen_idx_zero_based if chosen_idx_zero_based != "" else "",
+                    "result": trial_result,
+                }
+            )
+            _show_preview_afc_scene(
+                phase="feedback",
+                block_paths_current=block_paths,
+                positions_current=positions,
+                trial_type_current=block_trial_type,
+                target_index_current=target_index,
+                chosen_index_current=chosen_idx_1based,
+                is_correct_current=is_correct,
+            )
 
             feedback_s = 0.0
             if is_correct and float(reward_pulse_time) > 0.0:
@@ -610,19 +962,26 @@ def run_task(
                     timestamp_perf_s=pulse_start,
                     requested_duration=float(reward_pulse_time),
                 )
-                core.wait(float(reward_pulse_time))
+                if _wait_or_abort(float(reward_pulse_time)):
+                    task_end_notes = "experimenter_exit"
+                    msg_logger.log("WARN", f"experimenter_exit_during_reward_pulse trial_num={trial_num}")
                 logger.log_signal(
                     trial_num=trial_num,
                     event="pump_off",
                     timestamp_perf_s=time.perf_counter(),
                 )
+                if task_end_notes != "done":
+                    break
             elif (not is_correct) and timeout_frames > 0:
                 # Silent timeout (no signal logging)
                 msg_logger.log(
                     "INFO",
                     f"timeout trial_num={trial_num} duration={float(timeout_s):.3f}s",
                 )
-                core.wait(float(timeout_s))
+                if _wait_or_abort(float(timeout_s)):
+                    task_end_notes = "experimenter_exit"
+                    msg_logger.log("WARN", f"experimenter_exit_during_timeout trial_num={trial_num}")
+                    break
 
             behavior_row: Dict[str, Any] = {
                 "trial_num": int(trial_num),
@@ -651,11 +1010,20 @@ def run_task(
             behavior_logger.writerow(behavior_row)
 
             if ibi_frames > 0:
+                _show_preview_afc_scene(phase="inter-trial interval")
                 for _ in range(max(0, int(ibi_frames) - 1)):
+                    if _poll_experimenter_controls():
+                        task_end_notes = "experimenter_exit"
+                        msg_logger.log("WARN", f"experimenter_exit_during_ibi trial_num={trial_num}")
+                        break
                     bg_rect.draw()
                     if fix is not None:
                         fix.draw()
                     win.flip()
+                if task_end_notes != "done":
+                    break
+            else:
+                _show_preview_afc_scene(phase="ready")
 
             try:
                 session_logs.flush()
@@ -670,6 +1038,11 @@ def run_task(
             pass
         try:
             session_logs.close()
+        except Exception:
+            pass
+        try:
+            if experimenter_preview is not None:
+                experimenter_preview.close()
         except Exception:
             pass
         try:
@@ -705,6 +1078,12 @@ def main():
         if val is not None:
             return val
         return cfg.get(name, default)
+
+    screen_config = load_screen_config(
+        cfg,
+        cli_main=args.main_screen,
+        cli_experimenter=args.experimenter_screen,
+    )
 
     duration_raw = _get("duration", cfg.get("duration", None))
     cue_time_raw = _get("cue_time", cfg.get("cue_time", duration_raw))
@@ -759,6 +1138,7 @@ def main():
             fixation_size=_get("fixation_size", cfg.get("fixation_size", None)),
             show_fixation=bool(_get("show_fixation", cfg.get("show_fixation", False))),
             refresh_rate=_get("refresh_rate", cfg.get("refresh_rate", cfg.get("refrech_rate", None))),
+            touchscreen=bool(_get("touchscreen", cfg.get("touchscreen", False))),
             raspi=bool(_get("raspi", cfg.get("raspi", False))),
             raspi_pin=int(_get("raspi_pin", cfg.get("raspi_pin", 18))),
             fixed_positions=bool(_get("fixed_positions", cfg.get("fixed_positions", False))),
@@ -769,6 +1149,7 @@ def main():
             reward_inter_pulse_time=float(_get("reward_inter_pulse_time", cfg.get("reward_inter_pulse_time", 0.0))),
             choice_hitbox_scale=float(_get("choice_hitbox_scale", cfg.get("choice_hitbox_scale", 1.0))),
             config_name=cfg.get("config_name", "afc_csc1"),
+            screen_config=screen_config,
         )
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)

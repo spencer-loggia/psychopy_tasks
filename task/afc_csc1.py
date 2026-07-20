@@ -95,9 +95,23 @@ def parse_args():
     p.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate")
     p.add_argument("--touchscreen", action="store_true", default=None, help="Enable touchscreen mode and hide the main-screen cursor")
     p.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi GPIO trial-start pulses")
-    p.add_argument("--raspi_pin", type=int, default=None, help="GPIO pin for trial-start pulses")
-    p.add_argument("--main_screen", default=None, help="Main task screen index or output name")
-    p.add_argument("--experimenter_screen", default=None, help="Experimenter screen index or output name")
+    p.add_argument("--trial_start_pin", type=int, default=None, help="GPIO pin to use for trial start pulses (BCM numbering)")
+    p.add_argument("--pump_pin", type=int, default=None, help="GPIO pin for pump reward delivery")
+    p.add_argument("--buzz_pin", type=int, default=None, help="GPIO pin for timeout buzzer")    p.add_argument("--main_screen", default=None, help="Main task screen index or output name")
+    p.add_argument(
+        "--pump_delay_time",
+        type=float,
+        default=None,
+        help="Delay in seconds between a rewarded choice and the first pump pulse",
+    )
+    p.add_argument("--pump_pulse_time_seconds", type=float, default=None, help="Duration of pump pulse in seconds")
+    p.add_argument(
+        "--inter_pump_interval",
+        type=float,
+        default=None,
+        help="Delay in seconds between pump pulses; defaults to pump_pulse_time_seconds",
+    )    p.add_argument("--experimenter_screen", default=None, help="Experimenter screen index or output name")
+    
     return p.parse_args()
 
 
@@ -350,7 +364,10 @@ def run_task(
     refresh_rate: Optional[float] = None,
     touchscreen: bool = False,
     raspi: bool = False,
-    raspi_pin: int = 18,
+    trial_start_pin: int = 18,
+    pump_pin: int = 17, 
+    buzz_pin: int = 16, 
+    buzz: bool = False,
     fixed_positions: bool = False,
     position_spacing: Optional[int] = None,
     trial_type: str = "random",
@@ -738,17 +755,65 @@ def run_task(
 
         _show_preview_afc_scene(phase="ready")
 
+        pigpio_chip = None
+        gpio_chip = None
         if raspi:
             try:
                 import lgpio
 
                 chip = lgpio.gpiochip_open(0)
-                lgpio.gpio_claim_output(chip, int(raspi_pin))
+
+                lgpio.chip_claim_output(chip, trial_start_pin)
+                lgpio.gpio_claim_output(chip, pump_pin)
+                lgpio.gpio_claim_output(chip, buzz_pin)
                 pigpio_pi = chip
+                gpio_chip = chip
                 msg_logger.log("INFO", f"lgpio initialized on chip 0, pin {raspi_pin} claimed as output")
             except Exception as e:
                 pigpio_pi = None
-                msg_logger.log("WARN", f"lgpio not available or failed to initialize: {e}; raspi disabled")
+                gpio_chip = None
+                try: 
+                    msg_logger.log("WARN", f"lgpio not available or failed to initialize: {e}; raspi disabled")
+                except: Exception: 
+                    pass
+        else: 
+            msg_logger.log("INFO", "raspi=False; GPIO pin signals will not be sent (events will be logged only)")
+
+    def _set_pump_pin(value: int, *, context: str) -> None:
+        if raspi and gpio_chip is not None:
+            try:
+                import lgpio
+                lgpio.gpio_write(gpio_chip, pump_pin, int(value))
+            except Exception as e:
+                msg_logger.log("ERROR", f"Failed to set pump_pin {'high' if value else 'low'} during {context}: {e}")
+
+    def _deliver_manual_reward() -> None:
+        pulse_duration = max(0.0, float(pump_pulse_time_seconds))
+        start_perf = time.perf_counter()
+        _set_pump_pin(1, context="manual_reward")
+        try:
+            logger.log_signal(
+                trial_num=None,
+                event="pump_on",
+                timestamp_perf_s=start_perf,
+                requested_duration=pulse_duration,
+            )
+            core.wait(pulse_duration)
+        finally:
+            end_perf = time.perf_counter()
+            _set_pump_pin(0, context="manual_reward")
+            logger.log_signal(
+                trial_num=None,
+                event="pump_off",
+                timestamp_perf_s=end_perf,
+            )
+
+    def _poll_experimenter_controls() -> bool:
+        if experimenter_preview is None:
+            return False
+        if experimenter_preview.consume_manual_reward_request():
+            _deliver_manual_reward()
+        return bool(experimenter_preview is not None and experimenter_preview.poll())
 
         if refresh_rate is not None and float(refresh_rate) > 0:
             fps = float(refresh_rate)
@@ -787,9 +852,7 @@ def run_task(
         ibi_frames, ibi_s = quantized["ibi"]
         timeout_frames, timeout_s = quantized["timeout_time"]
 
-        # Every delayed AFC trial is initiated by clicking/touching the checkerboard onset cue.
-        # ``self_initiation`` is kept only for older configs/CLI calls and is intentionally ignored.
-        onset_stim = utils.make_onset_cue_stim(
+=        onset_stim = utils.make_onset_cue_stim(
             win,
             bg_rgb_255=bg_rgb,
             size_frac=0.075,
@@ -887,7 +950,7 @@ def run_task(
                 trial_meta=trial_meta,
                 raspi=bool(raspi and pigpio_pi is not None),
                 pigpio_pi=pigpio_pi,
-                raspi_pin=int(raspi_pin),
+                raspi_pin=raspi_pin,
                 external_abort_checker=_poll_experimenter_controls,
                 show_fixation=bool(show_fixation),
             )
@@ -955,13 +1018,26 @@ def run_task(
                 )
 
             if is_correct and float(reward_pulse_time) > 0.0:
+                pulse_duration = max(0.0, float(reward_pulse_time))
                 pulse_start = time.perf_counter()
-                logger.log_signal(
-                    trial_num=trial_num,
-                    event="pump_on",
-                    timestamp_perf_s=pulse_start,
-                    requested_duration=float(reward_pulse_time),
-                )
+
+                _set_pump_pin(1, context="afc_reward")
+                try:  
+                    logger.log_signal(
+                        trial_num=trial_num,
+                        event="pump_on",
+                        timestamp_perf_s=pulse_start,
+                        requested_duration=float(reward_pulse_time),
+                    )
+                    core.wait(pulse_duration)
+                finally: 
+                    pulse_end = time.perf_counter()
+                    _set_pump_pin(0, context="afc_reward")
+                    logger.log_signal(
+                        trial_num=trial_num,
+                        event="pump_off",
+                        timestamp_perf_s=pulse_end,
+                    )
                 if _wait_or_abort(float(reward_pulse_time)):
                     task_end_notes = "experimenter_exit"
                     msg_logger.log("WARN", f"experimenter_exit_during_reward_pulse trial_num={trial_num}")
@@ -1141,6 +1217,7 @@ def main():
             touchscreen=bool(_get("touchscreen", cfg.get("touchscreen", False))),
             raspi=bool(_get("raspi", cfg.get("raspi", False))),
             raspi_pin=int(_get("raspi_pin", cfg.get("raspi_pin", 18))),
+            pump_pin=int(_get("pump_pin", cfg.get("pump_pin", 17))),
             fixed_positions=bool(_get("fixed_positions", cfg.get("fixed_positions", False))),
             position_spacing=position_spacing,
             trial_type=trial_type,

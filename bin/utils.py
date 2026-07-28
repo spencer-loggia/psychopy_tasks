@@ -44,6 +44,9 @@ VECTOR_EXTS = {".svg"}
 IMAGE_EXTS = RASTER_EXTS | VECTOR_EXTS  # for discovery
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".mpeg", ".mpg", ".m4v", ".wmv"}
 
+NON_ASSOCIATED_SHAPE_IDS: Tuple[int, ...] = tuple(range(14, 28))
+
+
 
 def find_image_files(images_dir: str, recursive: bool = False) -> List[Path]:
     p = Path(images_dir)
@@ -1703,183 +1706,6 @@ def sample_blocks(files: List[Path], num_afc: int, n_blocks: int, seed: Optional
     return blocks
 
 
-# -----------------------------------------------------------------------------------------
-# Trial Buffer Manager (for background trial generation with multiprocessing)
-# -----------------------------------------------------------------------------------------
-
-def _trial_buffer_worker_generic(
-    trial_generator_func: Callable[[int, dict], dict],
-    config: dict,
-    trial_queue: Any,
-    stop_event: Any,
-    start_idx: int = 0,
-):
-    """
-    Generic worker process that generates trials in the background.
-    
-    Args:
-        trial_generator_func: Callable that takes (trial_idx, config) and returns trial dict
-        config: Configuration dictionary to pass to the generator
-        trial_queue: Queue to push generated trials into
-        stop_event: Event to signal worker to stop
-        start_idx: Starting trial index
-    """
-    trial_idx = start_idx
-    while not stop_event.is_set():
-        try:
-            trial_data = trial_generator_func(trial_idx, config)
-            while not stop_event.is_set():
-                try:
-                    trial_queue.put(trial_data, timeout=0.1)
-                    break
-                except queue.Full:
-                    continue
-            trial_idx += 1
-        except Exception as e:
-            # Put error into queue for main process to handle
-            error_text = str(e) or repr(e)
-            error_trace = traceback.format_exc()
-            while not stop_event.is_set():
-                try:
-                    trial_queue.put(
-                        {
-                            "type": "error",
-                            "error": error_text,
-                            "traceback": error_trace,
-                            "trial_idx": trial_idx,
-                        },
-                        timeout=0.1,
-                    )
-                    break
-                except queue.Full:
-                    continue
-            break
-
-
-class TrialBufferManager:
-    """
-    Generic trial buffer manager that uses multiprocessing to pre-generate trials
-    on a separate core. Works with any task paradigm by taking a user-defined
-    trial generation callable.
-    
-    The trial_generator_func should be a function that takes:
-        - trial_idx: int (the index of the trial to generate)
-        - config: dict (containing any parameters needed for generation)
-    
-    And returns a dictionary representing the trial data.
-    
-    Example usage:
-        def my_trial_generator(trial_idx: int, config: dict) -> dict:
-            # Generate trial based on config
-            return {"trial_idx": trial_idx, "stimuli": [...], ...}
-        
-        buffer_mgr = TrialBufferManager(
-            trial_generator_func=my_trial_generator,
-            config={"param1": value1, "param2": value2},
-            buffer_size=5
-        )
-        
-        # In your task loop:
-        trial_data = buffer_mgr.get_next_trial()
-        # Use trial_data...
-        
-        # When done:
-        buffer_mgr.close()
-    """
-    
-    def __init__(
-        self, 
-        trial_generator_func: Callable[[int, dict], dict],
-        config: dict,
-        buffer_size: int = 5,
-        start_idx: int = 0,
-    ):
-        """
-        Initialize the trial buffer manager.
-        
-        Args:
-            trial_generator_func: A callable that generates trial data.
-                                  Must take (trial_idx: int, config: dict) -> dict
-            config: Dictionary of configuration parameters to pass to generator
-            buffer_size: Maximum number of trials to buffer ahead (default: 5)
-            start_idx: Starting trial index (default: 0)
-        """
-        self.trial_generator_func = trial_generator_func
-        self.config = config
-        self.buffer_size = buffer_size
-        self.start_idx = start_idx
-        self.next_trial_idx = start_idx
-        
-        # Set up multiprocessing with spawn context (required for some libraries like PsychoPy)
-        ctx = mp.get_context('spawn')
-        self.trial_queue = ctx.Queue(maxsize=buffer_size)
-        self.stop_event = ctx.Event()
-        
-        # Start the worker process
-        self.worker = ctx.Process(
-            target=_trial_buffer_worker_generic,
-            args=(trial_generator_func, config, self.trial_queue, self.stop_event, start_idx)
-        )
-        self.worker.start()
-        self.is_closed = False
-    
-    def get_next_trial(self) -> dict:
-        """
-        Get the next pre-generated trial from the buffer.
-        
-        Returns:
-            Dictionary containing the trial data generated by trial_generator_func
-            
-        Raises:
-            RuntimeError: If the buffer manager has been closed or worker encountered an error
-        """
-        if self.is_closed:
-            raise RuntimeError("TrialBufferManager has been closed")
-        
-        try:
-            trial_data = self.trial_queue.get(timeout=30.0)
-            
-            # Check if worker sent an error
-            if isinstance(trial_data, dict) and trial_data.get("type") == "error":
-                error_text = trial_data.get("error", "Unknown worker error")
-                trial_idx = trial_data.get("trial_idx")
-                trace_text = trial_data.get("traceback")
-                details = f"Trial generation error at trial_idx={trial_idx}: {error_text}"
-                if trace_text:
-                    details = f"{details}\n{trace_text}"
-                raise RuntimeError(details)
-            
-            self.next_trial_idx += 1
-            return trial_data
-            
-        except Exception as e:
-            self.close()
-            raise RuntimeError(f"Failed to get next trial: {e}")
-    
-    def close(self):
-        """
-        Clean up the worker process and release resources.
-        Should be called when done using the buffer manager.
-        """
-        if self.is_closed:
-            return
-            
-        self.is_closed = True
-        self.stop_event.set()
-        
-        # Give worker time to finish cleanly
-        self.worker.join(timeout=2.0)
-        
-        # Force terminate if still alive
-        if self.worker.is_alive():
-            self.worker.terminate()
-            self.worker.join(timeout=1.0)
-    
-    def __del__(self):
-        """Destructor to ensure cleanup happens even if close() not called."""
-        self.close()
-
-
 def make_color_gaussian_image(
     color_rgb_255: Tuple[int, int, int],
     size_px: Tuple[int, int],
@@ -1927,11 +1753,62 @@ def _csc1_choice_mapping(trial_type: str) -> Tuple[str, str]:
     raise ValueError("trial_type must be 'shape_to_color' or 'color_to_shape'")
 
 
+def make_shape_to_shape_trial(
+    *,
+    n_choices: int,
+    rng: Optional[random.Random] = None,
+    cue_shape_id: Optional[int] = None,
+) -> Tuple[List[Tuple[int, Optional[int]]], int]:
+    """Construct one identity-matching trial from s14.svg through s27.svg.
+
+    The cue/target is included exactly once among the shuffled choices. Every
+    remaining choice is a different non-associated shape. ``target_index`` is
+    returned as a 1-based index for ``present_delayed_afc_trial``.
+    """
+    n_choices = int(n_choices)
+    if not 2 <= n_choices <= len(NON_ASSOCIATED_SHAPE_IDS):
+        raise ValueError(
+            f"n_choices must be between 2 and "
+            f"{len(NON_ASSOCIATED_SHAPE_IDS)}, got {n_choices}"
+        )
+
+    if rng is None:
+        rng = random.Random()
+
+    if cue_shape_id is None:
+        cue_shape_id = rng.choice(NON_ASSOCIATED_SHAPE_IDS)
+    else:
+        cue_shape_id = int(cue_shape_id)
+
+    if cue_shape_id not in NON_ASSOCIATED_SHAPE_IDS:
+        raise ValueError(
+            "cue_shape_id must be between 14 and 27, "
+            f"got {cue_shape_id}"
+        )
+
+    distractor_pool = [
+        shape_id
+        for shape_id in NON_ASSOCIATED_SHAPE_IDS
+        if shape_id != cue_shape_id
+    ]
+    distractor_ids = rng.sample(distractor_pool, k=n_choices - 1)
+
+    choice_shape_ids = [cue_shape_id, *distractor_ids]
+    rng.shuffle(choice_shape_ids)
+
+    target_index = choice_shape_ids.index(cue_shape_id) + 1
+    block_paths: List[Tuple[int, Optional[int]]] = [
+        (shape_id, None)
+        for shape_id in choice_shape_ids
+    ]
+    return block_paths, target_index
+
+
 def present_delayed_afc_trial(
     *,
     win: visual.Window,
     preloaded: Dict[Any, Image.Image],
-    block_paths: List[Tuple[int, int]],
+    block_paths: List[Tuple[int, Optional[int]]],
     positions: List[Tuple[float, float]],
     cue_time: float,
     delay_time: float,
@@ -1959,7 +1836,13 @@ def present_delayed_afc_trial(
     """Present one delayed AFC trial with frame-locked cue/delay/choice timing.
 
     Sequence:
-        checkerboard onset cue click/touch -> optional pre-cue ISI -> feature cue -> delay -> choices -> grey
+        checkerboard onset cue click/touch -> optional pre-cue ISI ->
+        feature cue -> delay -> choices -> grey
+
+    For ``shape_to_shape`` trials, every entry in ``block_paths`` must be
+    ``(shape_id, None)``, where ``shape_id`` is 14 through 27. The item at the
+    1-based ``target_index`` supplies both the cue and the correct choice. All
+    remaining entries are different non-associated-shape distractors.
 
     The AFC cue sequence always begins only after the participant clicks/touches
     the ``make_onset_cue_stim`` checkerboard stimulus.
@@ -1968,10 +1851,78 @@ def present_delayed_afc_trial(
 
     if len(block_paths) != len(positions):
         raise ValueError("block_paths and positions must have the same length")
+    if not block_paths:
+        raise ValueError("block_paths must contain at least one AFC choice")
     if target_index < 1 or target_index > len(block_paths):
         raise ValueError("target_index must be 1-based and within block_paths")
     if onset_cue is None:
-        raise ValueError("present_delayed_afc_trial requires an onset_cue made by make_onset_cue_stim")
+        raise ValueError(
+            "present_delayed_afc_trial requires an onset_cue made by "
+            "make_onset_cue_stim"
+        )
+
+    # Normalize every stimulus to (shape_id, color_id). Shape-only stimuli use
+    # color_id=None, for example (14, None) for s14.svg.
+    normalized_block_paths: List[Tuple[int, Optional[int]]] = []
+    for item_number, raw_pair in enumerate(block_paths, start=1):
+        try:
+            shape_id, color_id = raw_pair
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Each block_paths entry must contain exactly two values: "
+                "(shape_id, color_id). Use None for a shape with no associated "
+                f"color. Invalid entry {item_number}: {raw_pair!r}"
+            ) from exc
+
+        try:
+            normalized_shape_id = int(shape_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid shape ID in block_paths entry {item_number}: "
+                f"{raw_pair!r}"
+            ) from exc
+
+        if color_id is None:
+            normalized_color_id: Optional[int] = None
+        else:
+            try:
+                normalized_color_id = int(color_id)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid color ID in block_paths entry {item_number}: "
+                    f"{raw_pair!r}"
+                ) from exc
+
+        normalized_block_paths.append(
+            (normalized_shape_id, normalized_color_id)
+        )
+
+    block_paths = normalized_block_paths
+
+    if trial_type == "shape_to_shape":
+        if len(block_paths) < 2:
+            raise ValueError("shape_to_shape requires at least two choices")
+
+        allowed_shape_ids = frozenset(range(14, 28))
+        invalid_pairs = [
+            pair
+            for pair in block_paths
+            if pair[0] not in allowed_shape_ids or pair[1] is not None
+        ]
+        if invalid_pairs:
+            raise ValueError(
+                "shape_to_shape trials must contain only (shape_id, None) "
+                "entries for s14.svg through s27.svg. "
+                f"Invalid entries: {invalid_pairs!r}"
+            )
+
+        choice_shape_ids = [pair[0] for pair in block_paths]
+        if len(choice_shape_ids) != len(set(choice_shape_ids)):
+            raise ValueError(
+                "shape_to_shape choices must be unique so that the target "
+                "appears exactly once. "
+                f"Got shape IDs: {choice_shape_ids!r}"
+            )
 
     if fps is None:
         fps, frame_dur = detect_frame_rate(win, msg_logger=msg_logger)
@@ -2002,13 +1953,84 @@ def present_delayed_afc_trial(
         ),
     )
 
-    cue_feature, choice_feature = _csc1_choice_mapping(trial_type)
-    target_pair = tuple(block_paths[target_index - 1])
-    cue_img = preloaded.get(_csc1_feature_key(target_pair, cue_feature))
-    if cue_img is None:
-        cue_img = preloaded.get(target_pair)
-    if cue_img is None:
-        raise KeyError(f"Missing cue image for {target_pair} feature={cue_feature}")
+    if trial_type == "shape_to_shape":
+        cue_feature, choice_feature = "shape", "shape"
+    else:
+        cue_feature, choice_feature = _csc1_choice_mapping(trial_type)
+
+    target_pair = block_paths[target_index - 1]
+
+    def _lookup_feature_image(
+        pair: Tuple[int, Optional[int]],
+        feature: str,
+        *,
+        role: str,
+    ) -> Image.Image:
+        """Return an image already stored in ``preloaded``."""
+        if trial_type != "shape_to_shape":
+            image = preloaded.get(_csc1_feature_key(pair, feature))
+            if image is None:
+                image = preloaded.get(pair)
+            if image is None:
+                raise KeyError(
+                    f"Missing {role} image for {pair!r}, feature={feature!r}"
+                )
+            return image
+
+        # An existing _csc1_feature_key may already support (shape_id, None).
+        # If it does not, try common explicit keys for the preloaded SVG image.
+        shape_id = int(pair[0])
+        candidate_keys: List[Any] = []
+        try:
+            candidate_keys.append(_csc1_feature_key(pair, "shape"))
+        except (NameError, TypeError, ValueError, KeyError, IndexError):
+            pass
+
+        candidate_keys.extend(
+            [
+                ("shape", shape_id),
+                pair,
+                (shape_id, None),
+                shape_id,
+                f"s{shape_id}.svg",
+                f"s{shape_id}",
+            ]
+        )
+
+        checked_keys: List[Any] = []
+        seen_keys = set()
+        for key in candidate_keys:
+            try:
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+            except TypeError:
+                continue
+
+            checked_keys.append(key)
+            image = preloaded.get(key)
+            if image is not None:
+                return image
+
+        raise KeyError(
+            f"Missing {role} image for s{shape_id}.svg. Preload it under "
+            f"('shape', {shape_id}) or ({shape_id}, None). "
+            f"Checked keys: {checked_keys!r}"
+        )
+
+    cue_img = _lookup_feature_image(target_pair, cue_feature, role="cue")
+
+    if trial_type == "shape_to_shape":
+        _log_message(
+            msg_logger,
+            "INFO",
+            (
+                f"shape_to_shape_config block={block_idx} "
+                f"cue_shape=s{target_pair[0]}.svg "
+                f"choice_shapes={[f's{pair[0]}.svg' for pair in block_paths]} "
+                f"target_index={target_index}"
+            ),
+        )
 
     cue_stim = make_image_stim_from_array(win, cue_img, size=None, bg_rgb_255=bg_rgb_255)
     cue_stim.pos = cue_pos
@@ -2017,11 +2039,11 @@ def present_delayed_afc_trial(
     choice_hit_targets: List[visual.Rect] = []
     for pair, pos in zip(block_paths, positions):
         pair = tuple(pair)
-        choice_img = preloaded.get(_csc1_feature_key(pair, choice_feature))
-        if choice_img is None:
-            choice_img = preloaded.get(pair)
-        if choice_img is None:
-            raise KeyError(f"Missing choice image for {pair} feature={choice_feature}")
+        choice_img = _lookup_feature_image(
+            pair,
+            choice_feature,
+            role="choice",
+        )
         stim = make_image_stim_from_array(win, choice_img, size=None, bg_rgb_255=bg_rgb_255)
         stim.pos = pos
         choice_stims.append(stim)
@@ -2218,6 +2240,10 @@ def present_delayed_afc_trial(
                 trial_meta["cue_flip_perf_s"] = float(cue_perf)
                 trial_meta["cue_feature"] = cue_feature
                 trial_meta["choice_feature"] = choice_feature
+                trial_meta["target_pair"] = target_pair
+                trial_meta["target_shape_id"] = int(target_pair[0])
+                trial_meta["target_color_id"] = target_pair[1]
+                trial_meta["choice_pairs"] = list(block_paths)
             logger.log_frame_flip(
                 trial_num=block_idx,
                 event="options_on",
@@ -2287,6 +2313,9 @@ def present_delayed_afc_trial(
             choice_info = {
                 "chosen_index": int(immediate_idx),
                 "chosen_pos": tuple(positions[immediate_idx - 1]),
+                "chosen_pair": block_paths[immediate_idx - 1],
+                "chosen_shape_id": int(block_paths[immediate_idx - 1][0]),
+                "chosen_color_id": block_paths[immediate_idx - 1][1],
                 "choice_start_perf_s": float(choice_perf),
                 "choice_time_perf_s": float(click_perf),
                 "reaction_time_s": float(click_perf - choice_perf),
@@ -2295,6 +2324,8 @@ def present_delayed_afc_trial(
                 "is_correct": bool(correct),
                 "target_index": int(target_index),
                 "target_pair": target_pair,
+                "target_shape_id": int(target_pair[0]),
+                "target_color_id": target_pair[1],
                 "trial_type": trial_type,
                 "cue_feature": cue_feature,
                 "choice_feature": choice_feature,
@@ -2329,6 +2360,9 @@ def present_delayed_afc_trial(
                 choice_info = {
                     "chosen_index": int(chosen_idx),
                     "chosen_pos": tuple(positions[chosen_idx - 1]),
+                    "chosen_pair": block_paths[chosen_idx - 1],
+                    "chosen_shape_id": int(block_paths[chosen_idx - 1][0]),
+                    "chosen_color_id": block_paths[chosen_idx - 1][1],
                     "choice_start_perf_s": float(choice_perf),
                     "choice_time_perf_s": float(click_perf),
                     "reaction_time_s": float(click_perf - choice_perf),
@@ -2337,6 +2371,8 @@ def present_delayed_afc_trial(
                     "is_correct": bool(correct),
                     "target_index": int(target_index),
                     "target_pair": target_pair,
+                    "target_shape_id": int(target_pair[0]),
+                    "target_color_id": target_pair[1],
                     "trial_type": trial_type,
                     "cue_feature": cue_feature,
                     "choice_feature": choice_feature,
@@ -2366,9 +2402,187 @@ def present_delayed_afc_trial(
             "INFO",
             (
                 f"choice_registered block={block_idx} idx={choice_info['chosen_index']} "
+                f"chosen_pair={choice_info['chosen_pair']} "
                 f"correct={int(choice_info['is_correct'])} trial_type={trial_type} "
                 f"target_index={target_index} target_pair={target_pair}"
             ),
         )
 
     return False, choice_info
+
+    
+# -----------------------------------------------------------------------------------------
+# Trial Buffer Manager (for background trial generation with multiprocessing)
+# -----------------------------------------------------------------------------------------
+
+def _trial_buffer_worker_generic(
+    trial_generator_func: Callable[[int, dict], dict],
+    config: dict,
+    trial_queue: Any,
+    stop_event: Any,
+    start_idx: int = 0,
+):
+    """
+    Generic worker process that generates trials in the background.
+    
+    Args:
+        trial_generator_func: Callable that takes (trial_idx, config) and returns trial dict
+        config: Configuration dictionary to pass to the generator
+        trial_queue: Queue to push generated trials into
+        stop_event: Event to signal worker to stop
+        start_idx: Starting trial index
+    """
+    trial_idx = start_idx
+    while not stop_event.is_set():
+        try:
+            trial_data = trial_generator_func(trial_idx, config)
+            while not stop_event.is_set():
+                try:
+                    trial_queue.put(trial_data, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+            trial_idx += 1
+        except Exception as e:
+            # Put error into queue for main process to handle
+            error_text = str(e) or repr(e)
+            error_trace = traceback.format_exc()
+            while not stop_event.is_set():
+                try:
+                    trial_queue.put(
+                        {
+                            "type": "error",
+                            "error": error_text,
+                            "traceback": error_trace,
+                            "trial_idx": trial_idx,
+                        },
+                        timeout=0.1,
+                    )
+                    break
+                except queue.Full:
+                    continue
+            break
+
+
+class TrialBufferManager:
+    """
+    Generic trial buffer manager that uses multiprocessing to pre-generate trials
+    on a separate core. Works with any task paradigm by taking a user-defined
+    trial generation callable.
+    
+    The trial_generator_func should be a function that takes:
+        - trial_idx: int (the index of the trial to generate)
+        - config: dict (containing any parameters needed for generation)
+    
+    And returns a dictionary representing the trial data.
+    
+    Example usage:
+        def my_trial_generator(trial_idx: int, config: dict) -> dict:
+            # Generate trial based on config
+            return {"trial_idx": trial_idx, "stimuli": [...], ...}
+        
+        buffer_mgr = TrialBufferManager(
+            trial_generator_func=my_trial_generator,
+            config={"param1": value1, "param2": value2},
+            buffer_size=5
+        )
+        
+        # In your task loop:
+        trial_data = buffer_mgr.get_next_trial()
+        # Use trial_data...
+        
+        # When done:
+        buffer_mgr.close()
+    """
+    
+    def __init__(
+        self, 
+        trial_generator_func: Callable[[int, dict], dict],
+        config: dict,
+        buffer_size: int = 5,
+        start_idx: int = 0,
+    ):
+        """
+        Initialize the trial buffer manager.
+        
+        Args:
+            trial_generator_func: A callable that generates trial data.
+                                  Must take (trial_idx: int, config: dict) -> dict
+            config: Dictionary of configuration parameters to pass to generator
+            buffer_size: Maximum number of trials to buffer ahead (default: 5)
+            start_idx: Starting trial index (default: 0)
+        """
+        self.trial_generator_func = trial_generator_func
+        self.config = config
+        self.buffer_size = buffer_size
+        self.start_idx = start_idx
+        self.next_trial_idx = start_idx
+        
+        # Set up multiprocessing with spawn context (required for some libraries like PsychoPy)
+        ctx = mp.get_context('spawn')
+        self.trial_queue = ctx.Queue(maxsize=buffer_size)
+        self.stop_event = ctx.Event()
+        
+        # Start the worker process
+        self.worker = ctx.Process(
+            target=_trial_buffer_worker_generic,
+            args=(trial_generator_func, config, self.trial_queue, self.stop_event, start_idx)
+        )
+        self.worker.start()
+        self.is_closed = False
+    
+    def get_next_trial(self) -> dict:
+        """
+        Get the next pre-generated trial from the buffer.
+        
+        Returns:
+            Dictionary containing the trial data generated by trial_generator_func
+            
+        Raises:
+            RuntimeError: If the buffer manager has been closed or worker encountered an error
+        """
+        if self.is_closed:
+            raise RuntimeError("TrialBufferManager has been closed")
+        
+        try:
+            trial_data = self.trial_queue.get(timeout=30.0)
+            
+            # Check if worker sent an error
+            if isinstance(trial_data, dict) and trial_data.get("type") == "error":
+                error_text = trial_data.get("error", "Unknown worker error")
+                trial_idx = trial_data.get("trial_idx")
+                trace_text = trial_data.get("traceback")
+                details = f"Trial generation error at trial_idx={trial_idx}: {error_text}"
+                if trace_text:
+                    details = f"{details}\n{trace_text}"
+                raise RuntimeError(details)
+            
+            self.next_trial_idx += 1
+            return trial_data
+            
+        except Exception as e:
+            self.close()
+            raise RuntimeError(f"Failed to get next trial: {e}")
+    
+    def close(self):
+        """
+        Clean up the worker process and release resources.
+        Should be called when done using the buffer manager.
+        """
+        if self.is_closed:
+            return
+            
+        self.is_closed = True
+        self.stop_event.set()
+        
+        # Give worker time to finish cleanly
+        self.worker.join(timeout=2.0)
+        
+        # Force terminate if still alive
+        if self.worker.is_alive():
+            self.worker.terminate()
+            self.worker.join(timeout=1.0)
+    
+    def __del__(self):
+        """Destructor to ensure cleanup happens even if close() not called."""
+        self.close()

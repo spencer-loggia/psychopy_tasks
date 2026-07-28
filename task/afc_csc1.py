@@ -52,6 +52,16 @@ from bin.screen import (
 from interface.rig_mode import IS_RIG_ENV_VAR, experimenter_cursor_visible_for_touchscreen
 
 
+StimulusPair = Tuple[int, Optional[int]]
+NON_ASSOCIATED_SHAPE_IDS: Tuple[int, ...] = tuple(range(14, 28))
+VALID_TRIAL_TYPES: Tuple[str, ...] = (
+    "random",
+    "shape_to_color",
+    "color_to_shape",
+    "shape_to_shape",
+)
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Delayed CSC1 AFC task")
     p.add_argument("--config", help="Path to JSON config file. CLI overrides config keys.")
@@ -70,7 +80,12 @@ def parse_args():
     p.add_argument("--timeout_time", type=float, default=None, help="Optional gray timeout after incorrect/no-choice trials")
     p.add_argument("--reward_pulse_time", type=float, default=None, help="Optional logged reward pulse duration after correct trials")
     p.add_argument("--reward_inter_pulse_time", type=float, default=None, help="Reserved for compatibility; currently only one logged reward pulse is emitted")
-    p.add_argument("--trial_type", choices=["random", "shape_to_color", "color_to_shape"], default=None, help="Feature mapping for trials")
+    p.add_argument(
+        "--trial_type",
+        choices=list(VALID_TRIAL_TYPES),
+        default=None,
+        help="Feature mapping for trials, including non-associated shape identity matching",
+    )
     p.add_argument("--shape_cue_color", type=int, nargs=3, default=None, help="Neutral RGB color for shape-only cues/choices")
     p.add_argument("--bg", type=int, nargs=3, default=None, help="Background RGB; if omitted and colors_tsv_has_bg_row=true, use the first color row")
     p.add_argument("--colors_tsv_has_bg_row", action="store_true", default=None, help="Treat first colors_tsv row as background and skip it for stimuli")
@@ -122,6 +137,11 @@ def _fmt_optional(value: Any) -> str:
     if value == "" or value is None:
         return ""
     return f"{float(value):.9f}"
+
+
+def _fmt_optional_int(value: Optional[int]) -> Any:
+    """Return a CSV-safe integer, leaving absent shape-only colors blank."""
+    return "" if value is None else int(value)
 
 
 def _build_behavior_fieldnames(num_afc: int) -> List[str]:
@@ -254,7 +274,15 @@ def _sample_pair_block(
     if num_afc > len(all_pairs):
         raise ValueError("num_afc cannot be larger than the number of available pairs")
 
-    unique_feature_idx = 1 if trial_type == "shape_to_color" else 0
+    if trial_type == "shape_to_color":
+        unique_feature_idx = 1
+    elif trial_type == "color_to_shape":
+        unique_feature_idx = 0
+    else:
+        raise ValueError(
+            "_sample_pair_block only supports shape_to_color and color_to_shape"
+        )
+
     replace = int(np.count_nonzero(probs)) < int(num_afc)
 
     for _attempt in range(1000):
@@ -272,6 +300,40 @@ def _sample_pair_block(
         ),
     )
     return block
+
+
+def _sample_shape_to_shape_block(
+    *,
+    shape_ids: List[int],
+    num_afc: int,
+    rng: np.random.Generator,
+) -> Tuple[List[StimulusPair], int]:
+    """Build one identity-matching trial from non-associated shapes.
+
+    Every selected shape is unique. The shape at the returned 1-based
+    ``target_index`` is shown as the cue and is therefore the correct choice.
+    Shape-only stimuli use ``None`` as their color ID.
+    """
+    available_shape_ids = sorted({int(sid) for sid in shape_ids})
+
+    if num_afc < 2:
+        raise ValueError("shape_to_shape trials require at least two choices")
+    if num_afc > len(available_shape_ids):
+        raise ValueError(
+            f"num_afc={num_afc}, but only {len(available_shape_ids)} "
+            "non-associated shapes are available"
+        )
+
+    sampled_ids = rng.choice(
+        np.asarray(available_shape_ids, dtype=int),
+        size=int(num_afc),
+        replace=False,
+    )
+    block_paths: List[StimulusPair] = [
+        (int(shape_id), None) for shape_id in sampled_ids.tolist()
+    ]
+    target_index = int(rng.integers(1, int(num_afc) + 1))
+    return block_paths, target_index
 
 
 def _fixed_circle_positions(num_afc: int, radius_px: float) -> List[Tuple[float, float]]:
@@ -402,13 +464,59 @@ def run_task(
         bg_rgb = tuple((128, 128, 128) if bg is None else bg)
 
     shapes = utils.load_shape_definitions(Path(shapes_tsv))
-    color_ids = list(colors.keys())
-    shape_ids = list(shapes.keys())
+    color_ids = [int(cid) for cid in colors.keys()]
+    shape_ids = [int(sid) for sid in shapes.keys()]
 
+    if trial_type not in VALID_TRIAL_TYPES:
+        raise ValueError(
+            "trial_type must be one of: " + ", ".join(VALID_TRIAL_TYPES)
+        )
     if num_afc < 1:
         raise ValueError("num_afc must be >= 1")
     if n_blocks < 1:
         raise ValueError("n must be >= 1")
+
+    uses_associated_trials = trial_type in (
+        "random",
+        "shape_to_color",
+        "color_to_shape",
+    )
+    uses_shape_to_shape_trials = trial_type in ("random", "shape_to_shape")
+
+    nonassociated_shape_ids = [
+        sid for sid in NON_ASSOCIATED_SHAPE_IDS if sid in shapes
+    ]
+    associated_shape_ids = [
+        sid for sid in shape_ids if sid not in NON_ASSOCIATED_SHAPE_IDS
+    ]
+
+    if uses_shape_to_shape_trials:
+        missing_nonassociated = [
+            sid for sid in NON_ASSOCIATED_SHAPE_IDS if sid not in shapes
+        ]
+        if missing_nonassociated:
+            missing_names = ", ".join(
+                f"s{sid}.svg" for sid in missing_nonassociated
+            )
+            raise ValueError(
+                "shape_to_shape trials require shape IDs 14 through 27 in "
+                f"shapes_tsv. Missing: {missing_names}"
+            )
+        if int(num_afc) > len(nonassociated_shape_ids):
+            raise ValueError(
+                f"num_afc={num_afc} exceeds the "
+                f"{len(nonassociated_shape_ids)} available non-associated shapes"
+            )
+        if int(num_afc) < 2:
+            raise ValueError(
+                "shape_to_shape trials require num_afc to be at least 2"
+            )
+
+    if uses_associated_trials and not associated_shape_ids:
+        raise ValueError(
+            "No associated shapes remain after reserving shape IDs 14-27 "
+            "for shape_to_shape trials"
+        )
 
     resolved_config_name = str(config_name).strip() if config_name else "afc_csc1"
     behavior_fieldnames = _build_behavior_fieldnames(num_afc)
@@ -433,24 +541,46 @@ def run_task(
         ),
     )
 
-    all_pairs = _build_pair_pool(
-        shape_ids,
-        color_ids,
-        pairing_mode=pairing_mode,
-        num_stim=num_stim,
-    )
-    if num_afc > len(all_pairs):
-        raise ValueError("num_afc cannot be larger than the number of available color-shape pairs")
+    all_pairs: List[Tuple[int, int]] = []
+    pair_probs = np.asarray([], dtype=float)
+
+    if uses_associated_trials:
+        all_pairs = _build_pair_pool(
+            associated_shape_ids,
+            color_ids,
+            pairing_mode=pairing_mode,
+            num_stim=num_stim,
+        )
+        if num_afc > len(all_pairs):
+            raise ValueError(
+                "num_afc cannot be larger than the number of available "
+                "associated color-shape pairs"
+            )
+
+        likelihood = _load_likelihood(
+            likelihood_tsv,
+            color_ids,
+            shape_ids,
+            msg_logger,
+        )
+        pair_probs = _pair_probabilities(
+            all_pairs,
+            likelihood,
+            color_ids,
+            shape_ids,
+            msg_logger,
+        )
+
     msg_logger.log(
         "INFO",
         (
-            f"stimulus_pool pairing_mode={pairing_mode} pool_size={len(all_pairs)} "
-            f"n_shapes={len(shape_ids)} n_colors={len(color_ids)} num_afc={num_afc}"
+            f"stimulus_pool pairing_mode={pairing_mode} "
+            f"associated_pair_pool_size={len(all_pairs)} "
+            f"n_associated_shapes={len(associated_shape_ids)} "
+            f"n_nonassociated_shapes={len(nonassociated_shape_ids)} "
+            f"n_colors={len(color_ids)} num_afc={num_afc}"
         ),
     )
-
-    likelihood = _load_likelihood(likelihood_tsv, color_ids, shape_ids, msg_logger)
-    pair_probs = _pair_probabilities(all_pairs, likelihood, color_ids, shape_ids, msg_logger)
 
     # Pre-render only the feature-level images used by this delayed AFC task.
     preloaded: Dict[Any, Any] = {}
@@ -510,6 +640,7 @@ def run_task(
         "no_choice": 0,
         "s2c": 0,
         "c2s": 0,
+        "s2s": 0,
     }
     last_trial_summary: Dict[str, Any] = {}
 
@@ -575,11 +706,15 @@ def run_task(
         except Exception:
             pass
 
-        def _feature_key(pair: Tuple[int, int], feature: str) -> Tuple[str, int]:
+        def _feature_key(pair: StimulusPair, feature: str) -> Tuple[str, int]:
             sid, cid = pair
             if feature == "shape":
                 return ("shape_only", int(sid))
             if feature == "color":
+                if cid is None:
+                    raise ValueError(
+                        f"Shape-only stimulus {pair!r} has no color feature"
+                    )
                 return ("color_only", int(cid))
             raise ValueError(f"Unknown AFC feature: {feature}")
 
@@ -588,6 +723,8 @@ def run_task(
                 return "shape", "color"
             if ttype == "color_to_shape":
                 return "color", "shape"
+            if ttype == "shape_to_shape":
+                return "shape", "shape"
             raise ValueError(f"Unknown AFC trial_type: {ttype}")
 
         def _make_stats_panel_image(*, phase: str = "idle"):
@@ -623,7 +760,7 @@ def run_task(
             y += 24
             draw.text((16, y), f"accuracy: {pct:.1f}%   no choice: {no_choice}", fill=(0, 0, 0, 255), font=font_body)
             y += 24
-            draw.text((16, y), f"S2C: {afc_counts.get('s2c', 0)}   C2S: {afc_counts.get('c2s', 0)}", fill=(0, 0, 0, 255), font=font_body)
+            draw.text((16, y), f"S2C: {afc_counts.get('s2c', 0)}   C2S: {afc_counts.get('c2s', 0)}   S2S: {afc_counts.get('s2s', 0)}", fill=(0, 0, 0, 255), font=font_body)
             y += 31
             if last_trial_summary:
                 draw.text((16, y), "last trial", fill=(0, 0, 0, 255), font=font_title)
@@ -672,7 +809,7 @@ def run_task(
         def _show_preview_afc_scene(
             *,
             phase: str,
-            block_paths_current: Optional[List[Tuple[int, int]]] = None,
+            block_paths_current: Optional[List[StimulusPair]] = None,
             positions_current: Optional[List[Tuple[float, float]]] = None,
             trial_type_current: Optional[str] = None,
             target_index_current: Optional[int] = None,
@@ -921,19 +1058,33 @@ def run_task(
                 break
 
             if trial_type == "random":
-                block_trial_type = random.choice(["shape_to_color", "color_to_shape"])
+                block_trial_type = random.choice(
+                    ["shape_to_color", "color_to_shape", "shape_to_shape"]
+                )
             else:
                 block_trial_type = trial_type
 
-            block_paths = _sample_pair_block(
-                all_pairs=all_pairs,
-                probs=pair_probs,
-                num_afc=int(num_afc),
-                trial_type=block_trial_type,
-                rng=rng,
-                msg_logger=msg_logger,
-            )
-            target_index = int(rng.integers(1, int(num_afc) + 1))
+            block_paths: List[StimulusPair]
+            if block_trial_type == "shape_to_shape":
+                block_paths, target_index = _sample_shape_to_shape_block(
+                    shape_ids=nonassociated_shape_ids,
+                    num_afc=int(num_afc),
+                    rng=rng,
+                )
+            else:
+                paired_block = _sample_pair_block(
+                    all_pairs=all_pairs,
+                    probs=pair_probs,
+                    num_afc=int(num_afc),
+                    trial_type=block_trial_type,
+                    rng=rng,
+                    msg_logger=msg_logger,
+                )
+                block_paths = [
+                    (int(sid), int(cid)) for sid, cid in paired_block
+                ]
+                target_index = int(rng.integers(1, int(num_afc) + 1))
+
             target_sid, target_cid = block_paths[target_index - 1]
             msg_logger.log(
                 "INFO",
@@ -1018,6 +1169,8 @@ def run_task(
                 afc_counts["s2c"] += 1
             elif block_trial_type == "color_to_shape":
                 afc_counts["c2s"] += 1
+            elif block_trial_type == "shape_to_shape":
+                afc_counts["s2s"] += 1
             if is_correct:
                 afc_counts["correct"] += 1
                 trial_result = "correct"
@@ -1112,7 +1265,7 @@ def run_task(
                 "choice_feature": trial_meta.get("choice_feature", ""),
                 "target_index": int(target_index - 1),
                 "target_shape": int(target_sid),
-                "target_color": int(target_cid),
+                "target_color": _fmt_optional_int(target_cid),
                 "initiation_time": _fmt_optional(trial_meta.get("initiation_time_s")),
                 "choice_made_index": chosen_idx_zero_based,
                 "choice_made_shape": "",
@@ -1124,11 +1277,11 @@ def run_task(
             }
             for idx, (sid, cid) in enumerate(block_paths):
                 behavior_row[f"option_{idx}_shape"] = int(sid)
-                behavior_row[f"option_{idx}_color"] = int(cid)
+                behavior_row[f"option_{idx}_color"] = _fmt_optional_int(cid)
             if chosen_idx_1based is not None:
                 chosen_sid, chosen_cid = block_paths[int(chosen_idx_1based) - 1]
                 behavior_row["choice_made_shape"] = int(chosen_sid)
-                behavior_row["choice_made_color"] = int(chosen_cid)
+                behavior_row["choice_made_color"] = _fmt_optional_int(chosen_cid)
             behavior_logger.writerow(behavior_row)
 
             if ibi_frames > 0:
@@ -1229,8 +1382,10 @@ def main():
     position_spacing = int(pos_spacing_val) if pos_spacing_val is not None else None
 
     trial_type = _get("trial_type", cfg.get("trial_type", "random"))
-    if trial_type not in ("random", "shape_to_color", "color_to_shape"):
-        raise ValueError("trial_type must be one of: random, shape_to_color, color_to_shape")
+    if trial_type not in VALID_TRIAL_TYPES:
+        raise ValueError(
+            "trial_type must be one of: " + ", ".join(VALID_TRIAL_TYPES)
+        )
 
     try:
         run_task(

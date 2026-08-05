@@ -1191,7 +1191,7 @@ def present_block_with_persistent_dots(
             _core.wait(0.01)
 
     # Quantize durations to frames and log rounding in message logger.
-    if sequential:
+    if sequential or is_memory:
         stim_frames, stim_s = _q_to_frames(duration, at_least_one=True)
     else:
         stim_frames, stim_s = (0, 0.0)
@@ -1549,24 +1549,34 @@ def present_block_with_persistent_dots(
         _show_preview(preview_images)
         if not _arm_trial_start_signal():
             return True, None
-        bg_rect.draw()
-        for d in dots:
-            d.draw()
-        for s in stims:
-            s.draw()
-        if fix is not None:
-            fix.draw()
-        flip_ps = win.flip()
-        flip_perf = time.perf_counter()
-        _commit_trial_start_signal(flip_perf)
-        _set_initiation_time(flip_perf)
-        stim_request = choice_s if not is_memory else frame_dur
-        logger.log_frame_flip(
-            trial_num=block_idx,
-            event=_frame_event_name("stim"),
-            timestamp_perf_s=flip_perf,
-            requested_duration=stim_request,
-        )
+        first_flip = True
+        flip_ps = None
+        flip_perf = None
+        for _ in range(stim_frames if is_memory else 1):
+            if _abort_from_input("experimenter_exit_during_stimulus"):
+                return True, None
+            bg_rect.draw()
+            for d in dots:
+                d.draw()
+            for s in stims:
+                s.draw()
+            if fix is not None:
+                fix.draw()
+            flip_ps = win.flip()
+            if first_flip:
+                flip_perf = time.perf_counter()
+                _commit_trial_start_signal(flip_perf)
+                _set_initiation_time(flip_perf)
+                stim_request = stim_s if is_memory else choice_s
+                logger.log_frame_flip(
+                    trial_num=block_idx,
+                    event=_frame_event_name("stim"),
+                    timestamp_perf_s=flip_perf,
+                    requested_duration=stim_request,
+                )
+                first_flip = False
+        if flip_perf is None:
+            flip_perf = time.perf_counter()
         if not is_memory:
             _build_choice_hit_targets()
             _start_choice_window(flip_ps, flip_perf)
@@ -1578,6 +1588,17 @@ def present_block_with_persistent_dots(
             if choice_deadline is not None and _poll_choice_until(choice_deadline):
                 return True, None
         else:
+            if not dots:
+                for pos in positions:
+                    dot = _make_dot(pos, dot_color)
+                    dots.append(dot)
+                    dot_records.append(
+                        {
+                            "pos": tuple(pos),
+                            "radius": float(dot_size) / 2.0,
+                            "color": tuple(dot_color),
+                        }
+                    )
             for d in dots:
                 d.fillColor = rgb255_to_psychopy(dot_color)
                 d.fillColorSpace = "rgb"

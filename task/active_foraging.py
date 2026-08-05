@@ -54,6 +54,10 @@ from bin.screen import (
     set_window_mouse_visible,
 )
 from interface.rig_mode import IS_RIG_ENV_VAR, experimenter_cursor_visible_for_touchscreen
+from task.active_foraging_timing import (
+    duration_requires_positive_frames,
+    validate_duration_for_presentation_mode,
+)
 
 
 def _generate_active_foraging_trial(trial_idx: int, config: dict) -> dict:
@@ -329,7 +333,10 @@ def parse_args():
         "--duration",
         type=float,
         default=None,
-        help="Stimulus duration (s). Must be 0 when sequential=false.",
+        help=(
+            "Stimulus duration (s). Must be positive when sequential=true or "
+            "is_memory=true; must be 0 when both are false."
+        ),
     )
     p.add_argument("--choice_time", type=float, default=None, help="Choice display time after block (s)")
     p.add_argument("--ibi", type=float, default=None, help="Inter-block interval (s)")
@@ -477,15 +484,15 @@ def run_task(
         ),
     )
 
-    if not sequential:
-        if float(duration) != 0.0:
-            msg = (
-                "Invalid active_foraging timing config: when sequential=false, "
-                f"duration must be exactly 0, got {float(duration):.6f}. "
-                "In this mode the stimuli appear on the first choice frame and remain visible for choice_time only."
-            )
-            msg_logger.log("ERROR", msg)
-            raise ValueError(msg)
+    try:
+        validate_duration_for_presentation_mode(
+            duration,
+            sequential=bool(sequential),
+            is_memory=bool(is_memory),
+        )
+    except ValueError as exc:
+        msg_logger.log("ERROR", str(exc))
+        raise
 
     affinity_plan = build_main_and_worker_affinity_plan(main_core=0)
     main_cpu_affinity = affinity_plan.get("main_cpu_affinity")
@@ -775,7 +782,14 @@ def run_task(
         context="active_foraging",
         minimum_frames={
             "choice_time": 1,
-            **({"duration": 1} if sequential else {}),
+            **(
+                {"duration": 1}
+                if duration_requires_positive_frames(
+                    sequential=bool(sequential),
+                    is_memory=bool(is_memory),
+                )
+                else {}
+            ),
         },
         msg_logger=msg_logger,
     )
@@ -787,7 +801,10 @@ def run_task(
                 frames = max(1, frames)
             return frames, frames / float(fps)
 
-        if sequential:
+        if duration_requires_positive_frames(
+            sequential=bool(sequential),
+            is_memory=bool(is_memory),
+        ):
             dur_fr, dur_s = _q(duration, at_least_one=True)
         else:
             dur_fr, dur_s = (0, 0.0)

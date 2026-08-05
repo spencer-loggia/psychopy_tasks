@@ -46,7 +46,12 @@
                 }
             }, 
             "sequential": {},
-            "memory": {}
+            "memory": {
+                "Yuri": {
+                    "launch": "task/active_foraging.py",
+                    "config": "config_files/csc2/yuri_rigtrain_no_seq_mem_20260803.json"
+                }
+            }
         },
         "video": {
             "launch": "task/play_video.py",

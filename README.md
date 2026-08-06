@@ -62,7 +62,7 @@ Common event-log rules:
 - `event_type` is one of `frame_flip`, `interaction`, or `signal`.
 - Frame-flip events are logged at the real flip time for the frame that changed the main display.
 - Interaction events are logged as close as possible to the touch / click / key / eye-tracker event itself.
-- Signal events are logged as close as possible to the GPIO or external signal send.
+- Signal events are logged as close as possible to the GPIO, DAQC2, or external signal send.
 - Events that have no visible effect or a programmatic zero-duration no-op should not be logged.
 - `requested_duration` is filled only when the code requested a fixed duration for that state or signal. Variable windows such as `choice_start` leave it blank.
 
@@ -187,6 +187,19 @@ The `active_foraging` task treats CPU core `0` as the timing-critical presentati
 - Launch the task from a shell or service whose affinity mask still includes CPU `0` and the worker cores. If the launcher has already removed CPU `0` from the process affinity mask, the task cannot pin the main presentation process onto that core.
 - Event, message, and behavior logs for `active_foraging` are buffered during the timing-critical portion of a trial and flushed only in the between-trial gap, so synchronous disk flushes do not run while the initiation cue, stimulus presentation, touch detection, and reward delivery are active.
 
+Active Foraging Hardware Signals
+--------------------------------
+When `active_foraging` runs with `raspi=true`, the hardware outputs are split across Raspberry Pi GPIO and the Pi-Plates DAQC2plate:
+
+- `trial_start_pin`: Raspberry Pi BCM GPIO pin used for the timing-critical trial-start pulse. This still uses `lgpio` and is scheduled on the PsychoPy flip path for precise timing.
+- `daq.address` or top-level `daq_address`: DAQC2plate address for pump and buzzer output, default `0`.
+- `pump_pin`: DAQC2 DOUT bit for pump reward delivery, in the range `0` through `7`.
+- `buzz_pin`: DAQC2 DOUT bit for the timeout buzzer, in the range `0` through `7`.
+
+Pump and buzzer writes use `piplates.DAQC2plate.setDOUTbit(addr, bit)` for logical on and `clrDOUTbit(addr, bit)` for logical off. DAQC2 DOUTs are open-drain outputs, so the terminal voltage is inverted for a pulled-up digital signal: setting a DOUT bit pulls the terminal near `0 V`, while clearing it turns the transistor off and lets the terminal return to `5 VDC`. The checked-in active-foraging configs use `pump_pin=0` and `buzz_pin=1` as DOUT defaults.
+
+The launcher setup scripts use the same mapping by default: `task/pulse_pump.py` primes the pump on DAQC2 `DOUT0`, and `task/pulse_buzzer.py` tests the buzzer on DAQC2 `DOUT1`.
+
 Active Foraging Timing
 ----------------------
 The main visual timing parameters in `active_foraging` are interpreted by the presentation mode, not as abstract global delays. Those visual timings are quantized to display frames before use. `pump_delay_time` is separate: it is a post-choice reward delay applied in wall-clock seconds before reward delivery begins.
@@ -265,6 +278,9 @@ All tasks in this repository must support loading a JSON configuration file as a
 - `image_size` (array of 2 ints, optional)
 - `center_point` (array of 2 ints or null, optional): `active_foraging` stimulus circle center in main-screen pixels
 - `stim_range_radius` (int or null, optional): `active_foraging` stimulus circle radius in pixels
+- `trial_start_pin` (int, optional): `active_foraging` BCM GPIO pin for the trial-start pulse
+- `daq.address` or `daq_address` (int, optional): `active_foraging` DAQC2plate address for pump/buzzer outputs
+- `pump_pin` and `buzz_pin` (int, optional): `active_foraging` DAQC2 DOUT bits, not Raspberry Pi GPIO pins
 
 Tasks must validate the config when loaded and raise a helpful error if required keys are missing or types are invalid. Command-line arguments should override values in the config file when both are provided.
 

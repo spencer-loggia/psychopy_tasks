@@ -24,8 +24,11 @@
     "3": 0
   },
 
-  "pump_pin": 24,
-  "buzz_pin": 23,
+  "daq": {
+    "address": 0
+  },
+  "pump_pin": 0,
+  "buzz_pin": 1,
   "trial_start_pin": 18,
 
   "seed": null,

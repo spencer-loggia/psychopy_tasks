@@ -17,6 +17,8 @@ Config keys required/additional:
 - num_afc, n, duration, isi, ibi, choice_time, dot_size, dot_color, init_dot_color
 - pump_delay_time: delay in seconds between a rewarded choice and the first pump pulse
 - inter_pump_interval: optional delay in seconds between pump pulses; defaults to pump_pulse_time_seconds
+- trial_start_pin is a Raspberry Pi BCM GPIO pin; pump_pin and buzz_pin are
+  DAQC2 DOUT bits on the Pi-Plate.
 
 """
 import argparse
@@ -41,6 +43,7 @@ from bin.affinity import (
     describe_cpu_set,
     set_process_cpu_affinity,
 )
+from bin.daqc2_outputs import DAQC2DigitalOutputs
 from bin.logger import SessionLogBundle
 import numpy as np
 from bin.config import load_config, validate_config
@@ -360,10 +363,11 @@ def parse_args():
     p.add_argument("--sequential", action="store_true", default=None, help="Present stimuli sequentially (one at a time). If not set, config value or default True is used")
     p.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate (Hz); skip auto-detection if provided")
     p.add_argument("--touchscreen", action="store_true", default=None, help="Enable touchscreen mode (hide mouse cursor)")
-    p.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi GPIO LED pulses for onset cues")
+    p.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi GPIO trial-start pulses and DAQC2 DOUT pump/buzzer outputs")
     p.add_argument("--trial_start_pin", type=int, default=None, help="GPIO pin to use for trial start pulses (BCM numbering)")
-    p.add_argument("--pump_pin", type=int, default=None, help="GPIO pin for pump reward delivery")
-    p.add_argument("--buzz_pin", type=int, default=None, help="GPIO pin for timeout buzzer")
+    p.add_argument("--daq_address", type=int, default=None, help="DAQC2plate address for pump/buzzer DOUT outputs")
+    p.add_argument("--pump_pin", type=int, default=None, help="DAQC2 DOUT bit for pump reward delivery (0-7)")
+    p.add_argument("--buzz_pin", type=int, default=None, help="DAQC2 DOUT bit for timeout buzzer (0-7)")
     p.add_argument("--freq_space_tsv", help="CSV file defining color-shape pair probabilities")
     p.add_argument("--reward_space_tsv", help="CSV file defining reward levels for color-shape pairs")
     p.add_argument(
@@ -418,8 +422,10 @@ def run_task(
     touchscreen: bool = False,
     raspi: bool = False,
     trial_start_pin: int = 18,
-    pump_pin: int = 17,
-    buzz_pin: int = 16,
+    daq_address: int = 0,
+    daq_module_name: str = "piplates.DAQC2plate",
+    pump_pin: int = 0,
+    buzz_pin: int = 1,
     fixed_positions: bool = False,
     center_point: Optional[Tuple[float, float]] = None,
     stim_range_radius: Optional[float] = None,
@@ -454,6 +460,12 @@ def run_task(
         0.0,
         float(pump_pulse_time_seconds if inter_pump_interval is None else inter_pump_interval),
     )
+    if raspi:
+        DAQC2DigitalOutputs.validate_address(int(daq_address))
+        DAQC2DigitalOutputs.validate_bit(int(pump_pin))
+        DAQC2DigitalOutputs.validate_bit(int(buzz_pin))
+        if int(pump_pin) == int(buzz_pin):
+            raise ValueError("pump_pin and buzz_pin must refer to different DAQC2 DOUT bits")
 
     colors = utils.load_color_palette(Path(colors_tsv))
     shapes = utils.load_shape_definitions(Path(shapes_tsv))
@@ -961,39 +973,68 @@ def run_task(
     _show_preview_idle()
     pylogging.console.setLevel(pylogging.CRITICAL)
 
-    # Initialize lgpio if requested; do not fail the task if lgpio is unavailable.
+    # Initialize hardware outputs if requested; do not fail the task if hardware
+    # libraries are unavailable.
     pigpio_pi = None  # naming kept for compatibility with presenter API
-    gpio_chip = None
+    daqc2_outputs: Optional[DAQC2DigitalOutputs] = None
     if raspi:
         try:
             import lgpio
 
             chip = lgpio.gpiochip_open(0)  # 0 is the default chip for RPi5
-            # Claim all three pins as outputs
             lgpio.gpio_claim_output(chip, trial_start_pin)
-            lgpio.gpio_claim_output(chip, pump_pin)
-            lgpio.gpio_claim_output(chip, buzz_pin)
             pigpio_pi = chip  # store chip handle
-            gpio_chip = chip  # store for later use
-            msg_logger.log("INFO", f"lgpio initialized on chip 0, pins claimed: trial_start={trial_start_pin}, pump={pump_pin}, buzz={buzz_pin}")
+            msg_logger.log("INFO", f"lgpio initialized on chip 0, trial_start_pin={trial_start_pin}")
         except Exception as e:
             pigpio_pi = None
-            gpio_chip = None
             try:
-                msg_logger.log("WARN", f"lgpio not available or failed to initialize: {e}; raspi disabled")
+                msg_logger.log("WARN", f"lgpio not available or failed to initialize: {e}; trial-start GPIO signal will be logged only")
+            except Exception:
+                pass
+
+        try:
+            daqc2_outputs = DAQC2DigitalOutputs(
+                address=int(daq_address),
+                module_name=str(daq_module_name),
+            )
+            daqc2_outputs.open()
+            daqc2_outputs.write(int(pump_pin), False)
+            daqc2_outputs.write(int(buzz_pin), False)
+            msg_logger.log(
+                "INFO",
+                (
+                    f"DAQC2 DOUT initialized address={int(daq_address)} "
+                    f"pump_dout={int(pump_pin)} buzz_dout={int(buzz_pin)}"
+                ),
+            )
+        except Exception as e:
+            daqc2_outputs = None
+            try:
+                msg_logger.log("WARN", f"DAQC2 DOUT unavailable or failed to initialize: {e}; pump/buzzer signals will be logged only")
             except Exception:
                 pass
     else:
-        msg_logger.log("INFO", "raspi=False; GPIO pin signals will not be sent (events will be logged only)")
+        msg_logger.log("INFO", "raspi=False; GPIO/DAQC2 hardware signals will not be sent (events will be logged only)")
+
+    def _set_daqc2_output(bit: int, active: bool, *, signal_name: str, context: str) -> None:
+        if raspi and daqc2_outputs is not None:
+            try:
+                daqc2_outputs.write(int(bit), bool(active))
+            except Exception as e:
+                state = "on" if active else "off"
+                msg_logger.log(
+                    "ERROR",
+                    (
+                        f"Failed to turn {signal_name} {state} on DAQC2 "
+                        f"DOUT{int(bit)} during {context}: {e}"
+                    ),
+                )
 
     def _set_pump_pin(value: int, *, context: str) -> None:
-        if raspi and gpio_chip is not None:
-            try:
-                import lgpio
+        _set_daqc2_output(pump_pin, bool(value), signal_name="pump", context=context)
 
-                lgpio.gpio_write(gpio_chip, pump_pin, int(value))
-            except Exception as e:
-                msg_logger.log("ERROR", f"Failed to set pump_pin {'high' if value else 'low'} during {context}: {e}")
+    def _set_buzzer_pin(value: int, *, context: str) -> None:
+        _set_daqc2_output(buzz_pin, bool(value), signal_name="buzzer", context=context)
 
     def _deliver_manual_reward() -> None:
         pulse_duration = max(0.0, float(pump_pulse_time_seconds))
@@ -1287,12 +1328,7 @@ def run_task(
 
                 if apply_timeout > 0:
                     timeout_start_perf = time.perf_counter()
-                    if raspi and gpio_chip is not None:
-                        try:
-                            import lgpio
-                            lgpio.gpio_write(gpio_chip, buzz_pin, 1)
-                        except Exception as e:
-                            msg_logger.log("ERROR", f"Failed to set buzz_pin high: {e}")
+                    _set_buzzer_pin(1, context="timeout")
                     logger.log_signal(
                         trial_num=trial_num,
                         event="buzzer_on",
@@ -1305,12 +1341,7 @@ def run_task(
                         abort_requested = True
 
                     timeout_end_perf = time.perf_counter()
-                    if raspi and gpio_chip is not None:
-                        try:
-                            import lgpio
-                            lgpio.gpio_write(gpio_chip, buzz_pin, 0)
-                        except Exception as e:
-                            msg_logger.log("ERROR", f"Failed to set buzz_pin low: {e}")
+                    _set_buzzer_pin(0, context="timeout")
                     logger.log_signal(
                         trial_num=trial_num,
                         event="buzzer_off",
@@ -1371,6 +1402,11 @@ def run_task(
             block_idx += 1
 
     finally:
+        try:
+            _set_pump_pin(0, context="task_cleanup")
+            _set_buzzer_pin(0, context="task_cleanup")
+        except Exception:
+            pass
         _flush_between_trials()
         try:
             buffer_mgr.close()
@@ -1454,8 +1490,11 @@ def main():
     touchscreen = bool(_get("touchscreen", cfg.get("touchscreen", False)))
     raspi = _get("raspi", cfg.get("raspi", False))
     trial_start_pin = int(_get("trial_start_pin", cfg.get("trial_start_pin", 18)))
-    pump_pin = int(_get("pump_pin", cfg.get("pump_pin", 17)))
-    buzz_pin = int(_get("buzz_pin", cfg.get("buzz_pin", 16)))
+    daq_cfg = cfg.get("daq", {}) if isinstance(cfg.get("daq", {}), dict) else {}
+    daq_address = int(_get("daq_address", daq_cfg.get("address", cfg.get("daq_address", 0))))
+    daq_module_name = str(daq_cfg.get("module_name", cfg.get("daq_module_name", "piplates.DAQC2plate")))
+    pump_pin = int(_get("pump_pin", cfg.get("pump_pin", 0)))
+    buzz_pin = int(_get("buzz_pin", cfg.get("buzz_pin", 1)))
     fixed_positions = bool(_get("fixed_positions", cfg.get("fixed_positions", False)))
     center_point_val = _get("center_point", cfg.get("center_point", None))
     center_point = tuple(center_point_val) if center_point_val is not None else None
@@ -1512,6 +1551,8 @@ def main():
             touchscreen=touchscreen,
             raspi=_get("raspi", cfg.get("raspi", False)),
             trial_start_pin=trial_start_pin,
+            daq_address=daq_address,
+            daq_module_name=daq_module_name,
             pump_pin=pump_pin,
             buzz_pin=buzz_pin,
             fixed_positions=fixed_positions,

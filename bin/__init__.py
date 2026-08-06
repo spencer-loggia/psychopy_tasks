@@ -6,4 +6,4 @@ import-time failures or circular imports. Consumers can import the submodules
 directly (e.g. `from bin import utils`) or access `bin.utils`.
 """
 
-__all__ = ["utils", "logger", "config"]
+__all__ = ["utils", "logger", "config", "daqc2_outputs"]

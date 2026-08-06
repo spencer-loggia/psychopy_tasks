@@ -5,3 +5,4 @@ cairosvg>=2.5.0
 lgpio>=0.2.0
 screeninfo>=0.8.1
 psutil>=5.9
+Pi-Plates

@@ -32,20 +32,20 @@ def main():
 
     try:
         outputs.open()
+        output_on, output_off = outputs.bind_bit(int(args.pump_pin))
     except Exception as exc:
         print(f"ERROR: Could not initialize DAQC2 DOUT output: {exc}", file=sys.stderr)
         print("Install the Pi-Plates driver and check the DAQC2plate address.", file=sys.stderr)
         sys.exit(1)
 
-    print(
-        f"Priming pump on DAQC2 address {int(args.daq_address)} DOUT{int(args.pump_pin)} "
-        f"for {duration_s:.3f} seconds."
-    )
-    print("DOUT is open-drain: logical on pulls the terminal near 0 V; off releases it high.")
-
     exit_code = 0
     try:
-        outputs.write(int(args.pump_pin), True)
+        output_on()
+        print(
+            f"Priming pump on DAQC2 address {int(args.daq_address)} DOUT{int(args.pump_pin)} "
+            f"for {duration_s:.3f} seconds."
+        )
+        print("DOUT is open-drain: logical on pulls the terminal near 0 V; off releases it high.")
         time.sleep(duration_s)
     except KeyboardInterrupt:
         print("\nInterrupted; turning pump off.")
@@ -54,7 +54,7 @@ def main():
         exit_code = 1
     finally:
         try:
-            outputs.write(int(args.pump_pin), False)
+            output_off()
             print("Pump DOUT cleared.")
         except Exception as exc:
             print(f"ERROR: Failed to clear pump DOUT: {exc}", file=sys.stderr)

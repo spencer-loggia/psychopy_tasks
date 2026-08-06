@@ -977,6 +977,10 @@ def run_task(
     # libraries are unavailable.
     pigpio_pi = None  # naming kept for compatibility with presenter API
     daqc2_outputs: Optional[DAQC2DigitalOutputs] = None
+    pump_output_on = None
+    pump_output_off = None
+    buzzer_output_on = None
+    buzzer_output_off = None
     if raspi:
         try:
             import lgpio
@@ -998,8 +1002,10 @@ def run_task(
                 module_name=str(daq_module_name),
             )
             daqc2_outputs.open()
-            daqc2_outputs.write(int(pump_pin), False)
-            daqc2_outputs.write(int(buzz_pin), False)
+            pump_output_on, pump_output_off = daqc2_outputs.bind_bit(int(pump_pin))
+            buzzer_output_on, buzzer_output_off = daqc2_outputs.bind_bit(int(buzz_pin))
+            pump_output_off()
+            buzzer_output_off()
             msg_logger.log(
                 "INFO",
                 (
@@ -1018,8 +1024,16 @@ def run_task(
 
     def _set_daqc2_output(bit: int, active: bool, *, signal_name: str, context: str) -> None:
         if raspi and daqc2_outputs is not None:
+            if signal_name == "pump":
+                output_fn = pump_output_on if active else pump_output_off
+            elif signal_name == "buzzer":
+                output_fn = buzzer_output_on if active else buzzer_output_off
+            else:
+                output_fn = None
+            if output_fn is None:
+                return
             try:
-                daqc2_outputs.write(int(bit), bool(active))
+                output_fn()
             except Exception as e:
                 state = "on" if active else "off"
                 msg_logger.log(
@@ -1241,21 +1255,6 @@ def run_task(
                 chosen_shape_idx, chosen_color_idx, chosen_lum_idx = block_meta[chosen_idx - 1]
                 reward_level_row = reward_level
                 reward_counts[int(reward_level)] = reward_counts.get(int(reward_level), 0) + 1
-                msg_logger.log(
-                    "INFO",
-                    (
-                        f"choice_registered trial_num={trial_num} idx={chosen_idx} pair={chosen_pair} "
-                        f"base_color_idx={chosen_color_idx} shape_idx={chosen_shape_idx} "
-                        f"lum_idx={chosen_lum_idx} reward_level={reward_level}"
-                    ),
-                )
-                _preview_choice_feedback(
-                    preloaded_items=preloaded,
-                    block_paths_current=block_paths,
-                    positions_current=positions,
-                    chosen_index_1based=chosen_idx,
-                    reward_level=reward_level,
-                )
 
                 if reward_to_pulse_map is not None:
                     num_pulses = reward_to_pulse_map.get(str(reward_level), 0)
@@ -1350,6 +1349,22 @@ def run_task(
 
                 if abort_requested or task_end_notes != "done":
                     break
+
+                msg_logger.log(
+                    "INFO",
+                    (
+                        f"choice_registered trial_num={trial_num} idx={chosen_idx} pair={chosen_pair} "
+                        f"base_color_idx={chosen_color_idx} shape_idx={chosen_shape_idx} "
+                        f"lum_idx={chosen_lum_idx} reward_level={reward_level}"
+                    ),
+                )
+                _preview_choice_feedback(
+                    preloaded_items=preloaded,
+                    block_paths_current=block_paths,
+                    positions_current=positions,
+                    chosen_index_1based=chosen_idx,
+                    reward_level=reward_level,
+                )
 
             if _poll_experimenter_controls():
                 task_end_notes = "experimenter_exit"

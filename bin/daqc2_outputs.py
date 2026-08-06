@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import importlib
-from typing import Optional
+from typing import Callable, Optional
 
 
 class DAQC2DigitalOutputs:
@@ -19,6 +19,8 @@ class DAQC2DigitalOutputs:
         self.module_name = str(module_name)
         self.enabled = bool(enabled)
         self._module: Optional[object] = None
+        self._set_dout_bit: Optional[Callable[[int, int], object]] = None
+        self._clear_dout_bit: Optional[Callable[[int, int], object]] = None
 
     def open(self) -> None:
         if not self.enabled:
@@ -34,6 +36,8 @@ class DAQC2DigitalOutputs:
                 f"{self.module_name} does not expose required DAQC2 DOUT functions: {', '.join(missing)}"
             )
         self._module = module
+        self._set_dout_bit = module.setDOUTbit
+        self._clear_dout_bit = module.clrDOUTbit
 
     def write(self, bit: int, active: bool) -> None:
         """Set a DOUT bit logically on/off.
@@ -48,12 +52,34 @@ class DAQC2DigitalOutputs:
             return
         if self._module is None:
             self.open()
-        if self._module is None:
+        if self._set_dout_bit is None or self._clear_dout_bit is None:
             return
         if active:
-            self._module.setDOUTbit(self.address, bit)  # type: ignore[attr-defined]
+            self._set_dout_bit(self.address, bit)
         else:
-            self._module.clrDOUTbit(self.address, bit)  # type: ignore[attr-defined]
+            self._clear_dout_bit(self.address, bit)
+
+    def bind_bit(self, bit: int) -> tuple[Callable[[], None], Callable[[], None]]:
+        """Return prevalidated on/off callables for a DOUT bit."""
+        bit = self.validate_bit(bit)
+
+        def set_bit() -> None:
+            if not self.enabled:
+                return
+            if self._set_dout_bit is None:
+                self.open()
+            if self._set_dout_bit is not None:
+                self._set_dout_bit(self.address, bit)
+
+        def clear_bit() -> None:
+            if not self.enabled:
+                return
+            if self._clear_dout_bit is None:
+                self.open()
+            if self._clear_dout_bit is not None:
+                self._clear_dout_bit(self.address, bit)
+
+        return set_bit, clear_bit
 
     @staticmethod
     def validate_address(value: int) -> int:

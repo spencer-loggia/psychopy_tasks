@@ -898,14 +898,39 @@ def _normalize_reward_counts(value: Any) -> Optional[dict[int, int]]:
     return out
 
 
-def _reward_level_color(level: int) -> tuple[int, int, int]:
+def reward_level_color(level: int) -> tuple[int, int, int]:
     palette = {
         0: (220, 60, 60),
-        1: (0, 0, 0),
+        1: (140, 140, 140),
         2: (230, 200, 40),
         3: (60, 180, 75),
     }
     return palette.get(int(level), (255, 255, 255))
+
+
+def build_reward_hit_boxes(
+    items: Sequence[Dict[str, Any]],
+    *,
+    hitbox_scale: float = 1.0,
+    line_width: float = 6.0,
+) -> list[Dict[str, Any]]:
+    """Build preview outlines from stimulus entries carrying reward levels."""
+    scale = max(0.0, float(hitbox_scale))
+    boxes: list[Dict[str, Any]] = []
+    for item in items:
+        if item.get("reward_level") is None:
+            continue
+        pos = item.get("pos", (0.0, 0.0))
+        size = item.get("size", (64.0, 64.0))
+        boxes.append(
+            {
+                "pos": [float(pos[0]), float(pos[1])],
+                "size": [float(size[0]) * scale, float(size[1]) * scale],
+                "color": list(reward_level_color(int(item["reward_level"]))),
+                "line_width": float(line_width),
+            }
+        )
+    return boxes
 
 
 def _experimenter_preview_process(
@@ -1012,6 +1037,30 @@ def _experimenter_preview_process(
             )
             dots.append(dot)
 
+        hit_boxes = []
+        for item in payload.get("hit_boxes", []) or []:
+            scaled_size = scale_scene_size(item.get("size", (64, 64)), main_size, preview_size)
+            hit_boxes.append(
+                visual.Rect(
+                    win,
+                    width=max(4.0, scaled_size[0]),
+                    height=max(4.0, scaled_size[1]),
+                    pos=_map_pos(item.get("pos", (0, 0))),
+                    lineColor=_preview_rgb255_to_psychopy(item.get("color", (255, 255, 255))),
+                    lineColorSpace="rgb",
+                    lineWidth=max(
+                        2.0,
+                        scale_scene_length(
+                            float(item.get("line_width", 4.0)),
+                            main_size,
+                            preview_size,
+                        ),
+                    ),
+                    fillColor=None,
+                    units="pix",
+                )
+            )
+
         fixation = None
         fixation_size = payload.get("fixation_size", None)
         if fixation_size is not None and float(fixation_size) > 0:
@@ -1049,6 +1098,7 @@ def _experimenter_preview_process(
             "preview_outline_rect": preview_outline_rect,
             "images": images,
             "dots": dots,
+            "hit_boxes": hit_boxes,
             "fixation": fixation,
             "highlight_box": highlight_box,
             "reward_counts": _normalize_reward_counts(payload.get("reward_counts")),
@@ -1080,27 +1130,49 @@ def _experimenter_preview_process(
         if left_space >= reward_button_width + (2.0 * margin) and right_space >= exit_button_width + (2.0 * margin):
             reward_pos = (canvas_left + (left_space * 0.5), canvas_top - margin - (reward_button_height * 0.5))
             exit_pos = (canvas_right - (right_space * 0.5), canvas_top - margin - (exit_button_height * 0.5))
-            timer_pos = (canvas_left + margin, reward_pos[1] - (reward_button_height * 0.5) - timer_text_height)
+            clock_pos = (
+                canvas_left + margin,
+                reward_pos[1] - (reward_button_height * 0.5) - system_time_text_height,
+            )
+            timer_pos = (
+                clock_pos[0],
+                clock_pos[1] - max(system_time_text_height, timer_text_height) * 1.15,
+            )
             counts_pos = (canvas_left + margin, timer_pos[1] - max(56.0, reward_counts_text_height * 3.2))
             label_pos = (float(box_center[0]), box_bottom + margin + (task_label_height * 0.5))
         elif top_space >= button_h + (2.0 * margin):
             y = box_top + (top_space * 0.5)
             reward_pos = (canvas_left + margin + (reward_button_width * 0.5), y)
             exit_pos = (canvas_right - margin - (exit_button_width * 0.5), y)
-            timer_pos = (float(box_center[0]) - (timer_text_height * 2.2), y)
+            clock_pos = (
+                float(box_center[0]) - (timer_text_height * 2.2),
+                y + (system_time_text_height * 0.65),
+            )
+            timer_pos = (clock_pos[0], y - (timer_text_height * 0.65))
             counts_pos = (canvas_left + margin, y - max(40.0, reward_counts_text_height * 2.0))
             label_pos = (float(box_center[0]), box_bottom + margin + (task_label_height * 0.5))
         elif bottom_space >= button_h + (2.0 * margin):
             y = canvas_bottom + (bottom_space * 0.5)
             reward_pos = (canvas_left + margin + (reward_button_width * 0.5), y)
             exit_pos = (canvas_right - margin - (exit_button_width * 0.5), y)
-            timer_pos = (canvas_left + margin, canvas_top - margin - timer_text_height)
+            clock_pos = (canvas_left + margin, canvas_top - margin - system_time_text_height)
+            timer_pos = (
+                clock_pos[0],
+                clock_pos[1] - max(system_time_text_height, timer_text_height) * 1.15,
+            )
             counts_pos = (canvas_left + margin, timer_pos[1] - max(56.0, reward_counts_text_height * 3.2))
             label_pos = (float(box_center[0]), y)
         else:
             reward_pos = (canvas_left + margin + (reward_button_width * 0.5), canvas_top - margin - (reward_button_height * 0.5))
             exit_pos = (canvas_right - margin - (exit_button_width * 0.5), canvas_top - margin - (exit_button_height * 0.5))
-            timer_pos = (canvas_left + margin, reward_pos[1] - (reward_button_height * 0.5) - timer_text_height)
+            clock_pos = (
+                canvas_left + margin,
+                reward_pos[1] - (reward_button_height * 0.5) - system_time_text_height,
+            )
+            timer_pos = (
+                clock_pos[0],
+                clock_pos[1] - max(system_time_text_height, timer_text_height) * 1.15,
+            )
             counts_pos = (canvas_left + margin, timer_pos[1] - max(56.0, reward_counts_text_height * 3.2))
             label_pos = (float(box_center[0]), box_bottom + margin + (task_label_height * 0.5))
 
@@ -1108,6 +1180,7 @@ def _experimenter_preview_process(
         reward_button_text.pos = reward_pos
         exit_button_rect.pos = exit_pos
         exit_button_text.pos = exit_pos
+        system_time_text.pos = clock_pos
         timer_text.pos = timer_pos
         reward_counts_text.pos = counts_pos
         if task_label_text is not None:
@@ -1116,6 +1189,8 @@ def _experimenter_preview_process(
     def _draw_overlay(layout: Optional[Dict[str, Any]] = None) -> None:
         _place_overlay_controls(layout or static_scene.get("layout"))
         elapsed = time.perf_counter() - float(start_perf_s)
+        system_time_text.text = time.strftime("%H:%M:%S")
+        system_time_text.draw()
         timer_text.text = format_elapsed_hms(elapsed)
         timer_text.draw()
         reward_counts = static_scene.get("reward_counts")
@@ -1171,7 +1246,22 @@ def _experimenter_preview_process(
 
         task_label_height = max(18.0, min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.032)
         timer_text_height = max(22.0, min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.04)
+        system_time_text_height = max(
+            18.0,
+            min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.028,
+        )
         reward_counts_text_height = max(16.0, min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.028)
+        system_time_text = visual.TextStim(
+            win,
+            text="00:00:00",
+            units="pix",
+            height=system_time_text_height,
+            pos=(-float(preview_canvas_size[0]) * 0.35, float(preview_canvas_size[1]) * 0.47),
+            alignText="left",
+            anchorHoriz="left",
+            color=_preview_rgb255_to_psychopy((210, 210, 210)),
+            colorSpace="rgb",
+        )
         timer_text = visual.TextStim(
             win,
             text="00:00:00",
@@ -1306,6 +1396,12 @@ def _experimenter_preview_process(
                     continue
 
             try:
+                if event.getKeys(keyList=["r"]):
+                    reward_event.set()
+            except Exception:
+                pass
+
+            try:
                 mouse_down = any(mouse.getPressed())
             except Exception:
                 mouse_down = False
@@ -1340,6 +1436,8 @@ def _experimenter_preview_process(
                     stim.draw()
                 for stim in static_scene["images"]:
                     stim.draw()
+                for hit_box in static_scene["hit_boxes"]:
+                    hit_box.draw()
                 if static_scene["fixation"] is not None:
                     static_scene["fixation"].draw()
                 if static_scene["highlight_box"] is not None:
@@ -1381,7 +1479,7 @@ class ExperimenterPreview:
         self.update_interval_s = max(0.05, float(update_interval_s))
         self.exit_requested = False
         self._ctx = mp.get_context("spawn")
-        self._queue = self._ctx.Queue()
+        self._queue = self._ctx.Queue(maxsize=4)
         self._reward_event = self._ctx.Event()
         self._exit_event = self._ctx.Event()
         self._stop_event = self._ctx.Event()
@@ -1425,11 +1523,21 @@ class ExperimenterPreview:
         return True
 
     def _send(self, payload: Dict[str, Any]) -> None:
-        if self.poll():
+        if self.poll() or not self._process.is_alive():
             return
         try:
             self._queue.put_nowait(payload)
-        except Exception:
+            return
+        except queue.Full:
+            try:
+                self._queue.get_nowait()
+            except (queue.Empty, OSError, ValueError):
+                return
+        except (OSError, ValueError):
+            return
+        try:
+            self._queue.put_nowait(payload)
+        except (queue.Full, OSError, ValueError):
             pass
 
     def show_static_scene(
@@ -1439,6 +1547,7 @@ class ExperimenterPreview:
         main_size: Sequence[int],
         images: Optional[list[Dict[str, Any]]] = None,
         dots: Optional[list[Dict[str, Any]]] = None,
+        hit_boxes: Optional[list[Dict[str, Any]]] = None,
         fixation_size: Optional[float] = None,
         fixation_color: Sequence[int] = (0, 0, 0),
         reward_counts: Any = _UNSET,
@@ -1450,6 +1559,7 @@ class ExperimenterPreview:
             "main_size": [int(main_size[0]), int(main_size[1])],
             "images": list(images or []),
             "dots": list(dots or []),
+            "hit_boxes": list(hit_boxes or []),
             "fixation_size": fixation_size,
             "fixation_color": list(fixation_color),
         }

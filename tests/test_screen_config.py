@@ -1,15 +1,19 @@
 import os
+import queue
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from bin.screen import (
+    ExperimenterPreview,
     MAIN_SCREEN_ENV,
     SECONDARY_SCREEN_ENV,
     ScreenGeometry,
     _parse_xrandr_query,
+    build_reward_hit_boxes,
     compute_centered_aspect_fit,
     get_psychopy_window_kwargs,
     load_screen_config,
+    reward_level_color,
     resolve_task_screens,
     resolve_scene_size,
     scale_scene_point,
@@ -18,6 +22,65 @@ from bin.screen import (
 
 
 class ScreenConfigTests(unittest.TestCase):
+    def test_reward_level_colors_match_active_foraging_legend(self):
+        self.assertEqual(reward_level_color(0), (220, 60, 60))
+        self.assertEqual(reward_level_color(1), (140, 140, 140))
+        self.assertEqual(reward_level_color(2), (230, 200, 40))
+        self.assertEqual(reward_level_color(3), (60, 180, 75))
+
+    def test_reward_hit_boxes_use_choice_target_scale(self):
+        boxes = build_reward_hit_boxes(
+            [
+                {
+                    "pos": (12.0, -8.0),
+                    "size": (80.0, 60.0),
+                    "reward_level": 2,
+                },
+                {
+                    "pos": (0.0, 0.0),
+                    "size": (20.0, 20.0),
+                },
+            ],
+            hitbox_scale=1.25,
+        )
+
+        self.assertEqual(
+            boxes,
+            [
+                {
+                    "pos": [12.0, -8.0],
+                    "size": [100.0, 75.0],
+                    "color": [230, 200, 40],
+                    "line_width": 6.0,
+                }
+            ],
+        )
+
+    def test_preview_queue_drops_old_scene_for_latest_scene(self):
+        class OneItemQueue:
+            def __init__(self):
+                self.items = [{"type": "old"}]
+
+            def put_nowait(self, payload):
+                if self.items:
+                    raise queue.Full
+                self.items.append(payload)
+
+            def get_nowait(self):
+                if not self.items:
+                    raise queue.Empty
+                return self.items.pop(0)
+
+        preview = object.__new__(ExperimenterPreview)
+        preview.poll = lambda: False
+        preview._process = Mock()
+        preview._process.is_alive.return_value = True
+        preview._queue = OneItemQueue()
+
+        preview._send({"type": "latest"})
+
+        self.assertEqual(preview._queue.items, [{"type": "latest"}])
+
     def test_none_screen_values_inherit_environment(self):
         cfg = {"screens": {"main": None, "experimenter": None}}
         with patch.dict(

@@ -26,7 +26,11 @@ from PIL import Image
 import threading
 from psychopy import visual, event
 import time
-from .screen import get_psychopy_window_kwargs, serialize_preview_image
+from .screen import (
+    build_reward_hit_boxes,
+    get_psychopy_window_kwargs,
+    serialize_preview_image,
+)
 
 # Global debug flag: when True, utilities may write debug files (PNG) to logs/
 # Default is False; tasks can enable it via CLI (--debug) or config.
@@ -963,6 +967,7 @@ def present_block_with_persistent_dots(
     external_abort_checker: Optional[Callable[[], bool]] = None,
     scene_main_size: Optional[Sequence[float]] = None,
     event_profile: str = "generic_afc",
+    reward_levels: Optional[Sequence[int]] = None,
 ):
     """Present stimuli one at a time, leave faint dots at their locations,
     show all dots for `choice_time`, then clear.
@@ -985,6 +990,11 @@ def present_block_with_persistent_dots(
     # stims to potentially keep visible during the choice period when is_memory is False
     stims_for_choice: List[visual.ImageStim] = []
     stims_for_choice_preview: List[Dict[str, Any]] = []
+    preview_reward_levels: Optional[list[int]] = None
+    if reward_levels is not None:
+        preview_reward_levels = [int(level) for level in reward_levels]
+        if len(preview_reward_levels) != len(block_paths):
+            raise ValueError("reward_levels must contain one value per block item")
     # Establish frame timing
     if fps is None:
         fps, frame_dur = detect_frame_rate(win, msg_logger=msg_logger)
@@ -1087,14 +1097,15 @@ def present_block_with_persistent_dots(
         trial_start_signal_armed_s = None
 
     def _preview_images(items: Sequence[Dict[str, Any]]) -> list[Dict[str, Any]]:
-        return [
-            {
+        images = []
+        for item in items:
+            image = {
                 "image_payload": item.get("image_payload"),
                 "pos": [float(item["pos"][0]), float(item["pos"][1])],
                 "size": [float(item["size"][0]), float(item["size"][1])],
             }
-            for item in items
-        ]
+            images.append(image)
+        return images
 
     def _preview_dots() -> list[Dict[str, Any]]:
         return [
@@ -1109,6 +1120,7 @@ def present_block_with_persistent_dots(
     def _show_preview(images: Optional[Sequence[Dict[str, Any]]] = None) -> None:
         if experimenter_preview is None or bg_rgb_255 is None:
             return
+        preview_items = list(images or [])
         fixation_size = None
         try:
             fixation_size = float(getattr(fix, "height"))
@@ -1117,18 +1129,29 @@ def present_block_with_persistent_dots(
         experimenter_preview.show_static_scene(
             bg_rgb_255=bg_rgb_255,
             main_size=tuple(scene_main_size) if scene_main_size is not None else tuple(win.size),
-            images=_preview_images(images or []),
+            images=_preview_images(preview_items),
             dots=_preview_dots(),
+            hit_boxes=build_reward_hit_boxes(
+                preview_items,
+                hitbox_scale=choice_hitbox_scale,
+            ),
             fixation_size=fixation_size,
             fixation_color=(0, 0, 0),
         )
 
-    def _make_preview_image_entry(image_obj, stim_obj: visual.ImageStim) -> Dict[str, Any]:
-        return {
+    def _make_preview_image_entry(
+        image_obj,
+        stim_obj: visual.ImageStim,
+        reward_level: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        entry = {
             "image_payload": serialize_preview_image(image_obj),
             "pos": tuple(float(v) for v in getattr(stim_obj, "pos", (0.0, 0.0))),
             "size": tuple(float(v) for v in getattr(stim_obj, "size", (64.0, 64.0))),
         }
+        if reward_level is not None:
+            entry["reward_level"] = int(reward_level)
+        return entry
 
     if onset_cue is not None:
         try:
@@ -1415,7 +1438,14 @@ def present_block_with_persistent_dots(
         for idx, (p, pos) in enumerate(zip(block_paths, positions), start=1):
             name, pil_img, stim = _build_stimulus(p, pos)
             stims_for_choice.append(stim)
-            stims_for_choice_preview.append(_make_preview_image_entry(pil_img, stim))
+            reward_level = (
+                preview_reward_levels[idx - 1]
+                if preview_reward_levels is not None
+                else None
+            )
+            stims_for_choice_preview.append(
+                _make_preview_image_entry(pil_img, stim, reward_level)
+            )
             try:
                 stim_sizes.append(tuple(stim.size))
             except Exception:
@@ -1453,7 +1483,9 @@ def present_block_with_persistent_dots(
                         first_flip = False
 
             first_flip = True
-            current_preview_image = [_make_preview_image_entry(pil_img, stim)]
+            current_preview_image = [
+                _make_preview_image_entry(pil_img, stim, reward_level)
+            ]
             _show_preview(current_preview_image)
             if not _arm_trial_start_signal():
                 return True, None
@@ -1505,11 +1537,18 @@ def present_block_with_persistent_dots(
                 _show_preview(stims_for_choice_preview)
 
     else:
-        for p, pos in zip(block_paths, positions):
+        for item_index, (p, pos) in enumerate(zip(block_paths, positions)):
             name, pil_img, stim = _build_stimulus(p, pos)
             stims.append(stim)
             names.append(name)
-            preview_images.append(_make_preview_image_entry(pil_img, stim))
+            reward_level = (
+                preview_reward_levels[item_index]
+                if preview_reward_levels is not None
+                else None
+            )
+            preview_images.append(
+                _make_preview_image_entry(pil_img, stim, reward_level)
+            )
             try:
                 stim_sizes.append(tuple(stim.size))
             except Exception:

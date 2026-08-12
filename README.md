@@ -136,6 +136,11 @@ to those environment variables for launched tasks.
 For `active_foraging`, setting `screens.main` and `screens.experimenter` to the same display is allowed and disables
 the experimenter preview, so only the main task content is shown.
 
+The `active_foraging` experimenter display shows the current system time above the elapsed task timer. While
+stimuli are visible, their selectable hit boxes are outlined by reward level: red for `0`, gray for `1`, yellow
+for `2`, and green for `3`. Clicking `rew.` or pressing `r` delivers the configured manual juice-pump pulse.
+The keyboard command works when either the main task window or experimenter window has keyboard focus.
+
 Eye Tracker Calibration
 -----------------------
 `task/calibrate_eye_tracker.py` calibrates two analog eye-position voltages from a Pi-Plates DAQC2plate.

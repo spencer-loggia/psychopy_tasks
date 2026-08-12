@@ -51,6 +51,7 @@ from bin.screen import (
     ExperimenterPreview,
     describe_screen,
     load_screen_config,
+    reward_level_color,
     resolve_scene_size,
     resolve_task_screens,
     serialize_preview_image,
@@ -855,15 +856,6 @@ def run_task(
     except Exception:
         pass
 
-    def _reward_preview_color(level: int) -> tuple[int, int, int]:
-        palette = {
-            0: (220, 60, 60),
-            1: (0, 0, 0),
-            2: (230, 200, 40),
-            3: (60, 180, 75),
-        }
-        return palette.get(int(level), (255, 255, 255))
-
     def _show_preview_idle() -> None:
         if experimenter_preview is None:
             return
@@ -906,7 +898,7 @@ def run_task(
             highlight_box = {
                 "pos": [float(chosen_pos[0]), float(chosen_pos[1])],
                 "size": [float(dot_size * 2.4), float(dot_size * 2.4)],
-                "color": list(_reward_preview_color(reward_level)),
+                "color": list(reward_level_color(reward_level)),
                 "line_width": 6.0,
             }
         else:
@@ -930,7 +922,7 @@ def run_task(
                     highlight_box = {
                         "pos": [float(pos[0]), float(pos[1])],
                         "size": [highlight_size[0], highlight_size[1]],
-                        "color": list(_reward_preview_color(reward_level)),
+                        "color": list(reward_level_color(reward_level)),
                         "line_width": 6.0,
                     }
 
@@ -1072,9 +1064,17 @@ def run_task(
             )
 
     def _poll_experimenter_controls() -> bool:
-        if experimenter_preview is None:
-            return False
-        if experimenter_preview.consume_manual_reward_request():
+        manual_reward_requested = False
+        try:
+            manual_reward_requested = bool(event.getKeys(keyList=["r"]))
+        except Exception:
+            pass
+        if experimenter_preview is not None:
+            manual_reward_requested = (
+                experimenter_preview.consume_manual_reward_request()
+                or manual_reward_requested
+            )
+        if manual_reward_requested:
             _deliver_manual_reward()
         return bool(experimenter_preview is not None and experimenter_preview.poll())
 
@@ -1230,6 +1230,7 @@ def run_task(
                 external_abort_checker=_poll_experimenter_controls,
                 scene_main_size=effective_win_size,
                 event_profile="active_foraging",
+                reward_levels=[reward_map.get(pair, 0) for pair in block_paths],
             )
             if aborted:
                 if task_end_notes == "done" and _poll_experimenter_controls():

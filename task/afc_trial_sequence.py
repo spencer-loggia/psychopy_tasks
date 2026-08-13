@@ -1,25 +1,24 @@
 """
-AFC block sequence task.
+AFC trial sequence task.
 
-- Stimuli are shown in blocks of `num_afc` (from config).
-- Each block: sample `num_afc` unique stimuli (without replacement within block).
+- Each trial samples `num_afc` unique options without replacement.
 - Stimuli are shown one at a time for `duration` seconds at random non-overlapping
   screen positions. After a stimulus disappears a faint dot is left at its location
-  (controlled by `dot_size` and `dot_color`). Dots remain visible for the block.
-- After all stimuli in a block are shown, the dots remain visible for `choice_time`
-  seconds (choice period). Then dots are cleared, the task waits `ibi` seconds
-  (inter-block interval), and the next block starts.
+  (controlled by `dot_size` and `dot_color`). Dots remain visible for the trial.
+- After all options have been presented, the dots remain visible for `choice_time`
+  seconds. Then dots are cleared, the task waits `iti` seconds, and the next trial
+  starts.
 
 Configuration keys used (in addition to common ones):
-- num_afc: number of stimuli per block
-- ibi: inter-block interval (seconds)
+- num_afc: number of options per trial
+- iti: inter-trial interval (seconds)
 - dot_size: pixels
 - dot_color: [r,g,b] 0-255
 - choice_time: seconds to show all dots before clearing
-- n: number of blocks (overrides previous meaning)
+- n: number of trials (overrides previous meaning)
 
 Usage example:
-python task/afc_block_sequence.py --config test_configs/csc_shape_config
+python task/afc_trial_sequence.py --config test_configs/csc_shape_config
 
 """
 import argparse
@@ -38,19 +37,27 @@ if str(_project_root) not in sys.path:
 
 from bin import utils
 from bin.logger import SessionLogBundle
+from bin.task_lifecycle import USER_EXIT_CODE
 from bin.config import load_config, validate_config
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="AFC block sequence task")
+    p = argparse.ArgumentParser(description="AFC trial sequence task")
     p.add_argument("--config", help="Path to JSON config file. CLI overrides config keys.")
     p.add_argument("--images_dir", help="Path to images dir (overrides config)")
-    p.add_argument("--n", type=int, default=None, help="Number of blocks (overrides config n)")
-    p.add_argument("--num_afc", type=int, default=None, help="Number of stimuli per block")
+    p.add_argument("--n", type=int, default=None, help="Number of trials (overrides config n)")
+    p.add_argument("--num_afc", type=int, default=None, help="Number of options per trial")
     p.add_argument("--duration", type=float, default=None, help="Stimulus duration (s)")
-    p.add_argument("--choice_time", type=float, default=None, help="Choice display time after block (s)")
-    p.add_argument("--ibi", type=float, default=None, help="Inter-block interval (s)")
-    p.add_argument("--isi", type=float, default=None, help="Pre-block fixation delay (seconds) before first stimulus)")
+    p.add_argument("--choice_time", type=float, default=None, help="Choice display duration (s)")
+    p.add_argument(
+        "--iti",
+        "--ibi",
+        dest="iti",
+        type=float,
+        default=None,
+        help="Inter-trial interval (s); --ibi is a deprecated compatibility alias",
+    )
+    p.add_argument("--isi", type=float, default=None, help="Pre-stimulus cue duration (s)")
     p.add_argument("--dot_size", type=int, default=None, help="Dot size in pixels")
     p.add_argument("--dot_color", type=int, nargs=3, default=None, help="Dot RGB color 0-255")
     p.add_argument("--bg", type=int, nargs=3, default=None, help="Background RGB (0-255)")
@@ -74,11 +81,11 @@ def parse_args():
 
 def run_task(
     images_dir: str,
-    n_blocks: int,
+    n_trials: int,
     num_afc: int,
     duration: float,
     choice_time: float,
-    ibi: float,
+    iti: float,
     isi: float,
     dot_size: int,
     dot_color: Tuple[int, int, int],
@@ -118,7 +125,7 @@ def run_task(
     fix = utils.make_fixation_cross(win, size=32)
     bg_rect = utils.make_bg_rect(win, bg)
 
-    resolved_config_name = str(config_name).strip() if config_name else "afc_block_sequence"
+    resolved_config_name = str(config_name).strip() if config_name else "afc_trial_sequence"
     behavior_fieldnames = ["trial_num"] + [f"stimulus_{idx}" for idx in range(int(num_afc))] + [
         "choice_made_index",
         "choice_touch_x",
@@ -127,7 +134,7 @@ def run_task(
     ]
     session_logs = SessionLogBundle(
         output_root=output_dir,
-        task_name="afc_block_sequence",
+        task_name="afc_trial_sequence",
         config_name=resolved_config_name,
         behavior_fieldnames=behavior_fieldnames,
     )
@@ -135,11 +142,11 @@ def run_task(
     msg_logger = session_logs.message_logger
     behavior_logger = session_logs.behavior_logger
     if behavior_logger is None:
-        raise RuntimeError("afc_block_sequence requires a behavior logger")
+        raise RuntimeError("afc_trial_sequence requires a behavior logger")
     pylogging.console.setLevel(pylogging.CRITICAL)
     msg_logger.log(
         "INFO",
-        f"session_start task=afc_block_sequence config_name={resolved_config_name} session_dir={session_logs.session_dir}",
+        f"session_start task=afc_trial_sequence config_name={resolved_config_name} session_dir={session_logs.session_dir}",
     )
 
     # Initialize lgpio if requested
@@ -176,9 +183,9 @@ def run_task(
             "duration": duration,
             "isi": isi,
             "choice_time": choice_time,
-            "ibi": ibi,
+            "iti": iti,
         },
-        context="afc_block_sequence",
+        context="afc_trial_sequence",
         minimum_frames={
             "duration": 1,
             "choice_time": 1,
@@ -196,7 +203,7 @@ def run_task(
         dur_fr, dur_s = _q(duration, at_least_one=True)
         isi_fr, isi_s = _q(isi, at_least_one=False)
         ch_fr, ch_s = _q(choice_time, at_least_one=False)
-        ibi_fr, ibi_s = _q(ibi, at_least_one=False)
+        iti_frames, iti_s = _q(iti, at_least_one=False)
         msg_logger.log(
             "INFO",
             (
@@ -204,21 +211,20 @@ def run_task(
                 f"duration={duration:.6f}s-> {dur_fr}fr({dur_s:.6f}s) "
                 f"isi={isi:.6f}s-> {isi_fr}fr({isi_s:.6f}s) "
                 f"choice_time={choice_time:.6f}s-> {ch_fr}fr({ch_s:.6f}s) "
-                f"ibi={ibi:.6f}s-> {ibi_fr}fr({ibi_s:.6f}s)"
+                f"iti={iti:.6f}s-> {iti_frames}fr({iti_s:.6f}s)"
             ),
         )
     except Exception:
         pass
 
-    # Pre-sample blocks (each block samples `num_afc` unique stimuli without
-    # replacement within the block). Blocks are independent.
-    blocks = utils.sample_blocks(image_files, num_afc, n_blocks, seed=seed)
+    # Pre-sample independent trial option sets.
+    trials = utils.sample_trial_options(image_files, num_afc, n_trials, seed=seed)
 
-    msg_logger.log("INFO", f"task_ready n_blocks={n_blocks} num_afc={num_afc}")
+    msg_logger.log("INFO", f"task_ready n_trials={n_trials} num_afc={num_afc}")
 
-    # main block loop
+    # Main trial loop
     aborted_task = False
-    for block_idx in range(1, n_blocks + 1):
+    for trial_num in range(1, n_trials + 1):
         if isi and isi > 0:
             bg_rect.draw()
             if fix is not None:
@@ -226,8 +232,8 @@ def run_task(
             cue_flip = win.flip()
             cue_perf = time.perf_counter()
             logger.log_frame_flip(
-                trial_num=block_idx,
-                event="block_cue",
+                trial_num=trial_num,
+                event="trial_cue",
                 timestamp_perf_s=cue_perf,
                 requested_duration=isi_s,
             )
@@ -237,11 +243,11 @@ def run_task(
                     fix.draw()
                 win.flip()
 
-        block_paths = blocks[block_idx - 1]
-        msg_logger.log("INFO", f"trial_loaded trial_num={block_idx} stimuli={[p.name for p in block_paths]}")
+        trial_options = trials[trial_num - 1]
+        msg_logger.log("INFO", f"trial_loaded trial_num={trial_num} stimuli={[p.name for p in trial_options]}")
 
         # compute native stim size from preloaded images (we will use same size for all)
-        first_p = block_paths[0]
+        first_p = trial_options[0]
         pil0 = preloaded[first_p]
         stim_size = pil0.size  # (W,H) in pixels
 
@@ -252,7 +258,7 @@ def run_task(
         # keeps coordinates in the expected logical pixel space.
         effective_win_size = tuple(win_size) if win_size is not None else tuple(win.size)
 
-        # compute non-overlapping positions for all items in this block
+        # Compute non-overlapping positions for all options in this trial.
         sampled_positions = utils.sample_non_overlapping_positions(
             num_afc, stim_size, effective_win_size, margin=margin
         )
@@ -264,16 +270,16 @@ def run_task(
         for i, (spos, cpos) in enumerate(zip(sampled_positions, positions), start=1):
             # Non-task diagnostic: log to message logger
             try:
-                img = block_paths[i - 1].name if i - 1 < len(block_paths) else ""
+                img = trial_options[i - 1].name if i - 1 < len(trial_options) else ""
             except Exception:
                 img = ""
-            msg_logger.log("INFO", f"position_assigned block={block_idx} idx={i} image={img} sampled={spos} clamped={cpos}")
+            msg_logger.log("INFO", f"position_assigned trial_num={trial_num} option_num={i} image={img} sampled={spos} clamped={cpos}")
 
         trial_meta = {}
-        aborted, choice_info = utils.present_block_with_persistent_dots(
+        aborted, choice_info = utils.present_trial_with_persistent_dots(
             win=win,
             preloaded=preloaded,
-            block_paths=block_paths,
+            trial_options=trial_options,
             positions=positions,
             duration=duration,
             choice_time=choice_time,
@@ -282,7 +288,7 @@ def run_task(
             bg_rect=bg_rect,
             fix=fix,
             logger=logger,
-            block_idx=block_idx,
+            trial_num=trial_num,
             isi=isi,
             init_dot_color=init_dot_color,
             bg_rgb_255=bg,
@@ -295,20 +301,20 @@ def run_task(
         )
         if aborted:
             aborted_task = True
-            msg_logger.log("WARN", f"trial_aborted trial_num={block_idx}")
+            msg_logger.log("WARN", f"trial_aborted trial_num={trial_num}")
             break
 
         gray_start_perf = trial_meta.get("gray_flip_perf_s", None)
         if gray_start_perf is not None:
             logger.log_frame_flip(
-                trial_num=block_idx,
+                trial_num=trial_num,
                 event="gray_inter_trial_interval",
                 timestamp_perf_s=float(gray_start_perf),
-                requested_duration=ibi_s if ibi_s > 0 else None,
+                requested_duration=iti_s if iti_s > 0 else None,
             )
 
-        behavior_row = {"trial_num": block_idx}
-        for idx, path in enumerate(block_paths):
+        behavior_row = {"trial_num": trial_num}
+        for idx, path in enumerate(trial_options):
             behavior_row[f"stimulus_{idx}"] = path.name
         chosen_idx = choice_info.get("chosen_index") if choice_info is not None else None
         behavior_row["choice_made_index"] = int(chosen_idx - 1) if chosen_idx is not None else ""
@@ -323,9 +329,9 @@ def run_task(
         )
         behavior_logger.writerow(behavior_row)
 
-        if ibi and ibi > 0:
-            msg_logger.log("INFO", f"timing_quantization block={block_idx} ibi={ibi:.6f}s-> {ibi_fr}fr({ibi_s:.6f}s)")
-            for _f in range(max(0, ibi_fr - 1)):
+        if iti and iti > 0:
+            msg_logger.log("INFO", f"timing_quantization trial_num={trial_num} iti={iti:.6f}s-> {iti_frames}fr({iti_s:.6f}s)")
+            for _f in range(max(0, iti_frames - 1)):
                 bg_rect.draw()
                 if fix is not None:
                     fix.draw()
@@ -335,7 +341,7 @@ def run_task(
     msg_logger.log("INFO", f"session_end status={'aborted' if aborted_task else 'done'}")
     session_logs.close()
     win.close()
-    core.quit()
+    return aborted_task
 
 
 def main():
@@ -365,11 +371,11 @@ def main():
 
     # gather parameters (use config defaults where CLI doesn't override)
     images_dir = _get("images_dir", cfg.get("images_dir"))
-    n_blocks = int(_get("n", cfg.get("n")))
+    n_trials = int(_get("n", cfg.get("n")))
     num_afc = int(_get("num_afc", cfg.get("num_afc", 2)))
     duration = float(_get("duration", cfg.get("duration")))
     choice_time = float(_get("choice_time", cfg.get("choice_time", 2.0)))
-    ibi = float(_get("ibi", cfg.get("ibi", 1.0)))
+    iti = float(_get("iti", cfg.get("iti", cfg.get("ibi", 1.0))))
     dot_size = int(_get("dot_size", cfg.get("dot_size", 8)))
     dot_color = tuple(_get("dot_color", cfg.get("dot_color", (180, 180, 180))))
     init_dot_color = tuple(_get("init_dot_color", cfg.get("init_dot_color", None))) if _get("init_dot_color", None) else None
@@ -386,16 +392,16 @@ def main():
     refresh_rate = _get("refresh_rate", cfg.get("refresh_rate", cfg.get("refrech_rate", None)))
     raspi = _get("raspi", cfg.get("raspi", False))
     raspi_pin = int(_get("raspi_pin", cfg.get("raspi_pin", 18)))
-    config_name = cfg.get("config_name", "afc_block_sequence")
+    config_name = cfg.get("config_name", "afc_trial_sequence")
 
     try:
-        run_task(
+        aborted_by_user = run_task(
             images_dir=images_dir,
-            n_blocks=n_blocks,
+            n_trials=n_trials,
             num_afc=num_afc,
             duration=duration,
             choice_time=choice_time,
-            ibi=ibi,
+            iti=iti,
             isi=isi,
             margin=margin,
             init_dot_color=init_dot_color,
@@ -413,6 +419,8 @@ def main():
             raspi_pin=_get("raspi_pin", cfg.get("raspi_pin", 18)),
             config_name=config_name,
         )
+        if aborted_by_user:
+            sys.exit(USER_EXIT_CODE)
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)

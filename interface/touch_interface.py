@@ -35,6 +35,12 @@ from interface.rig_mode import (
     normalize_is_rig,
     target_mode_for_current_mode,
 )
+from interface.experiment_manager import (
+    ExperimentManager,
+    PreparedBlock,
+    task_run_sequence,
+)
+from bin.task_lifecycle import USER_EXIT_CODE
 
 
 IDLE_CLEANUP_MS = 30 * 60 * 1000
@@ -126,6 +132,12 @@ class TouchInterfaceApp:
         self.screen_info = screen_info
         self.environment_cfg = _expect_dict(cfg.get("environment"), "environment")
         self.tasks_cfg = _expect_dict(cfg.get("tasks"), "tasks")
+        self.subjects_cfg = _expect_dict(cfg.get("subjects"), "subjects")
+        if not self.subjects_cfg:
+            raise ValueError("Config field 'subjects' must include at least one subject")
+        for subject_name, subject_code in self.subjects_cfg.items():
+            if not str(subject_name).strip() or not str(subject_code).strip():
+                raise ValueError("Subject names and codes must be non-empty strings")
         self.working_dir = _get_working_directory(self.environment_cfg, self.config_dir)
         self.python_cmd = str(self.environment_cfg.get("python", "")).strip()
         if not self.python_cmd:
@@ -135,6 +147,7 @@ class TouchInterfaceApp:
         self.status_var = tk.StringVar(value="Ready")
         self.page_title_var = tk.StringVar(value="Task Launcher")
         self.page_stack: list[tuple[str, Dict[str, Any]]] = []
+        self.experiment: Optional[ExperimentManager] = None
         self.is_rig = self._initialize_is_rig_mode()
 
         self.startup()
@@ -278,7 +291,7 @@ class TouchInterfaceApp:
         self._schedule_idle_cleanup()
 
     def _build_ui(self) -> None:
-        self.root.title("Task Launcher")
+        self.root.title("Experiment Manager")
         place_tk_window_on_screen(self.root, self.screen_info, min_width=800, min_height=600, margin_x=20, margin_y=20)
         min_width = min(800, max(int(getattr(self.screen_info, "width", 800) or 800), 1))
         min_height = min(600, max(int(getattr(self.screen_info, "height", 600) or 600), 1))
@@ -304,8 +317,7 @@ class TouchInterfaceApp:
         button_frame.inner.configure(bg="#e9ecef")
         self.button_container = button_frame.inner
 
-        self.page_stack = [("Task Launcher", self.tasks_cfg)]
-        self._render_current_page()
+        self._render_subject_selection()
 
         footer = tk.Label(
             self.root,
@@ -332,9 +344,47 @@ class TouchInterfaceApp:
             "bd": 2,
         }
 
-    def _render_current_page(self) -> None:
+    def _clear_buttons(self) -> None:
         for child in self.button_container.winfo_children():
             child.destroy()
+
+    def _render_subject_selection(self) -> None:
+        self._clear_buttons()
+        self.page_title_var.set("Select Subject")
+        self.status_var.set("Choose the subject to start a new experiment")
+        for row_idx, (subject_name, subject_code) in enumerate(self.subjects_cfg.items()):
+            button = tk.Button(
+                self.button_container,
+                text=str(subject_name),
+                command=lambda n=str(subject_name), c=str(subject_code): self._select_subject(n, c),
+                **self._button_kwargs(),
+            )
+            button.grid(row=row_idx, column=0, sticky="ew", pady=10, padx=10)
+        self.button_container.grid_columnconfigure(0, weight=1)
+
+    def _select_subject(self, subject_name: str, subject_code: str) -> None:
+        if self.experiment is not None:
+            return
+        try:
+            self.experiment = ExperimentManager(
+                working_dir=self.working_dir,
+                launch_config_path=self.config_path,
+                launch_config=self.cfg,
+                subject_name=subject_name,
+                subject_code=subject_code,
+            )
+        except Exception as exc:
+            messagebox.showerror("Experiment Error", str(exc))
+            self.status_var.set("Could not start experiment")
+            return
+        self.page_stack = [("Tasks", self.tasks_cfg)]
+        self.status_var.set(
+            f"Subject: {subject_name} — {self.experiment.experiment_dir.name}"
+        )
+        self._render_current_page()
+
+    def _render_current_page(self) -> None:
+        self._clear_buttons()
 
         page_name, page_cfg = self._current_page()
         self.page_title_var.set(self._current_page_label())
@@ -451,47 +501,59 @@ class TouchInterfaceApp:
         self.status_var.set("Shutdown requested")
         self.root.after(1000, self.root.destroy)
 
-    def _build_command(self, task_name: str, task_cfg: Dict[str, Any]) -> subprocess.CompletedProcess:
-        launch_value = task_cfg.get("launch")
-        if not launch_value:
-            raise KeyError(f"Task '{task_name}' is missing required field 'launch'")
-
-        launch_path = _resolve_candidate(
-            str(launch_value),
-            (self.working_dir, self.config_dir),
-        )
-
-        cmd = [self.python_cmd, str(launch_path)]
-
-        task_config_value = task_cfg.get("config")
-        if task_config_value:
-            task_config_path = _resolve_candidate(
-                str(task_config_value),
-                (self.working_dir, self.config_dir),
-            )
-            cmd.extend(["--config", str(task_config_path)])
-
-        self.status_var.set(f"Running: {task_name}")
+    def _run_block(self, block: PreparedBlock) -> subprocess.CompletedProcess:
+        if self.experiment is None:
+            raise RuntimeError("Select a subject before launching a task")
+        cmd = [self.python_cmd, str(block.launch_path), "--config", str(block.config_path)]
+        self.status_var.set(f"Running block {block.block_num}: {block.block_name}")
         self.root.update_idletasks()
-        return subprocess.run(cmd, cwd=self.working_dir, check=False)
+        try:
+            return subprocess.run(
+                cmd,
+                cwd=self.working_dir,
+                check=False,
+                env=self.experiment.subprocess_environment(block),
+            )
+        finally:
+            self.experiment.finish_block(block)
 
     def _run_task(self, task_name: str, task_cfg: Dict[str, Any]) -> None:
         if self.task_active:
             return
+        if self.experiment is None:
+            messagebox.showerror("Launch Error", "Select a subject before launching a task")
+            return
 
         self.task_active = True
+        blocks_run = 0
         try:
-            result = self._build_command(task_name, task_cfg)
+            for launch_value, config_value in task_run_sequence(task_name, task_cfg):
+                block = self.experiment.prepare_block(
+                    task_name=task_name,
+                    launch_value=launch_value,
+                    config_value=config_value,
+                )
+                result = self._run_block(block)
+                blocks_run += 1
+                if result.returncode == USER_EXIT_CODE:
+                    self.status_var.set(
+                        f"Stopped: {task_name} after {blocks_run} block(s)"
+                    )
+                    break
+                if result.returncode != 0:
+                    self.status_var.set(
+                        f"Failed: {block.block_name} (exit {result.returncode})"
+                    )
+                    messagebox.showwarning(
+                        "Task Finished",
+                        f"Block '{block.block_name}' exited with status {result.returncode}; its loop was stopped.",
+                    )
+                    break
+            else:
+                self.status_var.set(f"Finished: {task_name} ({blocks_run} block(s))")
         except Exception as exc:
             messagebox.showerror("Launch Error", str(exc))
             self.status_var.set(f"Launch failed: {task_name}")
-        else:
-            self.status_var.set(f"Finished: {task_name} (exit {result.returncode})")
-            if result.returncode != 0:
-                messagebox.showwarning(
-                    "Task Finished",
-                    f"Task '{task_name}' exited with status {result.returncode}.",
-                )
         finally:
             self.task_active = False
             self.cleanup()

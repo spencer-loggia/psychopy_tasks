@@ -25,6 +25,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from bin import utils
+from bin.config import resolve_subject_mapped_value
 
 
 def _resolve_path(raw: str, config_path: Path) -> Path:
@@ -125,7 +126,14 @@ def main() -> None:
 
     colors_tsv = _resolve_path(cfg["colors_tsv"], config_path)
     shapes_tsv = _resolve_path(cfg["shapes_tsv"], config_path)
-    reward_space_tsv = _resolve_path(cfg["reward_space_tsv"], config_path)
+    reward_space_tsv = _resolve_path(
+        resolve_subject_mapped_value(
+            cfg["reward_space_tsv"],
+            subject=cfg.get("subject"),
+            field_name="reward_space_tsv",
+        ),
+        config_path,
+    )
 
     colors: Dict[int, Tuple[int, int, int]] = utils.load_color_palette(colors_tsv)
     _bg_rgb, colors = utils.split_background_from_palette(colors)

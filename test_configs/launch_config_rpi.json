@@ -7,6 +7,10 @@
         "main": "HDMI-1",
         "experimenter": "DSI-1"
     },
+    "subjects": {
+        "Yuri": "Y",
+        "Debug": "D"
+    },
     "tasks": {
         "CSC2": {
             "classic": {
@@ -34,5 +38,17 @@
                 "launch": "task/pulse_buzzer.py"
             }
         }
+    },
+    "initial_state": {
+        "subject": null,
+        "eye_tracker_calibration": [
+            {
+                "x_scale": null,
+                "y_scale": null,
+                "x_offset": null,
+                "y_offset": null,
+                "set_time": 0.0
+            }
+        ]
     }
 }

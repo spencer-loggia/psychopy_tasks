@@ -21,6 +21,7 @@ if str(_project_root) not in sys.path:
 from bin import utils
 from bin.config import load_config, validate_config
 from bin.logger import SessionLogBundle
+from bin.task_lifecycle import USER_EXIT_CODE
 from bin.screen import (
     ExperimenterPreview,
     describe_screen,
@@ -219,7 +220,7 @@ def run_task(
     except Exception:
         pass
     win.close()
-    core.quit()
+    return stop_reason
 
 
 def main():
@@ -242,7 +243,7 @@ def main():
     )
 
     try:
-        run_task(
+        stop_reason = run_task(
             videos_dir=_get("videos_dir", "./task/resources/cropped_videos"),
             output_dir=_get("output_dir", "./logs"),
             seed=_get("seed", None),
@@ -254,6 +255,8 @@ def main():
             ffprobe_bin=_get("ffprobe", cfg.get("ffprobe", "ffprobe")),
             screen_config=screen_config,
         )
+        if stop_reason != "done":
+            sys.exit(USER_EXIT_CODE)
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)

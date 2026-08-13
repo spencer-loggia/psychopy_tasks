@@ -29,6 +29,7 @@ if str(_project_root) not in sys.path:
 
 from bin import utils
 from bin.logger import SessionLogBundle
+from bin.task_lifecycle import USER_EXIT_CODE
 from bin.config import load_config, validate_config
 
 
@@ -293,8 +294,8 @@ def run_task(
     msg_logger.log("INFO", f"session_end status={'aborted' if aborted else 'done'}")
     session_logs.close()
     win.close()
-    core.quit()
     print(f"Finished; logs written to {session_logs.session_dir.resolve()}")
+    return aborted
 
 
 def main():
@@ -323,7 +324,7 @@ def main():
         return cfg.get(name, default)
 
     try:
-        run_task(
+        aborted_by_user = run_task(
             images_dir=_get("images_dir", cfg.get("images_dir")),
             n=int(_get("n", cfg.get("n", 10))),
             duration=float(_get("duration", cfg.get("duration"))),
@@ -342,6 +343,8 @@ def main():
             raspi_pin=_get("raspi_pin", cfg.get("raspi_pin", 18)),
             config_name=cfg.get("config_name", "random_image_sequence"),
         )
+        if aborted_by_user:
+            sys.exit(USER_EXIT_CODE)
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)

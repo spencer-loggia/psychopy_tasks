@@ -3,7 +3,7 @@ Helpers to load and validate JSON configuration files for tasks.
 """
 import json
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Mapping, Optional
 from json import JSONDecodeError
 
 
@@ -38,6 +38,37 @@ def load_config(path: str) -> Dict[str, Any]:
 def _expect_key(cfg: Dict[str, Any], key: str):
     if key not in cfg:
         raise KeyError(f"Missing required config key: '{key}'")
+
+
+def resolve_subject_mapped_value(
+    value: Any,
+    *,
+    subject: Optional[str],
+    field_name: str,
+) -> str:
+    """Resolve an exact subject entry from a required subject-to-path mapping."""
+    if not isinstance(value, Mapping):
+        raise ValueError(
+            f"Config field '{field_name}' must be a subject-to-path object"
+        )
+
+    resolved_subject = "" if subject is None else str(subject).strip()
+    if not resolved_subject:
+        raise ValueError(
+            f"Config field '{field_name}' is subject-mapped, but config field 'subject' is not set"
+        )
+    if resolved_subject not in value:
+        available = ", ".join(sorted(str(key) for key in value)) or "none"
+        raise ValueError(
+            f"Config field '{field_name}' has no entry for subject '{resolved_subject}'. "
+            f"Available subjects: {available}"
+        )
+    selected = value[resolved_subject]
+    if not isinstance(selected, str) or not selected.strip():
+        raise ValueError(
+            f"Config field '{field_name}' entry for subject '{resolved_subject}' must be a path string"
+        )
+    return selected.strip()
 
 
 def validate_config(

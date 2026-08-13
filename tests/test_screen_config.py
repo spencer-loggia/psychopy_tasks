@@ -11,6 +11,7 @@ from bin.screen import (
     _parse_xrandr_query,
     build_reward_hit_boxes,
     compute_centered_aspect_fit,
+    format_experimenter_label,
     get_psychopy_window_kwargs,
     load_screen_config,
     reward_level_color,
@@ -80,6 +81,50 @@ class ScreenConfigTests(unittest.TestCase):
         preview._send({"type": "latest"})
 
         self.assertEqual(preview._queue.items, [{"type": "latest"}])
+
+    def test_preview_queue_includes_subject_and_trial_progress(self):
+        preview = object.__new__(ExperimenterPreview)
+        preview.poll = lambda: False
+        preview._process = Mock()
+        preview._process.is_alive.return_value = True
+        preview._queue = queue.Queue()
+        preview.subject = "Yuri"
+        preview.current_trial_num = 17
+        preview.total_trials = 2000
+
+        preview._send({"type": "static_scene"})
+
+        self.assertEqual(
+            preview._queue.get_nowait(),
+            {
+                "type": "static_scene",
+                "subject": "Yuri",
+                "current_trial_num": 17,
+                "total_trials": 2000,
+            },
+        )
+
+    def test_experimenter_label_shows_subject_and_trial_total(self):
+        self.assertEqual(
+            format_experimenter_label(
+                "csc2_foraging_classic",
+                subject="Yuri",
+                current_trial_num=17,
+                total_trials=2000,
+            ),
+            "csc2_foraging_classic\nSubject: Yuri\nTrial: 17 / 2000",
+        )
+
+    def test_experimenter_label_marks_indefinite_trial_total(self):
+        self.assertEqual(
+            format_experimenter_label(
+                "csc2_foraging_classic",
+                subject="Yuri",
+                current_trial_num=17,
+                total_trials=0,
+            ),
+            "csc2_foraging_classic\nSubject: Yuri\nTrial: 17 / ∞",
+        )
 
     def test_none_screen_values_inherit_environment(self):
         cfg = {"screens": {"main": None, "experimenter": None}}

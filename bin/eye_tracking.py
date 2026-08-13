@@ -592,8 +592,8 @@ def calibration_payload(
     fixation_fraction: Sequence[float],
     latest_state: Optional[EyeTrackerState] = None,
 ) -> dict:
-    payload = calibration.to_json_dict()
-    payload.update(
+    eye_tracker_calibration = calibration.to_json_dict()
+    eye_tracker_calibration.update(
         {
             "daq": asdict(daq_config),
             "filter": asdict(filter_config),
@@ -602,5 +602,5 @@ def calibration_payload(
         }
     )
     if latest_state is not None:
-        payload["latest_state"] = asdict(latest_state)
-    return payload
+        eye_tracker_calibration["latest_state"] = asdict(latest_state)
+    return {"eye_tracker_calibration": eye_tracker_calibration}

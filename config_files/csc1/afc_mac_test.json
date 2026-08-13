@@ -10,7 +10,7 @@
   "cue_time": 1,
   "delay_time": 1,
   "choice_time": 5,
-  "ibi": 1.0,
+  "iti": 1.0,
   "isi": 0.0,
 
   "image_size": [128, 128],

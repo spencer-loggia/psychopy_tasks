@@ -7,6 +7,7 @@
         "main": null,
         "experimenter": null
     },
+    "subjects": {"Yuri": "Y", "Sally": "S", "Buzz": "B", "Tina": "T", "Wooster": "W", "Jeeves": "J"},
     "tasks": {
         "CSC1": {
             "classic": {
@@ -57,6 +58,20 @@
             "launch": "task/play_video.py",
             "config": "test_configs/play_video_config.json"
         },
+        "loops": {
+            "csc2_experiment": {
+                "launch": [
+                    "task/active_foraging.py",
+                    "task/active_foraging.py"
+                ],
+                "config": [
+                    "config_files/csc2/yuri_rigtrain_noseq_nomem_20260615.json",
+                    "config_files/csc2/yuri_rigtrain_no_seq_mem_20260803.json"
+                ],
+                "order_mode": "sequential",
+                "n_iters": null
+            }
+        },
         "setup": {
             "calibrate_eye_tracker": {
                 "launch": "task/calibrate_eye_tracker.py",
@@ -69,5 +84,17 @@
                 "launch": "task/pulse_buzzer.py"
             }
         }
+    },
+    "initial_state": {
+        "subject": null,
+        "eye_tracker_calibration": [
+            {
+                "x_scale": null,
+                "y_scale": null,
+                "x_offset": null,
+                "y_offset": null,
+                "set_time": 0.0
+            }
+        ]
     }
 }

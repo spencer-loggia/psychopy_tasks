@@ -36,6 +36,7 @@ from bin.eye_tracking import (
     fraction_to_pixels,
 )
 from bin.logger import SessionLogBundle
+from bin.task_lifecycle import USER_EXIT_CODE
 from bin.screen import (
     compute_centered_aspect_fit,
     describe_screen,
@@ -400,7 +401,7 @@ def run_task(
     tracker = None
     gpio_chip = None
     lgpio_module = None
-    calibration_path = output_root / f"{datetime.now().strftime('%Y%m%d%H%M%S')}_eye_calibration.json"
+    calibration_path = session_logs.calibration_path
 
     calibration = initial_calibration or EyeCalibration()
     daq_config = daq_config or DAQC2AnalogConfig()
@@ -625,7 +626,7 @@ def run_task(
         mouse = event.Mouse(win=exp_win)
         last_mouse_down = False
         dragging_slider: Optional[Slider] = None
-        reward_block_until_s = 0.0
+        reward_cooldown_until_s = 0.0
         last_sample_error = None
         exit_requested = False
         fixation_history = deque()
@@ -679,8 +680,8 @@ def run_task(
                 last_fix_acceptance = 0.0
                 fixation_window_ready = False
             fixation_accepted = fixation_window_ready and last_fix_acceptance >= fixation_accept_fraction
-            if fixation_accepted and auto_reward_armed and now_s >= reward_block_until_s:
-                reward_block_until_s = _deliver_reward_pulse(
+            if fixation_accepted and auto_reward_armed and now_s >= reward_cooldown_until_s:
+                reward_cooldown_until_s = _deliver_reward_pulse(
                     lgpio_module=lgpio_module,
                     gpio_chip=gpio_chip,
                     pump_pin=int(pump_pin),
@@ -712,8 +713,8 @@ def run_task(
                         msg_logger.log("INFO", "exit_requested_by_button")
                         exit_requested = True
                     elif reward_button[0].contains(mouse_pos):
-                        if now_s >= reward_block_until_s:
-                            reward_block_until_s = _deliver_reward_pulse(
+                        if now_s >= reward_cooldown_until_s:
+                            reward_cooldown_until_s = _deliver_reward_pulse(
                                 lgpio_module=lgpio_module,
                                 gpio_chip=gpio_chip,
                                 pump_pin=int(pump_pin),
@@ -799,8 +800,9 @@ def run_task(
             fixation_fraction=fixation_fraction,
             latest_state=latest_state,
         )
-        payload["saved_at"] = datetime.now().isoformat(timespec="seconds")
-        payload["fixation_acceptance"] = {
+        eye_tracker_calibration = payload["eye_tracker_calibration"]
+        eye_tracker_calibration["saved_at"] = datetime.now().isoformat(timespec="seconds")
+        eye_tracker_calibration["fixation_acceptance"] = {
             "fix_diameter": fixation_window_diameter,
             "fix_accept_percent": fixation_accept_fraction,
             "fix_accept_time": fixation_accept_time_s,
@@ -900,11 +902,17 @@ def main():
         max_voltage_step=None if max_voltage_step is None else float(max_voltage_step),
     )
 
+    def _calibration_value(state_key: str, legacy_key: str, default: float) -> float:
+        value = cfg.get(state_key)
+        if value is None:
+            value = cfg.get(legacy_key, default)
+        return float(default if value is None else value)
+
     calibration = EyeCalibration(
-        x_scale=float(cfg.get("x_scale", cfg.get("initial_x_scale", 0.05))),
-        y_scale=float(cfg.get("y_scale", cfg.get("initial_y_scale", 0.05))),
-        x_offset=float(cfg.get("x_offset", cfg.get("initial_x_offset", 0.0))),
-        y_offset=float(cfg.get("y_offset", cfg.get("initial_y_offset", 0.0))),
+        x_scale=_calibration_value("x_scale", "initial_x_scale", 0.05),
+        y_scale=_calibration_value("y_scale", "initial_y_scale", 0.05),
+        x_offset=_calibration_value("x_offset", "initial_x_offset", 0.0),
+        y_offset=_calibration_value("y_offset", "initial_y_offset", 0.0),
     )
 
     x_scale_limits = tuple(cfg.get("x_scale_limits", [-0.20, 0.20]))
@@ -936,6 +944,7 @@ def main():
         pump_pulse_time_seconds=float(cfg.get("pump_pulse_time_seconds", 0.25)),
     )
     print(f"Saved eye calibration to {path}")
+    sys.exit(USER_EXIT_CODE)
 
 
 if __name__ == "__main__":

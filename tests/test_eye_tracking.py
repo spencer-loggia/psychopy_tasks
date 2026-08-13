@@ -5,6 +5,7 @@ from bin.eye_tracking import (
     EyeCalibration,
     EyeFilterConfig,
     EyePositionFilter,
+    calibration_payload,
     fraction_distance_px,
     fraction_position_within_diameter,
 )
@@ -12,6 +13,22 @@ from bin.logger import load_task_event_definitions
 
 
 class EyeTrackingTests(unittest.TestCase):
+    def test_calibration_payload_is_namespaced(self):
+        payload = calibration_payload(
+            EyeCalibration(x_scale=0.1, y_scale=-0.2, x_offset=0.3, y_offset=-0.4),
+            daq_config=DAQC2AnalogConfig(),
+            filter_config=EyeFilterConfig(),
+            main_screen_size=(1920, 1080),
+            fixation_fraction=(0.25, -0.25),
+        )
+
+        self.assertEqual(list(payload), ["eye_tracker_calibration"])
+        eye_calibration = payload["eye_tracker_calibration"]
+        self.assertEqual(eye_calibration["x_scale"], 0.1)
+        self.assertEqual(eye_calibration["y_scale"], -0.2)
+        self.assertEqual(eye_calibration["x_offset"], 0.3)
+        self.assertEqual(eye_calibration["y_offset"], -0.4)
+
     def test_filter_uses_exponential_moving_average(self):
         eye_filter = EyePositionFilter(
             calibration=EyeCalibration(x_scale=0.1, y_scale=0.1),

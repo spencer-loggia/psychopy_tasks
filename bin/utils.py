@@ -937,10 +937,10 @@ def _send_led_pulse_on_flip(chip, pin: int, duration_us: int):
         raise RuntimeError(f"Hardware pulse failed with code {result} during flip callback")
 
 
-def present_block_with_persistent_dots(
+def present_trial_with_persistent_dots(
     win: visual.Window,
     preloaded: Dict[Union[Path, Tuple[int, int]], Image.Image],
-    block_paths: List[Union[Path, Tuple[int, int]]],
+    trial_options: List[Union[Path, Tuple[int, int]]],
     positions: List[Tuple[float, float]],
     duration: float,
     choice_time: float,
@@ -949,7 +949,7 @@ def present_block_with_persistent_dots(
     bg_rect,
     fix,
     logger,
-    block_idx: int,
+    trial_num: int,
     isi: float = 0.0,
     init_dot_color: Optional[Tuple[int, int, int]] = None,
     bg_rgb_255: Optional[Tuple[int, int, int]] = None,
@@ -975,7 +975,7 @@ def present_block_with_persistent_dots(
     Returns a tuple (aborted: bool, choice_info: Optional[dict]).
     - aborted: True if the task should stop immediately.
     - choice_info: None if no choice was made during the choice period, or a dict with keys:
-        - chosen_index: int (1-based index within the block)
+        - chosen_index: int (1-based index within the trial options)
         - chosen_pos: (x,y) psychopy pixel coords
         - choice_time_perf_s: perf_counter timestamp when the choice was made
         - reaction_time_s: time from choice_start to option_touch
@@ -993,8 +993,8 @@ def present_block_with_persistent_dots(
     preview_reward_levels: Optional[list[int]] = None
     if reward_levels is not None:
         preview_reward_levels = [int(level) for level in reward_levels]
-        if len(preview_reward_levels) != len(block_paths):
-            raise ValueError("reward_levels must contain one value per block item")
+        if len(preview_reward_levels) != len(trial_options):
+            raise ValueError("reward_levels must contain one value per trial option")
     # Establish frame timing
     if fps is None:
         fps, frame_dur = detect_frame_rate(win, msg_logger=msg_logger)
@@ -1071,10 +1071,10 @@ def present_block_with_persistent_dots(
             duration_us = int(pulse_s * 1_000_000)
             win.callOnFlip(_send_led_pulse_on_flip, pigpio_pi, raspi_pin, duration_us)
             trial_start_signal_armed_s = pulse_s
-            _log_message(msg_logger, "INFO", f"raspi_pulse_registered block={block_idx} duration_s={pulse_s:.6f}")
+            _log_message(msg_logger, "INFO", f"raspi_pulse_registered trial_num={trial_num} duration_s={pulse_s:.6f}")
             return True
         except Exception as e:
-            error_msg = f"trial_start_signal_registration_failed block={block_idx} error={e}"
+            error_msg = f"trial_start_signal_registration_failed trial_num={trial_num} error={e}"
             _log_message(msg_logger, "ERROR", error_msg)
             return False
 
@@ -1083,13 +1083,13 @@ def present_block_with_persistent_dots(
         if trial_start_signal_armed_s is None:
             return
         logger.log_signal(
-            trial_num=block_idx,
+            trial_num=trial_num,
             event="trial_start_signal_on",
             timestamp_perf_s=flip_perf_s,
             requested_duration=trial_start_signal_armed_s,
         )
         logger.log_signal(
-            trial_num=block_idx,
+            trial_num=trial_num,
             event="trial_start_signal_off",
             timestamp_perf_s=flip_perf_s + trial_start_signal_armed_s,
         )
@@ -1181,13 +1181,13 @@ def present_block_with_persistent_dots(
         oc_perf = time.perf_counter()
         _commit_trial_start_signal(oc_perf)
         logger.log_frame_flip(
-            trial_num=block_idx,
+            trial_num=trial_num,
             event=_frame_event_name("onset_cue"),
             timestamp_perf_s=oc_perf,
         )
         while True:
             if _event.getKeys(["escape"]):
-                _log_message(msg_logger, "WARN", f"escape_pressed block={block_idx} during_onset_cue=1")
+                _log_message(msg_logger, "WARN", f"escape_pressed trial_num={trial_num} during_onset_cue=1")
                 return True, None
             if _should_abort("experimenter_exit_during_onset_cue"):
                 return True, None
@@ -1204,7 +1204,7 @@ def present_block_with_persistent_dots(
                     click_perf = time.perf_counter()
                     _set_initiation_time(click_perf)
                     logger.log_interaction(
-                        trial_num=block_idx,
+                        trial_num=trial_num,
                         event=_interaction_event_name("cue_touch"),
                         timestamp_perf_s=click_perf,
                     )
@@ -1224,7 +1224,7 @@ def present_block_with_persistent_dots(
         msg_logger,
         "INFO",
         (
-            f"timing_quantization block={block_idx} "
+            f"timing_quantization trial_num={trial_num} "
             f"stim_duration={duration:.6f}s-> {stim_frames}fr({stim_s:.6f}s) "
             f"isi={isi:.6f}s-> {isi_frames}fr({isi_s:.6f}s) "
             f"choice_time={choice_time:.6f}s-> {int(round(max(0.0, float(choice_time)) * float(fps)))}fr({choice_s:.6f}s)"
@@ -1309,7 +1309,7 @@ def present_block_with_persistent_dots(
             msg_logger.log(
                 "INFO",
                 (
-                    f"choice_touch_attempt block={block_idx} "
+                    f"choice_touch_attempt trial_num={trial_num} "
                     f"click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f}) "
                     f"matched_idx={chosen_idx} origin={origin}"
                 ),
@@ -1330,7 +1330,7 @@ def present_block_with_persistent_dots(
             "touch_y": float(click_pos[1]),
         }
         logger.log_interaction(
-            trial_num=block_idx,
+            trial_num=trial_num,
             event=_interaction_event_name("option_touch"),
             timestamp_perf_s=click_perf_capture,
         )
@@ -1349,7 +1349,7 @@ def present_block_with_persistent_dots(
         start_click_pos = mouse.getPos()
         prev_touch_down = any(mouse.getPressed())
         logger.log_frame_flip(
-            trial_num=block_idx,
+            trial_num=trial_num,
             event=_frame_event_name("choice_start"),
             timestamp_perf_s=choice_perf,
         )
@@ -1368,7 +1368,7 @@ def present_block_with_persistent_dots(
 
     def _abort_from_input(reason: str) -> bool:
         if _event.getKeys(["escape"]):
-            _log_message(msg_logger, "WARN", f"escape_pressed block={block_idx} reason={reason}")
+            _log_message(msg_logger, "WARN", f"escape_pressed trial_num={trial_num} reason={reason}")
             return True
         return _should_abort(reason)
 
@@ -1435,7 +1435,7 @@ def present_block_with_persistent_dots(
         return dot
 
     if sequential:
-        for idx, (p, pos) in enumerate(zip(block_paths, positions), start=1):
+        for idx, (p, pos) in enumerate(zip(trial_options, positions), start=1):
             name, pil_img, stim = _build_stimulus(p, pos)
             stims_for_choice.append(stim)
             reward_level = (
@@ -1475,7 +1475,7 @@ def present_block_with_persistent_dots(
                         _commit_trial_start_signal(dot_perf)
                         _set_initiation_time(dot_perf)
                         logger.log_frame_flip(
-                            trial_num=block_idx,
+                            trial_num=trial_num,
                             event=_frame_event_name("dot", idx),
                             timestamp_perf_s=dot_perf,
                             requested_duration=isi_s,
@@ -1504,7 +1504,7 @@ def present_block_with_persistent_dots(
                     _commit_trial_start_signal(flip_perf)
                     _set_initiation_time(flip_perf)
                     logger.log_frame_flip(
-                        trial_num=block_idx,
+                        trial_num=trial_num,
                         event=_frame_event_name("stim", idx),
                         timestamp_perf_s=flip_perf,
                         requested_duration=stim_s,
@@ -1524,7 +1524,7 @@ def present_block_with_persistent_dots(
                 dots.pop()
                 dot_records.pop()
 
-            if (not is_memory) and idx == len(block_paths):
+            if (not is_memory) and idx == len(trial_options):
                 bg_rect.draw()
                 for s in stims_for_choice:
                     s.draw()
@@ -1537,7 +1537,7 @@ def present_block_with_persistent_dots(
                 _show_preview(stims_for_choice_preview)
 
     else:
-        for item_index, (p, pos) in enumerate(zip(block_paths, positions)):
+        for item_index, (p, pos) in enumerate(zip(trial_options, positions)):
             name, pil_img, stim = _build_stimulus(p, pos)
             stims.append(stim)
             names.append(name)
@@ -1578,7 +1578,7 @@ def present_block_with_persistent_dots(
                     _commit_trial_start_signal(dot_perf)
                     _set_initiation_time(dot_perf)
                     logger.log_frame_flip(
-                        trial_num=block_idx,
+                        trial_num=trial_num,
                         event=_frame_event_name("dot"),
                         timestamp_perf_s=dot_perf,
                         requested_duration=isi_s,
@@ -1608,7 +1608,7 @@ def present_block_with_persistent_dots(
                 _set_initiation_time(flip_perf)
                 stim_request = stim_s if is_memory else choice_s
                 logger.log_frame_flip(
-                    trial_num=block_idx,
+                    trial_num=trial_num,
                     event=_frame_event_name("stim"),
                     timestamp_perf_s=flip_perf,
                     requested_duration=stim_request,
@@ -1747,11 +1747,11 @@ def clamp_positions(
     return out
 
 
-def sample_blocks(files: List[Path], num_afc: int, n_blocks: int, seed: Optional[int] = None) -> List[List[Path]]:
-    """Sample stimuli for each block.
+def sample_trial_options(files: List[Path], num_afc: int, n_trials: int, seed: Optional[int] = None) -> List[List[Path]]:
+    """Sample the options for each trial.
 
-    For each block, sample `num_afc` unique stimuli without replacement within that block.
-    Blocks are independent (the same image may appear in different blocks).
+    Each trial contains `num_afc` unique stimuli sampled without replacement.
+    Trials are independent, so the same image may appear in different trials.
     """
     if seed is not None:
         random.seed(seed)
@@ -1760,10 +1760,10 @@ def sample_blocks(files: List[Path], num_afc: int, n_blocks: int, seed: Optional
     if num_afc > len(files):
         raise ValueError("num_afc cannot be larger than the number of available images")
 
-    blocks: List[List[Path]] = []
-    for _ in range(n_blocks):
-        blocks.append(random.sample(files, num_afc))
-    return blocks
+    trial_option_sets: List[List[Path]] = []
+    for _ in range(n_trials):
+        trial_option_sets.append(random.sample(files, num_afc))
+    return trial_option_sets
 
 
 def make_color_gaussian_image(
@@ -1857,18 +1857,18 @@ def make_shape_to_shape_trial(
     rng.shuffle(choice_shape_ids)
 
     target_index = choice_shape_ids.index(cue_shape_id) + 1
-    block_paths: List[Tuple[int, Optional[int]]] = [
+    trial_options: List[Tuple[int, Optional[int]]] = [
         (shape_id, None)
         for shape_id in choice_shape_ids
     ]
-    return block_paths, target_index
+    return trial_options, target_index
 
 
 def present_delayed_afc_trial(
     *,
     win: visual.Window,
     preloaded: Dict[Any, Image.Image],
-    block_paths: List[Tuple[int, Optional[int]]],
+    trial_options: List[Tuple[int, Optional[int]]],
     positions: List[Tuple[float, float]],
     cue_time: float,
     delay_time: float,
@@ -1876,7 +1876,7 @@ def present_delayed_afc_trial(
     bg_rect,
     fix,
     logger,
-    block_idx: int,
+    trial_num: int,
     target_index: int,
     trial_type: str = "shape_to_color",
     isi: float = 0.0,
@@ -1899,7 +1899,7 @@ def present_delayed_afc_trial(
         checkerboard onset cue click/touch -> optional pre-cue ISI ->
         feature cue -> delay -> choices -> grey
 
-    For ``shape_to_shape`` trials, every entry in ``block_paths`` must be
+    For ``shape_to_shape`` trials, every entry in ``trial_options`` must be
     ``(shape_id, None)``, where ``shape_id`` is 14 through 27. The item at the
     1-based ``target_index`` supplies both the cue and the correct choice. All
     remaining entries are different non-associated-shape distractors.
@@ -1909,12 +1909,12 @@ def present_delayed_afc_trial(
     """
     from psychopy import core as _core
 
-    if len(block_paths) != len(positions):
-        raise ValueError("block_paths and positions must have the same length")
-    if not block_paths:
-        raise ValueError("block_paths must contain at least one AFC choice")
-    if target_index < 1 or target_index > len(block_paths):
-        raise ValueError("target_index must be 1-based and within block_paths")
+    if len(trial_options) != len(positions):
+        raise ValueError("trial_options and positions must have the same length")
+    if not trial_options:
+        raise ValueError("trial_options must contain at least one AFC choice")
+    if target_index < 1 or target_index > len(trial_options):
+        raise ValueError("target_index must be 1-based and within trial_options")
     if onset_cue is None:
         raise ValueError(
             "present_delayed_afc_trial requires an onset_cue made by "
@@ -1923,13 +1923,13 @@ def present_delayed_afc_trial(
 
     # Normalize every stimulus to (shape_id, color_id). Shape-only stimuli use
     # color_id=None, for example (14, None) for s14.svg.
-    normalized_block_paths: List[Tuple[int, Optional[int]]] = []
-    for item_number, raw_pair in enumerate(block_paths, start=1):
+    normalized_trial_options: List[Tuple[int, Optional[int]]] = []
+    for item_number, raw_pair in enumerate(trial_options, start=1):
         try:
             shape_id, color_id = raw_pair
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                "Each block_paths entry must contain exactly two values: "
+                "Each trial_options entry must contain exactly two values: "
                 "(shape_id, color_id). Use None for a shape with no associated "
                 f"color. Invalid entry {item_number}: {raw_pair!r}"
             ) from exc
@@ -1938,7 +1938,7 @@ def present_delayed_afc_trial(
             normalized_shape_id = int(shape_id)
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                f"Invalid shape ID in block_paths entry {item_number}: "
+                f"Invalid shape ID in trial_options entry {item_number}: "
                 f"{raw_pair!r}"
             ) from exc
 
@@ -1949,24 +1949,24 @@ def present_delayed_afc_trial(
                 normalized_color_id = int(color_id)
             except (TypeError, ValueError) as exc:
                 raise ValueError(
-                    f"Invalid color ID in block_paths entry {item_number}: "
+                    f"Invalid color ID in trial_options entry {item_number}: "
                     f"{raw_pair!r}"
                 ) from exc
 
-        normalized_block_paths.append(
+        normalized_trial_options.append(
             (normalized_shape_id, normalized_color_id)
         )
 
-    block_paths = normalized_block_paths
+    trial_options = normalized_trial_options
 
     if trial_type == "shape_to_shape":
-        if len(block_paths) < 2:
+        if len(trial_options) < 2:
             raise ValueError("shape_to_shape requires at least two choices")
 
         allowed_shape_ids = frozenset(range(14, 28))
         invalid_pairs = [
             pair
-            for pair in block_paths
+            for pair in trial_options
             if pair[0] not in allowed_shape_ids or pair[1] is not None
         ]
         if invalid_pairs:
@@ -1976,7 +1976,7 @@ def present_delayed_afc_trial(
                 f"Invalid entries: {invalid_pairs!r}"
             )
 
-        choice_shape_ids = [pair[0] for pair in block_paths]
+        choice_shape_ids = [pair[0] for pair in trial_options]
         if len(choice_shape_ids) != len(set(choice_shape_ids)):
             raise ValueError(
                 "shape_to_shape choices must be unique so that the target "
@@ -2005,7 +2005,7 @@ def present_delayed_afc_trial(
         msg_logger,
         "INFO",
         (
-            f"timing_quantization block={block_idx} "
+            f"timing_quantization trial_num={trial_num} "
             f"isi={float(isi):.6f}s-> {isi_frames}fr({isi_s:.6f}s) "
             f"cue_time={float(cue_time):.6f}s-> {cue_frames}fr({cue_s:.6f}s) "
             f"delay_time={float(delay_time):.6f}s-> {delay_frames}fr({delay_s:.6f}s) "
@@ -2018,7 +2018,7 @@ def present_delayed_afc_trial(
     else:
         cue_feature, choice_feature = _csc1_choice_mapping(trial_type)
 
-    target_pair = block_paths[target_index - 1]
+    target_pair = trial_options[target_index - 1]
 
     def _lookup_feature_image(
         pair: Tuple[int, Optional[int]],
@@ -2085,9 +2085,9 @@ def present_delayed_afc_trial(
             msg_logger,
             "INFO",
             (
-                f"shape_to_shape_config block={block_idx} "
+                f"shape_to_shape_config trial_num={trial_num} "
                 f"cue_shape=s{target_pair[0]}.svg "
-                f"choice_shapes={[f's{pair[0]}.svg' for pair in block_paths]} "
+                f"choice_shapes={[f's{pair[0]}.svg' for pair in trial_options]} "
                 f"target_index={target_index}"
             ),
         )
@@ -2097,7 +2097,7 @@ def present_delayed_afc_trial(
 
     choice_stims: List[visual.ImageStim] = []
     choice_hit_targets: List[visual.Rect] = []
-    for pair, pos in zip(block_paths, positions):
+    for pair, pos in zip(trial_options, positions):
         pair = tuple(pair)
         choice_img = _lookup_feature_image(
             pair,
@@ -2152,12 +2152,12 @@ def present_delayed_afc_trial(
 
     def _abort_from_input(reason: str) -> bool:
         if event.getKeys(["escape"]):
-            _log_message(msg_logger, "WARN", f"escape_pressed block={block_idx} reason={reason}")
+            _log_message(msg_logger, "WARN", f"escape_pressed trial_num={trial_num} reason={reason}")
             return True
         if external_abort_checker is not None:
             try:
                 if external_abort_checker():
-                    _log_message(msg_logger, "WARN", f"external_abort block={block_idx} reason={reason}")
+                    _log_message(msg_logger, "WARN", f"external_abort trial_num={trial_num} reason={reason}")
                     return True
             except Exception:
                 pass
@@ -2182,10 +2182,10 @@ def present_delayed_afc_trial(
             duration_us = int(pulse_s * 1_000_000)
             win.callOnFlip(_send_led_pulse_on_flip, pigpio_pi, raspi_pin, duration_us)
             trial_start_signal_armed_s = pulse_s
-            _log_message(msg_logger, "INFO", f"raspi_pulse_registered block={block_idx} duration_s={pulse_s:.6f}")
+            _log_message(msg_logger, "INFO", f"raspi_pulse_registered trial_num={trial_num} duration_s={pulse_s:.6f}")
             return True
         except Exception as e:
-            _log_message(msg_logger, "ERROR", f"trial_start_signal_registration_failed block={block_idx} error={e}")
+            _log_message(msg_logger, "ERROR", f"trial_start_signal_registration_failed trial_num={trial_num} error={e}")
             return False
 
     def _commit_trial_start_signal(flip_perf_s: float) -> None:
@@ -2193,13 +2193,13 @@ def present_delayed_afc_trial(
         if trial_start_signal_armed_s is None:
             return
         logger.log_signal(
-            trial_num=block_idx,
+            trial_num=trial_num,
             event="trial_start_signal_on",
             timestamp_perf_s=flip_perf_s,
             requested_duration=trial_start_signal_armed_s,
         )
         logger.log_signal(
-            trial_num=block_idx,
+            trial_num=trial_num,
             event="trial_start_signal_off",
             timestamp_perf_s=flip_perf_s + trial_start_signal_armed_s,
         )
@@ -2219,7 +2219,7 @@ def present_delayed_afc_trial(
     win.flip()
     oc_perf = time.perf_counter()
     logger.log_frame_flip(
-        trial_num=block_idx,
+        trial_num=trial_num,
         event="onset_cue_on",
         timestamp_perf_s=oc_perf,
     )
@@ -2246,7 +2246,7 @@ def present_delayed_afc_trial(
                 click_perf = time.perf_counter()
                 _set_initiation_time(click_perf)
                 logger.log_interaction(
-                    trial_num=block_idx,
+                    trial_num=trial_num,
                     event="cue_touch",
                     timestamp_perf_s=click_perf,
                 )
@@ -2254,7 +2254,7 @@ def present_delayed_afc_trial(
                     msg_logger,
                     "INFO",
                     (
-                        f"checkerboard_onset_cue_touch block={block_idx} "
+                        f"checkerboard_onset_cue_touch trial_num={trial_num} "
                         f"click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f})"
                     ),
                 )
@@ -2279,7 +2279,7 @@ def present_delayed_afc_trial(
             _draw_blank()
             win.flip()
             if first_flip:
-                _log_message(msg_logger, "INFO", f"pre_cue_interval block={block_idx} duration_s={isi_s:.6f}")
+                _log_message(msg_logger, "INFO", f"pre_cue_interval trial_num={trial_num} duration_s={isi_s:.6f}")
                 first_flip = False
 
     first_flip = True
@@ -2303,10 +2303,10 @@ def present_delayed_afc_trial(
                 trial_meta["target_pair"] = target_pair
                 trial_meta["target_shape_id"] = int(target_pair[0])
                 trial_meta["target_color_id"] = target_pair[1]
-                trial_meta["choice_pairs"] = list(block_paths)
+                trial_meta["choice_pairs"] = list(trial_options)
             logger.log_frame_flip(
-                trial_num=block_idx,
-                event="options_on",
+                trial_num=trial_num,
+                event="feature_cue_on",
                 timestamp_perf_s=cue_perf,
                 requested_duration=cue_s,
             )
@@ -2324,7 +2324,7 @@ def present_delayed_afc_trial(
                 if trial_meta is not None:
                     trial_meta["delay_flip_perf_s"] = float(delay_perf)
                 logger.log_frame_flip(
-                    trial_num=block_idx,
+                    trial_num=trial_num,
                     event="delay_start",
                     timestamp_perf_s=delay_perf,
                     requested_duration=delay_s,
@@ -2349,7 +2349,13 @@ def present_delayed_afc_trial(
     if trial_meta is not None:
         trial_meta["choice_start_perf_s"] = float(choice_perf)
     logger.log_frame_flip(
-        trial_num=block_idx,
+        trial_num=trial_num,
+        event="options_on",
+        timestamp_perf_s=choice_perf,
+        requested_duration=choice_s,
+    )
+    logger.log_frame_flip(
+        trial_num=trial_num,
         event="choice_start",
         timestamp_perf_s=choice_perf,
         requested_duration=choice_s,
@@ -2366,16 +2372,16 @@ def present_delayed_afc_trial(
             click_perf = time.perf_counter()
             correct = immediate_idx == int(target_index)
             logger.log_interaction(
-                trial_num=block_idx,
+                trial_num=trial_num,
                 event="option_touch",
                 timestamp_perf_s=click_perf,
             )
             choice_info = {
                 "chosen_index": int(immediate_idx),
                 "chosen_pos": tuple(positions[immediate_idx - 1]),
-                "chosen_pair": block_paths[immediate_idx - 1],
-                "chosen_shape_id": int(block_paths[immediate_idx - 1][0]),
-                "chosen_color_id": block_paths[immediate_idx - 1][1],
+                "chosen_pair": trial_options[immediate_idx - 1],
+                "chosen_shape_id": int(trial_options[immediate_idx - 1][0]),
+                "chosen_color_id": trial_options[immediate_idx - 1][1],
                 "choice_start_perf_s": float(choice_perf),
                 "choice_time_perf_s": float(click_perf),
                 "reaction_time_s": float(click_perf - choice_perf),
@@ -2405,7 +2411,7 @@ def present_delayed_afc_trial(
                 msg_logger,
                 "INFO",
                 (
-                    f"choice_touch_attempt block={block_idx} "
+                    f"choice_touch_attempt trial_num={trial_num} "
                     f"click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f}) matched_idx={chosen_idx}"
                 ),
             )
@@ -2413,16 +2419,16 @@ def present_delayed_afc_trial(
                 click_perf = time.perf_counter()
                 correct = chosen_idx == int(target_index)
                 logger.log_interaction(
-                    trial_num=block_idx,
+                    trial_num=trial_num,
                     event="option_touch",
                     timestamp_perf_s=click_perf,
                 )
                 choice_info = {
                     "chosen_index": int(chosen_idx),
                     "chosen_pos": tuple(positions[chosen_idx - 1]),
-                    "chosen_pair": block_paths[chosen_idx - 1],
-                    "chosen_shape_id": int(block_paths[chosen_idx - 1][0]),
-                    "chosen_color_id": block_paths[chosen_idx - 1][1],
+                    "chosen_pair": trial_options[chosen_idx - 1],
+                    "chosen_shape_id": int(trial_options[chosen_idx - 1][0]),
+                    "chosen_color_id": trial_options[chosen_idx - 1][1],
                     "choice_start_perf_s": float(choice_perf),
                     "choice_time_perf_s": float(click_perf),
                     "reaction_time_s": float(click_perf - choice_perf),
@@ -2452,7 +2458,7 @@ def present_delayed_afc_trial(
             msg_logger,
             "INFO",
             (
-                f"choice_timeout block={block_idx} trial_type={trial_type} "
+                f"choice_timeout trial_num={trial_num} trial_type={trial_type} "
                 f"target_index={target_index} target_pair={target_pair}"
             ),
         )
@@ -2461,7 +2467,7 @@ def present_delayed_afc_trial(
             msg_logger,
             "INFO",
             (
-                f"choice_registered block={block_idx} idx={choice_info['chosen_index']} "
+                f"choice_registered trial_num={trial_num} idx={choice_info['chosen_index']} "
                 f"chosen_pair={choice_info['chosen_pair']} "
                 f"correct={int(choice_info['is_correct'])} trial_type={trial_type} "
                 f"target_index={target_index} target_pair={target_pair}"

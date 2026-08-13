@@ -1,12 +1,27 @@
 { 
   "config_name": "yuri_test",
+  "subject": "Yuri",
   "n_colors": 36,
   "n_shapes": 36, 
   "n_lum_levels": 11,
   "shapes_tsv": "./task/resources/csc2/shape_definitions.tsv",
   "colors_tsv": "./task/resources/csc2/mt2_062026_amoledB_colors.tsv",
-  "freq_space_tsv": "./task/resources/csc2/freq_space_TY.csv",
-  "reward_space_tsv": "./task/resources/csc2/reward_space_TY.csv",
+  "freq_space_tsv": {
+    "test_env1": "./task/resources/csc2/freq_space_TY.csv",
+    "Yuri": "./task/resources/csc2/freq_space_TY.csv",
+    "Tina": "./task/resources/csc2/freq_space_TY.csv",
+    "test_env2": "./task/resources/csc2/freq_space_SB.csv",
+    "Buzz": "./task/resources/csc2/freq_space_SB.csv",
+    "Sally": "./task/resources/csc2/freq_space_SB.csv"
+  },
+  "reward_space_tsv": {
+    "test_env1": "./task/resources/csc2/reward_space_TY.csv",
+    "Yuri": "./task/resources/csc2/reward_space_TY.csv",
+    "Tina": "./task/resources/csc2/reward_space_TY.csv",
+    "test_env2": "./task/resources/csc2/reward_space_SB.csv",
+    "Buzz": "./task/resources/csc2/reward_space_SB.csv",
+    "Sally": "./task/resources/csc2/reward_space_SB.csv"
+  },
   "pump_pulse_time_seconds": 0.2,
   "timeout_duration_seconds": 3.0,
   "reward_to_pulse_map": {
@@ -52,7 +67,7 @@
 
 
   "self_initiation": true,
-  "ibi": 1.0,
+  "iti": 1.0,
   "duration": 0.0,
   "num_afc": 4,
   "choice_time": 0.5,

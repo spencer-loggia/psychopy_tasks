@@ -682,6 +682,25 @@ def format_elapsed_hms(elapsed_s: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def format_experimenter_label(
+    task_label: str,
+    *,
+    subject: Optional[str] = None,
+    current_trial_num: Optional[int] = None,
+    total_trials: Optional[int] = None,
+) -> str:
+    """Build the task/subject/trial label shown on an experimenter preview."""
+    lines = []
+    if str(task_label or "").strip():
+        lines.append(str(task_label).strip())
+    if subject is not None and str(subject).strip():
+        lines.append(f"Subject: {str(subject).strip()}")
+    if current_trial_num is not None:
+        total_label = str(int(total_trials)) if total_trials is not None and int(total_trials) > 0 else "∞"
+        lines.append(f"Trial: {int(current_trial_num)} / {total_label}")
+    return "\n".join(lines)
+
+
 def describe_screen(screen_info: Optional[ScreenGeometry]) -> str:
     if screen_info is None:
         return "none"
@@ -942,6 +961,9 @@ def _experimenter_preview_process(
     reward_event,
     exit_event,
     mouse_visible: Optional[bool],
+    initial_subject: Optional[str],
+    initial_current_trial_num: Optional[int],
+    initial_total_trials: Optional[int],
     stop_event,
 ) -> None:
     from psychopy import core, event, visual
@@ -977,7 +999,15 @@ def _experimenter_preview_process(
         movie_bg_rect = None
         movie_outline_rect = None
         movie_layout = None
-        static_scene = _build_static_scene({"bg_rgb_255": last_bg_rgb, "main_size": preview_canvas_size})
+        static_scene = _build_static_scene(
+            {
+                "bg_rgb_255": last_bg_rgb,
+                "main_size": preview_canvas_size,
+                "subject": current_subject,
+                "current_trial_num": current_trial_num,
+                "total_trials": current_total_trials,
+            }
+        )
 
     def _build_static_scene(payload: Dict[str, Any]) -> Dict[str, Any]:
         bg_rgb_255 = tuple(payload.get("bg_rgb_255", (0, 0, 0)))
@@ -1102,6 +1132,9 @@ def _experimenter_preview_process(
             "fixation": fixation,
             "highlight_box": highlight_box,
             "reward_counts": _normalize_reward_counts(payload.get("reward_counts")),
+            "subject": payload.get("subject"),
+            "current_trial_num": payload.get("current_trial_num"),
+            "total_trials": payload.get("total_trials"),
             "layout": layout,
         }
 
@@ -1203,6 +1236,12 @@ def _experimenter_preview_process(
             )
             reward_counts_text.draw()
         if task_label_text is not None:
+            task_label_text.text = format_experimenter_label(
+                task_label,
+                subject=static_scene.get("subject"),
+                current_trial_num=static_scene.get("current_trial_num"),
+                total_trials=static_scene.get("total_trials"),
+            )
             task_label_text.draw()
         reward_button_rect.draw()
         reward_button_text.draw()
@@ -1223,14 +1262,25 @@ def _experimenter_preview_process(
     mouse = event.Mouse(win=win)
     last_mouse_down = False
     last_bg_rgb = (0, 0, 0)
-    static_scene = _build_static_scene({"bg_rgb_255": last_bg_rgb, "main_size": preview_canvas_size})
+    current_reward_counts = None
+    current_highlight_box = None
+    current_subject = initial_subject
+    current_trial_num = initial_current_trial_num
+    current_total_trials = initial_total_trials
+    static_scene = _build_static_scene(
+        {
+            "bg_rgb_255": last_bg_rgb,
+            "main_size": preview_canvas_size,
+            "subject": current_subject,
+            "current_trial_num": current_trial_num,
+            "total_trials": current_total_trials,
+        }
+    )
     movie = None
     movie_bg_rect = None
     movie_outline_rect = None
     movie_layout = None
     task_label_text = None
-    current_reward_counts = None
-    current_highlight_box = None
 
     try:
         if task_label:
@@ -1347,9 +1397,18 @@ def _experimenter_preview_process(
                         current_reward_counts = _normalize_reward_counts(payload.get("reward_counts"))
                     if "highlight_box" in payload:
                         current_highlight_box = payload.get("highlight_box")
+                    if "subject" in payload:
+                        current_subject = payload.get("subject")
+                    if "current_trial_num" in payload:
+                        current_trial_num = payload.get("current_trial_num")
+                    if "total_trials" in payload:
+                        current_total_trials = payload.get("total_trials")
                     scene_payload = dict(payload)
                     scene_payload["reward_counts"] = current_reward_counts
                     scene_payload["highlight_box"] = current_highlight_box
+                    scene_payload["subject"] = current_subject
+                    scene_payload["current_trial_num"] = current_trial_num
+                    scene_payload["total_trials"] = current_total_trials
                     if command_type == "static_scene":
                         _release_movie()
                         last_bg_rgb = tuple(payload.get("bg_rgb_255", last_bg_rgb))
@@ -1452,6 +1511,9 @@ def _experimenter_preview_process(
                         "main_size": preview_canvas_size,
                         "reward_counts": current_reward_counts,
                         "highlight_box": current_highlight_box,
+                        "subject": current_subject,
+                        "current_trial_num": current_trial_num,
+                        "total_trials": current_total_trials,
                     }
                 )
             core.wait(max(0.02, float(update_interval_ms) / 1000.0))
@@ -1469,12 +1531,18 @@ class ExperimenterPreview:
         screen_info: ScreenGeometry,
         *,
         task_label: str = "",
+        subject: Optional[str] = None,
+        current_trial_num: Optional[int] = None,
+        total_trials: Optional[int] = None,
         start_perf_s: Optional[float] = None,
         update_interval_s: float = 0.1,
         mouse_visible: Optional[bool] = True,
     ):
         self.screen_info = screen_info
         self.task_label = task_label
+        self.subject = subject
+        self.current_trial_num = current_trial_num
+        self.total_trials = total_trials
         self.start_perf_s = time.perf_counter() if start_perf_s is None else float(start_perf_s)
         self.update_interval_s = max(0.05, float(update_interval_s))
         self.exit_requested = False
@@ -1494,6 +1562,9 @@ class ExperimenterPreview:
                 self._reward_event,
                 self._exit_event,
                 mouse_visible,
+                subject,
+                current_trial_num,
+                total_trials,
                 self._stop_event,
             ),
             daemon=True,
@@ -1522,7 +1593,21 @@ class ExperimenterPreview:
         self._reward_event.clear()
         return True
 
+    def set_trial_progress(self, current_trial_num: int, total_trials: Optional[int]) -> None:
+        self.current_trial_num = int(current_trial_num)
+        self.total_trials = None if total_trials is None else int(total_trials)
+
     def _send(self, payload: Dict[str, Any]) -> None:
+        payload = dict(payload)
+        subject = getattr(self, "subject", None)
+        current_trial_num = getattr(self, "current_trial_num", None)
+        total_trials = getattr(self, "total_trials", None)
+        if subject is not None:
+            payload.setdefault("subject", str(subject))
+        if current_trial_num is not None:
+            payload.setdefault("current_trial_num", int(current_trial_num))
+        if total_trials is not None:
+            payload.setdefault("total_trials", int(total_trials))
         if self.poll() or not self._process.is_alive():
             return
         try:

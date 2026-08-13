@@ -1,12 +1,27 @@
 { 
   "config_name": "mac_test_files",
+  "subject": "test_env1",
   "n_colors": 36,
   "n_shapes": 36, 
   "n_lum_levels": 11,
   "shapes_tsv": "./task/resources/csc2/shape_definitions.tsv",
   "colors_tsv": "./task/resources/csc2/mt2_062026_amoledB_colors.tsv",
-  "freq_space_tsv": "./task/resources/csc2/freq_space_TY.csv",
-  "reward_space_tsv": "./task/resources/csc2/reward_space_TY.csv",
+  "freq_space_tsv": {
+    "test_env1": "./task/resources/csc2/freq_space_TY.csv",
+    "Yuri": "./task/resources/csc2/freq_space_TY.csv",
+    "Tina": "./task/resources/csc2/freq_space_TY.csv",
+    "test_env2": "./task/resources/csc2/freq_space_SB.csv",
+    "Buzz": "./task/resources/csc2/freq_space_SB.csv",
+    "Sally": "./task/resources/csc2/freq_space_SB.csv"
+  },
+  "reward_space_tsv": {
+    "test_env1": "./task/resources/csc2/reward_space_TY.csv",
+    "Yuri": "./task/resources/csc2/reward_space_TY.csv",
+    "Tina": "./task/resources/csc2/reward_space_TY.csv",
+    "test_env2": "./task/resources/csc2/reward_space_SB.csv",
+    "Buzz": "./task/resources/csc2/reward_space_SB.csv",
+    "Sally": "./task/resources/csc2/reward_space_SB.csv"
+  },
   "pump_delay_time": 0.0,
   "pump_pulse_time_seconds": 0.6,
   "inter_pump_interval": 0.1, 
@@ -56,7 +71,7 @@
 
 
   "self_initiation": true,
-  "ibi": 0.75,
+  "iti": 0.75,
   "duration": 0.0,
   "num_afc": 3,
   "choice_time": 2.0,

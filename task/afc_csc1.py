@@ -40,6 +40,7 @@ if str(_project_root) not in sys.path:
 from bin import utils
 from bin.config import load_config, validate_config
 from bin.logger import SessionLogBundle
+from bin.task_lifecycle import USER_EXIT_CODE
 from bin.screen import (
     ExperimenterPreview,
     describe_screen,
@@ -67,7 +68,7 @@ def parse_args():
     p.add_argument("--config", help="Path to JSON config file. CLI overrides config keys.")
     p.add_argument("--colors_tsv", help="Path to color TSV (overrides config)")
     p.add_argument("--shapes_tsv", help="Path to shapes TSV (overrides config)")
-    p.add_argument("--n", type=int, default=None, help="Number of trials/blocks")
+    p.add_argument("--n", type=int, default=None, help="Number of trials")
     p.add_argument("--num_afc", type=int, default=None, help="Number of choices per trial")
     p.add_argument("--num_stim", type=int, default=None, help="Pool size for matched shape-color pairs")
     p.add_argument("--pairing_mode", choices=["matched", "all"], default=None, help="matched: shape_i-color_i pool; all: full shape x color pool")
@@ -75,7 +76,14 @@ def parse_args():
     p.add_argument("--cue_time", type=float, default=None, help="Cue duration in seconds")
     p.add_argument("--delay_time", type=float, default=None, help="Blank delay after cue and before choices")
     p.add_argument("--choice_time", type=float, default=None, help="Choice window duration in seconds")
-    p.add_argument("--ibi", type=float, default=None, help="Inter-block interval in seconds")
+    p.add_argument(
+        "--iti",
+        "--ibi",
+        dest="iti",
+        type=float,
+        default=None,
+        help="Inter-trial interval in seconds; --ibi is a deprecated compatibility alias",
+    )
     p.add_argument("--isi", type=float, default=None, help="Optional pre-cue fixation interval in seconds")
     p.add_argument("--timeout_time", type=float, default=None, help="Optional gray timeout after incorrect/no-choice trials")
     p.add_argument("--reward_pulse_time", type=float, default=None, help="Optional logged reward pulse duration after correct trials")
@@ -262,7 +270,7 @@ def _pair_probabilities(
     return probs
 
 
-def _sample_pair_block(
+def _sample_trial_options(
     *,
     all_pairs: List[Tuple[int, int]],
     probs: np.ndarray,
@@ -280,29 +288,29 @@ def _sample_pair_block(
         unique_feature_idx = 0
     else:
         raise ValueError(
-            "_sample_pair_block only supports shape_to_color and color_to_shape"
+            "_sample_trial_options only supports shape_to_color and color_to_shape"
         )
 
     replace = int(np.count_nonzero(probs)) < int(num_afc)
 
     for _attempt in range(1000):
         picks = rng.choice(len(all_pairs), size=num_afc, replace=replace, p=probs)
-        block = [all_pairs[int(i)] for i in picks]
-        features = [pair[unique_feature_idx] for pair in block]
+        sampled_options = [all_pairs[int(i)] for i in picks]
+        features = [pair[unique_feature_idx] for pair in sampled_options]
         if len(set(features)) == len(features):
-            return block
+            return sampled_options
 
     msg_logger.log(
         "WARN",
         (
             f"Could not sample {num_afc} choices with unique "
-            f"{'colors' if trial_type == 'shape_to_color' else 'shapes'}; using last sampled block"
+            f"{'colors' if trial_type == 'shape_to_color' else 'shapes'}; using last sampled options"
         ),
     )
-    return block
+    return sampled_options
 
 
-def _sample_shape_to_shape_block(
+def _sample_shape_to_shape_options(
     *,
     shape_ids: List[int],
     num_afc: int,
@@ -329,11 +337,11 @@ def _sample_shape_to_shape_block(
         size=int(num_afc),
         replace=False,
     )
-    block_paths: List[StimulusPair] = [
+    trial_options: List[StimulusPair] = [
         (int(shape_id), None) for shape_id in sampled_ids.tolist()
     ]
     target_index = int(rng.integers(1, int(num_afc) + 1))
-    return block_paths, target_index
+    return trial_options, target_index
 
 
 def _fixed_circle_positions(num_afc: int, radius_px: float) -> List[Tuple[float, float]]:
@@ -383,7 +391,7 @@ def _log_global_timing(msg_logger, fps: float, frame_dur: float, timings: Dict[s
     q("delay_time", timings["delay_time"], at_least_one=False)
     q("isi", timings["isi"], at_least_one=False)
     q("choice_time", timings["choice_time"], at_least_one=True)
-    q("ibi", timings["ibi"], at_least_one=False)
+    q("iti", timings["iti"], at_least_one=False)
     q("timeout_time", timings["timeout_time"], at_least_one=False)
 
     msg_logger.log(
@@ -403,12 +411,12 @@ def run_task(
     *,
     colors_tsv: str,
     shapes_tsv: str,
-    n_blocks: int,
+    n_trials: int,
     num_afc: int,
     cue_time: float,
     delay_time: float,
     choice_time: float,
-    ibi: float,
+    iti: float,
     output_dir: str,
     isi: float = 0.0,
     bg: Optional[Tuple[int, int, int]] = None,
@@ -473,7 +481,7 @@ def run_task(
         )
     if num_afc < 1:
         raise ValueError("num_afc must be >= 1")
-    if n_blocks < 1:
+    if n_trials < 1:
         raise ValueError("n must be >= 1")
 
     uses_associated_trials = trial_type in (
@@ -743,7 +751,7 @@ def run_task(
                 font_small = ImageFont.load_default()
 
             total = int(afc_counts.get("total", 0))
-            planned = int(n_blocks)
+            planned = int(n_trials)
             remaining = max(0, planned - total)
             correct = int(afc_counts.get("correct", 0))
             incorrect = int(afc_counts.get("incorrect", 0))
@@ -809,7 +817,7 @@ def run_task(
         def _show_preview_afc_scene(
             *,
             phase: str,
-            block_paths_current: Optional[List[StimulusPair]] = None,
+            trial_options_current: Optional[List[StimulusPair]] = None,
             positions_current: Optional[List[Tuple[float, float]]] = None,
             trial_type_current: Optional[str] = None,
             target_index_current: Optional[int] = None,
@@ -826,11 +834,11 @@ def run_task(
                 images.append(panel)
 
             highlight_box = None
-            if block_paths_current and positions_current and trial_type_current:
+            if trial_options_current and positions_current and trial_type_current:
                 cue_feature, choice_feature = _choice_mapping_for_preview(trial_type_current)
                 if target_index_current is not None:
                     try:
-                        target_pair = tuple(block_paths_current[int(target_index_current) - 1])
+                        target_pair = tuple(trial_options_current[int(target_index_current) - 1])
                         cue_obj = preloaded.get(_feature_key(target_pair, cue_feature))
                         cue_payload = serialize_preview_image(cue_obj) if cue_obj is not None else None
                         if cue_payload is not None:
@@ -845,7 +853,7 @@ def run_task(
                     except Exception:
                         pass
 
-                for idx, (pair, pos) in enumerate(zip(block_paths_current, positions_current), start=1):
+                for idx, (pair, pos) in enumerate(zip(trial_options_current, positions_current), start=1):
                     pair = tuple(pair)
                     image_obj = preloaded.get(_feature_key(pair, choice_feature))
                     payload = serialize_preview_image(image_obj) if image_obj is not None else None
@@ -1012,7 +1020,7 @@ def run_task(
                 "delay_time": delay_time,
                 "isi": isi,
                 "choice_time": choice_time,
-                "ibi": ibi,
+                "iti": iti,
                 "timeout_time": timeout_time,
             },
             context="afc_csc1",
@@ -1028,11 +1036,11 @@ def run_task(
                 "delay_time": delay_time,
                 "isi": isi,
                 "choice_time": choice_time,
-                "ibi": ibi,
+                "iti": iti,
                 "timeout_time": timeout_time,
             },
         )
-        ibi_frames, ibi_s = quantized["ibi"]
+        iti_frames, iti_s = quantized["iti"]
         timeout_frames, timeout_s = quantized["timeout_time"]
 
         onset_stim = utils.make_onset_cue_stim(
@@ -1049,49 +1057,49 @@ def run_task(
             f"size={tuple(getattr(onset_stim, 'size', ())) if onset_stim is not None else ''}",
         )
 
-        msg_logger.log("INFO", f"task_ready n_blocks={n_blocks} num_afc={num_afc} delay_time={delay_time:.6f}")
+        msg_logger.log("INFO", f"task_ready n_trials={n_trials} num_afc={num_afc} delay_time={delay_time:.6f}")
 
-        for trial_num in range(1, int(n_blocks) + 1):
+        for trial_num in range(1, int(n_trials) + 1):
             if _poll_experimenter_controls():
                 task_end_notes = "experimenter_exit"
                 msg_logger.log("WARN", "experimenter_exit_before_trial_start")
                 break
 
             if trial_type == "random":
-                block_trial_type = random.choice(
+                current_trial_type = random.choice(
                     ["shape_to_color", "color_to_shape", "shape_to_shape"]
                 )
             else:
-                block_trial_type = trial_type
+                current_trial_type = trial_type
 
-            block_paths: List[StimulusPair]
-            if block_trial_type == "shape_to_shape":
-                block_paths, target_index = _sample_shape_to_shape_block(
+            trial_options: List[StimulusPair]
+            if current_trial_type == "shape_to_shape":
+                trial_options, target_index = _sample_shape_to_shape_options(
                     shape_ids=nonassociated_shape_ids,
                     num_afc=int(num_afc),
                     rng=rng,
                 )
             else:
-                paired_block = _sample_pair_block(
+                sampled_options = _sample_trial_options(
                     all_pairs=all_pairs,
                     probs=pair_probs,
                     num_afc=int(num_afc),
-                    trial_type=block_trial_type,
+                    trial_type=current_trial_type,
                     rng=rng,
                     msg_logger=msg_logger,
                 )
-                block_paths = [
-                    (int(sid), int(cid)) for sid, cid in paired_block
+                trial_options = [
+                    (int(sid), int(cid)) for sid, cid in sampled_options
                 ]
                 target_index = int(rng.integers(1, int(num_afc) + 1))
 
-            target_sid, target_cid = block_paths[target_index - 1]
+            target_sid, target_cid = trial_options[target_index - 1]
             msg_logger.log(
                 "INFO",
                 (
-                    f"trial_loaded trial_num={trial_num} trial_type={block_trial_type} "
+                    f"trial_loaded trial_num={trial_num} trial_type={current_trial_type} "
                     f"target_index={target_index} target_shape={target_sid} target_color={target_cid} "
-                    f"options={block_paths}"
+                    f"options={trial_options}"
                 ),
             )
 
@@ -1119,15 +1127,15 @@ def run_task(
             trial_meta: Dict[str, Any] = {}
             _show_preview_afc_scene(
                 phase="awaiting initiation",
-                block_paths_current=block_paths,
+                trial_options_current=trial_options,
                 positions_current=positions,
-                trial_type_current=block_trial_type,
+                trial_type_current=current_trial_type,
                 target_index_current=target_index,
             )
             aborted, choice_info = utils.present_delayed_afc_trial(
                 win=win,
                 preloaded=preloaded,
-                block_paths=block_paths,
+                trial_options=trial_options,
                 positions=positions,
                 cue_time=float(cue_time),
                 delay_time=float(delay_time),
@@ -1135,9 +1143,9 @@ def run_task(
                 bg_rect=bg_rect,
                 fix=fix,
                 logger=logger,
-                block_idx=trial_num,
+                trial_num=trial_num,
                 target_index=target_index,
-                trial_type=block_trial_type,
+                trial_type=current_trial_type,
                 isi=float(isi),
                 bg_rgb_255=bg_rgb,
                 onset_cue=onset_stim,
@@ -1165,11 +1173,11 @@ def run_task(
             is_correct = bool(choice_info.get("is_correct")) if choice_info is not None else False
 
             afc_counts["total"] += 1
-            if block_trial_type == "shape_to_color":
+            if current_trial_type == "shape_to_color":
                 afc_counts["s2c"] += 1
-            elif block_trial_type == "color_to_shape":
+            elif current_trial_type == "color_to_shape":
                 afc_counts["c2s"] += 1
-            elif block_trial_type == "shape_to_shape":
+            elif current_trial_type == "shape_to_shape":
                 afc_counts["s2s"] += 1
             if is_correct:
                 afc_counts["correct"] += 1
@@ -1185,7 +1193,7 @@ def run_task(
             last_trial_summary.update(
                 {
                     "trial_num": int(trial_num),
-                    "trial_type": block_trial_type,
+                    "trial_type": current_trial_type,
                     "target_index": int(target_index - 1),
                     "chosen_index": chosen_idx_zero_based if chosen_idx_zero_based != "" else "",
                     "result": trial_result,
@@ -1193,9 +1201,9 @@ def run_task(
             )
             _show_preview_afc_scene(
                 phase="feedback",
-                block_paths_current=block_paths,
+                trial_options_current=trial_options,
                 positions_current=positions,
-                trial_type_current=block_trial_type,
+                trial_type_current=current_trial_type,
                 target_index_current=target_index,
                 chosen_index_current=chosen_idx_1based,
                 is_correct_current=is_correct,
@@ -1213,7 +1221,7 @@ def run_task(
                     trial_num=trial_num,
                     event="gray_inter_trial_interval",
                     timestamp_perf_s=float(gray_start_perf),
-                    requested_duration=(float(ibi_s) + float(feedback_s)) if (ibi_s + feedback_s) > 0 else None,
+                    requested_duration=(float(iti_s) + float(feedback_s)) if (iti_s + feedback_s) > 0 else None,
                 )
 
             if is_correct and float(reward_pulse_s) > 0.0:
@@ -1260,7 +1268,7 @@ def run_task(
 
             behavior_row: Dict[str, Any] = {
                 "trial_num": int(trial_num),
-                "trial_type": block_trial_type,
+                "trial_type": current_trial_type,
                 "cue_feature": trial_meta.get("cue_feature", ""),
                 "choice_feature": trial_meta.get("choice_feature", ""),
                 "target_index": int(target_index - 1),
@@ -1275,21 +1283,21 @@ def run_task(
                 "choice_touch_y": _fmt_optional(choice_info.get("touch_y") if choice_info is not None else ""),
                 "choice_reaction_time": _fmt_optional(choice_info.get("reaction_time_s") if choice_info is not None else ""),
             }
-            for idx, (sid, cid) in enumerate(block_paths):
+            for idx, (sid, cid) in enumerate(trial_options):
                 behavior_row[f"option_{idx}_shape"] = int(sid)
                 behavior_row[f"option_{idx}_color"] = _fmt_optional_int(cid)
             if chosen_idx_1based is not None:
-                chosen_sid, chosen_cid = block_paths[int(chosen_idx_1based) - 1]
+                chosen_sid, chosen_cid = trial_options[int(chosen_idx_1based) - 1]
                 behavior_row["choice_made_shape"] = int(chosen_sid)
                 behavior_row["choice_made_color"] = _fmt_optional_int(chosen_cid)
             behavior_logger.writerow(behavior_row)
 
-            if ibi_frames > 0:
+            if iti_frames > 0:
                 _show_preview_afc_scene(phase="inter-trial interval")
-                for _ in range(max(0, int(ibi_frames) - 1)):
+                for _ in range(max(0, int(iti_frames) - 1)):
                     if _poll_experimenter_controls():
                         task_end_notes = "experimenter_exit"
-                        msg_logger.log("WARN", f"experimenter_exit_during_ibi trial_num={trial_num}")
+                        msg_logger.log("WARN", f"experimenter_exit_during_iti trial_num={trial_num}")
                         break
                     bg_rect.draw()
                     if fix is not None:
@@ -1326,6 +1334,7 @@ def run_task(
         except Exception:
             pass
         # Do not call core.quit() here; it raises SystemExit and can mask real exceptions.
+    return task_end_notes
 
 
 def main():
@@ -1388,15 +1397,15 @@ def main():
         )
 
     try:
-        run_task(
+        task_end_status = run_task(
             colors_tsv=_get("colors_tsv", cfg.get("colors_tsv")),
             shapes_tsv=_get("shapes_tsv", cfg.get("shapes_tsv")),
-            n_blocks=int(_get("n", cfg.get("n"))),
+            n_trials=int(_get("n", cfg.get("n"))),
             num_afc=int(_get("num_afc", cfg.get("num_afc", 4))),
             cue_time=float(cue_time_raw),
             delay_time=float(_get("delay_time", cfg.get("delay_time", 0.5))),
             choice_time=float(_get("choice_time", cfg.get("choice_time", 0.75))),
-            ibi=float(_get("ibi", cfg.get("ibi", 1.0))),
+            iti=float(_get("iti", cfg.get("iti", cfg.get("ibi", 1.0)))),
             output_dir=_get("output_dir", cfg.get("output_dir", "./logs")),
             isi=float(_get("isi", cfg.get("isi", 0.0))),
             bg=bg,
@@ -1441,6 +1450,8 @@ def main():
             config_name=cfg.get("config_name", "afc_csc1"),
             screen_config=screen_config,
         )
+        if task_end_status != "done":
+            sys.exit(USER_EXIT_CODE)
     except Exception as e:
         traceback.print_exc()
         print(f"ERROR: {e}", file=sys.stderr)

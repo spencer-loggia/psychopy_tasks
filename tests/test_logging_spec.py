@@ -1,3 +1,4 @@
+import csv
 import json
 import tempfile
 import unittest
@@ -6,6 +7,19 @@ from bin.logger import EventCodeLibrary, MessageLogger, SessionClock, SessionLog
 
 
 class LoggingSpecTests(unittest.TestCase):
+    def test_session_bundle_exposes_optional_calibration_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = SessionLogBundle(
+                output_root=tmpdir,
+                task_name="active_foraging",
+                config_name="test",
+            )
+            try:
+                self.assertEqual(bundle.calibration_path, bundle.session_dir / "calibration.json")
+                self.assertFalse(bundle.calibration_path.exists())
+            finally:
+                bundle.close()
+
     def test_message_logger_rejects_unknown_levels(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             logger = MessageLogger(tmpdir, session_clock=SessionClock())
@@ -73,6 +87,48 @@ class LoggingSpecTests(unittest.TestCase):
         self.assertEqual(option_dot.description, "Dot cue for option 2 became visible.")
         self.assertEqual(option_on.code, 1102)
         self.assertEqual(option_on.description, "Stimulus for option 2 became visible.")
+
+    def test_event_log_uses_trial_num_without_stimulus_counter(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = SessionLogBundle(
+                output_root=tmpdir,
+                task_name="random_image_sequence",
+                config_name="test",
+            )
+            try:
+                bundle.event_logger.log_frame_flip(
+                    trial_num=1,
+                    event="stimulus_on",
+                    timestamp_perf_s=bundle.session_clock.start_perf_s,
+                    requested_duration=0.5,
+                )
+            finally:
+                bundle.close()
+
+            with (bundle.session_dir / "event_log.tsv").open(
+                "r", encoding="utf-8", newline=""
+            ) as handle:
+                rows = list(csv.DictReader(handle, delimiter="\t"))
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(
+                list(rows[0]),
+                [
+                    "trial_num",
+                    "time_since_session_start",
+                    "event",
+                    "event_code",
+                    "event_type",
+                    "requested_duration",
+                ],
+            )
+            self.assertEqual(rows[0]["trial_num"], "1")
+
+    def test_trial_sequence_uses_trial_cue_event(self):
+        definitions, _ = load_task_event_definitions("afc_trial_sequence")
+
+        self.assertIn("trial_cue", definitions)
+        self.assertEqual(definitions["trial_cue"].code, 104)
 
 
 if __name__ == "__main__":

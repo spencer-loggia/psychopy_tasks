@@ -1,14 +1,109 @@
-# Random Image Sequence (PsychoPy scaffold)
+# Neuro Tasks
 
-Files added
-- `bin/`:
-  - `__init__.py`
-  - `utils.py` (image discovery, preloading, window and stim helpers)
-  - `logger.py` (TSV logger)
-  - `generate_sample_images.py` (create sample PNGs)
-- `task/`:
-  - `random_image_sequence.py` (task runner)
-- `requirements.txt`
+Repository layout
+
+- `bin/`: shared presentation, timing, hardware, screen, and TSV logging helpers.
+- `task/`: runnable tasks, including `active_foraging.py`, `afc_csc1.py`, `afc_trial_sequence.py`, standalone image/video stimulus tasks, and hardware setup utilities.
+- `config_files/`: deployment configurations.
+- `test_configs/` and `tests/`: development configurations and automated tests.
+
+Experiment Manager
+------------------
+
+Launch the touch interface with an interface configuration:
+
+```bash
+python interface/touch_interface.py --config config_files/interface/rpi_launch_config.json
+```
+
+The interface opens on subject selection. The launch config's `subjects` object maps each displayed full name to
+the short subject code used in directory names. Selecting a subject starts a new experiment under `logs`:
+
+`exp_[subject_code]_[YYYYMMDD]_[incrementing_id]`
+
+For example, Yuri's first experiment on August 13, 2026 is `logs/exp_Y_20260813_001`. The experiment directory
+contains:
+
+- `launch_config.json`: a snapshot of the interface launch config.
+- `event_name_library.json`: a snapshot of the shared event-name/code library used by its blocks.
+- `task_configs/`: snapshots of every task config referenced anywhere in the launch config, preserving paths
+  relative to the working directory.
+- `state.json`: the current mutable experiment state.
+- `blocks.tsv`: blocks in launch order, including start and end times in milliseconds from experiment start.
+- `blocks/[block_num]_[block_name]/`: the generated config and outputs for each block.
+
+`blocks.tsv` has the fields `block_name`, `block_num`, `subject`, `start_time`, `end_time`, and `out_dir`.
+`block_name` is the task config's `config_name`, falling back to the interface button name for a task with no
+source config. A row is written with a blank `end_time` before the subprocess starts and is updated when it exits,
+so an interrupted or failed block remains visible in the experiment record.
+
+The launch config must contain `subjects`, `tasks`, and `initial_state` objects. `initial_state` is copied into
+`state.json`, then its `subject` field is set to the selected full subject name. Eye calibration uses this state
+shape:
+
+```json
+{
+  "subject": null,
+  "eye_tracker_calibration": [
+    {
+      "x_scale": null,
+      "y_scale": null,
+      "x_offset": null,
+      "y_offset": null,
+      "set_time": 0.0
+    }
+  ]
+}
+```
+
+After every block, the manager checks its directory for `calibration.json`. For each top-level field that also
+names a list-valued state field, the calibration object must contain all fields in that state's most recent entry
+except `set_time`. The manager then appends those values and supplies `set_time` in milliseconds from experiment
+start. Extra calibration metadata is ignored. This generic matching rule allows future calibration histories to be
+added to `initial_state` without adding task-specific manager code.
+
+Before each block, the manager creates its output directory and writes `config.json` there. It copies the task
+config snapshot captured at experiment start, sets `config_name`, `output_dir`, and the full-name `subject`, copies
+other non-list state fields, and flattens the newest entry from every list-valued state field into top-level config
+fields, excluding `set_time`. It never injects the calibration-history lists themselves. The task subprocess is
+then launched with `--config` pointing to this generated file.
+
+Interface task entries can be nested into menu pages. A normal leaf has one launch script and an optional config:
+
+```json
+{
+  "launch": "task/active_foraging.py",
+  "config": "config_files/csc2/example.json"
+}
+```
+
+A loop leaf uses equal-length `launch` and `config` lists:
+
+```json
+{
+  "launch": ["task/active_foraging.py", "task/active_foraging.py"],
+  "config": ["config_files/csc2/classic.json", "config_files/csc2/memory.json"],
+  "order_mode": "sequential",
+  "n_iters": null
+}
+```
+
+`n_iters` counts launched blocks, not complete passes through the list. `sequential` wraps to the first item after
+the last; `random` samples one item independently for each block. `null` runs indefinitely, while a non-negative
+integer limits the number of blocks. A natural block completion (exit `0`) advances the loop. A user exit stops the
+current block and its loop immediately.
+
+Experiment-managed task/subprocess policies:
+
+- Every launchable script must accept `--config`. This includes setup utilities, even if they use only a few fields.
+- Natural completion returns process exit code `0`. Escape, an exit button, Ctrl-C, or another explicit user stop
+  returns `130`. Other nonzero codes mean failure. The manager stops a loop for either a user stop or failure.
+- Tasks using `SessionLogBundle` automatically write directly into the manager-created block directory when the
+  manager sets `NEURO_TASK_SESSION_DIR`; they must not add another session directory.
+- The manager sets `NEURO_EVENT_NAME_LIBRARY` so block event-code exports are resolved from the experiment's
+  snapshot rather than a subsequently edited repository file.
+- A state-producing task writes `calibration.json` in its block directory. Its top-level keys are state-field names,
+  and each value is an object containing at least the subfields declared by that state history.
 
 Generate sample images (for quick testing)
 ```bash
@@ -32,18 +127,35 @@ Notes
 - If `--n` is greater than available images, sampling is done with replacement.
 - In `active_foraging` and the current image-sequence presentation paths, timing-critical visual sections use frame-counted `win.flip()` loops rather than `core.wait()`. Remaining `core.wait()` usage is limited to non-visual polling or housekeeping paths and is not used to schedule stimulus onsets/offsets.
 
+Behavioral Terminology
+----------------------
+
+- A `block` is a contiguous chunk of an experiment dedicated to one task and stimulus type. Blocks are experiment-level units and are not repeated choice cycles inside a task.
+- A `trial` is one complete behavioral cycle. In active foraging this is initiation cue, option presentation, choice, reward or timeout, and the inter-trial interval. In standalone image and video tasks, one presented image or clip is one trial.
+- An option presentation within an AFC trial is represented by its frame-flip event. It does not receive a separate numeric identifier.
+- `trial_num` identifies the enclosing trial for every task.
+
 Logging Output
 --------------
-All tasks now write session outputs into a dedicated run directory under the configured `output_dir` (normally `./logs`):
+When run directly, tasks write session outputs into a dedicated run directory under the configured `output_dir`
+(normally `./logs`):
 
 `L_[YYYYMMDDHHMMSS]_[task_name]_[config_name]`
 
-Each session directory contains:
+When run by the experiment manager, the same files are written directly into
+`exp_.../blocks/[block_num]_[block_name]`; no `L_...` directory is added.
+
+Each session directory contains the applicable files from this set:
 
 - `event_log.tsv`
 - `message_log.tsv`
-- `behavior_log.tsv`
+- `behavior_log.tsv` when the task records trial-level behavior
 - `event_code_library.json`
+- `calibration.json` when the task produces runtime state that can affect a future block or task
+
+`calibration.json` is the project-wide filename for optional runtime task output that may affect future experiment
+state. It must be written inside the task's session directory. Tasks that do not produce such state do not create
+the file.
 
 The repo also includes a shared checked-in `event_name_library.json`. It is the repo-wide source of truth for event names, codes, event types, and descriptions across tasks. Not every event in that file is used by every task.
 
@@ -81,7 +193,7 @@ Common event-log rules:
 
 Allowed levels are `INFO`, `WARN`, and `ERROR`.
 
-`behavior_log.tsv` is task-specific. Every behavior log includes `trial_num` so behavior rows can be aligned with the event log.
+`behavior_log.tsv` is task-specific. Every behavior log includes `trial_num` so behavior rows can be aligned with `event_log.tsv`.
 
 Task-Specific Logging
 ---------------------
@@ -122,9 +234,9 @@ For `active_foraging`:
 
 Other tasks use the same session packaging and shared schemas but simpler task-specific behavior rows:
 
-- `random_image_sequence` logs one behavior row per presented image.
-- `afc_block_sequence` logs one behavior row per block, including the selected item list and any choice touch.
-- `play_video` logs one behavior row per played clip and only logs video clip start / expected duration / end in the event log, not every frame.
+- `random_image_sequence` treats each image presentation as a trial and logs one behavior row per image.
+- `afc_trial_sequence` logs one behavior row per trial, including the option list and any choice touch.
+- `play_video` treats each played clip as a trial and only logs clip start / expected duration / end in the event log, not every frame.
 
 Screen Selection
 ----------------
@@ -136,10 +248,12 @@ to those environment variables for launched tasks.
 For `active_foraging`, setting `screens.main` and `screens.experimenter` to the same display is allowed and disables
 the experimenter preview, so only the main task content is shown.
 
-The `active_foraging` experimenter display shows the current system time above the elapsed task timer. While
-stimuli are visible, their selectable hit boxes are outlined by reward level: red for `0`, gray for `1`, yellow
-for `2`, and green for `3`. Clicking `rew.` or pressing `r` delivers the configured manual juice-pump pulse.
-The keyboard command works when either the main task window or experimenter window has keyboard focus.
+The `active_foraging` experimenter display shows the config name, current subject, and current trial as
+`Trial: current / total`, in addition to the current system time and elapsed task timer. An indefinite task
+(`n <= 0`) displays `∞` as its total. While stimuli are visible, their selectable hit boxes are outlined by
+reward level: red for `0`, gray for `1`, yellow for `2`, and green for `3`. Clicking `rew.` or pressing `r`
+delivers the configured manual juice-pump pulse. The keyboard command works when either the main task window or
+experimenter window has keyboard focus.
 
 Eye Tracker Calibration
 -----------------------
@@ -177,9 +291,9 @@ When the smoothed eye position stays within `fix_diameter` of the fixation cross
 of the past `fix_accept_time`, the task delivers one automatic `pump_pulse_time_seconds` reward. That automatic
 reward re-arms only after fixation is broken or the fixation/calibration target is changed.
 
-On exit, the task writes `[YYYYMMDDHHMMSS]_eye_calibration.json` directly under `output_dir` with `x_scale`,
-`y_scale`, `x_offset`, and `y_offset`, plus DAQ/filter metadata. A normal session log directory is also created
-under `output_dir` for messages and pump signal events.
+On exit, the task writes `calibration.json` in its session log directory. The file has one top-level
+`eye_tracker_calibration` object containing `x_scale`, `y_scale`, `x_offset`, and `y_offset`, plus DAQ/filter
+metadata. The same directory contains its message and pump signal event logs.
 
 CPU Affinity for `active_foraging`
 ----------------------------------
@@ -209,12 +323,12 @@ Active Foraging Timing
 ----------------------
 The main visual timing parameters in `active_foraging` are interpreted by the presentation mode, not as abstract global delays. Those visual timings are quantized to display frames before use. `pump_delay_time` is separate: it is a post-choice reward delay applied in wall-clock seconds before reward delivery begins.
 
-`active_foraging` now validates requested visual timings against the active frame rate before the task starts. If `duration`, `isi`, `choice_time`, or `ibi` is not an exact multiple of the frame duration, the task logs an error and exits instead of silently rounding. It also enforces minimum visible durations: `choice_time` must be at least 1 frame, and when `sequential=true` or `is_memory=true`, `duration` must be at least 1 frame. If you want nominal frame-based timings such as `0.050` at `120 Hz`, set `refresh_rate` explicitly to the intended rate.
+`active_foraging` now validates requested visual timings against the active frame rate before the task starts. If `duration`, `isi`, `choice_time`, or `iti` is not an exact multiple of the frame duration, the task logs an error and exits instead of silently rounding. It also enforces minimum visible durations: `choice_time` must be at least 1 frame, and when `sequential=true` or `is_memory=true`, `duration` must be at least 1 frame. If you want nominal frame-based timings such as `0.050` at `120 Hz`, set `refresh_rate` explicitly to the intended rate.
 
 - `duration`: stimulus display duration. When `sequential=true`, this is the on-screen time for each individual stimulus in the sequence. When `sequential=false` and `is_memory=true`, the full array remains visible for `duration`, then the task switches to dot-only choice for `choice_time`. When `sequential=false` and `is_memory=false`, `duration` must be exactly `0`; the full array appears on the first choice frame and remains visible for `choice_time` only.
 - `isi`: pre-stimulus cue interval, not a between-trial delay. In simultaneous non-memory mode it shows dots at all candidate locations before the full array appears. In sequential memory mode it shows the dot cue for each item before that item is shown.
 - `choice_time`: response-window extension after the stimulus display phase defined by the active mode. In simultaneous non-memory mode the response window starts on the first frame of the full array and lasts `choice_time`, with the full array remaining visible throughout. In memory modes, the response window begins only after the stimulus display phase has finished and lasts `choice_time`, with only the remembered dot locations visible.
-- `ibi`: inter-block interval after choice handling. This begins only after reward delivery or timeout handling completes; it is not inserted between stimuli within a block.
+- `iti`: inter-trial interval after choice handling. This begins only after reward delivery or timeout handling completes; it is not inserted between option presentations within a trial. The old `ibi` config/CLI name remains accepted only as a deprecated compatibility alias.
 - `pump_delay_time`: delay in seconds between a rewarded choice being made and the first pump pulse. It applies only on rewarded trials with at least one configured pump pulse, and defaults to `0.0`.
 - `pump_pulse_time_seconds`: duration in seconds that the pump output remains on for each reward pulse.
 - `inter_pump_interval`: delay in seconds between repeated pump pulses. When omitted, it defaults to `pump_pulse_time_seconds`, preserving the previous behavior.
@@ -233,10 +347,10 @@ Common `active_foraging` configurations:
   - `choice_time`: after `duration`, only memory dots remain visible and selectable for this long.
 
 - Config B: `sequential=true`, `is_memory=true`
-  - For each option in the block: show that option's dot for `isi`, then show that stimulus for `duration`.
+  - For each option in the trial: show that option's dot for `isi`, then show that stimulus for `duration`.
   - After each stimulus disappears, its location remains as a memory dot.
   - After the final stimulus, the task enters a dot-only choice period for `choice_time`.
-  - `ibi` starts only after the resulting reward or timeout has finished.
+  - `iti` starts only after the resulting reward or timeout has finished.
 
 Active Foraging Positioning
 ---------------------------
@@ -246,6 +360,30 @@ Active Foraging Positioning
 - `fixed_positions=false`: locations are random points on the circle, with rejected draws when stimulus bounding boxes would overlap.
 - Custom `center_point` and `stim_range_radius` values can be provided in JSON or as `--center_point X Y --stim_range_radius R`.
 
+Active Foraging Subject Maps
+----------------------------
+`active_foraging` requires a JSON config and an exact, case-sensitive `subject` value. Both `freq_space_tsv` and
+`reward_space_tsv` must be objects mapping subject names to paths; scalar path values and command-line path
+overrides are not supported. The task resolves both maps before opening a window. If `subject` is unset, absent
+from either map, or resolves to an empty/non-string path, the task exits with an error.
+
+```json
+{
+  "subject": "Yuri",
+  "freq_space_tsv": {
+    "Yuri": "./task/resources/csc2/freq_space_TY.csv",
+    "Buzz": "./task/resources/csc2/freq_space_SB.csv"
+  },
+  "reward_space_tsv": {
+    "Yuri": "./task/resources/csc2/reward_space_TY.csv",
+    "Buzz": "./task/resources/csc2/reward_space_SB.csv"
+  }
+}
+```
+
+When the experiment manager launches the task, its generated block config supplies the selected full subject name,
+so the subject keys in these maps must match the names in the launch config's `subjects` object.
+
 Active Foraging Color TSV
 -------------------------
 `active_foraging` expects `colors_tsv` to be a tab-delimited file with four columns: `id`, `r`, `g`, `b` (column name case is flexible, for example `ID R G B` also works).
@@ -253,7 +391,7 @@ Active Foraging Color TSV
 - Include a header row.
 - The first data row is treated as the background gray and is not used as a selectable stimulus color.
 - Every later row is one displayable color definition with a unique integer ID and integer RGB values.
-- Row order matters. After the background row, colors must be ordered by luminance blocks: all `n_colors` base colors for luminance level 1, then all `n_colors` base colors for luminance level 2, and so on.
+- Row order matters. After the background row, colors must be ordered by luminance groups: all `n_colors` base colors for luminance level 1, then all `n_colors` base colors for luminance level 2, and so on.
 - The number of non-background color rows must equal `n_colors * n_lum_levels`.
 
 Example:
@@ -272,9 +410,10 @@ All tasks in this repository must support loading a JSON configuration file as a
 
 - `images_dir` (string): path to image resources
 - `output_dir` (string): path where logs and metadata will be saved
-- `n` (int): number of stimuli to display
+- `n` (int): number of trials; for standalone sequence tasks, each image or clip presentation is one trial
 - `duration` (number): stimulus presentation duration in seconds. For `active_foraging`, this must be positive when `sequential=true` or `is_memory=true`, and must be `0` only when both are false.
 - `isi` (number): pre-stimulus / inter-stimulus interval in seconds; exact meaning is task-specific
+- `iti` (number): inter-trial interval in seconds for trial-based tasks
 - `bg` (array of 3 ints): background RGB values in 0-255
 - `seed` (int, optional): random seed
 - `fullscreen` (bool, optional)
@@ -316,8 +455,3 @@ Or override a config value from CLI:
 ```bash
 python task/random_image_sequence.py --config example_config.json --n 20 --duration 0.4
 ```
-
-Next steps
-- Add subject/run CLI args and include them in the TSV header and meta file.
-- Add a small unit test that verifies the logger writes TSV rows.
-- Add optional preloading progress reporting for large image sets.

@@ -6,15 +6,14 @@ Active foraging task.
 - Loads a shape-definition TSV (ID, PATH) where PATH must point to an SVG
 - Builds shape-color pairs (shape_id, color_id) and rasterizes SVGs recolored
   to each color at `image_size`.
-- Presents blocks similar to `afc_block_sequence`: shows stimuli one-at-a-time,
-  leaves persistent dots, shows all dots for `choice_time`, then inter-block
-  interval `ibi`.
+- Each trial presents a cue, the available options, a choice period, the
+  resulting reward or timeout, and an inter-trial interval (`iti`).
 
 Config keys required/additional:
 - colors_tsv: path to TSV file with ID, R, G, B
 - shapes_tsv: path to TSV file with ID, PATH (SVG)
 - image_size: [W, H]
-- num_afc, n, duration, isi, ibi, choice_time, dot_size, dot_color, init_dot_color
+- num_afc, n, duration, isi, iti, choice_time, dot_size, dot_color, init_dot_color
 - pump_delay_time: delay in seconds between a rewarded choice and the first pump pulse
 - inter_pump_interval: optional delay in seconds between pump pulses; defaults to pump_pulse_time_seconds
 - trial_start_pin is a Raspberry Pi BCM GPIO pin; pump_pin and buzz_pin are
@@ -28,7 +27,7 @@ import sys
 import time
 import random
 from pathlib import Path
-from typing import Tuple, Optional, List, Dict, Any
+from typing import Tuple, Optional, List, Dict, Any, Mapping
 import pandas as pd
 
 from psychopy import core, logging as pylogging, event
@@ -45,8 +44,9 @@ from bin.affinity import (
 )
 from bin.daqc2_outputs import DAQC2DigitalOutputs
 from bin.logger import SessionLogBundle
+from bin.task_lifecycle import USER_EXIT_CODE
 import numpy as np
-from bin.config import load_config, validate_config
+from bin.config import load_config, resolve_subject_mapped_value, validate_config
 from bin.screen import (
     ExperimenterPreview,
     describe_screen,
@@ -74,7 +74,7 @@ def _generate_active_foraging_trial(trial_idx: int, config: dict) -> dict:
         config: Dictionary with all parameters needed for trial generation
     
     Returns:
-        Dictionary with trial data including block_paths, block_meta, and rendered stimuli
+        Dictionary with trial data including trial_options, trial_option_meta, and rendered stimuli
     """
     # Extract config
     base_pairs = [tuple(x) for x in config["base_pairs"]]
@@ -83,7 +83,7 @@ def _generate_active_foraging_trial(trial_idx: int, config: dict) -> dict:
     flat_probs = np.array(config["flat_probs"], dtype=float)
     num_afc = int(config["num_afc"])
     n_lum_levels = int(config["n_lum_levels"])
-    n_blocks = int(config["n_blocks"])
+    n_trials = int(config["n_trials"])
     image_size = tuple(config["image_size"])
     bg = tuple(config["bg"])
     total_nonzero = int(config["total_nonzero"])
@@ -99,8 +99,8 @@ def _generate_active_foraging_trial(trial_idx: int, config: dict) -> dict:
     rng_seed = None if seed is None else int(seed) + trial_idx
     rng = np.random.default_rng(rng_seed)
     
-    # Check if we're done (when running with fixed n_blocks)
-    if n_blocks > 0 and trial_idx > n_blocks:
+    # Check if we're done (when running with fixed n_trials)
+    if n_trials > 0 and trial_idx > n_trials:
         return {"type": "done"}
     
     # Sample color-shape pairs for this trial
@@ -109,8 +109,8 @@ def _generate_active_foraging_trial(trial_idx: int, config: dict) -> dict:
     else:
         picks = rng.choice(len(base_pairs), size=num_afc, replace=True, p=flat_probs)
     
-    block_paths: List[Tuple[int, int]] = []
-    block_meta: List[Tuple[int, int, int]] = []
+    trial_options: List[Tuple[int, int]] = []
+    trial_option_meta: List[Tuple[int, int, int]] = []
     rendered: Dict[Tuple[int, int], np.ndarray] = {}
     
     for i in picks:
@@ -119,8 +119,8 @@ def _generate_active_foraging_trial(trial_idx: int, config: dict) -> dict:
         sid = int(shape_ids[shape_idx])
         cid = int(color_id_matrix[lum_idx, color_idx])
         pair = (sid, cid)
-        block_paths.append([int(sid), int(cid)])  # Store as list for serialization
-        block_meta.append([int(shape_idx), int(color_idx), int(lum_idx)])  # Store as list
+        trial_options.append([int(sid), int(cid)])  # Store as list for serialization
+        trial_option_meta.append([int(shape_idx), int(color_idx), int(lum_idx)])  # Store as list
         
         # Rasterize if not already done
         if pair not in rendered:
@@ -142,8 +142,8 @@ def _generate_active_foraging_trial(trial_idx: int, config: dict) -> dict:
     return {
         "type": "trial",
         "trial_idx": int(trial_idx),
-        "block_paths": block_paths,
-        "block_meta": block_meta,
+        "trial_options": trial_options,
+        "trial_option_meta": trial_option_meta,
         "rendered": rendered_serializable,
     }
 
@@ -154,13 +154,13 @@ def _decode_trial_payload(payload: dict) -> Tuple[List[Tuple[int, int]], List[Tu
     if payload.get("type") != "trial":
         raise RuntimeError(f"Unexpected payload from trial buffer: {payload}")
 
-    block_paths = [tuple(x) for x in payload["block_paths"]]
-    block_meta = [tuple(x) for x in payload["block_meta"]]
+    trial_options = [tuple(x) for x in payload["trial_options"]]
+    trial_option_meta = [tuple(x) for x in payload["trial_option_meta"]]
     preloaded: Dict[Tuple[int, int], Any] = {}
     for key_str, arr in payload["rendered"].items():
         sid, cid = map(int, key_str.split('_'))
         preloaded[(sid, cid)] = arr
-    return block_paths, block_meta, preloaded
+    return trial_options, trial_option_meta, preloaded
 
 
 def _stim_size_from_preloaded(preloaded: Dict[Tuple[int, int], Any], first_pair: Tuple[int, int]) -> Tuple[int, int]:
@@ -322,7 +322,11 @@ def _build_behavior_fieldnames(num_afc: int) -> List[str]:
 
 def parse_args():
     p = argparse.ArgumentParser(description="Active foraging task")
-    p.add_argument("--config", help="Path to JSON config file. CLI overrides config keys.")
+    p.add_argument(
+        "--config",
+        required=True,
+        help="Path to JSON config file. CLI overrides non-map config keys.",
+    )
     p.add_argument(
         "--colors_tsv",
         help=(
@@ -331,8 +335,8 @@ def parse_args():
         ),
     )
     p.add_argument("--shapes_tsv", help="Path to shapes TSV (overrides config)")
-    p.add_argument("--n", type=int, default=None, help="Number of blocks (overrides config n)")
-    p.add_argument("--num_afc", type=int, default=None, help="Number of stimuli per block")
+    p.add_argument("--n", type=int, default=None, help="Number of trials (overrides config n)")
+    p.add_argument("--num_afc", type=int, default=None, help="Number of options per trial")
     p.add_argument(
         "--duration",
         type=float,
@@ -342,20 +346,27 @@ def parse_args():
             "is_memory=true; must be 0 when both are false."
         ),
     )
-    p.add_argument("--choice_time", type=float, default=None, help="Choice display time after block (s)")
-    p.add_argument("--ibi", type=float, default=None, help="Inter-block interval (s)")
-    p.add_argument("--isi", type=float, default=None, help="Pre-block fixation delay before first stim")
+    p.add_argument("--choice_time", type=float, default=None, help="Choice display duration (s)")
+    p.add_argument(
+        "--iti",
+        "--ibi",
+        dest="iti",
+        type=float,
+        default=None,
+        help="Inter-trial interval (s); --ibi is a deprecated compatibility alias",
+    )
+    p.add_argument("--isi", type=float, default=None, help="Pre-stimulus cue duration (s)")
     p.add_argument("--dot_size", type=int, default=None, help="Dot size in pixels")
     p.add_argument("--dot_color", type=int, nargs=3, default=None, help="Persistent dot RGB color 0-255")
     p.add_argument("--init_dot_color", type=int, nargs=3, default=None, help="Init pre-stimulus dot RGB color 0-255")
     p.add_argument("--output_dir", default=None, help="Output dir for logs")
+    p.add_argument("--subject", default=None, help="Current subject name")
     p.add_argument("--seed", type=int, default=None, help="Random seed")
     p.add_argument("--fullscreen", action="store_true", default=None, help="Fullscreen")
     p.add_argument("--win_size", type=int, nargs=2, default=None, help="Window size when not fullscreen")
     p.add_argument("--image_size", type=int, nargs=2, default=None, help="Raster draw size (W H)")
-    p.add_argument("--likelihood_tsv", help="Optional TSV file (color,shape,prob) defining color-shape probabilities")
     p.add_argument("--debug", action="store_true", default=None, help="Enable debug outputs (write debug images to logs/)")
-    p.add_argument("--self_initiation", action="store_true", default=None, help="Require participant to self-initiate each block by clicking an onset cue")
+    p.add_argument("--self_initiation", action="store_true", default=None, help="Require participant to self-initiate each trial by clicking an onset cue")
     p.add_argument("--fixation_size", type=int, default=None, help="Fixation cross size in pixels; 0 disables fixation")
     p.add_argument("--fixed_positions", action="store_true", default=None, help="Fix option positions to evenly spaced locations on the stimulus circle")
     p.add_argument("--center_point", type=int, nargs=2, default=None, help="Stimulus circle center in main-screen pixels: X Y")
@@ -369,8 +380,6 @@ def parse_args():
     p.add_argument("--daq_address", type=int, default=None, help="DAQC2plate address for pump/buzzer DOUT outputs")
     p.add_argument("--pump_pin", type=int, default=None, help="DAQC2 DOUT bit for pump reward delivery (0-7)")
     p.add_argument("--buzz_pin", type=int, default=None, help="DAQC2 DOUT bit for timeout buzzer (0-7)")
-    p.add_argument("--freq_space_tsv", help="CSV file defining color-shape pair probabilities")
-    p.add_argument("--reward_space_tsv", help="CSV file defining reward levels for color-shape pairs")
     p.add_argument(
         "--pump_delay_time",
         type=float,
@@ -401,22 +410,24 @@ def parse_args():
 def run_task(
     colors_tsv: str,
     shapes_tsv: str,
-    n_blocks: int,
+    n_trials: int,
     num_afc: int,
     duration: float,
     choice_time: float,
-    ibi: float,
+    iti: float,
     isi: float,
     init_dot_color: Optional[Tuple[int, int, int]],
     dot_size: int,
     dot_color: Tuple[int, int, int],
     output_dir: str,
+    subject: str,
+    freq_space_tsv: Mapping[str, str],
+    reward_space_tsv: Mapping[str, str],
     seed: Optional[int] = None,
     fullscreen: bool = False,
     win_size: Optional[Tuple[int, int]] = None,
     image_size: Optional[Tuple[int, int]] = None,
     debug: bool = False,
-    likelihood_tsv: Optional[str] = None,
     self_initiation: bool = False,
     fixation_size: Optional[int] = None,
     refresh_rate: Optional[float] = None,
@@ -432,8 +443,6 @@ def run_task(
     stim_range_radius: Optional[float] = None,
     sequential: bool = True,
     is_memory: bool = True,
-    freq_space_tsv: Optional[str] = None,
-    reward_space_tsv: Optional[str] = None,
     pump_delay_time: float = 0.0,
     pump_pulse_time_seconds: float = 0.25,
     inter_pump_interval: Optional[float] = None,
@@ -451,6 +460,18 @@ def run_task(
     stroke_linecap: Optional[str] = None,
     screen_config: Optional[Dict[str, Any]] = None,
 ):
+    resolved_subject = "" if subject is None else str(subject).strip()
+    freq_space_tsv = resolve_subject_mapped_value(
+        freq_space_tsv,
+        subject=resolved_subject,
+        field_name="freq_space_tsv",
+    )
+    reward_space_tsv = resolve_subject_mapped_value(
+        reward_space_tsv,
+        subject=resolved_subject,
+        field_name="reward_space_tsv",
+    )
+
     # Set debug flag before rasterization if requested
     utils.set_debug(debug)
 
@@ -493,7 +514,7 @@ def run_task(
         "INFO",
         (
             f"session_start task=active_foraging config_name={resolved_config_name} "
-            f"session_dir={session_logs.session_dir}"
+            f"subject={resolved_subject or 'not_set'} session_dir={session_logs.session_dir}"
         ),
     )
 
@@ -598,88 +619,25 @@ def run_task(
     # Expected number of color-shape pairs for validation
     expected_len = n_colors_expected * n_shapes_expected
 
-    # Load frequency space (determines probability of each color-shape pair)
-    # If freq_space_tsv is provided, use it; otherwise fall back to likelihood_tsv
-    if freq_space_tsv is not None:
-        freq_path = Path(freq_space_tsv)
-        if not freq_path.exists():
-            raise FileNotFoundError(f"freq_space_tsv not found: {freq_space_tsv}")
-        # Load as specified: first column, reshape to (36, 36), transpose
-        freq_df = pd.read_csv(freq_path)
-        freq_flat = freq_df.iloc[:, 0].values
-        # Validate length matches expected pairs
-        if len(freq_flat) != expected_len:
-            raise ValueError(
-                f"freq_space has {len(freq_flat)} entries but expected n_colors*n_shapes={n_colors_expected}*{n_shapes_expected}={expected_len}"
-            )
-        # Reshape: user specifies reshape((36, 36)).T, but we need to use actual dims
-        freq_matrix = freq_flat.reshape((n_shapes_expected, n_colors_expected)).T  # shape (n_colors, n_shapes)
-        likelihood = freq_matrix.astype(float)
-        # Normalize
-        total = float(likelihood.sum())
-        if total <= 0.0:
-            msg_logger.log("WARN", "freq_space sums to zero; using uniform distribution")
-            likelihood = np.ones((n_colors_expected, n_shapes_expected), dtype=float) / float(expected_len)
-        else:
-            likelihood = likelihood / total
-        msg_logger.log("INFO", f"Loaded freq_space from {freq_space_tsv} (sum={total:.6f})")
-    elif likelihood_tsv is not None:
-        # Legacy: load from likelihood_tsv (previous format)
-        def load_likelihood(path: Optional[str]):
-            # returns numpy array shape (n_colors, m_shapes)
-            if path is None:
-                arr = np.ones((n_colors_expected, n_shapes_expected), dtype=float)
-                total = float(arr.sum())
-                msg_logger.log("WARN", f"No likelihood TSV provided; using uniform distribution (sum={total:.6f})")
-                arr = arr / total
-                return arr
-
-            p = Path(path)
-            if not p.exists():
-                raise FileNotFoundError(f"Likelihood TSV not found: {path}")
-
-            arr = np.zeros((n_colors_expected, n_shapes_expected), dtype=float)
-            import csv
-
-            with p.open("r", encoding="utf-8") as fh:
-                reader = csv.DictReader(fh, delimiter="\t")
-                if reader.fieldnames is None:
-                    # expect three columns without header -> not supported
-                    raise ValueError("Likelihood TSV must have header columns: color,shape,prob")
-                for row in reader:
-                    try:
-                        cid = int(row.get("color") or row.get("Color") or row.get(reader.fieldnames[0]))
-                        sid = int(row.get("shape") or row.get("Shape") or row.get(reader.fieldnames[1]))
-                        prob = float(row.get("prob") or row.get("Prob") or row.get(reader.fieldnames[2]))
-                    except Exception as e:
-                        raise ValueError(f"Invalid row in likelihood TSV: {row}") from e
-                    if cid not in color_ids:
-                        raise ValueError(f"Likelihood TSV references unknown color id: {cid}")
-                    if sid not in shape_ids:
-                        raise ValueError(f"Likelihood TSV references unknown shape id: {sid}")
-                    # Legacy likelihood_tsv addresses full color ids; map to base color index.
-                    ci_full = color_ids.index(cid)
-                    ci = int(ci_full % n_colors_expected)
-                    si = shape_ids.index(sid)
-                    arr[ci, si] = prob
-
-            total = float(arr.sum())
-            if total == 0.0:
-                msg_logger.log("WARN", "Likelihood TSV sums to zero; falling back to uniform distribution")
-                arr = np.ones((n_colors_expected, n_shapes_expected), dtype=float)
-                arr /= arr.sum()
-                return arr
-            if not np.isclose(total, 1.0):
-                msg_logger.log("WARN", f"Likelihood TSV sum is {total:.6f}; normalizing to sum to 1")
-                arr = arr / total
-            return arr
-
-        likelihood = load_likelihood(likelihood_tsv)
+    # Load the subject-selected frequency space.
+    freq_path = Path(freq_space_tsv)
+    if not freq_path.exists():
+        raise FileNotFoundError(f"freq_space_tsv not found: {freq_space_tsv}")
+    freq_df = pd.read_csv(freq_path)
+    freq_flat = freq_df.iloc[:, 0].values
+    if len(freq_flat) != expected_len:
+        raise ValueError(
+            f"freq_space has {len(freq_flat)} entries but expected n_colors*n_shapes={n_colors_expected}*{n_shapes_expected}={expected_len}"
+        )
+    freq_matrix = freq_flat.reshape((n_shapes_expected, n_colors_expected)).T
+    likelihood = freq_matrix.astype(float)
+    total = float(likelihood.sum())
+    if total <= 0.0:
+        msg_logger.log("WARN", "freq_space sums to zero; using uniform distribution")
+        likelihood = np.ones((n_colors_expected, n_shapes_expected), dtype=float) / float(expected_len)
     else:
-        # No freq_space or likelihood provided; use uniform
-        likelihood = np.ones((n_colors_expected, n_shapes_expected), dtype=float)
-        likelihood /= likelihood.sum()
-        msg_logger.log("WARN", "No freq_space_tsv or likelihood_tsv provided; using uniform distribution")
+        likelihood = likelihood / total
+    msg_logger.log("INFO", f"Loaded freq_space from {freq_space_tsv} (sum={total:.6f})")
 
     # Load reward space (maps each color-shape pair to a reward level)
     # Initialize default: all pairs have reward 0
@@ -687,49 +645,39 @@ def run_task(
     for pair in all_pairs:
         reward_map[pair] = 0
     
-    if reward_space_tsv is not None:
-        reward_path = Path(reward_space_tsv)
-        if not reward_path.exists():
-            raise FileNotFoundError(f"reward_space_tsv not found: {reward_space_tsv}")
-        # Load as specified: first column, reshape to (36, 36), transpose
-        reward_df = pd.read_csv(reward_path)
-        reward_flat = reward_df.iloc[:, 0].values
-        # Validate length matches expected pairs
-        if len(reward_flat) != expected_len:
-            raise ValueError(
-                f"reward_space has {len(reward_flat)} entries but expected n_colors*n_shapes={n_colors_expected}*{n_shapes_expected}={expected_len}"
-            )
-        # Reshape: same as freq_space
-        reward_matrix = reward_flat.reshape((n_shapes_expected, n_colors_expected)).T  # shape (n_colors, n_shapes)
-        
-        # Build reward_map from matrix
-        for shape_idx, sid in enumerate(shape_ids):
-            for color_idx in range(n_colors_expected):
-                reward_level = int(reward_matrix[color_idx, shape_idx])
-                for lum_idx in range(n_lum_levels):
-                    cid = int(color_id_matrix[lum_idx, color_idx])
-                    reward_map[(sid, cid)] = reward_level
-        
-        # Validate reward levels match reward_to_pulse_map and reward_to_timeout_map
-        unique_rewards = set(reward_map.values())
-        if reward_to_pulse_map is not None:
-            # Convert keys to int for comparison
-            pulse_keys = set(int(k) for k in reward_to_pulse_map.keys())
-            if not unique_rewards.issubset(pulse_keys):
-                missing = unique_rewards - pulse_keys
-                raise ValueError(f"reward_space contains reward levels {missing} not defined in reward_to_pulse_map")
-        if reward_to_timeout_map is not None:
-            # Convert keys to int for comparison
-            timeout_keys = set(int(k) for k in reward_to_timeout_map.keys())
-            if not unique_rewards.issubset(timeout_keys):
-                missing = unique_rewards - timeout_keys
-                raise ValueError(f"reward_space contains reward levels {missing} not defined in reward_to_timeout_map")
-        
-        msg_logger.log("INFO", f"Loaded reward_space from {reward_space_tsv}, unique rewards: {sorted(unique_rewards)}")
-    else:
-        msg_logger.log("INFO", "No reward_space_tsv provided; all pairs have reward level 0")
+    reward_path = Path(reward_space_tsv)
+    if not reward_path.exists():
+        raise FileNotFoundError(f"reward_space_tsv not found: {reward_space_tsv}")
+    reward_df = pd.read_csv(reward_path)
+    reward_flat = reward_df.iloc[:, 0].values
+    if len(reward_flat) != expected_len:
+        raise ValueError(
+            f"reward_space has {len(reward_flat)} entries but expected n_colors*n_shapes={n_colors_expected}*{n_shapes_expected}={expected_len}"
+        )
+    reward_matrix = reward_flat.reshape((n_shapes_expected, n_colors_expected)).T
 
-    # Preloading is deferred until after block sampling to avoid rasterizing
+    for shape_idx, sid in enumerate(shape_ids):
+        for color_idx in range(n_colors_expected):
+            reward_level = int(reward_matrix[color_idx, shape_idx])
+            for lum_idx in range(n_lum_levels):
+                cid = int(color_id_matrix[lum_idx, color_idx])
+                reward_map[(sid, cid)] = reward_level
+
+    unique_rewards = set(reward_map.values())
+    if reward_to_pulse_map is not None:
+        pulse_keys = set(int(k) for k in reward_to_pulse_map.keys())
+        if not unique_rewards.issubset(pulse_keys):
+            missing = unique_rewards - pulse_keys
+            raise ValueError(f"reward_space contains reward levels {missing} not defined in reward_to_pulse_map")
+    if reward_to_timeout_map is not None:
+        timeout_keys = set(int(k) for k in reward_to_timeout_map.keys())
+        if not unique_rewards.issubset(timeout_keys):
+            missing = unique_rewards - timeout_keys
+            raise ValueError(f"reward_space contains reward levels {missing} not defined in reward_to_timeout_map")
+
+    msg_logger.log("INFO", f"Loaded reward_space from {reward_space_tsv}, unique rewards: {sorted(unique_rewards)}")
+
+    # Preloading is deferred until after trial option sampling to avoid rasterizing
     # the full color x shape x luminance combinatoric space.
     preloaded: dict = {}
 
@@ -754,6 +702,9 @@ def run_task(
         experimenter_preview = ExperimenterPreview(
             experimenter_screen,
             task_label=resolved_config_name,
+            subject=resolved_subject or "(not set)",
+            current_trial_num=1,
+            total_trials=n_trials,
             start_perf_s=time.perf_counter(),
             update_interval_s=0.1,
             mouse_visible=experimenter_mouse_visible,
@@ -790,7 +741,7 @@ def run_task(
             "duration": duration,
             "isi": isi,
             "choice_time": choice_time,
-            "ibi": ibi,
+            "iti": iti,
         },
         context="active_foraging",
         minimum_frames={
@@ -823,7 +774,7 @@ def run_task(
             dur_fr, dur_s = (0, 0.0)
         isi_fr, isi_s = _q(isi, at_least_one=False)
         ch_fr, ch_s = _q(choice_time, at_least_one=False)
-        ibi_fr, ibi_s = _q(ibi, at_least_one=False)
+        iti_frames, iti_s = _q(iti, at_least_one=False)
         msg_logger.log(
             "INFO",
             (
@@ -831,7 +782,7 @@ def run_task(
                 f"duration={duration:.6f}s-> {dur_fr}fr({dur_s:.6f}s) "
                 f"isi={isi:.6f}s-> {isi_fr}fr({isi_s:.6f}s) "
                 f"choice_time={choice_time:.6f}s-> {ch_fr}fr({ch_s:.6f}s) "
-                f"ibi={ibi:.6f}s-> {ibi_fr}fr({ibi_s:.6f}s)"
+                f"iti={iti:.6f}s-> {iti_frames}fr({iti_s:.6f}s)"
             ),
         )
     except Exception:
@@ -874,7 +825,7 @@ def run_task(
     def _preview_choice_feedback(
         *,
         preloaded_items: Dict[Tuple[int, int], Any],
-        block_paths_current: List[Tuple[int, int]],
+        trial_options_current: List[Tuple[int, int]],
         positions_current: List[Tuple[float, float]],
         chosen_index_1based: int,
         reward_level: int,
@@ -904,7 +855,7 @@ def run_task(
         else:
             dots = []
             highlight_size = (float(dot_size * 2.4), float(dot_size * 2.4))
-            for idx, (pair, pos) in enumerate(zip(block_paths_current, positions_current), start=1):
+            for idx, (pair, pos) in enumerate(zip(trial_options_current, positions_current), start=1):
                 image_obj = preloaded_items.get(pair)
                 payload = serialize_preview_image(image_obj)
                 if payload is None:
@@ -1090,7 +1041,7 @@ def run_task(
         flat_probs = flat_probs / float(flat_probs.sum())
 
     # Configure background trial buffer worker (separate process/core).
-    run_indefinitely = int(n_blocks) <= 0
+    run_indefinitely = int(n_trials) <= 0
     buffer_len_trials = max(1, int(buffer_len_trials) if buffer_len_trials is not None else 5)
 
     worker_cfg = {
@@ -1100,7 +1051,7 @@ def run_task(
         "flat_probs": flat_probs.tolist(),
         "num_afc": int(num_afc),
         "n_lum_levels": int(n_lum_levels),
-        "n_blocks": int(n_blocks),
+        "n_trials": int(n_trials),
         "image_size": list(image_size),
         "bg": list(bg),
         "total_nonzero": int(total_nonzero),
@@ -1141,8 +1092,8 @@ def run_task(
         except Exception:
             pass
     task_end_notes = "done"
-    ibi_frames = max(0, int(round(float(ibi) * fps)))
-    ibi_s = ibi_frames / fps
+    iti_frames = max(0, int(round(float(iti) * fps)))
+    iti_s = iti_frames / fps
 
     def _fmt_optional(value: Any) -> str:
         if value == "" or value is None:
@@ -1153,31 +1104,33 @@ def run_task(
         msg_logger.log(
             "INFO",
             (
-                f"task_ready n_blocks={n_blocks} num_afc={num_afc} "
+                f"task_ready n_trials={n_trials} num_afc={num_afc} "
                 f"run_indefinitely={int(run_indefinitely)} buffer_len_trials={buffer_len_trials}"
             ),
         )
 
-        block_idx = 1
+        trial_num = 1
         while True:
+            if experimenter_preview is not None:
+                experimenter_preview.set_trial_progress(trial_num, n_trials)
             if _poll_experimenter_controls():
                 task_end_notes = "experimenter_exit"
                 msg_logger.log("WARN", "experimenter_exit_before_trial_start")
                 break
-            if (not run_indefinitely) and block_idx > n_blocks:
+            if (not run_indefinitely) and trial_num > n_trials:
                 break
 
             payload = buffer_mgr.get_next_trial()
-            block_paths, block_meta, preloaded = _decode_trial_payload(payload)
+            trial_options, trial_option_meta, preloaded = _decode_trial_payload(payload)
             if payload.get("type") == "done":
                 break
-            trial_num = int(payload.get("trial_idx", block_idx))
+            trial_num = int(payload.get("trial_idx", trial_num))
             msg_logger.log(
                 "INFO",
-                f"trial_loaded trial_num={trial_num} block_idx={block_idx} block_meta={block_meta}",
+                f"trial_loaded trial_num={trial_num} trial_option_meta={trial_option_meta}",
             )
 
-            first_pair = block_paths[0]
+            first_pair = trial_options[0]
             stim_size = _stim_size_from_preloaded(preloaded, first_pair)
 
             effective_win_size = resolve_scene_size(
@@ -1196,14 +1149,14 @@ def run_task(
             )
 
             for i, (spos, cpos) in enumerate(zip(sampled_positions, positions), start=1):
-                msg_logger.log("INFO", f"position_assigned block={block_idx} idx={i} screen_px={spos} psychopy_pos={cpos}")
+                msg_logger.log("INFO", f"position_assigned trial_num={trial_num} option_num={i} screen_px={spos} psychopy_pos={cpos}")
 
             trial_meta: Dict[str, Any] = {}
             _show_preview_idle()
-            aborted, choice_info = utils.present_block_with_persistent_dots(
+            aborted, choice_info = utils.present_trial_with_persistent_dots(
                 win=win,
                 preloaded=preloaded,
-                block_paths=block_paths,
+                trial_options=trial_options,
                 positions=positions,
                 duration=duration,
                 choice_time=choice_time,
@@ -1212,7 +1165,7 @@ def run_task(
                 bg_rect=bg_rect,
                 fix=fix,
                 logger=logger,
-                block_idx=block_idx,
+                trial_num=trial_num,
                 isi=isi,
                 init_dot_color=init_dot_color,
                 bg_rgb_255=bg,
@@ -1230,7 +1183,7 @@ def run_task(
                 external_abort_checker=_poll_experimenter_controls,
                 scene_main_size=effective_win_size,
                 event_profile="active_foraging",
-                reward_levels=[reward_map.get(pair, 0) for pair in block_paths],
+                reward_levels=[reward_map.get(pair, 0) for pair in trial_options],
             )
             if aborted:
                 if task_end_notes == "done" and _poll_experimenter_controls():
@@ -1243,7 +1196,7 @@ def run_task(
 
             chosen_idx_row_1based = choice_info.get("chosen_index") if choice_info is not None else None
             chosen_idx_row = int(chosen_idx_row_1based - 1) if chosen_idx_row_1based is not None else ""
-            chosen_pair_row = block_paths[chosen_idx_row_1based - 1] if chosen_idx_row_1based is not None else None
+            chosen_pair_row = trial_options[chosen_idx_row_1based - 1] if chosen_idx_row_1based is not None else None
             reward_level_row = reward_map.get(chosen_pair_row, "") if chosen_pair_row is not None else ""
             num_pulses = 0
             apply_timeout = 0
@@ -1251,9 +1204,9 @@ def run_task(
             if choice_info is not None:
                 abort_requested = False
                 chosen_idx = choice_info["chosen_index"]
-                chosen_pair = block_paths[chosen_idx - 1]
+                chosen_pair = trial_options[chosen_idx - 1]
                 reward_level = reward_map.get(chosen_pair, 0)
-                chosen_shape_idx, chosen_color_idx, chosen_lum_idx = block_meta[chosen_idx - 1]
+                chosen_shape_idx, chosen_color_idx, chosen_lum_idx = trial_option_meta[chosen_idx - 1]
                 reward_level_row = reward_level
                 reward_counts[int(reward_level)] = reward_counts.get(int(reward_level), 0) + 1
 
@@ -1262,7 +1215,7 @@ def run_task(
                 if reward_to_timeout_map is not None:
                     apply_timeout = reward_to_timeout_map.get(str(reward_level), 0)
 
-                gray_duration_requested = ibi_s
+                gray_duration_requested = iti_s
                 if num_pulses > 0:
                     gray_duration_requested += max(0.0, float(pump_delay_time))
                     gray_duration_requested += float(num_pulses * pump_pulse_time_seconds)
@@ -1271,7 +1224,7 @@ def run_task(
                     gray_duration_requested += float(timeout_duration_seconds)
             else:
                 abort_requested = False
-                gray_duration_requested = ibi_s
+                gray_duration_requested = iti_s
 
             gray_start_perf = trial_meta.get("gray_flip_perf_s", None)
             if gray_start_perf is not None:
@@ -1361,7 +1314,7 @@ def run_task(
                 )
                 _preview_choice_feedback(
                     preloaded_items=preloaded,
-                    block_paths_current=block_paths,
+                    trial_options_current=trial_options,
                     positions_current=positions,
                     chosen_index_1based=chosen_idx,
                     reward_level=reward_level,
@@ -1385,27 +1338,27 @@ def run_task(
                 "choice_touch_y": _fmt_optional(choice_info.get("touch_y") if choice_info is not None else ""),
                 "choice_reaction_time": _fmt_optional(choice_info.get("reaction_time_s") if choice_info is not None else ""),
             }
-            for opt_idx, (shape_idx, base_color_idx, lum_idx) in enumerate(block_meta):
+            for opt_idx, (shape_idx, base_color_idx, lum_idx) in enumerate(trial_option_meta):
                 behavior_row[f"shape_{opt_idx}"] = int(shape_idx)
                 behavior_row[f"color_{opt_idx}"] = int(base_color_idx)
                 behavior_row[f"lum_{opt_idx}"] = int(lum_idx)
 
             if chosen_idx_row_1based is not None:
-                chosen_shape_row, chosen_color_row, chosen_lum_row = block_meta[chosen_idx_row_1based - 1]
+                chosen_shape_row, chosen_color_row, chosen_lum_row = trial_option_meta[chosen_idx_row_1based - 1]
                 behavior_row["choice_made_shape"] = int(chosen_shape_row)
                 behavior_row["choice_made_color"] = int(chosen_color_row)
                 behavior_row["choice_made_lum"] = int(chosen_lum_row)
 
             behavior_logger.writerow(behavior_row)
 
-            if ibi_frames > 0:
+            if iti_frames > 0:
                 post_choice_delay_present = (choice_info is not None) and ((num_pulses > 0) or (apply_timeout > 0))
-                hold_frames = ibi_frames if post_choice_delay_present else max(0, ibi_frames - 1)
+                hold_frames = iti_frames if post_choice_delay_present else max(0, iti_frames - 1)
                 _show_preview_idle()
                 for _ in range(hold_frames):
                     if _poll_experimenter_controls():
                         task_end_notes = "experimenter_exit"
-                        msg_logger.log("WARN", f"experimenter_exit_during_ibi trial_num={trial_num}")
+                        msg_logger.log("WARN", f"experimenter_exit_during_iti trial_num={trial_num}")
                         break
                     bg_rect.draw()
                     if fix is not None:
@@ -1415,7 +1368,7 @@ def run_task(
                     break
 
             _flush_between_trials()
-            block_idx += 1
+            trial_num += 1
 
     finally:
         try:
@@ -1440,32 +1393,25 @@ def run_task(
     except Exception:
         pass
     win.close()
-    core.quit()
+    return task_end_notes
 
 
 def main():
     args = parse_args()
-    cfg = {}
-    if args.config:
-        cfg = load_config(args.config)
-        validate_config(
-            cfg,
-            required=["config_name", "colors_tsv", "shapes_tsv", "n"],
-            allow_zero_duration=True,
-        )  # basic
-    else:
-        missing = []
-        if not args.colors_tsv:
-            missing.append("--colors_tsv or config")
-        if not args.shapes_tsv:
-            missing.append("--shapes_tsv or config")
-        if args.n is None:
-            missing.append("--n or config")
-        if args.duration is None:
-            missing.append("--duration or config")
-        if missing:
-            print(f"ERROR: missing required args: {', '.join(missing)}", file=sys.stderr)
-            sys.exit(2)
+    cfg = load_config(args.config)
+    validate_config(
+        cfg,
+        required=[
+            "config_name",
+            "subject",
+            "colors_tsv",
+            "shapes_tsv",
+            "freq_space_tsv",
+            "reward_space_tsv",
+            "n",
+        ],
+        allow_zero_duration=True,
+    )
 
     def _get(name, default=None):
         val = getattr(args, name, None)
@@ -1481,7 +1427,7 @@ def main():
 
     colors_tsv = _get("colors_tsv", cfg.get("colors_tsv"))
     shapes_tsv = _get("shapes_tsv", cfg.get("shapes_tsv"))
-    n_blocks = int(_get("n", cfg.get("n")))
+    n_trials = int(_get("n", cfg.get("n")))
     num_afc = int(_get("num_afc", cfg.get("num_afc", 4)))
     duration_raw = _get("duration", cfg.get("duration", None))
     if duration_raw is None:
@@ -1489,18 +1435,18 @@ def main():
         sys.exit(2)
     duration = float(duration_raw)
     choice_time = float(_get("choice_time", cfg.get("choice_time", 0.75)))
-    ibi = float(_get("ibi", cfg.get("ibi", 1.0)))
+    iti = float(_get("iti", cfg.get("iti", cfg.get("ibi", 1.0))))
     isi = float(_get("isi", cfg.get("isi", 0.5)))
     init_dot_color = tuple(_get("init_dot_color", cfg.get("init_dot_color", None))) if _get("init_dot_color", None) else None
     dot_size = int(_get("dot_size", cfg.get("dot_size", 10)))
     dot_color = tuple(_get("dot_color", cfg.get("dot_color", (155, 155, 155))))
     output_dir = _get("output_dir", cfg.get("output_dir", "./logs"))
+    subject = _get("subject", cfg.get("subject", None))
     seed = _get("seed", cfg.get("seed", None))
     fullscreen = bool(_get("fullscreen", cfg.get("fullscreen", False)))
     win_size = tuple(_get("win_size", cfg.get("win_size", None))) if _get("win_size", None) else None
     image_size = tuple(_get("image_size", cfg.get("image_size", None))) if _get("image_size", None) else None
     debug = bool(_get("debug", cfg.get("debug", False)))
-    likelihood_tsv = _get("likelihood_tsv", cfg.get("likelihood_tsv", None))
     # Accept both 'refresh_rate' and the common misspelling 'refrech_rate' from config
     refresh_rate = _get("refresh_rate", cfg.get("refresh_rate", cfg.get("refrech_rate", None)))
     touchscreen = bool(_get("touchscreen", cfg.get("touchscreen", False)))
@@ -1520,8 +1466,8 @@ def main():
     is_memory = bool(_get("is_memory", cfg.get("is_memory", True)))
     
     # New reward system parameters
-    freq_space_tsv = _get("freq_space_tsv", cfg.get("freq_space_tsv", None))
-    reward_space_tsv = _get("reward_space_tsv", cfg.get("reward_space_tsv", None))
+    freq_space_tsv = cfg.get("freq_space_tsv")
+    reward_space_tsv = cfg.get("reward_space_tsv")
     pump_delay_time = float(_get("pump_delay_time", cfg.get("pump_delay_time", 0.0)))
     pump_pulse_time_seconds = float(_get("pump_pulse_time_seconds", cfg.get("pump_pulse_time_seconds", 0.25)))
     inter_pump_interval_val = _get("inter_pump_interval", cfg.get("inter_pump_interval", None))
@@ -1542,19 +1488,20 @@ def main():
     stroke_linecap = _get("stroke_linecap", cfg.get("stroke_linecap", None))
 
     try:
-        run_task(
+        task_end_status = run_task(
             colors_tsv=colors_tsv,
             shapes_tsv=shapes_tsv,
-            n_blocks=n_blocks,
+            n_trials=n_trials,
             num_afc=num_afc,
             duration=duration,
             choice_time=choice_time,
-            ibi=ibi,
+            iti=iti,
             isi=isi,
             init_dot_color=init_dot_color,
             dot_size=dot_size,
             dot_color=dot_color,
             output_dir=output_dir,
+            subject=subject,
             seed=seed,
             fullscreen=fullscreen,
             win_size=win_size,
@@ -1562,7 +1509,6 @@ def main():
             debug=debug,
             self_initiation=_get("self_initiation", cfg.get("self_initiation", False)),
             fixation_size=_get("fixation_size", cfg.get("fixation_size", None)),
-            likelihood_tsv=likelihood_tsv,
             refresh_rate=refresh_rate,
             touchscreen=touchscreen,
             raspi=_get("raspi", cfg.get("raspi", False)),
@@ -1595,6 +1541,8 @@ def main():
             stroke_linecap=stroke_linecap,
             screen_config=screen_config,
         )
+        if task_end_status != "done":
+            sys.exit(USER_EXIT_CODE)
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)

@@ -37,7 +37,7 @@
 
 
   "self_initiation": true,
-  "ibi": 0.75,
+  "iti": 0.75,
   "cue_time": 1.0,
   "num_afc": 4,
   "delay_time": 0.5,

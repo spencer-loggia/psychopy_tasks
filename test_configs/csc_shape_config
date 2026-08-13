@@ -10,7 +10,7 @@
   "win_size": [1920, 1080],
   "fixation_size": 48,
   "image_size": [48, 48],
-  "ibi": 1.0,
+  "iti": 1.0,
   "num_afc": 4,
   "choice_time": 0.75,
   "dot_size": 10,

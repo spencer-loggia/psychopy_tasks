@@ -3,8 +3,6 @@
   "n_lum_levels": 1,
   "shapes_tsv": "./task/resources/csc1/shape_definitions.tsv",
   "colors_tsv": "./task/resources/csc1/test_color_definitions.tsv",
-  "freq_space_tsv": "./task/resources/csc1/freq_space_TY.csv",
-  "reward_space_tsv": "./task/resources/csc1/reward_space_TY.csv",
   "pump_pulse_time_seconds": 0.25,
   "timeout_duration_seconds": 3.0,
   "reward_to_pulse_map": {
@@ -40,7 +38,7 @@
 
 
   "self_initiation": true,
-  "ibi": 0.75,
+  "iti": 0.75,
   "num_afc": 4,
   "choice_time": 2.0,
   "delay_time": 1.0, 

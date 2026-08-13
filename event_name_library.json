@@ -26,10 +26,10 @@
       "event_type": "frame_flip",
       "description": "Final gray fixation screen after the image sequence completed."
     },
-    "block_cue": {
+    "trial_cue": {
       "code": 104,
       "event_type": "frame_flip",
-      "description": "Block-start fixation or cue screen before the first stimulus in the block."
+      "description": "Trial-start fixation or cue screen before the first option presentation in the trial."
     },
     "stimulus_dot": {
       "code": 105,
@@ -44,7 +44,7 @@
     "gray_inter_trial_interval": {
       "code": 107,
       "event_type": "frame_flip",
-      "description": "The display transitioned to the gray between-trial or between-block interval."
+      "description": "The display transitioned to the gray inter-trial interval."
     },
     "onset_cue_on": {
       "code": 108,
@@ -80,7 +80,12 @@
       "code": 114,
       "event_type": "frame_flip",
       "description": "The delay period began after cue offset and before choices appeared."
-    }, 
+    },
+    "feature_cue_on": {
+      "code": 115,
+      "event_type": "frame_flip",
+      "description": "The trial's feature cue became visible."
+    },
     "cue_touch": {
       "code": 200,
       "event_type": "interaction",
@@ -129,8 +134,8 @@
       "gray_inter_stimulus",
       "gray_final_fixation"
     ],
-    "afc_block_sequence": [
-      "block_cue",
+    "afc_trial_sequence": [
+      "trial_cue",
       "stimulus_dot",
       "stimulus_on",
       "choice_start",
@@ -174,7 +179,8 @@
       "pump_off",
       "options_dot",
       "options_on",
-      "delay_start"
+      "delay_start",
+      "feature_cue_on"
     ]
   },
   "event_templates": {

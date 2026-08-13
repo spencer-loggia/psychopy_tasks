@@ -4,6 +4,7 @@ import csv
 import datetime as dt
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import re
 import time
@@ -14,7 +15,10 @@ EVENT_LOG_FILENAME = "event_log.tsv"
 MESSAGE_LOG_FILENAME = "message_log.tsv"
 BEHAVIOR_LOG_FILENAME = "behavior_log.tsv"
 EVENT_CODE_LIBRARY_FILENAME = "event_code_library.json"
+CALIBRATION_FILENAME = "calibration.json"
 EVENT_NAME_LIBRARY_FILENAME = "event_name_library.json"
+EXACT_SESSION_DIR_ENV = "NEURO_TASK_SESSION_DIR"
+EVENT_LIBRARY_ENV = "NEURO_EVENT_NAME_LIBRARY"
 ALLOWED_EVENT_TYPES = frozenset({"frame_flip", "interaction", "signal"})
 ALLOWED_MESSAGE_LEVELS = frozenset({"INFO", "WARN", "ERROR"})
 
@@ -90,6 +94,9 @@ def _normalize_message_level(level: str) -> str:
 
 
 def default_event_name_library_path() -> Path:
+    configured_path = os.environ.get(EVENT_LIBRARY_ENV)
+    if configured_path:
+        return Path(configured_path).expanduser().resolve()
     return Path(__file__).resolve().parents[1] / EVENT_NAME_LIBRARY_FILENAME
 
 
@@ -482,12 +489,24 @@ class SessionLogBundle:
         event_name_library_path: Optional[str | Path] = None,
     ):
         self.session_clock = SessionClock(started_at=when)
-        self.session_dir = build_session_output_dir(
-            output_root=output_root,
-            task_name=task_name,
-            config_name=config_name,
-            when=self.session_clock.started_at,
-        )
+        exact_session_dir = os.environ.get(EXACT_SESSION_DIR_ENV)
+        if exact_session_dir:
+            self.session_dir = Path(exact_session_dir).expanduser().resolve()
+            configured_output_root = Path(output_root).expanduser().resolve()
+            if configured_output_root != self.session_dir:
+                raise ValueError(
+                    f"Config output_dir {configured_output_root} does not match "
+                    f"{EXACT_SESSION_DIR_ENV}={self.session_dir}"
+                )
+            self.session_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            self.session_dir = build_session_output_dir(
+                output_root=output_root,
+                task_name=task_name,
+                config_name=config_name,
+                when=self.session_clock.started_at,
+            )
+        self.calibration_path = self.session_dir / CALIBRATION_FILENAME
         definitions, event_patterns = load_task_event_definitions(
             task_name=task_name,
             library_path=event_name_library_path,

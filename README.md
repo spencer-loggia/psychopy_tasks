@@ -104,6 +104,48 @@ Experiment-managed task/subprocess policies:
   snapshot rather than a subsequently edited repository file.
 - A state-producing task writes `calibration.json` in its block directory. Its top-level keys are state-field names,
   and each value is an object containing at least the subfields declared by that state history.
+- When main-input masking is enabled, a task that opens a subject window must signal readiness only after that
+  window exists and has requested focus. Tasks using `bin.utils.setup_window()` do this automatically. A task with
+  a custom window implementation must call `bin.task_lifecycle.signal_task_window_ready()` itself.
+
+X11 Main-Screen Idle Masking
+----------------------------
+
+On a dual-screen Linux/X11 rig, the experiment manager can prevent touches on the monkey-facing main screen from
+moving the desktop pointer or taking focus while the interface is idle. Configure these top-level launch-config
+fields:
+
+```json
+{
+  "screens": {
+    "main": "HDMI-1",
+    "experimenter": "DSI-1"
+  },
+  "mask_main_inputs": true,
+  "main_touchscreen_xinput": "Exact XInput Touchscreen Name"
+}
+```
+
+- `mask_main_inputs` defaults to `false` and must be a JSON boolean.
+- When it is `true` and the resolved main and experimenter displays differ, `main_touchscreen_xinput` is required.
+  It must be the exact stable device name reported by `xinput list --name-only`; numeric XInput IDs are rejected
+  because they can change after reboot.
+- When both screen selectors resolve to the same display, masking is skipped completely for debugging and
+  `main_touchscreen_xinput` is not required.
+- Masking requires Linux with a real X11 `DISPLAY`. It intentionally does not support Xwayland.
+
+While the interface is idle, the manager runs `xinput disable` only for that named touchscreen and covers the main
+display with a borderless black window. The experimenter touchscreen and physical mouse are not modified. A task
+subprocess creates and focuses its main window, then emits a private readiness marker. The manager removes the
+black window, maps the touchscreen to the resolved main RandR output with `xinput map-to-output`, and enables it.
+After every block—including errors and user exits—the manager disables the touchscreen again, restores the black
+window, and returns focus to the interface. Choosing **Desktop**, closing the interface window, or otherwise
+leaving the interface normally re-enables the touchscreen before exit.
+
+If input remapping fails after a task starts, the manager stops that task, restores the guarded idle state, records
+the block end, and reports the launch failure. The checked-in launcher configs leave `mask_main_inputs` disabled
+because an exact touchscreen name is rig-specific; enable it only after copying the name from that rig's
+`xinput list --name-only` output.
 
 Generate sample images (for quick testing)
 ```bash

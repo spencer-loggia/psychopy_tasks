@@ -94,12 +94,23 @@ def setup_window(
     monitor: Optional[str] = None,
     screen_info=None,
 ):
+    from .task_lifecycle import signal_task_window_ready
+
     color = rgb255_to_psychopy(bg_rgb_255)
     win_kwargs = dict(color=color, colorSpace="rgb", units="pix", allowStencil=False)
     if monitor:
         win_kwargs["monitor"] = monitor
     win_kwargs.update(get_psychopy_window_kwargs(screen_info, fullscreen=fullscreen, size=size))
-    return visual.Window(**win_kwargs)
+    win = visual.Window(**win_kwargs)
+    handle = getattr(win, "winHandle", None)
+    activate = getattr(handle, "activate", None)
+    if callable(activate):
+        try:
+            activate()
+        except Exception:
+            pass
+    signal_task_window_ready()
+    return win
 
 
 def _log_message(msg_logger, level: str, message: str) -> None:

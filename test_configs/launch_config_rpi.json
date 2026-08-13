@@ -7,6 +7,7 @@
         "main": "HDMI-1",
         "experimenter": "DSI-1"
     },
+    "mask_main_inputs": false,
     "subjects": {
         "Yuri": "Y",
         "Debug": "D"

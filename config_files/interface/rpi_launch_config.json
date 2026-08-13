@@ -7,6 +7,8 @@
         "main": null,
         "experimenter": null
     },
+    "mask_main_inputs": true,
+    "main_touchscreen_xinput": "WaveShare WaveShare",
     "subjects": {"Yuri": "Y", "Sally": "S", "Buzz": "B", "Tina": "T", "Wooster": "W", "Jeeves": "J"},
     "tasks": {
         "CSC1": {

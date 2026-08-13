@@ -1,12 +1,26 @@
 import csv
 import json
+import os
 import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from bin.logger import EventCodeLibrary, MessageLogger, SessionClock, SessionLogBundle, load_task_event_definitions
+from bin.task_lifecycle import TASK_WINDOW_READY_ENV, signal_task_window_ready
 
 
 class LoggingSpecTests(unittest.TestCase):
+    def test_task_window_ready_signal_is_manager_opt_in(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(signal_task_window_ready())
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ready_path = Path(tmpdir) / "task-ready"
+            with patch.dict(os.environ, {TASK_WINDOW_READY_ENV: str(ready_path)}):
+                self.assertTrue(signal_task_window_ready())
+            self.assertEqual(ready_path.read_text(encoding="utf-8"), "ready\n")
+
     def test_session_bundle_exposes_optional_calibration_path(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             bundle = SessionLogBundle(

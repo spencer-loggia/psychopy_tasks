@@ -24,6 +24,7 @@ from bin.screen import (
     load_screen_config,
     place_tk_window_on_screen,
     resolve_interface_screen,
+    resolve_task_screens,
 )
 from interface.rig_mode import (
     IS_RIG_ENV_VAR,
@@ -40,7 +41,13 @@ from interface.experiment_manager import (
     PreparedBlock,
     task_run_sequence,
 )
-from bin.task_lifecycle import USER_EXIT_CODE
+from bin.task_lifecycle import TASK_WINDOW_READY_ENV, USER_EXIT_CODE
+from interface.x11_idle_guard import (
+    ExperimentIdleGuard,
+    create_experiment_idle_guard,
+    stop_task_process,
+    wait_for_task_process,
+)
 
 
 IDLE_CLEANUP_MS = 30 * 60 * 1000
@@ -124,12 +131,21 @@ class ScrollableButtonFrame(tk.Frame):
 
 
 class TouchInterfaceApp:
-    def __init__(self, root: tk.Tk, config_path: Path, cfg: Dict[str, Any], *, screen_info):
+    def __init__(
+        self,
+        root: tk.Tk,
+        config_path: Path,
+        cfg: Dict[str, Any],
+        *,
+        screen_info,
+        idle_guard: Optional[ExperimentIdleGuard] = None,
+    ):
         self.root = root
         self.config_path = config_path.resolve()
         self.config_dir = self.config_path.parent
         self.cfg = cfg
         self.screen_info = screen_info
+        self.idle_guard = idle_guard
         self.environment_cfg = _expect_dict(cfg.get("environment"), "environment")
         self.tasks_cfg = _expect_dict(cfg.get("tasks"), "tasks")
         self.subjects_cfg = _expect_dict(cfg.get("subjects"), "subjects")
@@ -150,8 +166,11 @@ class TouchInterfaceApp:
         self.experiment: Optional[ExperimentManager] = None
         self.is_rig = self._initialize_is_rig_mode()
 
+        if self.idle_guard is not None:
+            self.idle_guard.enter_idle()
         self.startup()
         self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._exit_to_desktop)
         self._schedule_idle_cleanup()
 
     def _is_launchable_task(self, task_cfg: Dict[str, Any]) -> bool:
@@ -434,10 +453,23 @@ class TouchInterfaceApp:
         button = tk.Button(
             self.button_container,
             text="Desktop",
-            command=self.root.destroy,
+            command=self._exit_to_desktop,
             **self._button_kwargs(),
         )
         button.grid(row=row_idx, column=0, sticky="ew", pady=10, padx=10)
+
+    def _exit_to_desktop(self) -> None:
+        if self.task_active:
+            self.status_var.set("Cannot exit to desktop while a task is running")
+            return
+        try:
+            if self.idle_guard is not None:
+                self.idle_guard.release_for_desktop()
+        except Exception as exc:
+            self.status_var.set("Could not restore main touchscreen")
+            messagebox.showerror("Desktop Error", str(exc))
+            return
+        self.root.destroy()
 
     def _create_shutdown_button(self, row_idx: int) -> None:
         button_kwargs = self._button_kwargs()
@@ -507,15 +539,40 @@ class TouchInterfaceApp:
         cmd = [self.python_cmd, str(block.launch_path), "--config", str(block.config_path)]
         self.status_var.set(f"Running block {block.block_num}: {block.block_name}")
         self.root.update_idletasks()
+        ready_path = block.output_dir / ".task_window_ready"
+        env = self.experiment.subprocess_environment(block)
+        if self.idle_guard is not None:
+            env[TASK_WINDOW_READY_ENV] = str(ready_path)
+        process: Optional[subprocess.Popen] = None
         try:
-            return subprocess.run(
+            process = subprocess.Popen(
                 cmd,
                 cwd=self.working_dir,
-                check=False,
-                env=self.experiment.subprocess_environment(block),
+                env=env,
             )
+            try:
+                returncode = wait_for_task_process(
+                    process,
+                    ready_path=ready_path if self.idle_guard is not None else None,
+                    on_window_ready=(
+                        self.idle_guard.task_window_ready
+                        if self.idle_guard is not None
+                        else None
+                    ),
+                )
+            except BaseException:
+                stop_task_process(process)
+                raise
+            return subprocess.CompletedProcess(cmd, returncode)
         finally:
-            self.experiment.finish_block(block)
+            try:
+                if self.idle_guard is not None:
+                    self.idle_guard.enter_idle()
+            finally:
+                try:
+                    ready_path.unlink(missing_ok=True)
+                finally:
+                    self.experiment.finish_block(block)
 
     def _run_task(self, task_name: str, task_cfg: Dict[str, Any]) -> None:
         if self.task_active:
@@ -565,18 +622,43 @@ def main() -> None:
     cfg = load_launcher_config(config_path)
 
     root = tk.Tk()
-    screen_cfg = load_screen_config(
-        cfg,
-        cli_main=args.main_screen,
-        cli_experimenter=args.experimenter_screen,
-    )
-    screen_info = resolve_interface_screen(root, screen_cfg)
-    if screen_cfg["main"] is not None:
-        os.environ[MAIN_SCREEN_ENV] = str(screen_cfg["main"])
-    if screen_cfg["experimenter"] is not None:
-        os.environ[SECONDARY_SCREEN_ENV] = str(screen_cfg["experimenter"])
-    app = TouchInterfaceApp(root, config_path, cfg, screen_info=screen_info)
-    root.mainloop()
+    idle_guard = None
+    try:
+        screen_cfg = load_screen_config(
+            cfg,
+            cli_main=args.main_screen,
+            cli_experimenter=args.experimenter_screen,
+        )
+        main_screen, experimenter_screen = resolve_task_screens(
+            screen_cfg,
+            allow_same_screen=True,
+        )
+        screen_info = resolve_interface_screen(root, screen_cfg)
+        if screen_cfg["main"] is not None:
+            os.environ[MAIN_SCREEN_ENV] = str(screen_cfg["main"])
+        if screen_cfg["experimenter"] is not None:
+            os.environ[SECONDARY_SCREEN_ENV] = str(screen_cfg["experimenter"])
+        idle_guard = create_experiment_idle_guard(
+            root,
+            cfg,
+            main_screen,
+            experimenter_screen,
+            tk_module=tk,
+        )
+        TouchInterfaceApp(
+            root,
+            config_path,
+            cfg,
+            screen_info=screen_info,
+            idle_guard=idle_guard,
+        )
+        root.mainloop()
+    finally:
+        if idle_guard is not None:
+            try:
+                idle_guard.release_for_desktop()
+            except Exception as exc:
+                print(f"Could not restore main touchscreen: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":

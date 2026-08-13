@@ -31,6 +31,11 @@ from .screen import (
     get_psychopy_window_kwargs,
     serialize_preview_image,
 )
+from .stimulus_files import (
+    load_color_palette as _load_color_palette,
+    load_shape_definitions as _load_shape_definitions,
+    split_background_from_palette as _split_background_from_palette,
+)
 
 # Global debug flag: when True, utilities may write debug files (PNG) to logs/
 # Default is False; tasks can enable it via CLI (--debug) or config.
@@ -579,6 +584,19 @@ def _rasterize_svg_to_rgba(
     return im
 
 
+def rasterize_svg(
+    svg_path: Path,
+    size_px: Tuple[int, int],
+    bg_rgb_255: Optional[Tuple[int, int, int]] = None,
+) -> Image.Image:
+    """Rasterize an SVG as authored, without overriding its fill or stroke."""
+    return _rasterize_svg_to_rgba(
+        Path(svg_path),
+        size_px=size_px,
+        bg_rgb_255=bg_rgb_255,
+    )
+
+
 def rasterize_svg_with_color(
     svg_path: Path,
     size_px: Tuple[int, int],
@@ -696,35 +714,7 @@ def rasterize_svg_with_color(
 
 
 def load_color_palette(tsv_path: Path) -> Dict[int, Tuple[int, int, int]]:
-    """Load a TSV with columns ID,R,G,B (header optional) and return mapping id->(r,g,b).
-
-    ID is converted to int. Rows with invalid values raise ValueError.
-    """
-    import csv
-
-    p = Path(tsv_path)
-    if not p.exists():
-        raise FileNotFoundError(f"Color TSV not found: {tsv_path}")
-
-    out: Dict[int, Tuple[int, int, int]] = {}
-    with p.open("r", encoding="utf-8") as fh:
-        reader = csv.DictReader(fh, delimiter="\t")
-        # Accept files that may not have a header by falling back to positional columns
-        if reader.fieldnames is None:
-            raise ValueError("Color TSV must have header with columns ID,R,G,B")
-        names = [n.lower() for n in reader.fieldnames]
-        for row in reader:
-            try:
-                idv = int(row.get("id") or row.get("ID") or row.get("Id") or row.get(reader.fieldnames[0]))
-                r = int(row.get("r") or row.get("R") or row.get(reader.fieldnames[1]))
-                g = int(row.get("g") or row.get("G") or row.get(reader.fieldnames[2]))
-                b = int(row.get("b") or row.get("B") or row.get(reader.fieldnames[3]))
-            except Exception as e:
-                raise ValueError(f"Invalid row in color TSV: {row}") from e
-            if idv in out:
-                raise ValueError(f"Duplicate color ID in TSV: {idv}")
-            out[idv] = (r, g, b)
-    return out
+    return _load_color_palette(tsv_path)
 
 
 def split_background_from_palette(
@@ -735,48 +725,11 @@ def split_background_from_palette(
     `colors` must preserve file row order (as produced by `load_color_palette`).
     Returns (bg_rgb, remaining_colors).
     """
-    if not colors:
-        raise ValueError("colors_tsv is empty; expected at least background row plus color definitions")
-
-    ordered_items = list(colors.items())
-    _bg_id, bg_rgb = ordered_items[0]
-    remaining = dict(ordered_items[1:])
-    if not remaining:
-        raise ValueError("colors_tsv must include at least one color definition after the background row")
-    return bg_rgb, remaining
+    return _split_background_from_palette(colors)
 
 
 def load_shape_definitions(tsv_path: Path) -> Dict[int, Path]:
-    """Load a TSV with columns ID,PATH where PATH points to an SVG file.
-
-    Returns mapping id->Path and verifies files exist and are SVGs.
-    """
-    import csv
-
-    p = Path(tsv_path)
-    if not p.exists():
-        raise FileNotFoundError(f"Shape TSV not found: {tsv_path}")
-
-    out: Dict[int, Path] = {}
-    with p.open("r", encoding="utf-8") as fh:
-        reader = csv.DictReader(fh, delimiter="\t")
-        if reader.fieldnames is None:
-            raise ValueError("Shape TSV must have header with columns ID,PATH")
-        for row in reader:
-            try:
-                idv = int(row.get("id") or row.get("ID") or row.get(reader.fieldnames[0]))
-                path_str = row.get("path") or row.get("PATH") or row.get(reader.fieldnames[1])
-                if path_str is None:
-                    raise ValueError("Missing path column")
-                sp = Path(path_str)
-                if not sp.exists():
-                    raise FileNotFoundError(f"Shape file does not exist: {sp}")
-                if sp.suffix.lower() != ".svg":
-                    raise ValueError(f"Shape file must be SVG: {sp}")
-            except Exception as e:
-                raise ValueError(f"Invalid row in shape TSV: {row}") from e
-            out[idv] = sp
-    return out
+    return _load_shape_definitions(tsv_path)
 
 
 def load_image_assets(
@@ -979,6 +932,11 @@ def present_trial_with_persistent_dots(
     scene_main_size: Optional[Sequence[float]] = None,
     event_profile: str = "generic_afc",
     reward_levels: Optional[Sequence[int]] = None,
+    pre_options_cue_image: Optional[Any] = None,
+    pre_options_cue_duration: float = 0.0,
+    pre_options_delay: float = 0.0,
+    pre_options_cue_event: str = "match_cue_on",
+    pre_options_delay_event: str = "delay_start",
 ):
     """Present stimuli one at a time, leave faint dots at their locations,
     show all dots for `choice_time`, then clear.
@@ -1042,7 +1000,7 @@ def present_trial_with_persistent_dots(
         return False
 
     def _frame_event_name(kind: str, option_idx: Optional[int] = None) -> str:
-        if event_profile == "active_foraging":
+        if event_profile in {"active_foraging", "match2cue"}:
             if kind == "dot":
                 if sequential:
                     return f"option_{int(option_idx)}_dot"
@@ -1054,7 +1012,11 @@ def present_trial_with_persistent_dots(
             if kind == "choice_start":
                 return "choice_start"
             if kind == "gray":
-                return "grey_inter_trial_interval"
+                return (
+                    "grey_inter_trial_interval"
+                    if event_profile == "active_foraging"
+                    else "gray_inter_trial_interval"
+                )
             if kind == "onset_cue":
                 return "onset_cue_on"
         generic_names = {
@@ -1224,6 +1186,77 @@ def present_trial_with_persistent_dots(
 
             _core.wait(0.01)
 
+    cue_frames = 0
+    cue_s = 0.0
+    delay_frames = 0
+    delay_s = 0.0
+    if pre_options_cue_image is not None:
+        cue_frames, cue_s = _q_to_frames(pre_options_cue_duration, at_least_one=True)
+        delay_frames, delay_s = _q_to_frames(pre_options_delay, at_least_one=False)
+        cue_stim = make_image_stim_from_array(
+            win,
+            pre_options_cue_image,
+            size=None,
+            bg_rgb_255=bg_rgb_255,
+        )
+        cue_stim.pos = (0.0, 0.0)
+        cue_preview = [
+            {
+                "image_payload": serialize_preview_image(pre_options_cue_image),
+                "pos": [0.0, 0.0],
+                "size": [float(cue_stim.size[0]), float(cue_stim.size[1])],
+            }
+        ]
+        _show_preview(cue_preview)
+        if not _arm_trial_start_signal():
+            return True, None
+        first_flip = True
+        for _ in range(cue_frames):
+            if _event.getKeys(["escape"]):
+                _log_message(msg_logger, "WARN", f"escape_pressed trial_num={trial_num} during_match_cue=1")
+                return True, None
+            if _should_abort("experimenter_exit_during_match_cue"):
+                return True, None
+            bg_rect.draw()
+            cue_stim.draw()
+            if fix is not None:
+                fix.draw()
+            win.flip()
+            if first_flip:
+                cue_perf = time.perf_counter()
+                _commit_trial_start_signal(cue_perf)
+                _set_initiation_time(cue_perf)
+                logger.log_frame_flip(
+                    trial_num=trial_num,
+                    event=pre_options_cue_event,
+                    timestamp_perf_s=cue_perf,
+                    requested_duration=cue_s,
+                )
+                first_flip = False
+
+        if delay_frames > 0:
+            _show_preview([])
+            first_flip = True
+            for _ in range(delay_frames):
+                if _event.getKeys(["escape"]):
+                    _log_message(msg_logger, "WARN", f"escape_pressed trial_num={trial_num} during_match_delay=1")
+                    return True, None
+                if _should_abort("experimenter_exit_during_match_delay"):
+                    return True, None
+                bg_rect.draw()
+                if fix is not None:
+                    fix.draw()
+                win.flip()
+                if first_flip:
+                    delay_perf = time.perf_counter()
+                    logger.log_frame_flip(
+                        trial_num=trial_num,
+                        event=pre_options_delay_event,
+                        timestamp_perf_s=delay_perf,
+                        requested_duration=delay_s,
+                    )
+                    first_flip = False
+
     # Quantize durations to frames and log rounding in message logger.
     if sequential or is_memory:
         stim_frames, stim_s = _q_to_frames(duration, at_least_one=True)
@@ -1238,7 +1271,9 @@ def present_trial_with_persistent_dots(
             f"timing_quantization trial_num={trial_num} "
             f"stim_duration={duration:.6f}s-> {stim_frames}fr({stim_s:.6f}s) "
             f"isi={isi:.6f}s-> {isi_frames}fr({isi_s:.6f}s) "
-            f"choice_time={choice_time:.6f}s-> {int(round(max(0.0, float(choice_time)) * float(fps)))}fr({choice_s:.6f}s)"
+            f"choice_time={choice_time:.6f}s-> {int(round(max(0.0, float(choice_time)) * float(fps)))}fr({choice_s:.6f}s) "
+            f"pre_options_cue={float(pre_options_cue_duration):.6f}s-> {cue_frames}fr({cue_s:.6f}s) "
+            f"pre_options_delay={float(pre_options_delay):.6f}s-> {delay_frames}fr({delay_s:.6f}s)"
         ),
     )
 

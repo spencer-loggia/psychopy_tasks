@@ -11,13 +11,14 @@ def validate_duration_for_presentation_mode(
     *,
     sequential: bool,
     is_memory: bool,
+    context: str = "active_foraging",
 ) -> None:
     """Validate duration semantics before frame-alignment validation."""
     duration_s = float(duration)
     if duration_requires_positive_frames(sequential=sequential, is_memory=is_memory):
         if duration_s <= 0.0:
             raise ValueError(
-                "Invalid active_foraging timing config: duration must be positive when "
+                f"Invalid {context} timing config: duration must be positive when "
                 "sequential=true or is_memory=true. In memory modes, duration is the "
                 "stimulus display time before the dot-only choice period."
             )
@@ -25,7 +26,7 @@ def validate_duration_for_presentation_mode(
 
     if duration_s != 0.0:
         raise ValueError(
-            "Invalid active_foraging timing config: when sequential=false and "
+            f"Invalid {context} timing config: when sequential=false and "
             "is_memory=false, duration must be exactly 0. In this mode the stimuli "
             "appear on the first choice frame and remain visible for choice_time only."
         )

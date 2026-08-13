@@ -23,6 +23,10 @@
             "sequential": {},
             "memory": {}
         },
+        "Match2Cue": {
+            "launch": "task/match2cue.py",
+            "config": "test_configs/match2cue_test.json"
+        },
         "setup": {
             "calibrate_eye_tracker": {
                 "launch": "task/calibrate_eye_tracker.py",

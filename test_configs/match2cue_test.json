@@ -1,0 +1,50 @@
+{
+  "config_name": "match2cue_test",
+  "subject": "test_env1",
+  "n_colors": 0,
+  "n_shapes": 16,
+  "n_lum_levels": 0,
+  "shapes_tsv": "./task/resources/csc2/match2cue_shape_definitions.tsv",
+  "colors_tsv": "./test_configs/match2cue_background.tsv",
+
+  "pump_delay_time": 0.2,
+  "pump_pulse_time_seconds": 0.35,
+  "daq": {
+    "address": 0
+  },
+  "pump_pin": 0,
+  "trial_start_pin": 18,
+
+  "seed": null,
+  "output_dir": "./logs",
+  "screens": {
+    "main": null,
+    "experimenter": null
+  },
+  "refresh_rate": 60,
+  "n": 50,
+
+  "fullscreen": true,
+  "win_size": [2560, 1600],
+  "fixation_size": 0,
+  "dot_size": 40,
+  "dot_color": [50, 50, 50],
+  "init_dot_color": [50, 50, 50],
+  "center_point": null,
+  "stim_range_radius": null,
+  "image_size": [150, 150],
+
+  "self_initiation": true,
+  "match_cue_duration": 0.5,
+  "delay_time": 0.5,
+  "iti": 0.5,
+  "duration": 0.0,
+  "num_afc": 3,
+  "choice_time": 2.0,
+  "isi": 0.0,
+  "fixed_positions": false,
+  "sequential": false,
+  "is_memory": false,
+  "raspi": true,
+  "touchscreen": true
+}

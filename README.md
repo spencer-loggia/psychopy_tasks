@@ -3,7 +3,7 @@
 Repository layout
 
 - `bin/`: shared presentation, timing, hardware, screen, and TSV logging helpers.
-- `task/`: runnable tasks, including `active_foraging.py`, `afc_csc1.py`, `afc_trial_sequence.py`, standalone image/video stimulus tasks, and hardware setup utilities.
+- `task/`: runnable tasks, including `active_foraging.py`, `match2cue.py`, `afc_csc1.py`, `afc_trial_sequence.py`, standalone image/video stimulus tasks, and hardware setup utilities.
 - `config_files/`: deployment configurations.
 - `test_configs/` and `tests/`: development configurations and automated tests.
 
@@ -167,13 +167,13 @@ python task/random_image_sequence.py \
 Notes
 - Images are preloaded into RAM with `load_image_arrays()` before any flips, then converted into `ImageStim`s tied to the active `Window`. This minimizes disk I/O during timing-critical presentation.
 - If `--n` is greater than available images, sampling is done with replacement.
-- In `active_foraging` and the current image-sequence presentation paths, timing-critical visual sections use frame-counted `win.flip()` loops rather than `core.wait()`. Remaining `core.wait()` usage is limited to non-visual polling or housekeeping paths and is not used to schedule stimulus onsets/offsets.
+- In `active_foraging`, `match2cue`, and the current image-sequence presentation paths, timing-critical visual sections use frame-counted `win.flip()` loops rather than `core.wait()`. Remaining `core.wait()` usage is limited to non-visual polling or housekeeping paths and is not used to schedule stimulus onsets/offsets.
 
 Behavioral Terminology
 ----------------------
 
 - A `block` is a contiguous chunk of an experiment dedicated to one task and stimulus type. Blocks are experiment-level units and are not repeated choice cycles inside a task.
-- A `trial` is one complete behavioral cycle. In active foraging this is initiation cue, option presentation, choice, reward or timeout, and the inter-trial interval. In standalone image and video tasks, one presented image or clip is one trial.
+- A `trial` is one complete behavioral cycle. In active foraging this is initiation cue, option presentation, choice, reward or timeout, and the inter-trial interval. In match-to-cue it is initiation cue, match cue, delay, option presentation, choice, and inter-trial interval. In standalone image and video tasks, one presented image or clip is one trial.
 - An option presentation within an AFC trial is represented by its frame-flip event. It does not receive a separate numeric identifier.
 - `trial_num` identifies the enclosing trial for every task.
 
@@ -274,6 +274,10 @@ For `active_foraging`:
 - `reaction_time` is the time from `choice_start` until `option_touch`.
 - `choice_reaction_time` is currently the same quantity as `reaction_time`, retained because it is part of the requested task-specific schema.
 
+For `match2cue`, the behavior log additionally records the match cue, the number of matching options, whether the
+choice was correct, the resulting reward probability, and whether a reward was delivered. A no-response trial is
+left blank for correctness and does not increment either experimenter-screen correctness counter.
+
 Other tasks use the same session packaging and shared schemas but simpler task-specific behavior rows:
 
 - `random_image_sequence` treats each image presentation as a trial and logs one behavior row per image.
@@ -296,6 +300,9 @@ The `active_foraging` experimenter display shows the config name, current subjec
 reward level: red for `0`, gray for `1`, yellow for `2`, and green for `3`. Clicking `rew.` or pressing `r`
 delivers the configured manual juice-pump pulse. The keyboard command works when either the main task window or
 experimenter window has keyboard focus.
+
+The `match2cue` display uses the same preview, subject/trial indicator, manual reward control, and exit control.
+Its running counts are `Correct`, `Incorrect`, and `Rewards delivered`; it does not show reward-level outlines.
 
 Eye Tracker Calibration
 -----------------------
@@ -446,6 +453,45 @@ id	r	g	b
 3	141	117	108
 ```
 
+Match2Cue Task
+--------------
+
+Run the bundled native-SVG test configuration with:
+
+```bash
+python task/match2cue.py \
+  --config test_configs/match2cue_test.json \
+  --main_screen 1 \
+  --experimenter_screen 0
+```
+
+Replace the screen selectors with the local display indices or RandR output names. The interface supplies them
+automatically when launching the task as an experiment block.
+
+Each trial runs `onset cue -> match cue -> delay -> options -> choice -> inter-trial interval`. The
+`match_cue_duration` and `delay_time` fields control the two added phases. Option presentation uses the same
+`sequential`, `is_memory`, `fixed_positions`, `duration`, `isi`, `choice_time`, `center_point`,
+`stim_range_radius`, and `num_afc` semantics as active foraging.
+
+The cue is sampled uniformly from the complete configured shape/color/luminance stimulus space. One exact copy
+is guaranteed among the options; every other option is an independent random draw with replacement from that
+same space. Therefore the cue may occur more than once. Selecting any exact match is correct, and a correct choice
+delivers one `pump_pulse_time_seconds` pulse with probability `1 / matching_option_count`. An incorrect choice is
+never rewarded. The config has no frequency-space, reward-space, reward-level, timeout, or buzzer settings. Its
+`subject` field is still required and is displayed and logged, but it does not alter task behavior.
+
+Set `n_colors` to `0` to use SVG artwork exactly as authored rather than recoloring it. In this mode the color TSV
+must contain exactly one data row—the background gray—and `n_lum_levels` should be `0`. With positive
+`n_colors`, the task uses the same background-first palette layout as active foraging and requires exactly
+`n_colors * n_lum_levels` non-background rows. `n_shapes` must match the number of rows in `shapes_tsv` in either
+mode.
+
+The match-to-cue event log adds `match_cue_on` and `delay_start`. The behavior log records cue and option feature
+indices, `matching_option_count`, `choice_correct`, `reward_probability`, and `reward_delivered`, in addition to
+the shared choice/touch timing fields. The experimenter preview shows the configured subject, current/total trial,
+and separate cumulative counts for correct choices, incorrect choices, and rewards delivered. These reward and
+correct counts can differ on duplicate-match trials.
+
 Configuration via JSON (required for tasks)
 -----------------------------------------
 All tasks in this repository must support loading a JSON configuration file as an alternative to specifying parameters via command-line arguments. The config file should allow you to set experiment-level parameters such as:
@@ -453,7 +499,7 @@ All tasks in this repository must support loading a JSON configuration file as a
 - `images_dir` (string): path to image resources
 - `output_dir` (string): path where logs and metadata will be saved
 - `n` (int): number of trials; for standalone sequence tasks, each image or clip presentation is one trial
-- `duration` (number): stimulus presentation duration in seconds. For `active_foraging`, this must be positive when `sequential=true` or `is_memory=true`, and must be `0` only when both are false.
+- `duration` (number): stimulus presentation duration in seconds. For `active_foraging` and `match2cue`, this must be positive when `sequential=true` or `is_memory=true`, and must be `0` only when both are false.
 - `isi` (number): pre-stimulus / inter-stimulus interval in seconds; exact meaning is task-specific
 - `iti` (number): inter-trial interval in seconds for trial-based tasks
 - `bg` (array of 3 ints): background RGB values in 0-255
@@ -462,11 +508,11 @@ All tasks in this repository must support loading a JSON configuration file as a
 - `win_size` (array of 2 ints, optional)
 - `fixation_size` (int, optional)
 - `image_size` (array of 2 ints, optional)
-- `center_point` (array of 2 ints or null, optional): `active_foraging` stimulus circle center in main-screen pixels
-- `stim_range_radius` (int or null, optional): `active_foraging` stimulus circle radius in pixels
-- `trial_start_pin` (int, optional): `active_foraging` BCM GPIO pin for the trial-start pulse
-- `daq.address` or `daq_address` (int, optional): `active_foraging` DAQC2plate address for pump/buzzer outputs
-- `pump_pin` and `buzz_pin` (int, optional): `active_foraging` DAQC2 DOUT bits, not Raspberry Pi GPIO pins
+- `center_point` (array of 2 ints or null, optional): AFC-style stimulus circle center in main-screen pixels
+- `stim_range_radius` (int or null, optional): AFC-style stimulus circle radius in pixels
+- `trial_start_pin` (int, optional): AFC-style BCM GPIO pin for the trial-start pulse
+- `daq.address` or `daq_address` (int, optional): DAQC2plate address for task hardware outputs
+- `pump_pin` and `buzz_pin` (int, optional): DAQC2 DOUT bits, not Raspberry Pi GPIO pins
 
 Tasks must validate the config when loaded and raise a helpful error if required keys are missing or types are invalid. Command-line arguments should override values in the config file when both are provided.
 

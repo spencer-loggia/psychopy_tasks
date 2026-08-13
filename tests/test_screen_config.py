@@ -104,6 +104,29 @@ class ScreenConfigTests(unittest.TestCase):
             },
         )
 
+    def test_preview_queue_includes_generic_status_counts(self):
+        preview = object.__new__(ExperimenterPreview)
+        preview.poll = lambda: False
+        preview._process = Mock()
+        preview._process.is_alive.return_value = True
+        preview._queue = queue.Queue()
+        preview.status_counts = {
+            "Correct": 4,
+            "Incorrect": 2,
+            "Rewards delivered": 3,
+        }
+
+        preview._send({"type": "static_scene"})
+
+        self.assertEqual(
+            preview._queue.get_nowait()["status_counts"],
+            {
+                "Correct": 4,
+                "Incorrect": 2,
+                "Rewards delivered": 3,
+            },
+        )
+
     def test_experimenter_label_shows_subject_and_trial_total(self):
         self.assertEqual(
             format_experimenter_label(

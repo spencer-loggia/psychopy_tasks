@@ -21,7 +21,6 @@ Config keys required/additional:
 
 """
 import argparse
-import math
 import os
 import sys
 import time
@@ -43,6 +42,8 @@ from bin.affinity import (
     set_process_cpu_affinity,
 )
 from bin.daqc2_outputs import DAQC2DigitalOutputs
+from bin.afc_geometry import compute_afc_positions, stimulus_size
+from bin.afc_stimuli import render_afc_stimulus
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 import numpy as np
@@ -124,13 +125,14 @@ def _generate_active_foraging_trial(trial_idx: int, config: dict) -> dict:
         
         # Rasterize if not already done
         if pair not in rendered:
-            pil = utils.rasterize_svg_with_color(
-                shapes[sid],
-                size_px=image_size,
-                color_rgb_255=colors[cid],
-                bg_rgb_255=bg,
-                stroke_rgb_255=stroke_color,
-                stroke_width_px=stroke_width,
+            pil = render_afc_stimulus(
+                pair,
+                shapes=shapes,
+                colors=colors,
+                image_size=image_size,
+                bg=bg,
+                stroke_color=stroke_color,
+                stroke_width=stroke_width,
                 stroke_linejoin=stroke_linejoin,
                 stroke_linecap=stroke_linecap,
             )
@@ -161,144 +163,6 @@ def _decode_trial_payload(payload: dict) -> Tuple[List[Tuple[int, int]], List[Tu
         sid, cid = map(int, key_str.split('_'))
         preloaded[(sid, cid)] = arr
     return trial_options, trial_option_meta, preloaded
-
-
-def _stim_size_from_preloaded(preloaded: Dict[Tuple[int, int], Any], first_pair: Tuple[int, int]) -> Tuple[int, int]:
-    item = preloaded[first_pair]
-    if isinstance(item, np.ndarray):
-        if item.ndim < 2:
-            raise ValueError(f"Invalid preloaded stimulus array shape: {item.shape}")
-        return int(item.shape[1]), int(item.shape[0])
-    return item.size
-
-
-def _resolve_stimulus_circle(
-    center_point: Optional[Tuple[float, float]],
-    stim_range_radius: Optional[float],
-    effective_win_size: Tuple[int, int],
-) -> Tuple[Tuple[float, float], float]:
-    width_px, height_px = float(effective_win_size[0]), float(effective_win_size[1])
-    if width_px <= 0 or height_px <= 0:
-        raise ValueError(f"Invalid main screen size for stimulus circle: {effective_win_size}")
-
-    if center_point is None:
-        center_px = (width_px / 2.0, height_px / 2.0)
-    else:
-        if len(center_point) != 2:
-            raise ValueError("center_point must contain exactly two pixel coordinates")
-        center_px = (float(center_point[0]), float(center_point[1]))
-
-    if not (0.0 <= center_px[0] <= width_px and 0.0 <= center_px[1] <= height_px):
-        raise ValueError(
-            f"center_point={center_px} is outside the main screen bounds {effective_win_size}"
-        )
-
-    # Default radius is half the distance from the chosen center to the closest screen edge.
-    closest_edge_px = min(center_px[0], width_px - center_px[0], center_px[1], height_px - center_px[1])
-    radius_px = closest_edge_px / 2.0 if stim_range_radius is None else float(stim_range_radius)
-    if radius_px <= 0.0:
-        raise ValueError("stim_range_radius must be greater than 0 pixels")
-    if radius_px > closest_edge_px:
-        raise ValueError(
-            "stim_range_radius places the stimulus circle outside the main screen bounds"
-        )
-    return center_px, radius_px
-
-
-def _screen_px_to_psychopy(
-    position_px: Tuple[float, float],
-    effective_win_size: Tuple[int, int],
-) -> Tuple[float, float]:
-    width_px, height_px = float(effective_win_size[0]), float(effective_win_size[1])
-    return position_px[0] - (width_px / 2.0), (height_px / 2.0) - position_px[1]
-
-
-def _circle_point(
-    center_px: Tuple[float, float],
-    radius_px: float,
-    angle_rad: float,
-) -> Tuple[float, float]:
-    # Screen-pixel coordinates use +y downward, so pi/2 is the point directly below center.
-    return (
-        center_px[0] + radius_px * math.cos(angle_rad),
-        center_px[1] + radius_px * math.sin(angle_rad),
-    )
-
-
-def _has_overlap(
-    position_px: Tuple[float, float],
-    placed_px: List[Tuple[float, float]],
-    stim_size: Tuple[int, int],
-) -> bool:
-    stim_w, stim_h = float(stim_size[0]), float(stim_size[1])
-    for placed_x, placed_y in placed_px:
-        if abs(position_px[0] - placed_x) < stim_w and abs(position_px[1] - placed_y) < stim_h:
-            return True
-    return False
-
-
-def _assert_non_overlapping_circle_positions(
-    positions_px: List[Tuple[float, float]],
-    stim_size: Tuple[int, int],
-) -> None:
-    placed_px: List[Tuple[float, float]] = []
-    for position_px in positions_px:
-        if _has_overlap(position_px, placed_px, stim_size):
-            raise ValueError(
-                "Fixed stimulus circle positions overlap; increase stim_range_radius or reduce stimulus size"
-            )
-        placed_px.append(position_px)
-
-
-def _sample_non_overlapping_circle_positions(
-    count: int,
-    center_px: Tuple[float, float],
-    radius_px: float,
-    stim_size: Tuple[int, int],
-    max_attempts: int = 2000,
-) -> List[Tuple[float, float]]:
-    positions_px: List[Tuple[float, float]] = []
-    attempts = 0
-    while len(positions_px) < count and attempts < max_attempts:
-        attempts += 1
-        candidate_px = _circle_point(center_px, radius_px, random.uniform(0.0, 2.0 * math.pi))
-        if not _has_overlap(candidate_px, positions_px, stim_size):
-            positions_px.append(candidate_px)
-
-    if len(positions_px) < count:
-        raise RuntimeError(f"Could not place {count} non-overlapping stimuli on the stimulus circle")
-    return positions_px
-
-
-def _compute_positions(
-    fixed_positions: bool,
-    num_afc: int,
-    center_point: Optional[Tuple[float, float]],
-    stim_range_radius: Optional[float],
-    stim_size: Tuple[int, int],
-    effective_win_size: Tuple[int, int],
-) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
-    center_px, radius_px = _resolve_stimulus_circle(center_point, stim_range_radius, effective_win_size)
-    if fixed_positions:
-        # Fixed positions are evenly spaced, offset by half a spacing from the point directly below center.
-        spacing_angle = (2.0 * math.pi) / float(num_afc)
-        start_angle = (math.pi / 2.0) + (spacing_angle / 2.0)
-        sampled_positions_px = [
-            _circle_point(center_px, radius_px, start_angle + (idx * spacing_angle))
-            for idx in range(num_afc)
-        ]
-        _assert_non_overlapping_circle_positions(sampled_positions_px, stim_size)
-    else:
-        # Random positions stay on the circle and use the same axis-aligned overlap rule as the old sampler.
-        sampled_positions_px = _sample_non_overlapping_circle_positions(
-            num_afc,
-            center_px,
-            radius_px,
-            stim_size,
-        )
-
-    positions = [_screen_px_to_psychopy(pos_px, effective_win_size) for pos_px in sampled_positions_px]
-    return sampled_positions_px, positions
 
 
 def _build_behavior_fieldnames(num_afc: int) -> List[str]:
@@ -860,7 +724,7 @@ def run_task(
                 payload = serialize_preview_image(image_obj)
                 if payload is None:
                     continue
-                size_px = _stim_size_from_preloaded(preloaded_items, pair)
+                size_px = stimulus_size(preloaded_items, pair)
                 images.append(
                     {
                         "image_payload": payload,
@@ -1131,7 +995,7 @@ def run_task(
             )
 
             first_pair = trial_options[0]
-            stim_size = _stim_size_from_preloaded(preloaded, first_pair)
+            stim_size = stimulus_size(preloaded, first_pair)
 
             effective_win_size = resolve_scene_size(
                 main_screen,
@@ -1139,7 +1003,7 @@ def run_task(
                 requested_size=win_size,
                 realized_size=tuple(win.size),
             )
-            sampled_positions, positions = _compute_positions(
+            sampled_positions, positions = compute_afc_positions(
                 fixed_positions=fixed_positions,
                 num_afc=num_afc,
                 center_point=center_point,

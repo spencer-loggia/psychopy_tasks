@@ -52,6 +52,10 @@
                 "config": "config_files/csc2/yuri_rigtrain_no_seq_mem_20260803.json"
             }
         },
+        "Match2Cue": {
+            "launch": "task/match2cue.py",
+            "config": "config_files/csc2/match2cue_auxillary.json"
+        },
         "video": {
             "launch": "task/play_video.py",
             "config": "test_configs/play_video_config.json"
@@ -60,11 +64,11 @@
             "csc2_experiment": {
                 "launch": [
                     "task/active_foraging.py",
-                    "task/active_foraging.py"
+                    "task/match2cue.py"
                 ],
                 "config": [
                     "config_files/csc2/yuri_rigtrain_noseq_nomem_20260615.json",
-                    "config_files/csc2/yuri_rigtrain_no_seq_mem_20260803.json"
+                    "config_files/csc2/match2cue_auxillary.json"
                 ],
                 "order_mode": "sequential",
                 "n_iters": null

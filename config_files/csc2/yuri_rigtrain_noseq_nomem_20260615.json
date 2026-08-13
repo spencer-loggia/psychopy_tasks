@@ -53,7 +53,7 @@
     "experimenter": null
   },
   "refresh_rate": 60,
-  "n": 2000,
+  "n": 50,
 
   "fullscreen": true,
   "win_size": [2560, 1600],

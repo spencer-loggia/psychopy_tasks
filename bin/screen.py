@@ -917,6 +917,23 @@ def _normalize_reward_counts(value: Any) -> Optional[dict[int, int]]:
     return out
 
 
+def _normalize_status_counts(value: Any) -> Optional[dict[str, int]]:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return None
+    out: dict[str, int] = {}
+    for label, count in value.items():
+        clean_label = str(label).strip()
+        if not clean_label:
+            continue
+        try:
+            out[clean_label] = max(0, int(count))
+        except Exception:
+            continue
+    return out
+
+
 def reward_level_color(level: int) -> tuple[int, int, int]:
     palette = {
         0: (220, 60, 60),
@@ -964,6 +981,7 @@ def _experimenter_preview_process(
     initial_subject: Optional[str],
     initial_current_trial_num: Optional[int],
     initial_total_trials: Optional[int],
+    initial_status_counts: Optional[Dict[str, int]],
     stop_event,
 ) -> None:
     from psychopy import core, event, visual
@@ -1006,6 +1024,7 @@ def _experimenter_preview_process(
                 "subject": current_subject,
                 "current_trial_num": current_trial_num,
                 "total_trials": current_total_trials,
+                "status_counts": current_status_counts,
             }
         )
 
@@ -1132,6 +1151,7 @@ def _experimenter_preview_process(
             "fixation": fixation,
             "highlight_box": highlight_box,
             "reward_counts": _normalize_reward_counts(payload.get("reward_counts")),
+            "status_counts": _normalize_status_counts(payload.get("status_counts")),
             "subject": payload.get("subject"),
             "current_trial_num": payload.get("current_trial_num"),
             "total_trials": payload.get("total_trials"),
@@ -1226,8 +1246,14 @@ def _experimenter_preview_process(
         system_time_text.draw()
         timer_text.text = format_elapsed_hms(elapsed)
         timer_text.draw()
+        status_counts = static_scene.get("status_counts")
         reward_counts = static_scene.get("reward_counts")
-        if reward_counts is not None:
+        if status_counts is not None:
+            reward_counts_text.text = "\n".join(
+                f"{label}: {count}" for label, count in status_counts.items()
+            )
+            reward_counts_text.draw()
+        elif reward_counts is not None:
             reward_counts_text.text = (
                 f"R0: {reward_counts.get(0, 0)}\n"
                 f"R1: {reward_counts.get(1, 0)}\n"
@@ -1263,6 +1289,7 @@ def _experimenter_preview_process(
     last_mouse_down = False
     last_bg_rgb = (0, 0, 0)
     current_reward_counts = None
+    current_status_counts = _normalize_status_counts(initial_status_counts)
     current_highlight_box = None
     current_subject = initial_subject
     current_trial_num = initial_current_trial_num
@@ -1274,6 +1301,7 @@ def _experimenter_preview_process(
             "subject": current_subject,
             "current_trial_num": current_trial_num,
             "total_trials": current_total_trials,
+            "status_counts": current_status_counts,
         }
     )
     movie = None
@@ -1395,6 +1423,8 @@ def _experimenter_preview_process(
                     command_type = str(payload.get("type", "")).strip().lower()
                     if "reward_counts" in payload:
                         current_reward_counts = _normalize_reward_counts(payload.get("reward_counts"))
+                    if "status_counts" in payload:
+                        current_status_counts = _normalize_status_counts(payload.get("status_counts"))
                     if "highlight_box" in payload:
                         current_highlight_box = payload.get("highlight_box")
                     if "subject" in payload:
@@ -1405,6 +1435,7 @@ def _experimenter_preview_process(
                         current_total_trials = payload.get("total_trials")
                     scene_payload = dict(payload)
                     scene_payload["reward_counts"] = current_reward_counts
+                    scene_payload["status_counts"] = current_status_counts
                     scene_payload["highlight_box"] = current_highlight_box
                     scene_payload["subject"] = current_subject
                     scene_payload["current_trial_num"] = current_trial_num
@@ -1510,6 +1541,7 @@ def _experimenter_preview_process(
                         "bg_rgb_255": last_bg_rgb,
                         "main_size": preview_canvas_size,
                         "reward_counts": current_reward_counts,
+                        "status_counts": current_status_counts,
                         "highlight_box": current_highlight_box,
                         "subject": current_subject,
                         "current_trial_num": current_trial_num,
@@ -1534,6 +1566,7 @@ class ExperimenterPreview:
         subject: Optional[str] = None,
         current_trial_num: Optional[int] = None,
         total_trials: Optional[int] = None,
+        status_counts: Optional[Dict[str, int]] = None,
         start_perf_s: Optional[float] = None,
         update_interval_s: float = 0.1,
         mouse_visible: Optional[bool] = True,
@@ -1543,6 +1576,7 @@ class ExperimenterPreview:
         self.subject = subject
         self.current_trial_num = current_trial_num
         self.total_trials = total_trials
+        self.status_counts = dict(status_counts) if status_counts is not None else None
         self.start_perf_s = time.perf_counter() if start_perf_s is None else float(start_perf_s)
         self.update_interval_s = max(0.05, float(update_interval_s))
         self.exit_requested = False
@@ -1565,6 +1599,7 @@ class ExperimenterPreview:
                 subject,
                 current_trial_num,
                 total_trials,
+                self.status_counts,
                 self._stop_event,
             ),
             daemon=True,
@@ -1597,17 +1632,23 @@ class ExperimenterPreview:
         self.current_trial_num = int(current_trial_num)
         self.total_trials = None if total_trials is None else int(total_trials)
 
+    def set_status_counts(self, status_counts: Optional[Dict[str, int]]) -> None:
+        self.status_counts = dict(status_counts) if status_counts is not None else None
+
     def _send(self, payload: Dict[str, Any]) -> None:
         payload = dict(payload)
         subject = getattr(self, "subject", None)
         current_trial_num = getattr(self, "current_trial_num", None)
         total_trials = getattr(self, "total_trials", None)
+        status_counts = getattr(self, "status_counts", None)
         if subject is not None:
             payload.setdefault("subject", str(subject))
         if current_trial_num is not None:
             payload.setdefault("current_trial_num", int(current_trial_num))
         if total_trials is not None:
             payload.setdefault("total_trials", int(total_trials))
+        if status_counts is not None:
+            payload.setdefault("status_counts", dict(status_counts))
         if self.poll() or not self._process.is_alive():
             return
         try:
@@ -1636,6 +1677,7 @@ class ExperimenterPreview:
         fixation_size: Optional[float] = None,
         fixation_color: Sequence[int] = (0, 0, 0),
         reward_counts: Any = _UNSET,
+        status_counts: Any = _UNSET,
         highlight_box: Any = _UNSET,
     ) -> None:
         payload: Dict[str, Any] = {
@@ -1650,6 +1692,8 @@ class ExperimenterPreview:
         }
         if reward_counts is not _UNSET:
             payload["reward_counts"] = dict(reward_counts) if reward_counts is not None else None
+        if status_counts is not _UNSET:
+            payload["status_counts"] = dict(status_counts) if status_counts is not None else None
         if highlight_box is not _UNSET:
             payload["highlight_box"] = dict(highlight_box) if highlight_box is not None else None
         self._send(payload)
@@ -1660,6 +1704,7 @@ class ExperimenterPreview:
         bg_rgb_255: Sequence[int],
         main_size: Optional[Sequence[int]] = None,
         reward_counts: Any = _UNSET,
+        status_counts: Any = _UNSET,
         highlight_box: Any = _UNSET,
     ) -> None:
         payload: Dict[str, Any] = {
@@ -1670,6 +1715,8 @@ class ExperimenterPreview:
             payload["main_size"] = [int(main_size[0]), int(main_size[1])]
         if reward_counts is not _UNSET:
             payload["reward_counts"] = dict(reward_counts) if reward_counts is not None else None
+        if status_counts is not _UNSET:
+            payload["status_counts"] = dict(status_counts) if status_counts is not None else None
         if highlight_box is not _UNSET:
             payload["highlight_box"] = dict(highlight_box) if highlight_box is not None else None
         self._send(payload)

@@ -1,6 +1,6 @@
 { 
   "config_name": "csc2_foraging_mem",
-  "subject": "Yuri",
+  "subject": "test_env1",
   "n_colors": 36,
   "n_shapes": 36, 
   "n_lum_levels": 11,

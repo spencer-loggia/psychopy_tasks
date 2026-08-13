@@ -41,17 +41,13 @@
         },
         "CSC2": {
             "classic": {
-                "Yuri": {
-                    "launch": "task/active_foraging.py",
-                    "config": "config_files/csc2/yuri_rigtrain_noseq_nomem_20260615.json"
-                }
+                "launch": "task/active_foraging.py",
+                "config": "config_files/csc2/yuri_rigtrain_noseq_nomem_20260615.json"
             }, 
             "sequential": {},
             "memory": {
-                "Yuri": {
-                    "launch": "task/active_foraging.py",
-                    "config": "config_files/csc2/yuri_rigtrain_no_seq_mem_20260803.json"
-                }
+                "launch": "task/active_foraging.py",
+                "config": "config_files/csc2/yuri_rigtrain_no_seq_mem_20260803.json"
             }
         },
         "video": {

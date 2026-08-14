@@ -102,11 +102,13 @@ menu; Desktop, Shutdown, and mode switching are available only from that root me
 
 Run System Diagnostic uses the configured `environment.python` interpreter and does not create an experiment or
 block. It checks that PsychoPy can import, `lgpio` can open GPIO chip 0, and the Pi-Plates DAQC2 driver can read the
-board supply voltage on ADC channel 8. It then pins the diagnostic subprocess to CPU 0, opens a PsychoPy window on
-the resolved main monitor, requests blocking vsync, measures the monitor refresh rate, and records 120 independent
-flip intervals. The flip-lock check passes when at least 90% of those intervals match one measured monitor refresh
-and the median interval also matches the expected frame period. The completion dialog always includes the measured
-refresh rate (or `unavailable`) and a per-check list, followed by explicit errors for failed checks.
+board supply voltage on ADC channel 8. It then pins the diagnostic subprocess to CPU 0, reads the resolved main
+output's starred active-mode refresh rate from `xrandr`, opens a PsychoPy window on that output, requests blocking
+vsync, and records 120 independent flip intervals. PsychoPy's `getActualFrameRate()` result is reported separately
+as an observed flip rate; it is not treated as the monitor's hardware rate when xrandr is available. The flip-lock
+check passes when at least 90% of those intervals match one hardware refresh and the median interval also matches
+the expected frame period. The completion dialog always includes the monitor refresh rate (or `unavailable`) and a
+per-check list, followed by explicit errors for failed checks.
 
 The DAQC2 check uses board address 0 by default. A rig with a different address or module name can set optional
 top-level launcher settings:

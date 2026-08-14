@@ -7,7 +7,9 @@ import importlib
 import json
 import math
 import os
+import re
 import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -22,6 +24,7 @@ if str(_project_root) not in sys.path:
 DEFAULT_DAQ_ADDRESS = 0
 FLIP_TEST_INTERVALS = 120
 FLIP_WARMUP_FRAMES = 20
+MIN_LOCKED_FRACTION = 0.90
 
 
 def parse_args() -> argparse.Namespace:
@@ -167,7 +170,7 @@ def pin_diagnostic_to_cpu_zero() -> dict[str, Any]:
 def evaluate_flip_lock(
     refresh_rate_hz: float,
     intervals_s: Iterable[float],
-) -> tuple[bool, dict[str, float | int]]:
+) -> tuple[bool, dict[str, float | int | bool]]:
     """Evaluate whether consecutive flips occur once per measured refresh."""
     refresh_rate_hz = float(refresh_rate_hz)
     if not math.isfinite(refresh_rate_hz) or refresh_rate_hz <= 0.0:
@@ -184,25 +187,77 @@ def evaluate_flip_lock(
     interval_tolerance_s = max(0.0015, expected_s * 0.12)
     median_tolerance_s = max(0.00075, expected_s * 0.05)
     median_s = float(statistics.median(intervals))
-    deviations_s = [abs(value - median_s) for value in intervals]
-    mad_s = float(statistics.median(deviations_s))
     locked_count = sum(
         1 for value in intervals if abs(value - expected_s) <= interval_tolerance_s
     )
     locked_fraction = locked_count / len(intervals)
     dropped_count = sum(1 for value in intervals if value > expected_s * 1.5)
-    passed = bool(
-        abs(median_s - expected_s) <= median_tolerance_s
-        and locked_fraction >= 0.90
-    )
+    median_error_s = abs(median_s - expected_s)
+    median_matches = median_error_s <= median_tolerance_s
+    passed = bool(median_matches and locked_fraction >= MIN_LOCKED_FRACTION)
     return passed, {
         "sample_count": len(intervals),
         "expected_interval_ms": expected_s * 1000.0,
         "median_interval_ms": median_s * 1000.0,
-        "median_absolute_deviation_ms": mad_s * 1000.0,
+        "interval_tolerance_ms": interval_tolerance_s * 1000.0,
+        "median_tolerance_ms": median_tolerance_s * 1000.0,
+        "median_error_ms": median_error_s * 1000.0,
+        "median_matches": median_matches,
         "locked_fraction": locked_fraction,
         "dropped_interval_count": dropped_count,
     }
+
+
+def parse_xrandr_active_refresh_rate(
+    output: str,
+    output_name: str,
+) -> Optional[float]:
+    """Return the starred active-mode refresh for one xrandr output."""
+    in_requested_output = False
+    for raw_line in str(output).splitlines():
+        if raw_line and not raw_line[0].isspace():
+            connected_match = re.match(r"^(\S+)\s+(connected|disconnected)\b", raw_line)
+            in_requested_output = bool(
+                connected_match
+                and connected_match.group(1) == output_name
+                and connected_match.group(2) == "connected"
+            )
+            continue
+        if not in_requested_output:
+            continue
+        active_match = re.search(r"(?<![\d.])(\d+(?:\.\d+)?)\*", raw_line)
+        if active_match is None:
+            continue
+        refresh_rate_hz = float(active_match.group(1))
+        if math.isfinite(refresh_rate_hz) and refresh_rate_hz > 0.0:
+            return refresh_rate_hz
+    return None
+
+
+def query_main_monitor_refresh_rate(
+    screen_info: object,
+) -> tuple[Optional[float], str]:
+    """Read the main output's active hardware mode without timing PsychoPy flips."""
+    output_name = str(getattr(screen_info, "name", "") or "").strip()
+    if not output_name:
+        return None, "resolved main monitor has no output name"
+    try:
+        completed = subprocess.run(
+            ["xrandr", "--current"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except Exception as exc:
+        return None, f"xrandr query failed: {_error_text(exc)}"
+    refresh_rate_hz = parse_xrandr_active_refresh_rate(
+        completed.stdout,
+        output_name,
+    )
+    if refresh_rate_hz is None:
+        return None, f"xrandr did not report an active mode for output {output_name}"
+    return refresh_rate_hz, f"xrandr active mode for output {output_name}"
 
 
 def _measure_flip_intervals(win, *, interval_count: int = FLIP_TEST_INTERVALS) -> list[float]:
@@ -257,6 +312,9 @@ def run_display_diagnostic(
         main_screen, _experimenter_screen = resolve_task_screens(
             screen_cfg,
             allow_same_screen=True,
+        )
+        monitor_refresh_rate_hz, monitor_rate_detail = query_main_monitor_refresh_rate(
+            main_screen
         )
         win_kwargs = {
             "color": (0.0, 0.0, 0.0),
@@ -339,7 +397,7 @@ def run_display_diagnostic(
             if median_interval_s is not None and median_interval_s > 0.0
             else None
         )
-        if psychopy_rate is None:
+        if monitor_refresh_rate_hz is None and psychopy_rate is None:
             refresh_rate_hz = interval_rate
             estimate_detail = (
                 f"; the diagnostic intervals suggest {interval_rate:.3f} Hz, but this is unconfirmed"
@@ -349,8 +407,14 @@ def run_display_diagnostic(
             refresh_check = _check(
                 "Monitor refresh rate",
                 "fail",
-                f"PsychoPy could not obtain a stable main-monitor refresh measurement{estimate_detail}",
-                error=rate_error or "Window.getActualFrameRate() returned no stable rate",
+                (
+                    "The main-monitor active mode and a stable PsychoPy refresh "
+                    f"measurement were unavailable{estimate_detail}"
+                ),
+                error=(
+                    f"{monitor_rate_detail}; "
+                    f"{rate_error or 'Window.getActualFrameRate() returned no stable rate'}"
+                ),
             )
             flip_check = _check(
                 "Flip synchronization",
@@ -362,35 +426,61 @@ def run_display_diagnostic(
             )
             return [vsync_check, refresh_check, flip_check], refresh_rate_hz, None
 
-        refresh_rate_hz = psychopy_rate
+        refresh_rate_hz = monitor_refresh_rate_hz or psychopy_rate
+        if monitor_refresh_rate_hz is not None:
+            source = monitor_rate_detail
+            observed = (
+                f"; PsychoPy observed {psychopy_rate:.3f} Hz"
+                if psychopy_rate is not None
+                else "; PsychoPy stable-rate measurement unavailable"
+            )
+        else:
+            source = f"PsychoPy fallback; {monitor_rate_detail}"
+            observed = ""
         refresh_check = _check(
             "Monitor refresh rate",
             "pass",
-            (
-                f"Main monitor refresh rate: {refresh_rate_hz:.3f} Hz "
-                "(PsychoPy stable-frame measurement)"
-            ),
+            f"Main monitor refresh rate: {refresh_rate_hz:.3f} Hz ({source}){observed}",
         )
 
         flip_passed, metrics = evaluate_flip_lock(refresh_rate_hz, intervals)
-        metrics["refresh_rate_hz"] = refresh_rate_hz
+        metrics["monitor_refresh_rate_hz"] = refresh_rate_hz
+        metrics["psychopy_measured_rate_hz"] = psychopy_rate
+        metrics["observed_median_rate_hz"] = interval_rate
         locked_percent = float(metrics["locked_fraction"]) * 100.0
+        psychopy_rate_text = (
+            f"{psychopy_rate:.3f} Hz" if psychopy_rate is not None else "unavailable"
+        )
+        interval_rate_text = (
+            f"{interval_rate:.3f} Hz" if interval_rate is not None else "unavailable"
+        )
         detail = (
-            f"{locked_percent:.1f}% of {metrics['sample_count']} intervals matched one refresh; "
-            f"median {metrics['median_interval_ms']:.3f} ms; "
-            f"dropped/long intervals {metrics['dropped_interval_count']}"
+            f"target {refresh_rate_hz:.3f} Hz ({metrics['expected_interval_ms']:.3f} ms); "
+            f"PsychoPy measured {psychopy_rate_text}; median flip interval "
+            f"{metrics['median_interval_ms']:.3f} ms ({interval_rate_text}); "
+            f"{locked_percent:.1f}% of {metrics['sample_count']} intervals within "
+            f"±{metrics['interval_tolerance_ms']:.3f} ms; "
+            f"long/dropped intervals {metrics['dropped_interval_count']}"
         )
         if flip_passed:
             flip_check = _check("Flip synchronization", "pass", detail)
         else:
+            failure_reasons = []
+            if locked_percent < MIN_LOCKED_FRACTION * 100.0:
+                failure_reasons.append(
+                    f"only {locked_percent:.1f}% of intervals matched; at least "
+                    f"{MIN_LOCKED_FRACTION * 100.0:.1f}% is required"
+                )
+            if not bool(metrics["median_matches"]):
+                failure_reasons.append(
+                    f"median interval error {metrics['median_error_ms']:.3f} ms exceeded "
+                    f"the {metrics['median_tolerance_ms']:.3f} ms limit"
+                )
             flip_check = _check(
                 "Flip synchronization",
                 "fail",
                 detail,
-                error=(
-                    "PsychoPy flips did not remain locked to one main-monitor refresh "
-                    "for at least 90% of the diagnostic"
-                ),
+                error="; ".join(failure_reasons),
             )
         return [vsync_check, refresh_check, flip_check], refresh_rate_hz, metrics
     except Exception as exc:

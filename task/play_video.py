@@ -29,6 +29,7 @@ from bin.video_playback import (
 from bin.screen import (
     ExperimenterPreview,
     describe_screen,
+    enforce_window_vsync,
     load_screen_config,
     resolve_scene_size,
     resolve_task_screens,
@@ -161,6 +162,7 @@ def run_task(
 
     main_screen, experimenter_screen = resolve_task_screens(screen_config)
     win = utils.setup_window(bg_rgb_255=bg, fullscreen=fullscreen, size=win_size, screen_info=main_screen)
+    main_vsync_requested = enforce_window_vsync(win)
     bg_rect = utils.make_bg_rect(win, bg)
     mouse = event.Mouse(win=win)
     experimenter_preview = None
@@ -197,6 +199,7 @@ def run_task(
             "aborted",
             "stop_reason",
             "dropped_frames",
+            "main_display_dropped_frames",
             "sync_pulses",
         ],
         auto_flush=False,
@@ -245,6 +248,13 @@ def run_task(
         msg_logger.log(
             "INFO",
             f"resolved_screens main={describe_screen(main_screen)} experimenter={describe_screen(experimenter_screen)}",
+        )
+        msg_logger.log(
+            "INFO",
+            (
+                "main_display_sync wait_blanking=1 swap_interval=1 "
+                f"request_applied={int(main_vsync_requested)}"
+            ),
         )
         msg_logger.log(
             "INFO",
@@ -406,6 +416,11 @@ def run_task(
                     "aborted": int(playback_info["aborted"]),
                     "stop_reason": playback_info.get("abort_reason") or "completed",
                     "dropped_frames": playback_info["dropped_frames"],
+                    "main_display_dropped_frames": (
+                        playback_info["main_display_dropped_frames"]
+                        if playback_info.get("main_display_dropped_frames") is not None
+                        else ""
+                    ),
                     "sync_pulses": playback_info["sync_pulses"],
                 }
             )

@@ -61,6 +61,31 @@ def set_window_mouse_visible(win, visible: bool) -> bool:
     return applied
 
 
+def enforce_window_vsync(win) -> bool:
+    """Request blocking, refresh-synchronized swaps for a PsychoPy window."""
+    applied = False
+    try:
+        win.waitBlanking = True
+        applied = True
+    except Exception:
+        pass
+
+    targets = [getattr(win, "winHandle", None), getattr(win, "backend", None)]
+    for target in targets:
+        if target is None:
+            continue
+        for method_name in ("set_vsync", "setVSync"):
+            try:
+                method = getattr(target, method_name, None)
+                if callable(method):
+                    method(True)
+                    applied = True
+                    break
+            except Exception:
+                continue
+    return applied
+
+
 @dataclass(frozen=True)
 class ScreenGeometry:
     index: int
@@ -1002,7 +1027,9 @@ def _experimenter_preview_process(
     initial_status_counts: Optional[Dict[str, int]],
     stop_event,
 ) -> None:
+    import ctypes
     from psychopy import core, event, visual
+    from pyglet import gl as GL
     from .video_playback import (
         SharedVideoFrameReader,
         center_crop_bounds,
@@ -1010,6 +1037,30 @@ def _experimenter_preview_process(
     preview_canvas_size = resolve_screen_canvas_size(screen_info)
     outside_bg_rgb = (30, 30, 30)
     preview_outline_rgb = (150, 150, 150)
+
+    def _upload_rgba_texture(stim, rgba: np.ndarray) -> None:
+        """Update an ImageStim texture as raw RGBA bytes without color remapping."""
+        if rgba.dtype != np.uint8 or rgba.ndim != 3 or rgba.shape[2] != 4:
+            raise ValueError("Shared video frames must be contiguous uint8 RGBA")
+        if not rgba.flags.c_contiguous:
+            raise ValueError("Shared video upload buffer must be contiguous")
+        height, width = int(rgba.shape[0]), int(rgba.shape[1])
+        pixel_pointer = rgba.ctypes.data_as(ctypes.POINTER(GL.GLubyte))
+        GL.glActiveTexture(GL.GL_TEXTURE0)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, stim._texID)
+        GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
+        GL.glTexSubImage2D(
+            GL.GL_TEXTURE_2D,
+            0,
+            0,
+            0,
+            width,
+            height,
+            GL.GL_RGBA,
+            GL.GL_UNSIGNED_BYTE,
+            pixel_pointer,
+        )
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
 
     def _make_bg_rect(bg_rgb_255: Sequence[int]):
         return visual.Rect(
@@ -1026,6 +1077,7 @@ def _experimenter_preview_process(
         nonlocal movie, movie_bg_rect, movie_outline_rect, movie_layout
         nonlocal shared_movie_active, shared_movie_stim, shared_movie_sequence
         nonlocal shared_movie_minimum_sequence, shared_movie_crop_bounds
+        nonlocal shared_movie_upload_buffer
         nonlocal last_bg_rgb, static_scene
         if movie is not None:
             try:
@@ -1043,6 +1095,7 @@ def _experimenter_preview_process(
         shared_movie_sequence = 0
         shared_movie_minimum_sequence = 1
         shared_movie_crop_bounds = None
+        shared_movie_upload_buffer = None
         movie_bg_rect = None
         movie_outline_rect = None
         movie_layout = None
@@ -1310,7 +1363,9 @@ def _experimenter_preview_process(
         color=_preview_rgb255_to_psychopy((0, 0, 0)),
         allowStencil=False,
         allowGUI=False,
+        waitBlanking=True,
     )
+    enforce_window_vsync(win)
     last_cursor_apply_s = 0.0
     if mouse_visible is not None:
         set_window_mouse_visible(win, bool(mouse_visible))
@@ -1343,6 +1398,7 @@ def _experimenter_preview_process(
     shared_movie_sequence = 0
     shared_movie_minimum_sequence = 1
     shared_movie_crop_bounds = None
+    shared_movie_upload_buffer = None
     task_label_text = None
 
     try:
@@ -1609,21 +1665,41 @@ def _experimenter_preview_process(
                         if shared_frame is not None:
                             shared_movie_sequence = shared_frame.sequence
                             left, top, right, bottom = shared_movie_crop_bounds
-                            cropped_frame = np.ascontiguousarray(
-                                shared_frame.rgba[top:bottom, left:right]
+                            cropped_view = shared_frame.rgba[top:bottom, left:right]
+                            expected_shape = (
+                                int(bottom - top),
+                                int(right - left),
+                                4,
                             )
+                            if (
+                                shared_movie_upload_buffer is None
+                                or shared_movie_upload_buffer.shape != expected_shape
+                            ):
+                                shared_movie_upload_buffer = np.empty(
+                                    expected_shape,
+                                    dtype=np.uint8,
+                                )
+                            np.copyto(shared_movie_upload_buffer, cropped_view)
                             if shared_movie_stim is None:
+                                blank_image = Image.new(
+                                    "RGBA",
+                                    (expected_shape[1], expected_shape[0]),
+                                    (0, 0, 0, 255),
+                                )
                                 shared_movie_stim = visual.ImageStim(
                                     win,
-                                    image=cropped_frame,
+                                    image=blank_image,
                                     units="pix",
                                     size=movie_layout["box_size"],
                                     pos=movie_layout["box_center"],
                                     interpolate=True,
+                                    flipVert=True,
                                     autoLog=False,
                                 )
-                            else:
-                                shared_movie_stim.image = cropped_frame
+                            _upload_rgba_texture(
+                                shared_movie_stim,
+                                shared_movie_upload_buffer,
+                            )
                     if movie_bg_rect is not None:
                         movie_bg_rect.draw()
                     if shared_movie_stim is not None:

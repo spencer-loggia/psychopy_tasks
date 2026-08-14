@@ -12,6 +12,7 @@ from bin.screen import (
     build_reward_hit_boxes,
     compute_aspect_cover_size,
     compute_centered_aspect_fit,
+    enforce_window_vsync,
     format_experimenter_label,
     get_psychopy_window_kwargs,
     load_screen_config,
@@ -24,6 +25,23 @@ from bin.screen import (
 
 
 class ScreenConfigTests(unittest.TestCase):
+    def test_enforce_window_vsync_enables_blanking_and_native_swap_interval(self):
+        class WindowHandle:
+            def __init__(self):
+                self.vsync_calls = []
+
+            def set_vsync(self, enabled):
+                self.vsync_calls.append(enabled)
+
+        win = Mock()
+        win.waitBlanking = False
+        win.winHandle = WindowHandle()
+        win.backend = None
+
+        self.assertTrue(enforce_window_vsync(win))
+        self.assertTrue(win.waitBlanking)
+        self.assertEqual(win.winHandle.vsync_calls, [True])
+
     def test_reward_level_colors_match_active_foraging_legend(self):
         self.assertEqual(reward_level_color(0), (220, 60, 60))
         self.assertEqual(reward_level_color(1), (140, 140, 140))

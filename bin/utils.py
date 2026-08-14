@@ -371,6 +371,11 @@ def play_video_fill_screen(
     expected_duration_s = clip_duration_s
     actual_source_start_s = None
     actual_source_last_frame_s = None
+    previous_record_frame_intervals = bool(
+        getattr(win, "recordFrameIntervals", False)
+    )
+    main_display_dropped_frames = None
+    main_drop_count_before = None
     try:
         prepared_source_time_s = prepare_vlc_clip(
             movie,
@@ -383,6 +388,14 @@ def play_video_fill_screen(
         except Exception:
             pass
         raise
+
+    try:
+        if frame_duration_s is not None:
+            win.refreshThreshold = float(frame_duration_s) * 1.5
+        main_drop_count_before = int(getattr(win, "nDroppedFrames", 0))
+        win.recordFrameIntervals = True
+    except Exception:
+        main_drop_count_before = None
 
     try:
         while True:
@@ -591,6 +604,28 @@ def play_video_fill_screen(
                 ),
             )
     finally:
+        if main_drop_count_before is not None:
+            try:
+                main_display_dropped_frames = max(
+                    0,
+                    int(getattr(win, "nDroppedFrames", 0))
+                    - main_drop_count_before,
+                )
+            except Exception:
+                main_display_dropped_frames = None
+        _log_message(
+            msg_logger,
+            "INFO",
+            (
+                f"video_main_display_timing trial_num={trial_num} "
+                f"file={video_file.name} "
+                f"missed_refreshes={main_display_dropped_frames}"
+            ),
+        )
+        try:
+            win.recordFrameIntervals = previous_record_frame_intervals
+        except Exception:
+            pass
         if sync_schedule is not None and sync_schedule.high:
             try:
                 _set_gpio_level_on_flip(
@@ -681,6 +716,7 @@ def play_video_fill_screen(
         "draw_size": tuple(draw_size),
         "backend_used": backend_used,
         "backend_dropped_frames": backend_drop_count,
+        "main_display_dropped_frames": main_display_dropped_frames,
         "sync_pulses": sum(1 for record in sync_records if int(record["level"]) == 1),
         "movie_stim": movie if keep_movie_loaded else None,
     }

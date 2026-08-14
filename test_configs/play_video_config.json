@@ -1,7 +1,7 @@
 {
   "config_name": "play_video",
   "video_files": [
-    "./task/resources/cropped_videos/Gibbon Monkey sounds.mp4"
+    "/mnt/isilon/DATA/monkey_test_box_data/videos/monkey_kingdom.mp4"
   ],
   "clip_duration_seconds": 5.0,
   "seek_timeout_seconds": 30.0,

@@ -55,6 +55,8 @@ BUTTON_BG = "#f7f7f7"
 BUTTON_ACTIVE_BG = "#d9d9d9"
 SHUTDOWN_BUTTON_BG = "#b91c1c"
 SHUTDOWN_BUTTON_ACTIVE_BG = "#7f1d1d"
+TOUCH_SCROLL_THRESHOLD_PX = 12
+WHEEL_SCROLL_UNITS = 3
 
 
 def parse_args() -> argparse.Namespace:
@@ -107,12 +109,53 @@ def _get_working_directory(environment_cfg: Dict[str, Any], config_dir: Path) ->
     return working_dir
 
 
+def wheel_scroll_units(*, delta: int = 0, button_num: Optional[int] = None) -> int:
+    """Normalize Windows/macOS wheel deltas and X11 Button-4/5 events."""
+    if button_num == 4:
+        return -WHEEL_SCROLL_UNITS
+    if button_num == 5:
+        return WHEEL_SCROLL_UNITS
+    delta = int(delta)
+    if delta == 0:
+        return 0
+    notches = max(1, int(round(abs(delta) / 120.0)))
+    direction = -1 if delta > 0 else 1
+    return direction * notches * WHEEL_SCROLL_UNITS
+
+
+def touch_drag_exceeds_threshold(start_y: float, current_y: float) -> bool:
+    return abs(float(current_y) - float(start_y)) >= TOUCH_SCROLL_THRESHOLD_PX
+
+
+def touch_drag_scroll_fraction(
+    *,
+    initial_first: float,
+    start_y: float,
+    current_y: float,
+    content_height: float,
+    visible_fraction: float,
+) -> float:
+    """Translate a direct-manipulation vertical drag into a canvas yview value."""
+    if content_height <= 0.0 or visible_fraction >= 1.0:
+        return 0.0
+    max_first = max(0.0, 1.0 - float(visible_fraction))
+    requested = float(initial_first) + (
+        (float(start_y) - float(current_y)) / float(content_height)
+    )
+    return min(max(requested, 0.0), max_first)
+
+
 class ScrollableButtonFrame(tk.Frame):
     def __init__(self, master: tk.Misc, **kwargs: Any):
         super().__init__(master, **kwargs)
-        self.canvas = tk.Canvas(self, highlightthickness=0)
+        self.canvas = tk.Canvas(self, highlightthickness=0, yscrollincrement=20)
         self.scrollbar = tk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.inner = tk.Frame(self.canvas)
+        self._touch_start_y: Optional[float] = None
+        self._touch_initial_first = 0.0
+        self._touch_moved = False
+        self._pressed_button: Optional[tk.Button] = None
+        self._pressed_button_relief: Optional[str] = None
 
         self.inner.bind("<Configure>", self._on_inner_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
@@ -122,12 +165,129 @@ class ScrollableButtonFrame(tk.Frame):
 
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scrollbar.pack(side="right", fill="y")
+        self._bind_scroll_surface(self.canvas)
+        self._bind_scroll_surface(self.inner)
 
     def _on_inner_configure(self, _event: tk.Event) -> None:
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
     def _on_canvas_configure(self, event: tk.Event) -> None:
         self.canvas.itemconfigure(self.canvas_window, width=event.width)
+
+    def _bind_wheel(self, widget: tk.Misc) -> None:
+        widget.bind("<MouseWheel>", self._on_mousewheel, add="+")
+        widget.bind("<Button-4>", self._on_mousewheel, add="+")
+        widget.bind("<Button-5>", self._on_mousewheel, add="+")
+
+    def _bind_scroll_surface(self, widget: tk.Misc) -> None:
+        self._bind_wheel(widget)
+        widget.bind("<ButtonPress-1>", self._on_touch_press, add="+")
+        widget.bind("<B1-Motion>", self._on_touch_motion, add="+")
+        widget.bind("<ButtonRelease-1>", self._on_touch_release, add="+")
+
+    def register_button(self, button: tk.Button) -> None:
+        """Give a task button tap-to-activate and drag-to-scroll behavior."""
+        self._bind_wheel(button)
+        button.bind(
+            "<ButtonPress-1>",
+            lambda event, target=button: self._on_touch_press(event, target),
+            add="+",
+        )
+        button.bind("<B1-Motion>", self._on_touch_motion, add="+")
+        button.bind("<ButtonRelease-1>", self._on_touch_release, add="+")
+
+    def reset_scroll(self) -> None:
+        self._reset_touch_gesture()
+        self.after_idle(lambda: self.canvas.yview_moveto(0.0))
+
+    def _on_mousewheel(self, event: tk.Event) -> str:
+        units = wheel_scroll_units(
+            delta=getattr(event, "delta", 0),
+            button_num=getattr(event, "num", None),
+        )
+        if units:
+            self.canvas.yview_scroll(units, "units")
+        return "break"
+
+    def _on_touch_press(
+        self,
+        event: tk.Event,
+        button: Optional[tk.Button] = None,
+    ) -> str:
+        self._reset_touch_gesture()
+        self._touch_start_y = float(event.y_root)
+        self._touch_initial_first = float(self.canvas.yview()[0])
+        self._pressed_button = button
+        if button is not None and str(button.cget("state")) != "disabled":
+            self._pressed_button_relief = str(button.cget("relief"))
+            button.configure(relief="sunken")
+        return "break"
+
+    def _on_touch_motion(self, event: tk.Event) -> str:
+        if self._touch_start_y is None:
+            return "break"
+        current_y = float(event.y_root)
+        if not self._touch_moved:
+            self._touch_moved = touch_drag_exceeds_threshold(
+                self._touch_start_y,
+                current_y,
+            )
+            if self._touch_moved:
+                self._restore_pressed_button_relief()
+        if not self._touch_moved:
+            return "break"
+
+        bbox = self.canvas.bbox("all")
+        content_height = float(bbox[3] - bbox[1]) if bbox is not None else 0.0
+        first, last = self.canvas.yview()
+        visible_fraction = float(last) - float(first)
+        self.canvas.yview_moveto(
+            touch_drag_scroll_fraction(
+                initial_first=self._touch_initial_first,
+                start_y=self._touch_start_y,
+                current_y=current_y,
+                content_height=content_height,
+                visible_fraction=visible_fraction,
+            )
+        )
+        return "break"
+
+    def _on_touch_release(self, event: tk.Event) -> str:
+        button = self._pressed_button
+        should_invoke = bool(
+            button is not None
+            and not self._touch_moved
+            and str(button.cget("state")) != "disabled"
+            and self._event_is_inside_button(event, button)
+        )
+        self._reset_touch_gesture()
+        if should_invoke and button is not None:
+            button.invoke()
+        return "break"
+
+    @staticmethod
+    def _event_is_inside_button(event: tk.Event, button: tk.Button) -> bool:
+        x = float(event.x_root) - float(button.winfo_rootx())
+        y = float(event.y_root) - float(button.winfo_rooty())
+        return 0.0 <= x < float(button.winfo_width()) and 0.0 <= y < float(
+            button.winfo_height()
+        )
+
+    def _restore_pressed_button_relief(self) -> None:
+        if self._pressed_button is None or self._pressed_button_relief is None:
+            return
+        try:
+            self._pressed_button.configure(relief=self._pressed_button_relief)
+        except tk.TclError:
+            pass
+        self._pressed_button_relief = None
+
+    def _reset_touch_gesture(self) -> None:
+        self._restore_pressed_button_relief()
+        self._touch_start_y = None
+        self._touch_initial_first = 0.0
+        self._touch_moved = False
+        self._pressed_button = None
 
 
 class TouchInterfaceApp:
@@ -331,10 +491,10 @@ class TouchInterfaceApp:
         )
         header.grid(row=0, column=0, sticky="ew")
 
-        button_frame = ScrollableButtonFrame(self.root, bg="#e9ecef")
-        button_frame.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 12))
-        button_frame.inner.configure(bg="#e9ecef")
-        self.button_container = button_frame.inner
+        self.button_frame = ScrollableButtonFrame(self.root, bg="#e9ecef")
+        self.button_frame.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 12))
+        self.button_frame.inner.configure(bg="#e9ecef")
+        self.button_container = self.button_frame.inner
 
         self._render_subject_selection()
 
@@ -364,8 +524,14 @@ class TouchInterfaceApp:
         }
 
     def _clear_buttons(self) -> None:
+        self.button_frame.reset_scroll()
         for child in self.button_container.winfo_children():
             child.destroy()
+
+    def _place_button(self, button: tk.Button, row_idx: int) -> None:
+        self.button_frame.register_button(button)
+        button.grid(row=row_idx, column=0, sticky="ew", pady=10, padx=10)
+        self.button_container.grid_columnconfigure(0, weight=1)
 
     def _render_subject_selection(self) -> None:
         self._clear_buttons()
@@ -378,8 +544,7 @@ class TouchInterfaceApp:
                 command=lambda n=str(subject_name), c=str(subject_code): self._select_subject(n, c),
                 **self._button_kwargs(),
             )
-            button.grid(row=row_idx, column=0, sticky="ew", pady=10, padx=10)
-        self.button_container.grid_columnconfigure(0, weight=1)
+            self._place_button(button, row_idx)
 
     def _select_subject(self, subject_name: str, subject_code: str) -> None:
         if self.experiment is not None:
@@ -437,8 +602,7 @@ class TouchInterfaceApp:
             command=command,
             **self._button_kwargs(),
         )
-        button.grid(row=row_idx, column=0, sticky="ew", pady=10, padx=10)
-        self.button_container.grid_columnconfigure(0, weight=1)
+        self._place_button(button, row_idx)
 
     def _create_rig_mode_button(self, row_idx: int) -> None:
         button = tk.Button(
@@ -447,7 +611,7 @@ class TouchInterfaceApp:
             command=self._switch_rig_mode,
             **self._button_kwargs(),
         )
-        button.grid(row=row_idx, column=0, sticky="ew", pady=10, padx=10)
+        self._place_button(button, row_idx)
 
     def _create_desktop_button(self, row_idx: int) -> None:
         button = tk.Button(
@@ -456,7 +620,7 @@ class TouchInterfaceApp:
             command=self._exit_to_desktop,
             **self._button_kwargs(),
         )
-        button.grid(row=row_idx, column=0, sticky="ew", pady=10, padx=10)
+        self._place_button(button, row_idx)
 
     def _exit_to_desktop(self) -> None:
         if self.task_active:
@@ -487,7 +651,7 @@ class TouchInterfaceApp:
             command=self._shutdown_system,
             **button_kwargs,
         )
-        button.grid(row=row_idx, column=0, sticky="ew", pady=10, padx=10)
+        self._place_button(button, row_idx)
 
     def _create_back_button(self, row_idx: int) -> None:
         button = tk.Button(
@@ -496,7 +660,7 @@ class TouchInterfaceApp:
             command=self._go_back,
             **self._button_kwargs(),
         )
-        button.grid(row=row_idx, column=0, sticky="ew", pady=10, padx=10)
+        self._place_button(button, row_idx)
 
     def _shutdown_command(self) -> list[str]:
         if hasattr(os, "geteuid") and os.geteuid() == 0:

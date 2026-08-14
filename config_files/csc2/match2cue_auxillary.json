@@ -8,7 +8,7 @@
   "colors_tsv": "./task/resources/csc2/match2cue_background.tsv",
 
   "pump_delay_time": 0.2,
-  "pump_pulse_time_seconds": 0.35,
+  "pump_pulse_time_seconds": 0.6,
   "daq": {
     "address": 0
   },
@@ -36,7 +36,7 @@
 
   "self_initiation": true,
   "match_cue_duration": 0.5,
-  "delay_time": 0.5,
+  "delay_time": 0.0,
   "iti": 0.5,
   "duration": 0.0,
   "num_afc": 3,

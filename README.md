@@ -93,6 +93,10 @@ the last; `random` samples one item independently for each block. `null` runs in
 integer limits the number of blocks. A natural block completion (exit `0`) advances the loop. A user exit stops the
 current block and its loop immediately.
 
+The subject and task option area scrolls with a mouse wheel (including X11 Button-4/5 wheel events) or by dragging
+vertically with one finger. A touch drag must move at least 12 pixels before it becomes a scroll, so a normal tap
+still activates its button while a swipe does not accidentally launch it.
+
 Experiment-managed task/subprocess policies:
 
 - Every launchable script must accept `--config`. This includes setup utilities, even if they use only a few fields.

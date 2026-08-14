@@ -8,6 +8,7 @@
         "experimenter": "DSI-1"
     },
     "mask_main_inputs": false,
+    "experiment_quiet_mode": true,
     "subjects": {
         "Yuri": "Y",
         "Debug": "D"

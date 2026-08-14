@@ -24,6 +24,7 @@ from bin.screen import (
     resolve_scene_size,
     scale_scene_point,
     select_screen,
+    set_tk_window_fullscreen,
 )
 
 
@@ -330,17 +331,13 @@ class ScreenConfigTests(unittest.TestCase):
         self.assertEqual(select_screen(screens, "HDMI-1", role="main").index, 0)
         self.assertEqual(select_screen(screens, "HDMI-2", role="experimenter").index, 1)
 
-    def test_linux_psychopy_window_uses_virtual_desktop_position(self):
+    def test_linux_psychopy_window_uses_true_fullscreen_screen(self):
         screen = ScreenGeometry(index=1, x=800, y=0, width=2560, height=1600, name="HDMI-A-2")
 
         with patch("bin.screen.sys.platform", "linux"):
             kwargs = get_psychopy_window_kwargs(screen, fullscreen=True)
 
-        self.assertNotIn("screen", kwargs)
-        self.assertEqual(kwargs["fullscr"], False)
-        self.assertEqual(kwargs["size"], (2560, 1600))
-        self.assertEqual(kwargs["pos"], (800, 0))
-        self.assertEqual(kwargs["allowGUI"], False)
+        self.assertEqual(kwargs, {"screen": 1, "fullscr": True})
 
     def test_non_linux_psychopy_fullscreen_uses_screen_index(self):
         screen = ScreenGeometry(index=1, x=800, y=0, width=2560, height=1600, name="HDMI-A-2")
@@ -349,6 +346,18 @@ class ScreenConfigTests(unittest.TestCase):
             kwargs = get_psychopy_window_kwargs(screen, fullscreen=True)
 
         self.assertEqual(kwargs, {"screen": 1, "fullscr": True})
+
+    def test_tk_window_is_positioned_before_true_fullscreen(self):
+        screen = ScreenGeometry(
+            index=1, x=800, y=0, width=2560, height=1600, name="HDMI-A-2"
+        )
+        window = Mock()
+
+        set_tk_window_fullscreen(window, screen)
+
+        window.geometry.assert_called_once_with("2560x1600+800+0")
+        window.update_idletasks.assert_called_once_with()
+        window.attributes.assert_called_once_with("-fullscreen", True)
 
     def test_xrandr_query_uses_rotated_framebuffer_size(self):
         screens = _parse_xrandr_query(

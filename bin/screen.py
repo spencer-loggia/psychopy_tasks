@@ -696,26 +696,25 @@ def get_psychopy_window_kwargs(
         and int(screen_info.height) > 0
     )
     use_virtual_position = bool(has_geometry and sys.platform.startswith("linux"))
+
+    if fullscreen:
+        if screen_info is not None:
+            kwargs["screen"] = int(screen_info.index)
+        kwargs["fullscr"] = True
+        return kwargs
+
     if screen_info is not None and not use_virtual_position:
         kwargs["screen"] = int(screen_info.index)
 
-    if fullscreen and has_geometry:
-        resolved_size = (int(screen_info.width), int(screen_info.height))
-    elif size is not None:
+    if size is not None:
         resolved_size = (int(size[0]), int(size[1]))
     elif has_geometry:
         resolved_size = (int(screen_info.width), int(screen_info.height))
     else:
         resolved_size = (1024, 768)
 
-    if fullscreen and not use_virtual_position:
-        kwargs["fullscr"] = True
-        return kwargs
-
     kwargs["size"] = resolved_size
     kwargs["fullscr"] = False
-    if fullscreen and use_virtual_position:
-        kwargs["allowGUI"] = False
     if has_geometry:
         x = max(0, (int(screen_info.width) - int(resolved_size[0])) // 2)
         y = max(0, (int(screen_info.height) - int(resolved_size[1])) // 2)
@@ -724,6 +723,20 @@ def get_psychopy_window_kwargs(
             y += int(screen_info.y)
         kwargs["pos"] = (x, y)
     return kwargs
+
+
+def set_tk_window_fullscreen(window, screen_info: ScreenGeometry) -> None:
+    """Place a Tk window on one output before requesting real fullscreen."""
+    window.geometry(
+        _format_geometry(
+            max(int(screen_info.width), 1),
+            max(int(screen_info.height), 1),
+            int(screen_info.x),
+            int(screen_info.y),
+        )
+    )
+    window.update_idletasks()
+    window.attributes("-fullscreen", True)
 
 
 def resolve_scene_size(
@@ -919,15 +932,7 @@ def _experimenter_panel_process(
     root = tk.Tk()
     root.title("Experimenter")
     root.configure(bg="#e9ecef")
-    root.overrideredirect(True)
-    root.geometry(
-        _format_geometry(
-            max(int(screen_info.width), 800),
-            max(int(screen_info.height), 600),
-            int(screen_info.x),
-            int(screen_info.y),
-        )
-    )
+    set_tk_window_fullscreen(root, screen_info)
     try:
         root.attributes("-topmost", True)
     except Exception:
@@ -1501,7 +1506,7 @@ def _experimenter_preview_process(
         exit_button_text.draw()
 
     win = visual.Window(
-        **get_psychopy_window_kwargs(screen_info, fullscreen=False, size=preview_canvas_size),
+        **get_psychopy_window_kwargs(screen_info, fullscreen=True),
         units="pix",
         colorSpace="rgb",
         color=_preview_rgb255_to_psychopy((0, 0, 0)),

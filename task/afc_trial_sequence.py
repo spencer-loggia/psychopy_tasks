@@ -92,7 +92,7 @@ def run_task(
     bg: Tuple[int, int, int],
     output_dir: str,
     seed: Optional[int] = None,
-    fullscreen: bool = False,
+    fullscreen: bool = True,
     win_size: Optional[Tuple[int, int]] = None,
     image_size: Optional[Tuple[int, int]] = None,
     svg_size: Optional[Tuple[int, int]] = None,
@@ -382,7 +382,7 @@ def main():
     raw_margin = _get("margin", cfg.get("margin", 50))
     margin = int(raw_margin) if raw_margin is not None else 50
     seed = _get("seed", cfg.get("seed", None))
-    fullscreen = bool(_get("fullscreen", cfg.get("fullscreen", False)))
+    fullscreen = bool(_get("fullscreen", cfg.get("fullscreen", True)))
     win_size = tuple(_get("win_size", cfg.get("win_size", None))) if _get("win_size", None) else None
     image_size = tuple(_get("image_size", cfg.get("image_size", None))) if _get("image_size", None) else None
     svg_size = None

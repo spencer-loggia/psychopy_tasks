@@ -112,6 +112,7 @@ class ExperimentManagerTests(unittest.TestCase):
             self.assertEqual(generated["subject"], "Subject One")
             self.assertEqual(generated["session_mode"], "training")
             self.assertEqual(generated["output_dir"], str(block.output_dir))
+            self.assertTrue(generated["fullscreen"])
             self.assertIsNone(generated["x_scale"])
             self.assertNotIn("eye_tracker_calibration", generated)
             self.assertNotIn("set_time", generated)

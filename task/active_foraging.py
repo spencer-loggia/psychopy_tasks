@@ -290,7 +290,7 @@ def run_task(
     freq_space_tsv: Mapping[str, str],
     reward_space_tsv: Mapping[str, str],
     seed: Optional[int] = None,
-    fullscreen: bool = False,
+    fullscreen: bool = True,
     win_size: Optional[Tuple[int, int]] = None,
     image_size: Optional[Tuple[int, int]] = None,
     debug: bool = False,
@@ -1337,7 +1337,7 @@ def main():
     output_dir = _get("output_dir", cfg.get("output_dir", "./logs"))
     subject = _get("subject", cfg.get("subject", None))
     seed = _get("seed", cfg.get("seed", None))
-    fullscreen = bool(_get("fullscreen", cfg.get("fullscreen", False)))
+    fullscreen = bool(_get("fullscreen", cfg.get("fullscreen", True)))
     win_size = tuple(_get("win_size", cfg.get("win_size", None))) if _get("win_size", None) else None
     image_size = tuple(_get("image_size", cfg.get("image_size", None))) if _get("image_size", None) else None
     debug = bool(_get("debug", cfg.get("debug", False)))

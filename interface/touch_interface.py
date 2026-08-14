@@ -23,9 +23,9 @@ from bin.screen import (
     MAIN_SCREEN_ENV,
     SECONDARY_SCREEN_ENV,
     load_screen_config,
-    place_tk_window_on_screen,
     resolve_interface_screen,
     resolve_task_screens,
+    set_tk_window_fullscreen,
 )
 from interface.rig_mode import (
     IS_RIG_ENV_VAR,
@@ -42,6 +42,7 @@ from interface.experiment_manager import (
     PreparedBlock,
     task_run_sequence,
 )
+from interface.experiment_quiet_mode import create_experiment_quiet_mode
 from bin.task_lifecycle import TASK_WINDOW_READY_ENV, USER_EXIT_CODE
 from interface.x11_idle_guard import (
     ExperimentIdleGuard,
@@ -366,6 +367,7 @@ class TouchInterfaceApp:
         self.page_title_var = tk.StringVar(value="Task Launcher")
         self.page_stack: list[tuple[str, Dict[str, Any]]] = []
         self.experiment: Optional[ExperimentManager] = None
+        self.quiet_mode = create_experiment_quiet_mode(cfg)
         self.is_rig = self._initialize_is_rig_mode()
 
         if self.idle_guard is not None:
@@ -428,6 +430,11 @@ class TouchInterfaceApp:
         self.pull_latest_code()
 
     def cleanup(self) -> None:
+        quiet_mode = getattr(self, "quiet_mode", None)
+        if self.experiment is not None or (
+            quiet_mode is not None and quiet_mode.active
+        ):
+            return
         self.attempt_rectify_timezone()
         self.pull_latest_code()
 
@@ -507,16 +514,13 @@ class TouchInterfaceApp:
         self.root.after(IDLE_CLEANUP_MS, self._run_idle_cleanup_if_needed)
 
     def _run_idle_cleanup_if_needed(self) -> None:
-        if not self.task_active:
+        if not self.task_active and self.experiment is None:
             self.cleanup()
         self._schedule_idle_cleanup()
 
     def _build_ui(self) -> None:
         self.root.title("Experiment Manager")
-        place_tk_window_on_screen(self.root, self.screen_info, min_width=800, min_height=600, margin_x=20, margin_y=20)
-        min_width = min(800, max(int(getattr(self.screen_info, "width", 800) or 800), 1))
-        min_height = min(600, max(int(getattr(self.screen_info, "height", 600) or 600), 1))
-        self.root.minsize(min_width, min_height)
+        set_tk_window_fullscreen(self.root, self.screen_info)
 
         self.root.configure(bg="#e9ecef")
         self.root.grid_rowconfigure(1, weight=1)
@@ -720,7 +724,10 @@ class TouchInterfaceApp:
     def _select_subject(self, subject_name: str, subject_code: str) -> None:
         if self.experiment is not None:
             return
+        quiet_mode = getattr(self, "quiet_mode", None)
         try:
+            if quiet_mode is not None:
+                quiet_mode.enter()
             self.experiment = ExperimentManager(
                 working_dir=self.working_dir,
                 launch_config_path=self.config_path,
@@ -729,6 +736,11 @@ class TouchInterfaceApp:
                 subject_code=subject_code,
             )
         except Exception as exc:
+            if quiet_mode is not None:
+                try:
+                    quiet_mode.exit()
+                except Exception:
+                    pass
             messagebox.showerror("Experiment Error", str(exc))
             self.status_var.set("Could not start experiment")
             return
@@ -793,6 +805,14 @@ class TouchInterfaceApp:
         if self.task_active:
             self.status_var.set("Cannot exit to desktop while a task is running")
             return
+        quiet_mode = getattr(self, "quiet_mode", None)
+        try:
+            if quiet_mode is not None:
+                quiet_mode.exit()
+        except Exception as exc:
+            self.status_var.set("Could not restore quiet mode")
+            messagebox.showerror("Desktop Error", str(exc))
+            return
         try:
             if self.idle_guard is not None:
                 self.idle_guard.release_for_desktop()
@@ -851,6 +871,14 @@ class TouchInterfaceApp:
         if self.task_active:
             self.status_var.set("Cannot end experiment while a task is running")
             return
+        quiet_mode = getattr(self, "quiet_mode", None)
+        try:
+            if quiet_mode is not None:
+                quiet_mode.exit()
+        except Exception as exc:
+            messagebox.showerror("Experiment Cleanup Error", str(exc))
+            self.status_var.set("Could not restore quiet mode")
+            return
         self.experiment = None
         self._render_root_menu()
 
@@ -895,6 +923,7 @@ class TouchInterfaceApp:
         cmd = [self.python_cmd, str(block.launch_path), "--config", str(block.config_path)]
         self.status_var.set(f"Running block {block.block_num}: {block.block_name}")
         self.root.update_idletasks()
+        self.root.withdraw()
         ready_path = block.output_dir / ".task_window_ready"
         env = self.experiment.subprocess_environment(block)
         if self.idle_guard is not None:
@@ -924,6 +953,9 @@ class TouchInterfaceApp:
             try:
                 if self.idle_guard is not None:
                     self.idle_guard.enter_idle()
+                else:
+                    self.root.deiconify()
+                    self.root.lift()
             finally:
                 try:
                     ready_path.unlink(missing_ok=True)
@@ -969,7 +1001,6 @@ class TouchInterfaceApp:
             self.status_var.set(f"Launch failed: {task_name}")
         finally:
             self.task_active = False
-            self.cleanup()
 
 
 def main() -> None:
@@ -979,6 +1010,7 @@ def main() -> None:
 
     root = tk.Tk()
     idle_guard = None
+    app = None
     try:
         screen_cfg = load_screen_config(
             cfg,
@@ -1001,7 +1033,7 @@ def main() -> None:
             experimenter_screen,
             tk_module=tk,
         )
-        TouchInterfaceApp(
+        app = TouchInterfaceApp(
             root,
             config_path,
             cfg,
@@ -1010,6 +1042,11 @@ def main() -> None:
         )
         root.mainloop()
     finally:
+        if app is not None and app.quiet_mode is not None:
+            try:
+                app.quiet_mode.exit()
+            except Exception as exc:
+                print(f"Could not restore quiet-mode services: {exc}", file=sys.stderr)
         if idle_guard is not None:
             try:
                 idle_guard.release_for_desktop()

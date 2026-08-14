@@ -362,7 +362,7 @@ def run_task(
     *,
     output_dir: str = "logs",
     config_name: str = "calibrate_eye_tracker",
-    fullscreen: bool = False,
+    fullscreen: bool = True,
     win_size: Optional[Tuple[int, int]] = None,
     experimenter_win_size: Optional[Tuple[int, int]] = None,
     screen_config: Optional[Dict[str, Any]] = None,
@@ -847,7 +847,7 @@ def main():
     )
 
     output_dir = args.output_dir if args.output_dir is not None else cfg.get("output_dir", "logs")
-    fullscreen = bool(args.fullscreen if args.fullscreen is not None else cfg.get("fullscreen", False))
+    fullscreen = bool(args.fullscreen if args.fullscreen is not None else cfg.get("fullscreen", True))
     win_size = args.win_size if args.win_size is not None else cfg.get("win_size")
     experimenter_win_size = cfg.get("experimenter_win_size")
     simulate_eye = bool(args.simulate_eye if args.simulate_eye is not None else _get_nested(cfg, "daq", "simulate", False))

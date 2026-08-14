@@ -153,7 +153,7 @@ class X11IdleGuardTests(unittest.TestCase):
                 self.wait_calls = 0
                 self.ready_path = ready_path
 
-            def wait(self, timeout):
+            def wait(self, timeout=None):
                 self.wait_calls += 1
                 if self.wait_calls == 1:
                     self.ready_path.write_text("ready\n")

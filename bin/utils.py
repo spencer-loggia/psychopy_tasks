@@ -105,7 +105,7 @@ def rgb255_to_psychopy(rgb_255: Tuple[int, int, int]) -> List[float]:
 
 def setup_window(
     bg_rgb_255: Tuple[int, int, int] = (128, 128, 128),
-    fullscreen: bool = False,
+    fullscreen: bool = True,
     size: Optional[Tuple[int, int]] = None,
     monitor: Optional[str] = None,
     screen_info=None,

@@ -62,7 +62,7 @@ def run_task(
     bg: Tuple[int, int, int],
     output_dir: str,
     seed: int = None,
-    fullscreen: bool = False,
+    fullscreen: bool = True,
     win_size: Optional[Tuple[int, int]] = None,
     fixation_size: int = 40,
     image_size: Optional[Tuple[int, int]] = None,  # raster-only preferred size
@@ -328,7 +328,7 @@ def main():
             bg=tuple(_get("bg", cfg.get("bg", (128, 128, 128)))),
             output_dir=_get("output_dir", cfg.get("output_dir", "./logs")),
             seed=_get("seed", cfg.get("seed", None)),
-            fullscreen=bool(_get("fullscreen", cfg.get("fullscreen", False))),
+            fullscreen=bool(_get("fullscreen", cfg.get("fullscreen", True))),
             win_size=tuple(_get("win_size", cfg.get("win_size", None))) if _get("win_size", None) else None,
             fixation_size=int(_get("fixation_size", cfg.get("fixation_size", 40))),
             image_size=tuple(_get("image_size", cfg.get("image_size", None))) if _get("image_size", None) else None,

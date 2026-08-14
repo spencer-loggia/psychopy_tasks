@@ -272,7 +272,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
         "INFO",
         f"resolved_screens main={describe_screen(main_screen)} experimenter={describe_screen(experimenter_screen)}",
     )
-    fullscreen = bool(cfg.get("fullscreen", False))
+    fullscreen = bool(cfg.get("fullscreen", True))
     win_size_value = cfg.get("win_size")
     win_size = tuple(win_size_value) if win_size_value is not None else None
     win = utils.setup_window(

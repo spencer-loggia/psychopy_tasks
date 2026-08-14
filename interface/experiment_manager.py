@@ -258,6 +258,7 @@ class ExperimentManager:
         block_config["output_dir"] = str(output_dir)
         block_config["subject"] = self.subject_name
         block_config.update(injected)
+        block_config["fullscreen"] = True
 
         config_path = output_dir / BLOCK_CONFIG_FILENAME
         _write_json_atomic(config_path, block_config)

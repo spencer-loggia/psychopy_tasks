@@ -132,6 +132,8 @@ Experiment-managed task/subprocess policies:
   manager sets `NEURO_TASK_SESSION_DIR`; they must not add another session directory.
 - The manager sets `NEURO_EVENT_NAME_LIBRARY` so block event-code exports are resolved from the experiment's
   snapshot rather than a subsequently edited repository file.
+- Manager-generated block configs force `fullscreen=true`; portable windowed runs remain a standalone debugging
+  option and are not used by the Raspberry Pi interface.
 - A state-producing task writes `calibration.json` in its block directory. Its top-level keys are state-field names,
   and each value is an object containing at least the subfields declared by that state history.
 - When main-input masking is enabled, a task that opens a subject window must signal readiness only after that
@@ -165,17 +167,43 @@ fields:
 - Masking requires Linux with a real X11 `DISPLAY`. It intentionally does not support Xwayland.
 
 While the interface is idle, the manager runs `xinput disable` only for that named touchscreen and covers the main
-display with a borderless black window. The experimenter touchscreen and physical mouse are not modified. A task
+display with a fullscreen black window. The experimenter touchscreen and physical mouse are not modified. A task
 subprocess creates and focuses its main window, then emits a private readiness marker. The manager removes the
 black window, maps the touchscreen to the resolved main RandR output with `xinput map-to-output`, and enables it.
 After every block—including errors and user exits—the manager disables the touchscreen again, restores the black
 window, and returns focus to the interface. Choosing **Desktop**, closing the interface window, or otherwise
 leaving the interface normally re-enables the touchscreen before exit.
 
+Experiment Quiet Mode
+---------------------
+
+The Raspberry Pi launcher enables `experiment_quiet_mode` when a subject is selected and restores normal activity
+when **End Experiment** is pressed or the interface exits. While active, the launcher does not perform its network
+time check or `git pull`, hides itself while a task owns the displays, and blocks without polling once the task
+window is ready. It also stops active systemd maintenance timers for APT updates, man-db, log rotation, filesystem
+trimming/scrubbing, cron/anacron, and time synchronization. Only units that were active are restarted.
+Task-owned workers, preview processes, hardware services, networking, input, logging, and the window manager are not
+stopped.
+
+Set `"experiment_quiet_mode": true` in the launcher config to use the maintained unit list. A rig can replace it
+with an explicit list:
+
+```json
+{
+  "experiment_quiet_mode": {
+    "systemd_units": ["cron.service", "apt-daily.timer"]
+  }
+}
+```
+
+The interface user must be root or have non-interactive `sudo` permission to start and stop the listed units. If
+quiet mode cannot be entered, experiment creation fails instead of silently running without the requested guard.
+An already-running APT update is not terminated; experiment creation waits by failing clearly until that package
+operation finishes.
+
 If input remapping fails after a task starts, the manager stops that task, restores the guarded idle state, records
-the block end, and reports the launch failure. The checked-in launcher configs leave `mask_main_inputs` disabled
-because an exact touchscreen name is rig-specific; enable it only after copying the name from that rig's
-`xinput list --name-only` output.
+the block end, and reports the launch failure. An exact touchscreen name is rig-specific; enable masking only after
+copying the name from that rig's `xinput list --name-only` output.
 
 Generate sample images (for quick testing)
 ```bash
@@ -362,6 +390,9 @@ Each value can be a detected screen index or an output name such as `HDMI-1` or 
 Set either value to `null` to inherit the process environment defaults: `screens.main` reads `MAIN_SCREEN`, and
 `screens.experimenter` reads `SECONDARY_SCREEN`. The touch launcher exports its resolved global `screens` values
 to those environment variables for launched tasks.
+PsychoPy presentation windows default to true fullscreen and pass the resolved physical screen index to the
+backend on Linux as well as other platforms. The launcher, main-screen curtain, and experimenter controls likewise
+request true fullscreen after first being positioned on their assigned output.
 For `active_foraging`, setting `screens.main` and `screens.experimenter` to the same display is allowed and disables
 the experimenter preview, so only the main task content is shown.
 

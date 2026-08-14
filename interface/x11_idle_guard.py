@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
-from bin.screen import ScreenGeometry
+from bin.screen import ScreenGeometry, set_tk_window_fullscreen
 
 
 class XInputControlError(RuntimeError):
@@ -128,27 +128,16 @@ class MainScreenCurtain:
         self.screen_info = screen_info
         self.window = tk_module.Toplevel(root)
         self.window.withdraw()
-        self.window.overrideredirect(True)
         self.window.configure(bg="black", cursor="none", takefocus=False)
-        self.window.geometry(self._geometry())
+        set_tk_window_fullscreen(self.window, self.screen_info)
         try:
             self.window.attributes("-topmost", True)
         except Exception:
             pass
 
-    def _geometry(self) -> str:
-        width = max(1, int(self.screen_info.width))
-        height = max(1, int(self.screen_info.height))
-        x = int(self.screen_info.x)
-        y = int(self.screen_info.y)
-        x_part = f"+{x}" if x >= 0 else f"-{abs(x)}"
-        y_part = f"+{y}" if y >= 0 else f"-{abs(y)}"
-        return f"{width}x{height}{x_part}{y_part}"
-
     def show(self) -> None:
         self.window.deiconify()
         self.window.lift()
-        self.window.geometry(self._geometry())
         self.window.update_idletasks()
 
     def hide(self) -> None:
@@ -273,6 +262,8 @@ def wait_for_task_process(
     """Wait for a task, releasing guarded input once its main window is ready."""
     window_released = ready_path is None or on_window_ready is None
     while True:
+        if window_released:
+            return int(process.wait())
         if (
             not window_released
             and ready_path is not None
@@ -280,6 +271,7 @@ def wait_for_task_process(
         ):
             on_window_ready()
             window_released = True
+            continue
         try:
             return int(process.wait(timeout=max(0.01, float(poll_interval_s))))
         except subprocess.TimeoutExpired:

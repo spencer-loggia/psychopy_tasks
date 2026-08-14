@@ -9,6 +9,7 @@ class TouchInterfaceNavigationTests(unittest.TestCase):
         app = object.__new__(TouchInterfaceApp)
         app.task_active = False
         app.experiment = None
+        app.quiet_mode = Mock()
         app.page_stack = []
         app.page_title_var = Mock()
         app.status_var = Mock()
@@ -66,6 +67,7 @@ class TouchInterfaceNavigationTests(unittest.TestCase):
         app._end_experiment()
 
         self.assertIsNone(app.experiment)
+        app.quiet_mode.exit.assert_called_once_with()
         app._render_root_menu.assert_called_once_with()
 
     def test_active_task_prevents_ending_experiment(self):

@@ -10,6 +10,7 @@ from bin.screen import (
     ScreenGeometry,
     _parse_xrandr_query,
     build_reward_hit_boxes,
+    compute_aspect_cover_size,
     compute_centered_aspect_fit,
     format_experimenter_label,
     get_psychopy_window_kwargs,
@@ -292,6 +293,26 @@ class ScreenConfigTests(unittest.TestCase):
         self.assertAlmostEqual(layout["box_size"][1], 960.0)
         self.assertAlmostEqual(layout["top_margin"], 60.0)
         self.assertAlmostEqual(layout["bottom_margin"], 60.0)
+
+    def test_aspect_cover_uniformly_scales_and_crops_landscape_video(self):
+        draw_width, draw_height = compute_aspect_cover_size(
+            (1080, 1920),
+            (1920, 1080),
+        )
+
+        self.assertAlmostEqual(draw_height, 1920.0)
+        self.assertGreater(draw_width, 1080.0)
+        self.assertAlmostEqual(draw_width / draw_height, 1920.0 / 1080.0)
+
+    def test_aspect_cover_uniformly_scales_and_crops_portrait_video(self):
+        draw_width, draw_height = compute_aspect_cover_size(
+            (1920, 1080),
+            (1080, 1920),
+        )
+
+        self.assertAlmostEqual(draw_width, 1920.0)
+        self.assertGreater(draw_height, 1080.0)
+        self.assertAlmostEqual(draw_width / draw_height, 1080.0 / 1920.0)
 
     def test_preview_mapping_places_main_corners_on_fitted_box_corners(self):
         main_size = (1000, 500)

@@ -111,6 +111,16 @@
       "event_type": "signal",
       "description": "Trial-start GPIO signal offset."
     },
+    "video_sync_signal_on": {
+      "code": 302,
+      "event_type": "signal",
+      "description": "Frame-locked video sync GPIO signal onset."
+    },
+    "video_sync_signal_off": {
+      "code": 303,
+      "event_type": "signal",
+      "description": "Frame-locked video sync GPIO signal offset."
+    },
     "pump_on": {
       "code": 310,
       "event_type": "signal",
@@ -151,7 +161,9 @@
     ],
     "play_video": [
       "video_clip_start",
-      "video_clip_end"
+      "video_clip_end",
+      "video_sync_signal_on",
+      "video_sync_signal_off"
     ],
     "calibrate_eye_tracker": [
       "pump_on",

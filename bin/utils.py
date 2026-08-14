@@ -28,8 +28,15 @@ from psychopy import visual, event
 import time
 from .screen import (
     build_reward_hit_boxes,
+    compute_aspect_cover_size,
     get_psychopy_window_kwargs,
     serialize_preview_image,
+)
+from .video_playback import (
+    RandomFramePulseSchedule,
+    SharedVideoFrameBuffer,
+    prepare_vlc_clip,
+    video_duration_seconds,
 )
 from .stimulus_files import (
     load_color_palette as _load_color_palette,
@@ -134,7 +141,7 @@ def _run_subprocess_quiet(cmd: List[str]) -> Optional[subprocess.CompletedProces
         return None
 
 
-def _probe_video_stream(video_path: Path, ffprobe_bin: str = "ffprobe") -> Dict[str, Any]:
+def probe_video_stream(video_path: Path, ffprobe_bin: str = "ffprobe") -> Dict[str, Any]:
     ffprobe_path = shutil.which(ffprobe_bin) or ffprobe_bin
     result = _run_subprocess_quiet([
         ffprobe_path,
@@ -143,7 +150,10 @@ def _probe_video_stream(video_path: Path, ffprobe_bin: str = "ffprobe") -> Dict[
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=codec_name,width,height,pix_fmt",
+        (
+            "stream=codec_name,profile,level,width,height,pix_fmt,"
+            "r_frame_rate,avg_frame_rate,duration:format=duration"
+        ),
         "-of",
         "json",
         str(video_path),
@@ -155,7 +165,19 @@ def _probe_video_stream(video_path: Path, ffprobe_bin: str = "ffprobe") -> Dict[
     except Exception:
         return {}
     streams = payload.get("streams", [])
-    return streams[0] if streams else {}
+    if not streams:
+        return {}
+    stream = dict(streams[0])
+    if video_duration_seconds(stream) <= 0.0:
+        format_info = payload.get("format", {})
+        format_duration = format_info.get("duration") if isinstance(format_info, dict) else None
+        if format_duration not in (None, "", "N/A"):
+            stream["duration"] = format_duration
+    return stream
+
+
+# Compatibility for callers which used the original private helper.
+_probe_video_stream = probe_video_stream
 
 
 def _is_hevc_codec_name(codec_name: Optional[str]) -> bool:
@@ -167,7 +189,7 @@ def log_video_codec_expectation(
     ffprobe_bin: str = "ffprobe",
     msg_logger=None,
 ) -> Dict[str, Any]:
-    stream = _probe_video_stream(Path(video_path), ffprobe_bin=ffprobe_bin)
+    stream = probe_video_stream(Path(video_path), ffprobe_bin=ffprobe_bin)
     codec_name = str(stream.get("codec_name", "")).strip()
     if codec_name and not _is_hevc_codec_name(codec_name):
         _log_message(
@@ -178,6 +200,17 @@ def log_video_codec_expectation(
     elif not codec_name:
         _log_message(msg_logger, "WARN", f"video_codec_probe_failed file={Path(video_path).name}")
     return stream
+
+
+def _set_gpio_level_on_flip(lgpio_module, chip, pin: int, level: int) -> None:
+    """Set a GPIO level from PsychoPy's frame-flip callback queue."""
+    if lgpio_module is None or chip is None:
+        raise RuntimeError("Frame sync GPIO was not initialized")
+    result = lgpio_module.gpio_write(chip, int(pin), int(level))
+    if isinstance(result, int) and result < 0:
+        raise RuntimeError(
+            f"GPIO write failed with code {result} on pin {int(pin)}"
+        )
 
 
 def play_video_fill_screen(
@@ -192,33 +225,103 @@ def play_video_fill_screen(
     ffprobe_bin: str = "ffprobe",
     external_abort_checker: Optional[Callable[[], bool]] = None,
     trial_num: Optional[int] = None,
+    stream_info: Optional[Dict[str, Any]] = None,
+    frame_publisher: Optional[SharedVideoFrameBuffer] = None,
+    sync_schedule: Optional[RandomFramePulseSchedule] = None,
+    sync_gpio_module=None,
+    sync_gpio_chip=None,
+    sync_pin: int = 18,
+    frame_duration_s: Optional[float] = None,
+    frame_publish_interval_s: float = 0.0,
+    clip_start_s: float = 0.0,
+    clip_duration_s: Optional[float] = None,
+    movie_stim=None,
+    keep_movie_loaded: bool = False,
+    seek_timeout_s: float = 15.0,
 ) -> Dict[str, Any]:
     video_file = Path(video_path)
-    if not video_file.exists():
+    if stream_info is None and not video_file.is_file():
         raise FileNotFoundError(f"Video file not found: {video_file}")
 
-    stream = log_video_codec_expectation(
-        video_path=video_file,
-        ffprobe_bin=ffprobe_bin,
-        msg_logger=msg_logger,
-    )
+    stream = dict(stream_info or {})
+    if not stream:
+        stream = log_video_codec_expectation(
+            video_path=video_file,
+            ffprobe_bin=ffprobe_bin,
+            msg_logger=msg_logger,
+        )
+    if sync_schedule is not None and (
+        sync_gpio_module is None or sync_gpio_chip is None
+    ):
+        raise RuntimeError("A sync schedule requires an initialized GPIO output")
+    frame_publish_interval_s = float(frame_publish_interval_s)
+    if frame_publish_interval_s < 0.0:
+        raise ValueError("frame_publish_interval_s cannot be negative")
+    source_duration_s = video_duration_seconds(stream)
+    clip_start_s = float(clip_start_s)
+    if clip_duration_s is None:
+        clip_duration_s = source_duration_s - clip_start_s
+    clip_duration_s = float(clip_duration_s)
+    if not math.isfinite(clip_start_s) or clip_start_s < 0.0:
+        raise ValueError("clip_start_s must be a finite non-negative value")
+    if not math.isfinite(clip_duration_s) or clip_duration_s <= 0.0:
+        raise ValueError("clip_duration_s must be a positive finite value")
+    if source_duration_s > 0.0 and (
+        clip_start_s + clip_duration_s > source_duration_s + 1e-6
+    ):
+        raise ValueError(
+            f"Requested clip {clip_start_s:.6f}-{clip_start_s + clip_duration_s:.6f}s "
+            f"exceeds source duration {source_duration_s:.6f}s"
+        )
+    if frame_duration_s is not None and float(frame_duration_s) <= 0.0:
+        raise ValueError("frame_duration_s must be positive when provided")
 
     from psychopy.visual.vlcmoviestim import VlcMovieStim
 
     backend_used = "vlc"
-    movie = VlcMovieStim(
-        win,
-        filename=str(video_file),
-        units="pix",
-        size=tuple(win.size),
-        pos=(0.0, 0.0),
-        loop=False,
-        autoStart=False,
-        noAudio=True,
-    )
+    movie = movie_stim
+    movie_source = str(video_file)
+    needs_load = movie is None
+    if movie is not None:
+        current_source = str(
+            getattr(movie, "_neuro_tasks_source_path", None)
+            or getattr(movie, "filename", "")
+            or ""
+        )
+        needs_load = (
+            current_source != movie_source
+            or bool(getattr(movie, "isFinished", False))
+            or bool(getattr(movie, "isStopped", False))
+        )
+    if movie is None:
+        movie = VlcMovieStim(
+            win,
+            filename=movie_source,
+            units="pix",
+            size=tuple(win.size),
+            pos=(0.0, 0.0),
+            loop=False,
+            autoStart=False,
+            noAudio=True,
+        )
+    elif needs_load:
+        movie.loadMovie(movie_source, log=False)
+    movie._neuro_tasks_source_path = movie_source
 
     video_size = tuple(movie.videoSize)
-    draw_size = tuple(win.size)
+    if frame_publisher is not None and (
+        not hasattr(movie, "_framePixelBuffer")
+        or not hasattr(movie, "_pixelLock")
+    ):
+        try:
+            movie.stop(log=False)
+        except Exception:
+            pass
+        raise RuntimeError(
+            "The installed PsychoPy VlcMovieStim does not expose its decoded "
+            "frame buffer; shared single-decoder preview requires PsychoPy 2025.1.1."
+        )
+    draw_size = compute_aspect_cover_size(tuple(win.size), video_size)
     movie.size = draw_size
     movie.pos = (0.0, 0.0)
     abort_reason = ""
@@ -238,8 +341,11 @@ def play_video_fill_screen(
                 "INFO",
                 (
                     f"video_playback file={video_file.name} "
+                    f"source_path={video_file} clip_start_s={clip_start_s:.6f} "
+                    f"clip_end_s={clip_start_s + clip_duration_s:.6f} "
                     f"video_size={video_size} win_size={tuple(win.size)} draw_size={draw_size} "
-                    f"backend={backend_used} codec={stream.get('codec_name')} pix_fmt={stream.get('pix_fmt')}"
+                    f"scale_mode=uniform_cover backend={backend_used} "
+                    f"codec={stream.get('codec_name')} pix_fmt={stream.get('pix_fmt')}"
                 ),
             )
         except Exception:
@@ -251,7 +357,32 @@ def play_video_fill_screen(
     prev_frame_idx = None
     dropped_frames = 0
     aborted = False
-    movie.play(log=False)
+    display_frame_index = 0
+    last_published_frame_idx = None
+    next_frame_publish_perf = 0.0
+    frames_presented = 0
+    target_display_frames = (
+        max(1, int(math.floor((clip_duration_s / float(frame_duration_s)) + 0.5)))
+        if frame_duration_s is not None
+        else None
+    )
+    sync_records: List[Dict[str, Any]] = []
+    backend_drop_count = None
+    expected_duration_s = clip_duration_s
+    actual_source_start_s = None
+    actual_source_last_frame_s = None
+    try:
+        prepared_source_time_s = prepare_vlc_clip(
+            movie,
+            clip_start_s=clip_start_s,
+            seek_timeout_s=seek_timeout_s,
+        )
+    except Exception:
+        try:
+            movie.stop(log=False)
+        except Exception:
+            pass
+        raise
 
     try:
         while True:
@@ -282,32 +413,107 @@ def play_video_fill_screen(
                     _log_message(msg_logger, "WARN", f"video_abort trial_num={trial_num} file={video_file.name} reason=mouse_click")
                     break
 
+            if bool(getattr(movie, "isFinished", False)):
+                aborted = True
+                abort_reason = "source_ended_early"
+                _log_message(
+                    msg_logger,
+                    "WARN",
+                    f"video_abort trial_num={trial_num} file={video_file.name} reason=source_ended_early",
+                )
+                break
+
+            sync_edges = ()
+            if sync_schedule is not None:
+                sync_edges = sync_schedule.edges_for_frame(display_frame_index)
+                for edge in sync_edges:
+                    win.callOnFlip(
+                        _set_gpio_level_on_flip,
+                        sync_gpio_module,
+                        sync_gpio_chip,
+                        int(sync_pin),
+                        int(edge.level),
+                    )
+
             if bg_rect is not None:
                 bg_rect.draw()
             movie.draw()
             flip_ps = win.flip()
             flip_perf = time.perf_counter()
             frame_idx = movie.frameIndex
+            frames_presented += 1
+            try:
+                current_source_time_s = float(movie.getCurrentFrameTime())
+            except Exception:
+                current_source_time_s = prepared_source_time_s
+            actual_source_last_frame_s = current_source_time_s
+
+            for edge in sync_edges:
+                sync_records.append(
+                    {
+                        "level": int(edge.level),
+                        "frame_index": int(edge.frame_index),
+                        "interval_frames": edge.interval_frames,
+                        "timestamp_perf_s": flip_perf,
+                    }
+                )
+
+            if (
+                frame_publisher is not None
+                and frame_idx is not None
+                and frame_idx != last_published_frame_idx
+                and flip_perf >= next_frame_publish_perf
+            ):
+                frame_publisher.publish_rgba(
+                    movie._framePixelBuffer,
+                    width=int(video_size[0]),
+                    height=int(video_size[1]),
+                    source_frame_index=int(frame_idx),
+                    source_media_time_s=current_source_time_s,
+                    main_display_flip_perf_s=flip_perf,
+                    trial_num=trial_num,
+                    lock=movie._pixelLock,
+                )
+                last_published_frame_idx = int(frame_idx)
+                next_frame_publish_perf = flip_perf + frame_publish_interval_s
 
             if first_flip_ps is None:
                 first_flip_ps = flip_ps
                 first_flip_perf = flip_perf
+                actual_source_start_s = current_source_time_s
                 if logger is not None:
                     logger.log_frame_flip(
                         trial_num=trial_num,
                         event="video_clip_start",
                         timestamp_perf_s=first_flip_perf,
-                        requested_duration=movie.duration if movie.duration and movie.duration > 0 else None,
+                        requested_duration=expected_duration_s,
                     )
                     _log_message(
                         msg_logger,
                         "INFO",
                         (
                             f"video_start trial_num={trial_num} file={video_file.name} "
+                            f"source_path={video_file} requested_source_start_s={clip_start_s:.6f} "
+                            f"actual_source_start_s={actual_source_start_s:.6f} "
                             f"video_size={video_size} draw_size=({draw_size[0]:.1f},{draw_size[1]:.1f}) "
                             f"backend={backend_used}"
                         ),
                     )
+
+            duration_reached = (
+                frames_presented >= target_display_frames
+                if target_display_frames is not None
+                else (
+                    first_flip_perf is not None
+                    and flip_perf - first_flip_perf >= clip_duration_s
+                )
+            )
+            if (
+                frames_presented == 1
+                and not duration_reached
+                and bool(getattr(movie, "isPaused", False))
+            ):
+                movie.play(log=False)
 
             if prev_frame_idx is not None and frame_idx is not None and frame_idx > prev_frame_idx + 1:
                 dropped_now = int(frame_idx - prev_frame_idx - 1)
@@ -325,14 +531,46 @@ def play_video_fill_screen(
             if frame_idx is not None:
                 prev_frame_idx = int(frame_idx)
 
-            if movie.isFinished:
+            if duration_reached:
                 break
+            if bool(getattr(movie, "isFinished", False)):
+                aborted = True
+                abort_reason = "source_ended_early"
+                _log_message(
+                    msg_logger,
+                    "WARN",
+                    f"video_abort trial_num={trial_num} file={video_file.name} reason=source_ended_early",
+                )
+                break
+            display_frame_index += 1
 
+        if bool(getattr(movie, "isPlaying", False)):
+            movie.pause(log=False)
+        final_sync_edge = None
+        if sync_schedule is not None:
+            final_sync_edge = sync_schedule.mark_forced_low(display_frame_index + 1)
+            if final_sync_edge is not None:
+                win.callOnFlip(
+                    _set_gpio_level_on_flip,
+                    sync_gpio_module,
+                    sync_gpio_chip,
+                    int(sync_pin),
+                    0,
+                )
         if bg_rect is not None:
             bg_rect.draw()
         clear_flip_ps = win.flip()
         end_perf = time.perf_counter()
-        if logger is not None:
+        if final_sync_edge is not None:
+            sync_records.append(
+                {
+                    "level": 0,
+                    "frame_index": int(final_sync_edge.frame_index),
+                    "interval_frames": None,
+                    "timestamp_perf_s": end_perf,
+                }
+            )
+        if logger is not None and first_flip_perf is not None:
             backend_drop_count = getattr(movie, "nDroppedFrames", None)
             logger.log_frame_flip(
                 trial_num=trial_num,
@@ -344,36 +582,107 @@ def play_video_fill_screen(
                 "INFO",
                 (
                     f"video_end trial_num={trial_num} file={video_file.name} "
+                    f"source_path={video_file} requested_source_end_s={clip_start_s + clip_duration_s:.6f} "
+                    f"actual_source_last_frame_s={actual_source_last_frame_s} "
+                    f"frames_presented={frames_presented} "
                     f"dropped_frames={dropped_frames} aborted={int(aborted)} "
                     f"abort_reason={abort_reason or 'none'} "
                     f"backend={backend_used} backend_dropped_frames={backend_drop_count}"
                 ),
             )
     finally:
-        try:
-            movie.stop(log=False)
-        except Exception:
-            pass
-        try:
-            if hasattr(movie, "unload"):
-                movie.unload(log=False)
-        except Exception:
-            pass
+        if sync_schedule is not None and sync_schedule.high:
+            try:
+                _set_gpio_level_on_flip(
+                    sync_gpio_module,
+                    sync_gpio_chip,
+                    int(sync_pin),
+                    0,
+                )
+            except Exception:
+                pass
+            forced_edge = sync_schedule.mark_forced_low(display_frame_index + 1)
+            if forced_edge is not None:
+                sync_records.append(
+                    {
+                        "level": 0,
+                        "frame_index": int(forced_edge.frame_index),
+                        "interval_frames": None,
+                        "timestamp_perf_s": time.perf_counter(),
+                    }
+                )
+        backend_drop_count = getattr(movie, "nDroppedFrames", backend_drop_count)
+        if keep_movie_loaded:
+            try:
+                if bool(getattr(movie, "isPlaying", False)):
+                    movie.pause(log=False)
+            except Exception:
+                pass
+        else:
+            try:
+                movie.stop(log=False)
+            except Exception:
+                pass
+        if logger is not None:
+            pulse_duration = (
+                float(frame_duration_s) * int(sync_schedule.pulse_width_frames)
+                if sync_schedule is not None and frame_duration_s is not None
+                else None
+            )
+            for record in sync_records:
+                is_on = int(record["level"]) == 1
+                logger.log_signal(
+                    trial_num=trial_num,
+                    event="video_sync_signal_on" if is_on else "video_sync_signal_off",
+                    timestamp_perf_s=float(record["timestamp_perf_s"]),
+                    requested_duration=pulse_duration if is_on else None,
+                )
+                if is_on:
+                    _log_message(
+                        msg_logger,
+                        "INFO",
+                        (
+                            f"video_sync_pulse trial_num={trial_num} file={video_file.name} "
+                            f"display_frame={record['frame_index']} "
+                            f"interval_frames={record['interval_frames']} pin={int(sync_pin)}"
+                        ),
+                    )
+        if not keep_movie_loaded:
+            try:
+                if hasattr(movie, "unload"):
+                    movie.unload(log=False)
+            except Exception:
+                pass
 
     return {
         "video_name": video_file.name,
         "video_path": video_file,
-        "expected_duration_s": float(movie.duration) if movie.duration and movie.duration > 0 else None,
+        "source_duration_s": source_duration_s,
+        "clip_start_s": clip_start_s,
+        "clip_end_s": clip_start_s + clip_duration_s,
+        "clip_duration_s": clip_duration_s,
+        "expected_duration_s": expected_duration_s,
         "start_flip_psychopy_s": first_flip_ps,
         "start_flip_perf_s": first_flip_perf,
         "end_time_perf_s": end_perf,
+        "last_frame_end_perf_s": end_perf if first_flip_perf is not None else None,
+        "actual_source_start_s": actual_source_start_s,
+        "actual_source_last_frame_s": actual_source_last_frame_s,
+        "frames_presented": int(frames_presented),
+        "displayed_duration_s": (
+            end_perf - first_flip_perf
+            if end_perf is not None and first_flip_perf is not None
+            else None
+        ),
         "dropped_frames": int(dropped_frames),
         "aborted": bool(aborted),
         "abort_reason": abort_reason,
         "video_size": tuple(video_size),
         "draw_size": tuple(draw_size),
         "backend_used": backend_used,
-        "backend_dropped_frames": getattr(movie, "nDroppedFrames", None),
+        "backend_dropped_frames": backend_drop_count,
+        "sync_pulses": sum(1 for record in sync_records if int(record["level"]) == 1),
+        "movie_stim": movie if keep_movie_loaded else None,
     }
 
 

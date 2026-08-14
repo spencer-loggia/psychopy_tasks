@@ -1,11 +1,18 @@
 {
   "config_name": "play_video",
-  "videos_dir": "./task/resources/cropped_videos",
+  "video_files": [
+    "./task/resources/cropped_videos/Gibbon Monkey sounds.mp4"
+  ],
+  "clip_duration_seconds": 5.0,
+  "seek_timeout_seconds": 30.0,
   "output_dir": "./logs",
   "screens": {
     "main": null,
     "experimenter": null
   },
   "fullscreen": true,
-  "bg": [0, 0, 0]
+  "bg": [0, 0, 0],
+  "sync_pin": 18,
+  "sync_interval_frames": [100, 300],
+  "sync_pulse_frames": 1
 }

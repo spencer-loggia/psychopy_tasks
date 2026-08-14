@@ -459,7 +459,7 @@ class TouchInterfaceApp:
 
         target_mode = target_mode_for_current_mode(self.is_rig)
         if self._run_mode_script(target_mode):
-            self._render_current_page()
+            self._render_root_menu()
 
     def _schedule_idle_cleanup(self) -> None:
         self.root.after(IDLE_CLEANUP_MS, self._run_idle_cleanup_if_needed)
@@ -496,7 +496,7 @@ class TouchInterfaceApp:
         self.button_frame.inner.configure(bg="#e9ecef")
         self.button_container = self.button_frame.inner
 
-        self._render_subject_selection()
+        self._render_root_menu()
 
         footer = tk.Label(
             self.root,
@@ -533,6 +533,26 @@ class TouchInterfaceApp:
         button.grid(row=row_idx, column=0, sticky="ew", pady=10, padx=10)
         self.button_container.grid_columnconfigure(0, weight=1)
 
+    def _render_root_menu(self) -> None:
+        self._clear_buttons()
+        self.page_stack = []
+        self.page_title_var.set("Experiment Manager")
+        self.status_var.set("Choose an action")
+
+        self._create_start_experiment_button(0)
+        self._create_rig_mode_button(1)
+        self._create_desktop_button(2)
+        self._create_shutdown_button(3)
+
+    def _create_start_experiment_button(self, row_idx: int) -> None:
+        button = tk.Button(
+            self.button_container,
+            text="Start Experiment",
+            command=self._render_subject_selection,
+            **self._button_kwargs(),
+        )
+        self._place_button(button, row_idx)
+
     def _render_subject_selection(self) -> None:
         self._clear_buttons()
         self.page_title_var.set("Select Subject")
@@ -545,6 +565,7 @@ class TouchInterfaceApp:
                 **self._button_kwargs(),
             )
             self._place_button(button, row_idx)
+        self._create_root_menu_button(len(self.subjects_cfg))
 
     def _select_subject(self, subject_name: str, subject_code: str) -> None:
         if self.experiment is not None:
@@ -579,11 +600,7 @@ class TouchInterfaceApp:
             row_idx += 1
 
         if len(self.page_stack) == 1:
-            self._create_rig_mode_button(row_idx)
-            row_idx += 1
-            self._create_desktop_button(row_idx)
-            row_idx += 1
-            self._create_shutdown_button(row_idx)
+            self._create_end_experiment_button(row_idx)
         else:
             self._create_back_button(row_idx)
 
@@ -661,6 +678,31 @@ class TouchInterfaceApp:
             **self._button_kwargs(),
         )
         self._place_button(button, row_idx)
+
+    def _create_root_menu_button(self, row_idx: int) -> None:
+        button = tk.Button(
+            self.button_container,
+            text="Back",
+            command=self._render_root_menu,
+            **self._button_kwargs(),
+        )
+        self._place_button(button, row_idx)
+
+    def _create_end_experiment_button(self, row_idx: int) -> None:
+        button = tk.Button(
+            self.button_container,
+            text="End Experiment",
+            command=self._end_experiment,
+            **self._button_kwargs(),
+        )
+        self._place_button(button, row_idx)
+
+    def _end_experiment(self) -> None:
+        if self.task_active:
+            self.status_var.set("Cannot end experiment while a task is running")
+            return
+        self.experiment = None
+        self._render_root_menu()
 
     def _shutdown_command(self) -> list[str]:
         if hasattr(os, "geteuid") and os.geteuid() == 0:

@@ -1,4 +1,4 @@
-"""Experiment-level state, snapshots, block records, and loop selection."""
+"""Experiment-level state, block records, and loop selection."""
 from __future__ import annotations
 
 import copy
@@ -51,16 +51,6 @@ def _resolve_path(path_value: str | Path, search_roots: Iterable[Path]) -> Path:
         if candidate.exists():
             return candidate
     return ((roots[0] if roots else Path.cwd()) / path).resolve()
-
-
-def _task_leaves(tasks: Mapping[str, Any]) -> Iterator[tuple[str, Mapping[str, Any]]]:
-    for task_name, task_cfg in tasks.items():
-        if not isinstance(task_cfg, Mapping):
-            raise ValueError(f"Task '{task_name}' must be a JSON object")
-        if "launch" in task_cfg:
-            yield str(task_name), task_cfg
-        else:
-            yield from _task_leaves(task_cfg)
 
 
 def task_variants(task_name: str, task_cfg: Mapping[str, Any]) -> list[tuple[str, Optional[str]]]:
@@ -160,7 +150,6 @@ class ExperimentManager:
         self.started_perf_s = float(perf_counter())
         self.started_at = now or dt.datetime.now()
         self.blocks: list[dict[str, Any]] = []
-        self.task_config_snapshots: dict[Path, Path] = {}
 
         initial_state = self.launch_config.get("initial_state")
         if not isinstance(initial_state, dict):
@@ -182,7 +171,6 @@ class ExperimentManager:
         if not source_event_library.is_file():
             raise FileNotFoundError(f"Event library not found: {source_event_library}")
         shutil.copy2(source_event_library, self.event_library_path)
-        self._snapshot_task_configs()
         self._write_state()
         self._write_blocks()
 
@@ -200,32 +188,6 @@ class ExperimentManager:
         experiment_dir = self.logs_dir / f"{prefix}{experiment_id:03d}"
         experiment_dir.mkdir(exist_ok=False)
         return experiment_dir
-
-    def _snapshot_task_configs(self) -> None:
-        snapshot_root = self.experiment_dir / "task_configs"
-        snapshot_root.mkdir()
-        copied_sources: set[Path] = set()
-        tasks = self.launch_config.get("tasks")
-        if not isinstance(tasks, Mapping):
-            raise ValueError("Launcher config field 'tasks' must be a JSON object")
-        for task_name, task_cfg in _task_leaves(tasks):
-            for _launch, config_value in task_variants(task_name, task_cfg):
-                if config_value is None:
-                    continue
-                source = _resolve_path(config_value, (self.working_dir, self.config_dir))
-                if source in copied_sources:
-                    continue
-                if not source.is_file():
-                    raise FileNotFoundError(f"Task config not found: {source}")
-                copied_sources.add(source)
-                try:
-                    relative = source.relative_to(self.working_dir)
-                except ValueError:
-                    relative = Path(sanitize_filename_component(str(source)))
-                destination = snapshot_root / relative
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, destination)
-                self.task_config_snapshots[source] = destination
 
     def milliseconds_since_start(self) -> float:
         return (float(self._perf_counter()) - self.started_perf_s) * 1000.0
@@ -258,10 +220,7 @@ class ExperimentManager:
             source_config = _resolve_path(config_value, (self.working_dir, self.config_dir))
             if not source_config.is_file():
                 raise FileNotFoundError(f"Task config not found: {source_config}")
-            snapshot_config = self.task_config_snapshots.get(source_config)
-            if snapshot_config is None:
-                raise ValueError(f"Task config was not snapshotted at experiment start: {source_config}")
-            block_config = load_config(str(snapshot_config))
+            block_config = load_config(str(source_config))
 
         raw_block_name = block_config.get("config_name") or task_name
         block_name = str(raw_block_name).strip() or str(task_name)

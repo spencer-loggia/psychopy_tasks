@@ -71,7 +71,7 @@ class ExperimentManagerTests(unittest.TestCase):
         launch_path.write_text(json.dumps(launch_config), encoding="utf-8")
         return launch_config, launch_path
 
-    def test_experiment_snapshots_and_block_state_lifecycle(self):
+    def test_experiment_and_block_state_lifecycle_uses_current_source_config(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             launch_config, launch_path = self._project(root)
@@ -89,14 +89,12 @@ class ExperimentManagerTests(unittest.TestCase):
             self.assertEqual(manager.experiment_dir.name, "exp_S1_20260813_001")
             self.assertTrue((manager.experiment_dir / "launch_config.json").is_file())
             self.assertTrue((manager.experiment_dir / "event_name_library.json").is_file())
-            self.assertTrue(
-                (manager.experiment_dir / "task_configs" / "configs" / "demo.json").is_file()
-            )
+            self.assertFalse((manager.experiment_dir / "task_configs").exists())
             initial_state = json.loads(manager.state_path.read_text(encoding="utf-8"))
             self.assertEqual(initial_state["subject"], "Subject One")
 
-            # Block configs come from the experiment snapshot, not a source file
-            # that may be edited after the experiment has started.
+            # Each block config is based on the source file as it exists when the
+            # block is prepared, even if it changed after experiment creation.
             (root / "configs" / "demo.json").write_text(
                 json.dumps({"config_name": "changed_later", "task_value": 999}),
                 encoding="utf-8",
@@ -108,9 +106,9 @@ class ExperimentManagerTests(unittest.TestCase):
                 launch_value="task/demo.py",
                 config_value="configs/demo.json",
             )
-            self.assertEqual(block.output_dir.name, "1_demo_block")
+            self.assertEqual(block.output_dir.name, "1_changed_later")
             generated = json.loads(block.config_path.read_text(encoding="utf-8"))
-            self.assertEqual(generated["task_value"], 7)
+            self.assertEqual(generated["task_value"], 999)
             self.assertEqual(generated["subject"], "Subject One")
             self.assertEqual(generated["session_mode"], "training")
             self.assertEqual(generated["output_dir"], str(block.output_dir))
@@ -122,7 +120,7 @@ class ExperimentManagerTests(unittest.TestCase):
                 block_rows = list(csv.DictReader(handle, delimiter="\t"))
             self.assertEqual(block_rows[0]["start_time"], "125.000")
             self.assertEqual(block_rows[0]["end_time"], "")
-            self.assertEqual(block_rows[0]["out_dir"], "blocks/1_demo_block")
+            self.assertEqual(block_rows[0]["out_dir"], "blocks/1_changed_later")
 
             (block.output_dir / "calibration.json").write_text(
                 json.dumps(
@@ -153,6 +151,10 @@ class ExperimentManagerTests(unittest.TestCase):
                 rows = list(csv.DictReader(handle, delimiter="\t"))
             self.assertEqual(rows[0]["end_time"], "500.000")
 
+            (root / "configs" / "demo.json").write_text(
+                json.dumps({"config_name": "changed_again", "task_value": 1000}),
+                encoding="utf-8",
+            )
             clock.value = 101.0
             second = manager.prepare_block(
                 task_name="demo",
@@ -160,7 +162,8 @@ class ExperimentManagerTests(unittest.TestCase):
                 config_value="configs/demo.json",
             )
             second_config = json.loads(second.config_path.read_text(encoding="utf-8"))
-            self.assertEqual(second.output_dir.name, "2_demo_block")
+            self.assertEqual(second.output_dir.name, "2_changed_again")
+            self.assertEqual(second_config["task_value"], 1000)
             self.assertEqual(second_config["x_scale"], 0.1)
             self.assertEqual(second_config["y_scale"], -0.2)
 
@@ -225,7 +228,7 @@ class ExperimentManagerTests(unittest.TestCase):
             self.assertTrue((block_dir / "event_log.tsv").is_file())
             self.assertFalse(any(path.name.startswith("L_") for path in block_dir.iterdir()))
 
-    def test_manager_subprocess_environment_uses_snapshots(self):
+    def test_manager_subprocess_environment_uses_experiment_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             launch_config, launch_path = self._project(root)

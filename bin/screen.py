@@ -648,6 +648,24 @@ def compute_centered_aspect_fit(
     }
 
 
+def compute_aspect_cover_size(
+    container_size: Sequence[float],
+    content_size: Sequence[float],
+) -> tuple[float, float]:
+    """Uniformly scale content so it covers a container in both dimensions."""
+    container_w = float(container_size[0])
+    container_h = float(container_size[1])
+    content_w = float(content_size[0])
+    content_h = float(content_size[1])
+    if container_w <= 0 or container_h <= 0:
+        raise ValueError(f"Invalid container size: {tuple(container_size)}")
+    if content_w <= 0 or content_h <= 0:
+        raise ValueError(f"Invalid content size: {tuple(content_size)}")
+
+    scale = max(container_w / content_w, container_h / content_h)
+    return (content_w * scale, content_h * scale)
+
+
 def scale_scene_length(value: float, main_size: Sequence[float], preview_size: Sequence[float]) -> float:
     main_w = max(float(main_size[0]), 1.0)
     main_h = max(float(main_size[1]), 1.0)
@@ -985,6 +1003,10 @@ def _experimenter_preview_process(
     stop_event,
 ) -> None:
     from psychopy import core, event, visual
+    from .video_playback import (
+        SharedVideoFrameReader,
+        center_crop_bounds,
+    )
     preview_canvas_size = resolve_screen_canvas_size(screen_info)
     outside_bg_rgb = (30, 30, 30)
     preview_outline_rgb = (150, 150, 150)
@@ -1001,19 +1023,26 @@ def _experimenter_preview_process(
         )
 
     def _release_movie() -> None:
-        nonlocal movie, movie_bg_rect, movie_outline_rect, movie_layout, last_bg_rgb, static_scene
-        if movie is None:
-            return
-        try:
-            movie.stop(log=False)
-        except Exception:
-            pass
-        try:
-            if hasattr(movie, "unload"):
-                movie.unload(log=False)
-        except Exception:
-            pass
+        nonlocal movie, movie_bg_rect, movie_outline_rect, movie_layout
+        nonlocal shared_movie_active, shared_movie_stim, shared_movie_sequence
+        nonlocal shared_movie_minimum_sequence, shared_movie_crop_bounds
+        nonlocal last_bg_rgb, static_scene
+        if movie is not None:
+            try:
+                movie.stop(log=False)
+            except Exception:
+                pass
+            try:
+                if hasattr(movie, "unload"):
+                    movie.unload(log=False)
+            except Exception:
+                pass
         movie = None
+        shared_movie_active = False
+        shared_movie_stim = None
+        shared_movie_sequence = 0
+        shared_movie_minimum_sequence = 1
+        shared_movie_crop_bounds = None
         movie_bg_rect = None
         movie_outline_rect = None
         movie_layout = None
@@ -1308,6 +1337,12 @@ def _experimenter_preview_process(
     movie_bg_rect = None
     movie_outline_rect = None
     movie_layout = None
+    shared_movie_reader = None
+    shared_movie_active = False
+    shared_movie_stim = None
+    shared_movie_sequence = 0
+    shared_movie_minimum_sequence = 1
+    shared_movie_crop_bounds = None
     task_label_text = None
 
     try:
@@ -1478,6 +1513,47 @@ def _experimenter_preview_process(
                         movie.size = movie_layout["box_size"]
                         movie.pos = movie_layout["box_center"]
                         movie.play(log=False)
+                    elif command_type == "play_shared_video":
+                        _release_movie()
+                        last_bg_rgb = tuple(payload.get("bg_rgb_255", last_bg_rgb))
+                        movie_layout = compute_centered_aspect_fit(
+                            preview_canvas_size,
+                            tuple(payload.get("main_size") or preview_canvas_size),
+                        )
+                        movie_bg_rect = _make_bg_rect(outside_bg_rgb)
+                        movie_outline_rect = visual.Rect(
+                            win,
+                            width=movie_layout["box_size"][0],
+                            height=movie_layout["box_size"][1],
+                            pos=movie_layout["box_center"],
+                            fillColor=None,
+                            lineColor=_preview_rgb255_to_psychopy(preview_outline_rgb),
+                            lineColorSpace="rgb",
+                            lineWidth=2,
+                            units="pix",
+                        )
+                        descriptor = dict(payload["shared_frame_buffer"])
+                        if (
+                            shared_movie_reader is None
+                            or shared_movie_reader.name != str(descriptor["name"])
+                        ):
+                            if shared_movie_reader is not None:
+                                shared_movie_reader.close()
+                            shared_movie_reader = SharedVideoFrameReader(
+                                str(descriptor["name"]),
+                                int(descriptor["maximum_frame_bytes"]),
+                                slot_count=int(descriptor.get("slot_count", 4)),
+                                unregister_resource_tracker=True,
+                            )
+                        shared_movie_minimum_sequence = int(
+                            payload.get("minimum_sequence", 1)
+                        )
+                        shared_movie_sequence = shared_movie_minimum_sequence - 1
+                        shared_movie_crop_bounds = center_crop_bounds(
+                            tuple(payload["video_size"]),
+                            tuple(payload.get("main_size") or preview_canvas_size),
+                        )
+                        shared_movie_active = True
                     elif command_type == "clear_scene":
                         _release_movie()
                         last_bg_rgb = tuple(payload.get("bg_rgb_255", last_bg_rgb))
@@ -1497,7 +1573,11 @@ def _experimenter_preview_process(
                 mouse_down = False
             if mouse_down and (not last_mouse_down):
                 try:
-                    _place_overlay_controls(movie_layout if movie is not None else static_scene.get("layout"))
+                    _place_overlay_controls(
+                        movie_layout
+                        if movie is not None or shared_movie_active
+                        else static_scene.get("layout")
+                    )
                     mouse_pos = mouse.getPos()
                     if reward_button_rect.contains(mouse_pos):
                         reward_event.set()
@@ -1518,6 +1598,40 @@ def _experimenter_preview_process(
                     win.flip()
                     if bool(getattr(movie, "isFinished", False)):
                         _release_movie()
+                    continue
+
+                if shared_movie_active:
+                    if shared_movie_reader is not None:
+                        shared_frame = shared_movie_reader.read_latest(
+                            shared_movie_sequence,
+                            minimum_sequence=shared_movie_minimum_sequence,
+                        )
+                        if shared_frame is not None:
+                            shared_movie_sequence = shared_frame.sequence
+                            left, top, right, bottom = shared_movie_crop_bounds
+                            cropped_frame = np.ascontiguousarray(
+                                shared_frame.rgba[top:bottom, left:right]
+                            )
+                            if shared_movie_stim is None:
+                                shared_movie_stim = visual.ImageStim(
+                                    win,
+                                    image=cropped_frame,
+                                    units="pix",
+                                    size=movie_layout["box_size"],
+                                    pos=movie_layout["box_center"],
+                                    interpolate=True,
+                                    autoLog=False,
+                                )
+                            else:
+                                shared_movie_stim.image = cropped_frame
+                    if movie_bg_rect is not None:
+                        movie_bg_rect.draw()
+                    if shared_movie_stim is not None:
+                        shared_movie_stim.draw()
+                    if movie_outline_rect is not None:
+                        movie_outline_rect.draw()
+                    _draw_overlay(movie_layout)
+                    win.flip()
                     continue
 
                 static_scene["canvas_bg_rect"].draw()
@@ -1551,6 +1665,11 @@ def _experimenter_preview_process(
             core.wait(max(0.02, float(update_interval_ms) / 1000.0))
     finally:
         _release_movie()
+        if shared_movie_reader is not None:
+            try:
+                shared_movie_reader.close()
+            except Exception:
+                pass
         try:
             win.close()
         except Exception:
@@ -1731,6 +1850,27 @@ class ExperimenterPreview:
         payload: Dict[str, Any] = {
             "type": "play_video",
             "video_path": str(video_path),
+            "bg_rgb_255": list(bg_rgb_255),
+        }
+        if main_size is not None:
+            payload["main_size"] = [int(main_size[0]), int(main_size[1])]
+        self._send(payload)
+
+    def play_shared_video(
+        self,
+        *,
+        shared_frame_buffer: Dict[str, Any],
+        minimum_sequence: int,
+        video_size: Sequence[int],
+        bg_rgb_255: Sequence[int],
+        main_size: Optional[Sequence[int]] = None,
+    ) -> None:
+        """Mirror frames published by the main process without decoding again."""
+        payload: Dict[str, Any] = {
+            "type": "play_shared_video",
+            "shared_frame_buffer": dict(shared_frame_buffer),
+            "minimum_sequence": int(minimum_sequence),
+            "video_size": [int(video_size[0]), int(video_size[1])],
             "bg_rgb_255": list(bg_rgb_255),
         }
         if main_size is not None:

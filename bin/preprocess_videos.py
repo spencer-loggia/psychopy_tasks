@@ -8,7 +8,9 @@ HEVC/H.265 yuv420p for compact and ffpyplayer-friendly playback, and writes the
 results into a sibling `cropped_videos` directory by default.
 """
 import argparse
+from fractions import Fraction
 import json
+import math
 import platform
 import shutil
 import subprocess
@@ -70,6 +72,12 @@ def parse_args() -> argparse.Namespace:
         "--tune",
         default="fastdecode",
         help="Optional encoder tune for easier playback; use '' to disable",
+    )
+    parser.add_argument(
+        "--gop_seconds",
+        type=float,
+        default=2.0,
+        help="Maximum keyframe interval in seconds; shorter GOPs improve random network seeks",
     )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs")
     parser.add_argument("--ffmpeg", default="ffmpeg", help="Path to ffmpeg executable")
@@ -176,7 +184,7 @@ def probe_video(ffprobe_bin: str, path: Path) -> dict:
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=width,height,pix_fmt,r_frame_rate,codec_name",
+        "stream=width,height,pix_fmt,r_frame_rate,avg_frame_rate,codec_name",
         "-of",
         "json",
         str(path),
@@ -187,6 +195,14 @@ def probe_video(ffprobe_bin: str, path: Path) -> dict:
     if not streams:
         raise RuntimeError(f"No video stream found in {path}")
     return streams[0]
+
+
+def parse_frame_rate(stream: dict) -> float:
+    value = stream.get("avg_frame_rate") or stream.get("r_frame_rate") or ""
+    try:
+        return float(Fraction(str(value)))
+    except (ValueError, ZeroDivisionError):
+        return 0.0
 
 
 def build_filter(screen_width: int, screen_height: int, out_width: int, out_height: int) -> str:
@@ -214,6 +230,7 @@ def preprocess_video(
     preset: str,
     crf: int,
     tune: str,
+    gop_frames: int,
     overwrite: bool,
     expected_size: tuple[int, int],
 ) -> str:
@@ -239,6 +256,8 @@ def preprocess_video(
             codec,
             "-profile:v",
             "main",
+            "-g",
+            str(int(gop_frames)),
         ]
         if codec == "libx265":
             encoder_args.extend([
@@ -275,6 +294,8 @@ def preprocess_video(
             "hvc1",
             "-pix_fmt",
             "yuv420p",
+            "-movflags",
+            "+faststart",
             str(output_path),
         ]
 
@@ -318,6 +339,8 @@ def main() -> None:
     input_dir = Path(args.input_dir).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
     screen_width, screen_height = (int(v) for v in args.screen_size)
+    if not math.isfinite(float(args.gop_seconds)) or not float(args.gop_seconds) > 0.0:
+        raise ValueError("gop_seconds must be a positive finite value")
     out_width, out_height = compute_target_size(screen_width, screen_height, int(args.short_dim))
     filter_chain = build_filter(screen_width, screen_height, out_width, out_height)
 
@@ -342,6 +365,10 @@ def main() -> None:
                 f"codec={input_stream.get('codec_name')} expected={PREFERRED_VIDEO_STREAM_CODEC} "
                 f"action=reencode_to_{PREFERRED_VIDEO_STREAM_CODEC}"
             )
+        input_fps = parse_frame_rate(input_stream)
+        if input_fps <= 0.0:
+            raise ValueError(f"Could not determine source frame rate: {video_path}")
+        gop_frames = max(1, int(round(input_fps * float(args.gop_seconds))))
         used_codec = preprocess_video(
             ffmpeg_bin=ffmpeg_bin,
             ffprobe_bin=ffprobe_bin,
@@ -353,6 +380,7 @@ def main() -> None:
             preset=str(args.preset),
             crf=int(args.crf),
             tune=str(args.tune).strip(),
+            gop_frames=gop_frames,
             overwrite=bool(args.overwrite),
             expected_size=(out_width, out_height),
         )

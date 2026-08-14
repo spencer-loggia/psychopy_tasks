@@ -16,8 +16,10 @@ Launch the touch interface with an interface configuration:
 python interface/touch_interface.py --config config_files/interface/rpi_launch_config.json
 ```
 
-The interface opens on subject selection. The launch config's `subjects` object maps each displayed full name to
-the short subject code used in directory names. Selecting a subject starts a new experiment under `logs`:
+The interface opens on a root menu with Start Experiment, the context-dependent Rig Mode/Portable Mode switch,
+Desktop, and Shutdown actions. Start Experiment opens subject selection. The launch config's `subjects` object maps
+each displayed full name to the short subject code used in directory names. Selecting a subject starts a new
+experiment under `logs`:
 
 `exp_[subject_code]_[YYYYMMDD]_[incrementing_id]`
 
@@ -26,8 +28,6 @@ contains:
 
 - `launch_config.json`: a snapshot of the interface launch config.
 - `event_name_library.json`: a snapshot of the shared event-name/code library used by its blocks.
-- `task_configs/`: snapshots of every task config referenced anywhere in the launch config, preserving paths
-  relative to the working directory.
 - `state.json`: the current mutable experiment state.
 - `blocks.tsv`: blocks in launch order, including start and end times in milliseconds from experiment start.
 - `blocks/[block_num]_[block_name]/`: the generated config and outputs for each block.
@@ -63,7 +63,7 @@ start. Extra calibration metadata is ignored. This generic matching rule allows 
 added to `initial_state` without adding task-specific manager code.
 
 Before each block, the manager creates its output directory and writes `config.json` there. It copies the task
-config snapshot captured at experiment start, sets `config_name`, `output_dir`, and the full-name `subject`, copies
+config from its original source at block launch time, sets `config_name`, `output_dir`, and the full-name `subject`, copies
 other non-list state fields, and flattens the newest entry from every list-valued state field into top-level config
 fields, excluding `set_time`. It never injects the calibration-history lists themselves. The task subprocess is
 then launched with `--config` pointing to this generated file.
@@ -96,6 +96,9 @@ current block and its loop immediately.
 The subject and task option area scrolls with a mouse wheel (including X11 Button-4/5 wheel events) or by dragging
 vertically with one finger. A touch drag must move at least 12 pixels before it becomes a scroll, so a normal tap
 still activates its button while a swipe does not accidentally launch it.
+
+The top-level task menu has an End Experiment button. It closes the current experiment and returns to the root
+menu; Desktop, Shutdown, and mode switching are available only from that root menu.
 
 Experiment-managed task/subprocess policies:
 
@@ -286,7 +289,48 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
 
 - `random_image_sequence` treats each image presentation as a trial and logs one behavior row per image.
 - `afc_trial_sequence` logs one behavior row per trial, including the option list and any choice touch.
-- `play_video` treats each played clip as a trial and only logs clip start / expected duration / end in the event log, not every frame.
+- `play_video` takes an explicit `video_files` list and a required
+  `clip_duration_seconds`. Each trial randomly selects one source, uniformly
+  selects a valid frame-aligned temporal start, seeks within that source, and
+  presents the fixed-duration clip without extracting a temporary file.
+- Sources must be HEVC Main/yuv420p. The task probes each unique path once and
+  refuses incompatible media or sources shorter than the requested clip. On
+  Raspberry Pi, it also requires an accessible HEVC V4L2 hardware decoder.
+- The behavior row for each trial records the full source path, requested and
+  actual source timestamps, first-frame display time, last-frame end time,
+  displayed duration, and displayed frame count. The corresponding event-log
+  start/end records are main-display flips; the end flip removes the last frame.
+- `play_video` decodes each clip once. Every newly displayed decoded frame is
+  published to a four-slot, latest-frame-wins shared-memory ring; the
+  experimenter process displays the newest complete frame without creating a
+  second VLC decoder or accumulating a delayed frame queue. Each ring frame
+  includes its sequence, source frame/media time, main-display flip time, and
+  trial number.
+- The VLC player stays loaded when successive trials select the same source.
+  For efficient random access over a mounted network filesystem, preprocess
+  sources with `bin/preprocess_videos.py`; outputs use MP4 fast-start metadata
+  and a default two-second maximum keyframe interval.
+- On Raspberry Pi, `play_video` sends one-display-frame sync pulses on BCM GPIO
+  `sync_pin` (default `18`). Pulse onsets are frame locked and their successive
+  intervals are sampled inclusively from `sync_interval_frames` (default
+  `[100, 300]`) for each interval. `sync_pulse_frames` controls pulse width and
+  defaults to `1`.
+- `play_video` treats each randomly selected temporal clip as a trial. It logs
+  clip start/end and video sync on/off edges, but does not log every displayed
+  video frame.
+
+A minimal video-source portion of the configuration is:
+
+```json
+{
+  "video_files": [
+    "/mnt/experiment-videos/source_01.mp4",
+    "/mnt/experiment-videos/source_02.mp4"
+  ],
+  "clip_duration_seconds": 5.0,
+  "seek_timeout_seconds": 30.0
+}
+```
 
 Screen Selection
 ----------------

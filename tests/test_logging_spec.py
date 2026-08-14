@@ -144,6 +144,13 @@ class LoggingSpecTests(unittest.TestCase):
         self.assertIn("trial_cue", definitions)
         self.assertEqual(definitions["trial_cue"].code, 104)
 
+    def test_play_video_registers_frame_locked_sync_edges(self):
+        definitions, _ = load_task_event_definitions("play_video")
+
+        self.assertEqual(definitions["video_sync_signal_on"].code, 302)
+        self.assertEqual(definitions["video_sync_signal_off"].code, 303)
+        self.assertEqual(definitions["video_sync_signal_on"].default_type, "signal")
+
 
 if __name__ == "__main__":
     unittest.main()

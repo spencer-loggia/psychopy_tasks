@@ -3,7 +3,7 @@
   "video_files": [
     "/mnt/isilon/DATA/monkey_test_box_data/videos/monkey_kingdom.mp4"
   ],
-  "clip_duration_seconds": 5.0,
+  "clip_duration_seconds": 60.0,
   "seek_timeout_seconds": 30.0,
   "output_dir": "./logs",
   "screens": {

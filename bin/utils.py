@@ -257,6 +257,7 @@ def play_video_fill_screen(
     movie_stim=None,
     keep_movie_loaded: bool = False,
     seek_timeout_s: float = 15.0,
+    decoder_ready_callback: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     video_file = Path(video_path)
     if stream_info is None and not video_file.is_file():
@@ -400,6 +401,7 @@ def play_video_fill_screen(
             movie,
             clip_start_s=clip_start_s,
             seek_timeout_s=seek_timeout_s,
+            ready_callback=decoder_ready_callback,
         )
     except Exception:
         try:

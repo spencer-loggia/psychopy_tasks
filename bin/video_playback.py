@@ -11,7 +11,7 @@ import os
 import random
 import struct
 import time
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
 
@@ -125,7 +125,13 @@ def _wait_for_seekable_vlc_player(movie, deadline_perf_s: float) -> bool:
     return False
 
 
-def prepare_vlc_clip(movie, clip_start_s: float, seek_timeout_s: float) -> float:
+def prepare_vlc_clip(
+    movie,
+    clip_start_s: float,
+    seek_timeout_s: float,
+    *,
+    ready_callback: Optional[Callable[[], None]] = None,
+) -> float:
     """Seek without presenting pre-seek frames, then pause on the first frame."""
     clip_start_s = float(clip_start_s)
     seek_timeout_s = float(seek_timeout_s)
@@ -163,6 +169,8 @@ def prepare_vlc_clip(movie, clip_start_s: float, seek_timeout_s: float) -> float
         )
         if frame_ready and at_target:
             movie.pause(log=False)
+            if ready_callback is not None:
+                ready_callback()
             return source_time_s
         if bool(getattr(movie, "isFinished", False)):
             break

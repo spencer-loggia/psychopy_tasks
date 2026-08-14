@@ -104,9 +104,10 @@ Run System Diagnostic uses the configured `environment.python` interpreter and d
 block. It checks that PsychoPy can import, `lgpio` can open GPIO chip 0, and the Pi-Plates DAQC2 driver can read the
 board supply voltage on ADC channel 8. It then pins the diagnostic subprocess to CPU 0, reads the resolved main
 output's starred active-mode refresh rate from `xrandr`, opens a PsychoPy window on that output, requests blocking
-vsync, and records 120 independent flip intervals. PsychoPy's `getActualFrameRate()` result is reported separately
-as an observed flip rate; it is not treated as the monitor's hardware rate when xrandr is available. The flip-lock
-check passes when at least 90% of those intervals match one hardware refresh and the median interval also matches
+vsync, confirms that the X11/GLX driver acknowledged swap interval 1, and records 120 independent flip intervals.
+PsychoPy's `getActualFrameRate()` result is reported separately as an observed flip rate; it is never substituted
+for the main output's xrandr hardware rate. The flip-lock check passes when at least 90% of those intervals match
+one hardware refresh and the median interval also matches
 the expected frame period. The completion dialog always includes the monitor refresh rate (or `unavailable`) and a
 per-check list, followed by explicit errors for failed checks.
 
@@ -419,7 +420,7 @@ CPU Affinity for Timing-Critical Tasks
 The `active_foraging` and `play_video` tasks treat CPU core `0` as the timing-critical presentation core.
 
 - The main `active_foraging` process, including stimulus presentation and touch-event detection, pins itself to CPU `0` before entering the trial loop.
-- The main `play_video` process pins itself to CPU `0` after measuring the main display and starting the experimenter preview, but before entering the playback loop.
+- `play_video` measures the main display and starts both the experimenter preview and VLC decoder on worker cores. Once VLC has decoded and paused on the selected clip's first frame, only the main presentation thread moves to CPU `0` for the refresh-locked playback loop; it returns to worker cores between clips.
 - Non-timing-critical child processes such as the background trial-generation worker and the experimenter preview process inherit the remaining CPU cores. This keeps the `play_video` experimenter preview off CPU `0` as well.
 - This is necessary because `multiprocessing` children inherit the parent's CPU affinity by default. To prevent workers from inheriting CPU `0`, the parent process is first moved onto the non-zero worker-core pool, the child processes are spawned, and then the parent is pinned back to CPU `0`.
 - For the intended timing behavior on Linux or Raspberry Pi, CPU `0` should also be isolated from normal OS scheduling at the kernel level, for example with `isolcpus`, `nohz_full`, `rcu_nocbs`, or an equivalent cpuset-based setup.

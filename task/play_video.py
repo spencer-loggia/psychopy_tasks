@@ -242,9 +242,9 @@ def run_task(
             f"session_start task=play_video config_name={resolved_config_name} session_dir={session_logs.session_dir}",
         )
 
-        # Keep CPU 0 free while multiprocessing children are created. The
-        # experimenter preview inherits this worker-only mask; the parent is
-        # pinned back to CPU 0 immediately before the playback loop.
+        # Keep CPU 0 free while multiprocessing children and decoder threads
+        # are created. The preview and VLC decoder inherit this worker-only
+        # mask. Only the main presentation thread is later moved to CPU 0.
         affinity_plan = build_main_and_worker_affinity_plan(main_core=0)
         main_cpu_affinity = affinity_plan.get("main_cpu_affinity")
         worker_cpu_affinity = affinity_plan.get("worker_cpu_affinity")
@@ -330,19 +330,39 @@ def run_task(
                 ),
             )
 
-        if main_cpu_affinity:
+        def _pin_main_for_playback() -> None:
+            if not main_cpu_affinity:
+                return
             main_ok, main_detail = set_process_cpu_affinity(main_cpu_affinity)
             if main_ok:
                 msg_logger.log("INFO", f"cpu_affinity_main_phase {main_detail}")
-            else:
-                msg_logger.log("WARN", f"cpu_affinity_main_phase_failed {main_detail}")
-                restore_affinity = affinity_plan.get("current_affinity")
-                if parent_staged_off_main_core and restore_affinity:
-                    restore_ok, restore_detail = set_process_cpu_affinity(restore_affinity)
-                    if restore_ok:
-                        msg_logger.log("WARN", f"cpu_affinity_restore_after_failure {restore_detail}")
-                    else:
-                        msg_logger.log("WARN", f"cpu_affinity_restore_failed {restore_detail}")
+                return
+
+            msg_logger.log("WARN", f"cpu_affinity_main_phase_failed {main_detail}")
+            restore_affinity = affinity_plan.get("current_affinity")
+            if parent_staged_off_main_core and restore_affinity:
+                restore_ok, restore_detail = set_process_cpu_affinity(restore_affinity)
+                if restore_ok:
+                    msg_logger.log("WARN", f"cpu_affinity_restore_after_failure {restore_detail}")
+                else:
+                    msg_logger.log("WARN", f"cpu_affinity_restore_failed {restore_detail}")
+
+        def _stage_main_for_decoder() -> None:
+            if not worker_cpu_affinity:
+                return
+            staged_ok, staged_detail = set_process_cpu_affinity(worker_cpu_affinity)
+            if staged_ok:
+                msg_logger.log("INFO", f"cpu_affinity_decoder_phase {staged_detail}")
+                return
+
+            msg_logger.log("WARN", f"cpu_affinity_decoder_phase_failed {staged_detail}")
+            restore_affinity = affinity_plan.get("current_affinity")
+            if restore_affinity:
+                restore_ok, restore_detail = set_process_cpu_affinity(restore_affinity)
+                if restore_ok:
+                    msg_logger.log("WARN", f"cpu_affinity_restore_after_decoder_failure {restore_detail}")
+                else:
+                    msg_logger.log("WARN", f"cpu_affinity_restore_failed {restore_detail}")
 
         msg_logger.log(
             "INFO",
@@ -395,32 +415,39 @@ def run_task(
                 if raspi
                 else None
             )
-            playback_info = utils.play_video_fill_screen(
-                win=win,
-                video_path=chosen_video,
-                logger=logger,
-                bg_rect=bg_rect,
-                msg_logger=msg_logger,
-                allow_escape=True,
-                stop_on_mouse_click=True,
-                mouse=mouse,
-                ffprobe_bin=ffprobe_bin,
-                external_abort_checker=(experimenter_preview.poll if experimenter_preview is not None else None),
-                trial_num=played_videos + 1,
-                stream_info=chosen_stream,
-                frame_publisher=frame_publisher,
-                sync_schedule=sync_schedule,
-                sync_gpio_module=sync_lgpio,
-                sync_gpio_chip=sync_gpio_chip,
-                sync_pin=sync_pin,
-                frame_duration_s=frame_dur,
-                frame_publish_interval_s=0.0,
-                clip_start_s=selected_clip.start_s,
-                clip_duration_s=selected_clip.duration_s,
-                movie_stim=reusable_movie,
-                keep_movie_loaded=True,
-                seek_timeout_s=seek_timeout_seconds,
-            )
+            try:
+                playback_info = utils.play_video_fill_screen(
+                    win=win,
+                    video_path=chosen_video,
+                    logger=logger,
+                    bg_rect=bg_rect,
+                    msg_logger=msg_logger,
+                    allow_escape=True,
+                    stop_on_mouse_click=True,
+                    mouse=mouse,
+                    ffprobe_bin=ffprobe_bin,
+                    external_abort_checker=(experimenter_preview.poll if experimenter_preview is not None else None),
+                    trial_num=played_videos + 1,
+                    stream_info=chosen_stream,
+                    frame_publisher=frame_publisher,
+                    sync_schedule=sync_schedule,
+                    sync_gpio_module=sync_lgpio,
+                    sync_gpio_chip=sync_gpio_chip,
+                    sync_pin=sync_pin,
+                    frame_duration_s=frame_dur,
+                    frame_publish_interval_s=0.0,
+                    clip_start_s=selected_clip.start_s,
+                    clip_duration_s=selected_clip.duration_s,
+                    movie_stim=reusable_movie,
+                    keep_movie_loaded=True,
+                    seek_timeout_s=seek_timeout_seconds,
+                    decoder_ready_callback=_pin_main_for_playback,
+                )
+            finally:
+                # Move the Python thread off reserved CPU 0 between clips. A
+                # subsequent load/play can then create decoder threads on the
+                # worker-core mask before presentation is pinned again.
+                _stage_main_for_decoder()
             reusable_movie = playback_info["movie_stim"]
             played_videos += 1
             first_frame_time = (

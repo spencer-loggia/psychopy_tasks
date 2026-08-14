@@ -9,6 +9,7 @@ from task.system_diagnostic import (
     pin_diagnostic_to_cpu_zero,
     probe_gpio,
     probe_piplate,
+    query_main_monitor_refresh_rate,
     run_display_diagnostic,
 )
 
@@ -26,6 +27,23 @@ DSI-1 connected 1280x800+1920+0
             parse_xrandr_active_refresh_rate(xrandr_output, "HDMI-1"),
             60.33,
         )
+
+    def test_refresh_query_uses_the_resolved_main_output(self):
+        screen = types.SimpleNamespace(
+            name="HDMI-1", width=1920, height=1080, x=0, y=0
+        )
+        completed = types.SimpleNamespace(stdout="""\
+HDMI-1 connected primary 1920x1080+0+0
+   1920x1080     60.33*+
+DSI-1 connected 1280x800+1920+0
+   1280x800      59.99*+
+""")
+
+        with patch("task.system_diagnostic.subprocess.run", return_value=completed):
+            rate, detail = query_main_monitor_refresh_rate(screen)
+
+        self.assertEqual(rate, 60.33)
+        self.assertIn("resolved main output HDMI-1", detail)
 
     def test_stable_one_refresh_intervals_pass_flip_lock(self):
         passed, metrics = evaluate_flip_lock(120.0, [1.0 / 120.0] * 120)
@@ -95,6 +113,10 @@ DSI-1 connected 1280x800+1920+0
             patch("bin.screen.resolve_task_screens", return_value=(Mock(), None)),
             patch("bin.screen.get_psychopy_window_kwargs", return_value={}),
             patch("bin.screen.enforce_window_vsync", return_value=True),
+            patch(
+                "task.system_diagnostic.query_glx_swap_interval",
+                return_value=(1, "GLX_EXT_swap_control"),
+            ),
             patch("bin.task_lifecycle.signal_task_window_ready"),
             patch(
                 "task.system_diagnostic.query_main_monitor_refresh_rate",
@@ -126,6 +148,10 @@ DSI-1 connected 1280x800+1920+0
             patch("bin.screen.resolve_task_screens", return_value=(Mock(), None)),
             patch("bin.screen.get_psychopy_window_kwargs", return_value={}),
             patch("bin.screen.enforce_window_vsync", return_value=True),
+            patch(
+                "task.system_diagnostic.query_glx_swap_interval",
+                return_value=(1, "GLX_EXT_swap_control"),
+            ),
             patch("bin.task_lifecycle.signal_task_window_ready"),
             patch(
                 "task.system_diagnostic.query_main_monitor_refresh_rate",
@@ -145,7 +171,7 @@ DSI-1 connected 1280x800+1920+0
             [check["status"] for check in checks],
             ["pass", "fail", "skip"],
         )
-        self.assertAlmostEqual(refresh_rate, 60.0)
+        self.assertIsNone(refresh_rate)
         self.assertIsNone(metrics)
 
     def test_xrandr_rate_exposes_psychopy_every_other_refresh_failure(self):
@@ -159,6 +185,10 @@ DSI-1 connected 1280x800+1920+0
             patch("bin.screen.resolve_task_screens", return_value=(Mock(), None)),
             patch("bin.screen.get_psychopy_window_kwargs", return_value={}),
             patch("bin.screen.enforce_window_vsync", return_value=True),
+            patch(
+                "task.system_diagnostic.query_glx_swap_interval",
+                return_value=(2, "GLX_EXT_swap_control"),
+            ),
             patch("bin.task_lifecycle.signal_task_window_ready"),
             patch(
                 "task.system_diagnostic.query_main_monitor_refresh_rate",
@@ -177,8 +207,9 @@ DSI-1 connected 1280x800+1920+0
         self.assertEqual(refresh_rate, 60.33)
         self.assertEqual(
             [check["status"] for check in checks],
-            ["pass", "pass", "fail"],
+            ["fail", "pass", "fail"],
         )
+        self.assertIn("swap interval 2", checks[0]["detail"])
         self.assertEqual(metrics["locked_fraction"], 0.0)
         self.assertIn("PsychoPy measured 28.827 Hz", checks[2]["detail"])
         self.assertIn("median interval error", checks[2]["error"])

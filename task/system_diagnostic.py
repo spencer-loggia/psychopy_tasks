@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 import importlib
 import json
 import math
@@ -257,7 +259,69 @@ def query_main_monitor_refresh_rate(
     )
     if refresh_rate_hz is None:
         return None, f"xrandr did not report an active mode for output {output_name}"
-    return refresh_rate_hz, f"xrandr active mode for output {output_name}"
+    geometry = (
+        f"{getattr(screen_info, 'width', '?')}x{getattr(screen_info, 'height', '?')}"
+        f"+{getattr(screen_info, 'x', '?')}+{getattr(screen_info, 'y', '?')}"
+    )
+    return (
+        refresh_rate_hz,
+        f"xrandr active mode for resolved main output {output_name} ({geometry})",
+    )
+
+
+def query_glx_swap_interval() -> tuple[Optional[int], str]:
+    """Read the swap interval acknowledged for the current X11 drawable."""
+    if not sys.platform.startswith("linux"):
+        return None, "native GLX swap-interval queries are available only on Linux/X11"
+    try:
+        libgl = ctypes.CDLL(ctypes.util.find_library("GL") or "libGL.so.1")
+        libx11 = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+
+        libgl.glXGetCurrentDisplay.restype = ctypes.c_void_p
+        libgl.glXGetCurrentDrawable.restype = ctypes.c_ulong
+        display = libgl.glXGetCurrentDisplay()
+        drawable = libgl.glXGetCurrentDrawable()
+        if not display or not drawable:
+            return None, "the PsychoPy window has no current GLX display/drawable"
+
+        libx11.XDefaultScreen.argtypes = [ctypes.c_void_p]
+        libx11.XDefaultScreen.restype = ctypes.c_int
+        libgl.glXQueryExtensionsString.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        libgl.glXQueryExtensionsString.restype = ctypes.c_char_p
+        raw_extensions = libgl.glXQueryExtensionsString(
+            display,
+            libx11.XDefaultScreen(display),
+        )
+        extensions = set((raw_extensions or b"").decode("ascii", "replace").split())
+
+        if "GLX_EXT_swap_control" in extensions:
+            value = ctypes.c_uint()
+            libgl.glXQueryDrawable.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_ulong,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_uint),
+            ]
+            libgl.glXQueryDrawable(
+                display,
+                drawable,
+                0x20F1,  # GLX_SWAP_INTERVAL_EXT
+                ctypes.byref(value),
+            )
+            return int(value.value), "GLX_EXT_swap_control"
+
+        if "GLX_MESA_swap_control" in extensions:
+            libgl.glXGetProcAddressARB.argtypes = [ctypes.c_char_p]
+            libgl.glXGetProcAddressARB.restype = ctypes.c_void_p
+            address = libgl.glXGetProcAddressARB(b"glXGetSwapIntervalMESA")
+            if address:
+                get_interval = ctypes.CFUNCTYPE(ctypes.c_int)(address)
+                return int(get_interval()), "GLX_MESA_swap_control"
+            return None, "GLX_MESA_swap_control is advertised but not callable"
+
+        return None, "the current GLX driver exposes no queryable swap-control extension"
+    except Exception as exc:
+        return None, f"GLX swap-interval query failed: {_error_text(exc)}"
 
 
 def _measure_flip_intervals(win, *, interval_count: int = FLIP_TEST_INTERVALS) -> list[float]:
@@ -327,6 +391,7 @@ def run_display_diagnostic(
         win_kwargs.update(
             get_psychopy_window_kwargs(main_screen, fullscreen=True)
         )
+        window_mode = "fullscreen" if win_kwargs.get("fullscr") else "borderless"
         win = visual_module.Window(**win_kwargs)
         signal_task_window_ready()
     except Exception as exc:
@@ -360,11 +425,38 @@ def run_display_diagnostic(
         vsync_requested = bool(enforce_window_vsync(win)) and bool(
             getattr(win, "waitBlanking", False)
         )
+        swap_interval = None
+        swap_interval_detail = "vsync was not requested"
         if vsync_requested:
+            # EXT swap-control changes take effect after the next buffer swap.
+            win.flip()
+            swap_interval, swap_interval_detail = query_glx_swap_interval()
+
+        if swap_interval == 1:
             vsync_check = _check(
                 "Vsync request",
                 "pass",
-                "PsychoPy accepted a blocking vsync request for the main monitor",
+                (
+                    "PsychoPy requested blocking vsync and the driver acknowledged "
+                    f"swap interval 1 ({swap_interval_detail})"
+                ),
+            )
+        elif vsync_requested and swap_interval is not None:
+            vsync_check = _check(
+                "Vsync request",
+                "fail",
+                (
+                    "PsychoPy requested blocking vsync, but the driver reports "
+                    f"swap interval {swap_interval} ({swap_interval_detail})"
+                ),
+                error="The main window was not acknowledged for one swap per refresh",
+            )
+        elif vsync_requested:
+            vsync_check = _check(
+                "Vsync request",
+                "fail",
+                "PsychoPy requested blocking vsync, but driver acknowledgment is unavailable",
+                error=swap_interval_detail,
             )
         else:
             vsync_check = _check(
@@ -375,7 +467,6 @@ def run_display_diagnostic(
             )
 
         psychopy_rate = None
-        rate_error = None
         try:
             measured = win.getActualFrameRate(
                 nIdentical=20,
@@ -387,8 +478,8 @@ def run_display_diagnostic(
                 measured = float(measured)
                 if math.isfinite(measured) and measured > 0.0:
                     psychopy_rate = measured
-        except Exception as exc:
-            rate_error = _error_text(exc)
+        except Exception:
+            pass
 
         intervals = _measure_flip_intervals(win)
         median_interval_s = statistics.median(intervals) if intervals else None
@@ -397,24 +488,24 @@ def run_display_diagnostic(
             if median_interval_s is not None and median_interval_s > 0.0
             else None
         )
-        if monitor_refresh_rate_hz is None and psychopy_rate is None:
-            refresh_rate_hz = interval_rate
+        if monitor_refresh_rate_hz is None:
+            refresh_rate_hz = None
             estimate_detail = (
-                f"; the diagnostic intervals suggest {interval_rate:.3f} Hz, but this is unconfirmed"
-                if interval_rate is not None
+                f" PsychoPy observed {psychopy_rate:.3f} Hz;"
+                if psychopy_rate is not None
                 else ""
+            ) + (
+                f" the diagnostic intervals suggest {interval_rate:.3f} Hz."
+                if interval_rate is not None else ""
             )
             refresh_check = _check(
                 "Monitor refresh rate",
                 "fail",
                 (
-                    "The main-monitor active mode and a stable PsychoPy refresh "
-                    f"measurement were unavailable{estimate_detail}"
+                    "The resolved main output has no confirmed xrandr active-mode rate."
+                    f"{estimate_detail} Neither observed rate is used as the hardware rate."
                 ),
-                error=(
-                    f"{monitor_rate_detail}; "
-                    f"{rate_error or 'Window.getActualFrameRate() returned no stable rate'}"
-                ),
+                error=monitor_rate_detail,
             )
             flip_check = _check(
                 "Flip synchronization",
@@ -426,17 +517,13 @@ def run_display_diagnostic(
             )
             return [vsync_check, refresh_check, flip_check], refresh_rate_hz, None
 
-        refresh_rate_hz = monitor_refresh_rate_hz or psychopy_rate
-        if monitor_refresh_rate_hz is not None:
-            source = monitor_rate_detail
-            observed = (
-                f"; PsychoPy observed {psychopy_rate:.3f} Hz"
-                if psychopy_rate is not None
-                else "; PsychoPy stable-rate measurement unavailable"
-            )
-        else:
-            source = f"PsychoPy fallback; {monitor_rate_detail}"
-            observed = ""
+        refresh_rate_hz = monitor_refresh_rate_hz
+        source = monitor_rate_detail
+        observed = (
+            f"; PsychoPy observed {psychopy_rate:.3f} Hz"
+            if psychopy_rate is not None
+            else "; PsychoPy stable-rate measurement unavailable"
+        )
         refresh_check = _check(
             "Monitor refresh rate",
             "pass",
@@ -447,6 +534,8 @@ def run_display_diagnostic(
         metrics["monitor_refresh_rate_hz"] = refresh_rate_hz
         metrics["psychopy_measured_rate_hz"] = psychopy_rate
         metrics["observed_median_rate_hz"] = interval_rate
+        metrics["glx_swap_interval"] = swap_interval
+        metrics["window_mode"] = window_mode
         locked_percent = float(metrics["locked_fraction"]) * 100.0
         psychopy_rate_text = (
             f"{psychopy_rate:.3f} Hz" if psychopy_rate is not None else "unavailable"
@@ -455,7 +544,8 @@ def run_display_diagnostic(
             f"{interval_rate:.3f} Hz" if interval_rate is not None else "unavailable"
         )
         detail = (
-            f"target {refresh_rate_hz:.3f} Hz ({metrics['expected_interval_ms']:.3f} ms); "
+            f"{window_mode} window; target {refresh_rate_hz:.3f} Hz "
+            f"({metrics['expected_interval_ms']:.3f} ms); "
             f"PsychoPy measured {psychopy_rate_text}; median flip interval "
             f"{metrics['median_interval_ms']:.3f} ms ({interval_rate_text}); "
             f"{locked_percent:.1f}% of {metrics['sample_count']} intervals within "

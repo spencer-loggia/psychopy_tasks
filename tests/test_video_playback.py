@@ -114,11 +114,18 @@ class VideoPlaybackTests(unittest.TestCase):
                 return self.source_time
 
         movie = FakeMovie()
-        actual_start = prepare_vlc_clip(movie, 0.0, 0.1)
+        callback_states = []
+        actual_start = prepare_vlc_clip(
+            movie,
+            0.0,
+            0.1,
+            ready_callback=lambda: callback_states.append(movie.isPaused),
+        )
 
         self.assertEqual(movie.seek_calls, [0.0])
         self.assertEqual(actual_start, 0.0)
         self.assertTrue(movie.isPaused)
+        self.assertEqual(callback_states, [True])
 
     def test_random_frame_pulses_have_frame_locked_edges(self):
         schedule = RandomFramePulseSchedule(

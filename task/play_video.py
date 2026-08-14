@@ -14,6 +14,11 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from bin import utils
+from bin.affinity import (
+    build_main_and_worker_affinity_plan,
+    describe_cpu_set,
+    set_process_cpu_affinity,
+)
 from bin.config import load_config, validate_config
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
@@ -29,7 +34,6 @@ from bin.video_playback import (
 from bin.screen import (
     ExperimenterPreview,
     describe_screen,
-    enforce_window_vsync,
     load_screen_config,
     resolve_scene_size,
     resolve_task_screens,
@@ -162,7 +166,9 @@ def run_task(
 
     main_screen, experimenter_screen = resolve_task_screens(screen_config)
     win = utils.setup_window(bg_rgb_255=bg, fullscreen=fullscreen, size=win_size, screen_info=main_screen)
-    main_vsync_requested = enforce_window_vsync(win)
+    main_vsync_requested = bool(
+        getattr(win, "_neuro_tasks_refresh_sync_requested", False)
+    )
     bg_rect = utils.make_bg_rect(win, bg)
     mouse = event.Mouse(win=win)
     experimenter_preview = None
@@ -211,16 +217,6 @@ def run_task(
         raise RuntimeError("play_video requires a behavior logger")
     pylogging.console.setLevel(pylogging.CRITICAL)
     try:
-        if experimenter_screen is not None:
-            frame_publisher = SharedVideoFrameBuffer(maximum_frame_bytes)
-            experimenter_preview = ExperimenterPreview(
-                experimenter_screen,
-                task_label=resolved_config_name,
-                start_perf_s=time.perf_counter(),
-                update_interval_s=0.1,
-            )
-            experimenter_preview.clear_scene(bg_rgb_255=bg, main_size=main_scene_size)
-
         if raspi:
             import lgpio
 
@@ -245,6 +241,36 @@ def run_task(
             "INFO",
             f"session_start task=play_video config_name={resolved_config_name} session_dir={session_logs.session_dir}",
         )
+
+        # Keep CPU 0 free while multiprocessing children are created. The
+        # experimenter preview inherits this worker-only mask; the parent is
+        # pinned back to CPU 0 immediately before the playback loop.
+        affinity_plan = build_main_and_worker_affinity_plan(main_core=0)
+        main_cpu_affinity = affinity_plan.get("main_cpu_affinity")
+        worker_cpu_affinity = affinity_plan.get("worker_cpu_affinity")
+        parent_staged_off_main_core = False
+        if affinity_plan.get("supported"):
+            msg_logger.log(
+                "INFO",
+                (
+                    "cpu_affinity_plan "
+                    f"current=[{describe_cpu_set(affinity_plan['current_affinity'])}] "
+                    f"main=[{describe_cpu_set(main_cpu_affinity)}] "
+                    f"workers=[{describe_cpu_set(worker_cpu_affinity) if worker_cpu_affinity else ''}]"
+                ),
+            )
+            if affinity_plan.get("warning"):
+                msg_logger.log("WARN", str(affinity_plan["warning"]))
+            if worker_cpu_affinity:
+                staged_ok, staged_detail = set_process_cpu_affinity(worker_cpu_affinity)
+                if staged_ok:
+                    parent_staged_off_main_core = True
+                    msg_logger.log("INFO", f"cpu_affinity_spawn_phase {staged_detail}")
+                else:
+                    msg_logger.log("WARN", f"cpu_affinity_spawn_phase_failed {staged_detail}")
+        else:
+            msg_logger.log("WARN", f"cpu_affinity_unavailable {affinity_plan.get('reason')}")
+
         msg_logger.log(
             "INFO",
             f"resolved_screens main={describe_screen(main_screen)} experimenter={describe_screen(experimenter_screen)}",
@@ -274,25 +300,50 @@ def run_task(
                     f"pulse_width_frames={sync_pulse_frames}"
                 ),
             )
-        if frame_publisher is not None:
+        msg_logger.log(
+            "INFO",
+            f"resolved_main_scene_size size={main_scene_size[0]}x{main_scene_size[1]} fullscreen={int(bool(fullscreen))} requested_win_size={win_size} realized_win_size={tuple(win.size)}",
+        )
+        fps, frame_dur = utils.resolve_frame_rate(
+            win,
+            refresh_rate,
+            msg_logger=msg_logger,
+            context="play_video",
+        )
+
+        if experimenter_screen is not None:
+            frame_publisher = SharedVideoFrameBuffer(maximum_frame_bytes)
+            experimenter_preview = ExperimenterPreview(
+                experimenter_screen,
+                task_label=resolved_config_name,
+                start_perf_s=time.perf_counter(),
+                update_interval_s=0.1,
+            )
+            experimenter_preview.clear_scene(bg_rgb_255=bg, main_size=main_scene_size)
             msg_logger.log(
                 "INFO",
                 (
                     f"experimenter_video_mirror mode=single_decode_latest_frame_wins "
                     f"shared_memory={frame_publisher.name} capacity_bytes={maximum_frame_bytes}"
-                    f" slots={frame_publisher.slot_count} publish_interval_s=0"
+                    f" slots={frame_publisher.slot_count} publish_interval_s=0 "
+                    "vsync=disabled frame_pacing=new_source_frame"
                 ),
             )
-        msg_logger.log(
-            "INFO",
-            f"resolved_main_scene_size size={main_scene_size[0]}x{main_scene_size[1]} fullscreen={int(bool(fullscreen))} requested_win_size={win_size} realized_win_size={tuple(win.size)}",
-        )
-        if refresh_rate is not None and float(refresh_rate) > 0:
-            fps = float(refresh_rate)
-            frame_dur = 1.0 / fps
-            msg_logger.log("INFO", f"fps_override refresh_rate={fps:.6f}Hz frame_dur_s={frame_dur:.9f}")
-        else:
-            fps, frame_dur = utils.detect_frame_rate(win, msg_logger=msg_logger)
+
+        if main_cpu_affinity:
+            main_ok, main_detail = set_process_cpu_affinity(main_cpu_affinity)
+            if main_ok:
+                msg_logger.log("INFO", f"cpu_affinity_main_phase {main_detail}")
+            else:
+                msg_logger.log("WARN", f"cpu_affinity_main_phase_failed {main_detail}")
+                restore_affinity = affinity_plan.get("current_affinity")
+                if parent_staged_off_main_core and restore_affinity:
+                    restore_ok, restore_detail = set_process_cpu_affinity(restore_affinity)
+                    if restore_ok:
+                        msg_logger.log("WARN", f"cpu_affinity_restore_after_failure {restore_detail}")
+                    else:
+                        msg_logger.log("WARN", f"cpu_affinity_restore_failed {restore_detail}")
+
         msg_logger.log(
             "INFO",
             f"task_ready fps={fps:.6f} n_video_paths={len(resolved_video_files)} clip_duration_s={clip_duration_seconds:.6f}",

@@ -21,6 +21,7 @@ Config keys required/additional:
 
 """
 import argparse
+from contextlib import nullcontext
 import os
 import sys
 import time
@@ -179,6 +180,7 @@ def _build_behavior_fieldnames(num_afc: int) -> List[str]:
             "choice_touch_x",
             "choice_touch_y",
             "choice_reaction_time",
+            "main_display_dropped_frames",
         ]
     )
     return fieldnames
@@ -562,43 +564,15 @@ def run_task(
         is_rig=is_rig_raw,
     )
     experimenter_preview = None
-    if experimenter_screen is not None:
-        experimenter_preview = ExperimenterPreview(
-            experimenter_screen,
-            task_label=resolved_config_name,
-            subject=resolved_subject or "(not set)",
-            current_trial_num=1,
-            total_trials=n_trials,
-            start_perf_s=time.perf_counter(),
-            update_interval_s=0.1,
-            mouse_visible=experimenter_mouse_visible,
-        )
     if touchscreen:
         set_window_mouse_visible(win, False)
-        try:
-            exp_cursor_state = "none"
-            if experimenter_preview is not None:
-                exp_cursor_state = "visible" if experimenter_mouse_visible else "hidden"
-            msg_logger.log(
-                "INFO",
-                (
-                    "touchscreen=True; main mouse cursor hidden "
-                    f"experimenter_cursor={exp_cursor_state} "
-                    f"{IS_RIG_ENV_VAR}={is_rig_raw if is_rig_raw is not None else 'unset'}"
-                ),
-            )
-        except Exception:
-            pass
-    # Measure or override frame rate once per task
-    if refresh_rate is not None and float(refresh_rate) > 0:
-        fps = float(refresh_rate)
-        frame_dur = 1.0 / fps
-        try:
-            msg_logger.log("INFO", f"fps_override refresh_rate={fps:.6f}Hz frame_dur_s={frame_dur:.9f}")
-        except Exception:
-            pass
-    else:
-        fps, frame_dur = utils.detect_frame_rate(win, msg_logger=msg_logger)
+    # Measure the isolated main window before starting the experimenter process.
+    fps, frame_dur = utils.resolve_frame_rate(
+        win,
+        refresh_rate,
+        msg_logger=msg_logger,
+        context="active_foraging",
+    )
     utils.validate_frame_aligned_timings(
         fps,
         {
@@ -621,6 +595,32 @@ def run_task(
         },
         msg_logger=msg_logger,
     )
+    if experimenter_screen is not None:
+        experimenter_preview = ExperimenterPreview(
+            experimenter_screen,
+            task_label=resolved_config_name,
+            subject=resolved_subject or "(not set)",
+            current_trial_num=1,
+            total_trials=n_trials,
+            start_perf_s=time.perf_counter(),
+            update_interval_s=0.1,
+            mouse_visible=experimenter_mouse_visible,
+        )
+    if touchscreen:
+        try:
+            exp_cursor_state = "none"
+            if experimenter_preview is not None:
+                exp_cursor_state = "visible" if experimenter_mouse_visible else "hidden"
+            msg_logger.log(
+                "INFO",
+                (
+                    "touchscreen=True; main mouse cursor hidden "
+                    f"experimenter_cursor={exp_cursor_state} "
+                    f"{IS_RIG_ENV_VAR}={is_rig_raw if is_rig_raw is not None else 'unset'}"
+                ),
+            )
+        except Exception:
+            pass
     try:
         # Log global timing quantization once based on detected fps
         def _q(seconds: float, at_least_one: bool = False):
@@ -1049,7 +1049,17 @@ def run_task(
                 event_profile="active_foraging",
                 reward_levels=[reward_map.get(pair, 0) for pair in trial_options],
             )
+            timing_monitor = trial_meta.get("_main_display_frame_timing_monitor")
             if aborted:
+                if timing_monitor is not None:
+                    msg_logger.log(
+                        "INFO",
+                        (
+                            f"main_display_timing trial_num={trial_num} "
+                            f"missed_refreshes={timing_monitor.missed_refreshes} "
+                            "scope=continuous_frame_sequences"
+                        ),
+                    )
                 if task_end_notes == "done" and _poll_experimenter_controls():
                     task_end_notes = "experimenter_exit"
                     msg_logger.log("WARN", f"experimenter_exit_during_trial trial_num={trial_num}")
@@ -1213,23 +1223,43 @@ def run_task(
                 behavior_row["choice_made_color"] = int(chosen_color_row)
                 behavior_row["choice_made_lum"] = int(chosen_lum_row)
 
-            behavior_logger.writerow(behavior_row)
-
             if iti_frames > 0:
                 post_choice_delay_present = (choice_info is not None) and ((num_pulses > 0) or (apply_timeout > 0))
                 hold_frames = iti_frames if post_choice_delay_present else max(0, iti_frames - 1)
                 _show_preview_idle()
-                for _ in range(hold_frames):
-                    if _poll_experimenter_controls():
-                        task_end_notes = "experimenter_exit"
-                        msg_logger.log("WARN", f"experimenter_exit_during_iti trial_num={trial_num}")
-                        break
-                    bg_rect.draw()
-                    if fix is not None:
-                        fix.draw()
-                    win.flip()
-                if task_end_notes != "done":
-                    break
+                timing_context = (
+                    timing_monitor.continuous_sequence()
+                    if timing_monitor is not None and hold_frames > 0
+                    else nullcontext()
+                )
+                with timing_context:
+                    for _ in range(hold_frames):
+                        if _poll_experimenter_controls():
+                            task_end_notes = "experimenter_exit"
+                            msg_logger.log("WARN", f"experimenter_exit_during_iti trial_num={trial_num}")
+                            break
+                        bg_rect.draw()
+                        if fix is not None:
+                            fix.draw()
+                        win.flip()
+
+            missed_refreshes = (
+                timing_monitor.missed_refreshes
+                if timing_monitor is not None
+                else ""
+            )
+            behavior_row["main_display_dropped_frames"] = missed_refreshes
+            behavior_logger.writerow(behavior_row)
+            msg_logger.log(
+                "INFO",
+                (
+                    f"main_display_timing trial_num={trial_num} "
+                    f"missed_refreshes={missed_refreshes} "
+                    "scope=continuous_frame_sequences"
+                ),
+            )
+            if task_end_notes != "done":
+                break
 
             _flush_between_trials()
             trial_num += 1

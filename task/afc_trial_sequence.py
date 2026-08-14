@@ -168,15 +168,12 @@ def run_task(
                 pass
 
     # Detect or override frame rate once per task
-    if refresh_rate is not None and float(refresh_rate) > 0:
-        fps = float(refresh_rate)
-        frame_dur = 1.0 / fps
-        try:
-            msg_logger.log("INFO", f"fps_override refresh_rate={fps:.6f}Hz frame_dur_s={frame_dur:.9f}")
-        except Exception:
-            pass
-    else:
-        fps, frame_dur = utils.detect_frame_rate(win, msg_logger=msg_logger)
+    fps, frame_dur = utils.resolve_frame_rate(
+        win,
+        refresh_rate,
+        msg_logger=msg_logger,
+        context="afc_trial_sequence",
+    )
     utils.validate_frame_aligned_timings(
         fps,
         {

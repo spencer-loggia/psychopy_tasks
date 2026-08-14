@@ -29,7 +29,11 @@ import time
 from .screen import (
     build_reward_hit_boxes,
     compute_aspect_cover_size,
+    configure_window_vsync,
+    enforce_window_vsync,
     get_psychopy_window_kwargs,
+    MainDisplayFrameTimingMonitor,
+    resolve_window_frame_rate,
     serialize_preview_image,
 )
 from .video_playback import (
@@ -105,11 +109,18 @@ def setup_window(
     size: Optional[Tuple[int, int]] = None,
     monitor: Optional[str] = None,
     screen_info=None,
+    sync_to_refresh: bool = True,
 ):
     from .task_lifecycle import signal_task_window_ready
 
     color = rgb255_to_psychopy(bg_rgb_255)
-    win_kwargs = dict(color=color, colorSpace="rgb", units="pix", allowStencil=False)
+    win_kwargs = dict(
+        color=color,
+        colorSpace="rgb",
+        units="pix",
+        allowStencil=False,
+        waitBlanking=bool(sync_to_refresh),
+    )
     if monitor:
         win_kwargs["monitor"] = monitor
     win_kwargs.update(get_psychopy_window_kwargs(screen_info, fullscreen=fullscreen, size=size))
@@ -121,6 +132,14 @@ def setup_window(
             activate()
         except Exception:
             pass
+    sync_request_applied = (
+        enforce_window_vsync(win)
+        if sync_to_refresh
+        else configure_window_vsync(win, False)
+    )
+    win._neuro_tasks_refresh_sync_requested = bool(
+        sync_to_refresh and sync_request_applied
+    )
     signal_task_window_ready()
     return win
 
@@ -722,34 +741,29 @@ def play_video_fill_screen(
     }
 
 
+def resolve_frame_rate(
+    win: visual.Window,
+    configured_fps: Optional[float] = None,
+    *,
+    msg_logger=None,
+    context: str = "task",
+) -> Tuple[float, float]:
+    """Measure the main window and compare an optional configured override."""
+    return resolve_window_frame_rate(
+        win,
+        configured_fps=configured_fps,
+        msg_logger=msg_logger,
+        context=context,
+    )
+
+
 def detect_frame_rate(win: visual.Window, msg_logger=None) -> Tuple[float, float]:
     """Detect the display refresh rate and return (fps, frameDur_s).
 
     Attempts to use Window.getActualFrameRate(); falls back to 60 Hz if unavailable.
     Logs detection to the optional message logger.
     """
-    fps = None
-    try:
-        fps = win.getActualFrameRate(nIdentical=20, nMaxFrames=120, nWarmUpFrames=10, threshold=1)
-        # getActualFrameRate may return a float; if it's nonsensical (<= 0), ignore.
-        if fps is not None and fps <= 0:
-            fps = None
-    except Exception:
-        fps = None
-    if fps is None:
-        fps = 60.0
-        if msg_logger is not None:
-            try:
-                msg_logger.log("WARN", f"Frame rate detection failed; using fallback fps={fps:.3f}")
-            except Exception:
-                pass
-    frame_dur = 1.0 / float(fps)
-    if msg_logger is not None:
-        try:
-            msg_logger.log("INFO", f"frame_timing fps={fps:.6f} frame_dur_s={frame_dur:.9f}")
-        except Exception:
-            pass
-    return float(fps), float(frame_dur)
+    return resolve_frame_rate(win, msg_logger=msg_logger)
 
 
 def validate_frame_aligned_timings(
@@ -1314,6 +1328,9 @@ def present_trial_with_persistent_dots(
         fps, frame_dur = detect_frame_rate(win, msg_logger=msg_logger)
     else:
         frame_dur = 1.0 / float(fps)
+    frame_timing_monitor = MainDisplayFrameTimingMonitor(win, frame_dur)
+    if trial_meta is not None:
+        trial_meta["_main_display_frame_timing_monitor"] = frame_timing_monitor
 
     def _q_to_frames(seconds: float, at_least_one: bool = True) -> Tuple[int, float]:
         frames = int(round(max(0.0, float(seconds)) * float(fps)))
@@ -1556,51 +1573,53 @@ def present_trial_with_persistent_dots(
         if not _arm_trial_start_signal():
             return True, None
         first_flip = True
-        for _ in range(cue_frames):
-            if _event.getKeys(["escape"]):
-                _log_message(msg_logger, "WARN", f"escape_pressed trial_num={trial_num} during_match_cue=1")
-                return True, None
-            if _should_abort("experimenter_exit_during_match_cue"):
-                return True, None
-            bg_rect.draw()
-            cue_stim.draw()
-            if fix is not None:
-                fix.draw()
-            win.flip()
-            if first_flip:
-                cue_perf = time.perf_counter()
-                _commit_trial_start_signal(cue_perf)
-                _set_initiation_time(cue_perf)
-                logger.log_frame_flip(
-                    trial_num=trial_num,
-                    event=pre_options_cue_event,
-                    timestamp_perf_s=cue_perf,
-                    requested_duration=cue_s,
-                )
-                first_flip = False
-
-        if delay_frames > 0:
-            _show_preview([])
-            first_flip = True
-            for _ in range(delay_frames):
+        with frame_timing_monitor.continuous_sequence():
+            for _ in range(cue_frames):
                 if _event.getKeys(["escape"]):
-                    _log_message(msg_logger, "WARN", f"escape_pressed trial_num={trial_num} during_match_delay=1")
+                    _log_message(msg_logger, "WARN", f"escape_pressed trial_num={trial_num} during_match_cue=1")
                     return True, None
-                if _should_abort("experimenter_exit_during_match_delay"):
+                if _should_abort("experimenter_exit_during_match_cue"):
                     return True, None
                 bg_rect.draw()
+                cue_stim.draw()
                 if fix is not None:
                     fix.draw()
                 win.flip()
                 if first_flip:
-                    delay_perf = time.perf_counter()
+                    cue_perf = time.perf_counter()
+                    _commit_trial_start_signal(cue_perf)
+                    _set_initiation_time(cue_perf)
                     logger.log_frame_flip(
                         trial_num=trial_num,
-                        event=pre_options_delay_event,
-                        timestamp_perf_s=delay_perf,
-                        requested_duration=delay_s,
+                        event=pre_options_cue_event,
+                        timestamp_perf_s=cue_perf,
+                        requested_duration=cue_s,
                     )
                     first_flip = False
+
+        if delay_frames > 0:
+            _show_preview([])
+            first_flip = True
+            with frame_timing_monitor.continuous_sequence():
+                for _ in range(delay_frames):
+                    if _event.getKeys(["escape"]):
+                        _log_message(msg_logger, "WARN", f"escape_pressed trial_num={trial_num} during_match_delay=1")
+                        return True, None
+                    if _should_abort("experimenter_exit_during_match_delay"):
+                        return True, None
+                    bg_rect.draw()
+                    if fix is not None:
+                        fix.draw()
+                    win.flip()
+                    if first_flip:
+                        delay_perf = time.perf_counter()
+                        logger.log_frame_flip(
+                            trial_num=trial_num,
+                            event=pre_options_delay_event,
+                            timestamp_perf_s=delay_perf,
+                            requested_duration=delay_s,
+                        )
+                        first_flip = False
 
     # Quantize durations to frames and log rounding in message logger.
     if sequential or is_memory:
@@ -1852,26 +1871,27 @@ def present_trial_with_persistent_dots(
                 _show_preview([])
                 if not _arm_trial_start_signal():
                     return True, None
-                for _ in range(isi_frames):
-                    if _abort_from_input("experimenter_exit_during_isi"):
-                        return True, None
-                    bg_rect.draw()
-                    for d in dots:
-                        d.draw()
-                    if fix is not None:
-                        fix.draw()
-                    dot_flip = win.flip()
-                    if first_flip:
-                        dot_perf = time.perf_counter()
-                        _commit_trial_start_signal(dot_perf)
-                        _set_initiation_time(dot_perf)
-                        logger.log_frame_flip(
-                            trial_num=trial_num,
-                            event=_frame_event_name("dot", idx),
-                            timestamp_perf_s=dot_perf,
-                            requested_duration=isi_s,
-                        )
-                        first_flip = False
+                with frame_timing_monitor.continuous_sequence():
+                    for _ in range(isi_frames):
+                        if _abort_from_input("experimenter_exit_during_isi"):
+                            return True, None
+                        bg_rect.draw()
+                        for d in dots:
+                            d.draw()
+                        if fix is not None:
+                            fix.draw()
+                        dot_flip = win.flip()
+                        if first_flip:
+                            dot_perf = time.perf_counter()
+                            _commit_trial_start_signal(dot_perf)
+                            _set_initiation_time(dot_perf)
+                            logger.log_frame_flip(
+                                trial_num=trial_num,
+                                event=_frame_event_name("dot", idx),
+                                timestamp_perf_s=dot_perf,
+                                requested_duration=isi_s,
+                            )
+                            first_flip = False
 
             first_flip = True
             current_preview_image = [
@@ -1880,27 +1900,28 @@ def present_trial_with_persistent_dots(
             _show_preview(current_preview_image)
             if not _arm_trial_start_signal():
                 return True, None
-            for _ in range(stim_frames):
-                if _abort_from_input("experimenter_exit_during_stimulus"):
-                    return True, None
-                bg_rect.draw()
-                for d in dots:
-                    d.draw()
-                stim.draw()
-                if fix is not None:
-                    fix.draw()
-                flip_ps = win.flip()
-                if first_flip:
-                    flip_perf = time.perf_counter()
-                    _commit_trial_start_signal(flip_perf)
-                    _set_initiation_time(flip_perf)
-                    logger.log_frame_flip(
-                        trial_num=trial_num,
-                        event=_frame_event_name("stim", idx),
-                        timestamp_perf_s=flip_perf,
-                        requested_duration=stim_s,
-                    )
-                    first_flip = False
+            with frame_timing_monitor.continuous_sequence():
+                for _ in range(stim_frames):
+                    if _abort_from_input("experimenter_exit_during_stimulus"):
+                        return True, None
+                    bg_rect.draw()
+                    for d in dots:
+                        d.draw()
+                    stim.draw()
+                    if fix is not None:
+                        fix.draw()
+                    flip_ps = win.flip()
+                    if first_flip:
+                        flip_perf = time.perf_counter()
+                        _commit_trial_start_signal(flip_perf)
+                        _set_initiation_time(flip_perf)
+                        logger.log_frame_flip(
+                            trial_num=trial_num,
+                            event=_frame_event_name("stim", idx),
+                            timestamp_perf_s=flip_perf,
+                            requested_duration=stim_s,
+                        )
+                        first_flip = False
 
             if is_memory:
                 if cue_dot is None:
@@ -1955,26 +1976,27 @@ def present_trial_with_persistent_dots(
             _show_preview([])
             if not _arm_trial_start_signal():
                 return True, None
-            for _ in range(isi_frames):
-                if _abort_from_input("experimenter_exit_during_isi"):
-                    return True, None
-                bg_rect.draw()
-                for d in dots:
-                    d.draw()
-                if fix is not None:
-                    fix.draw()
-                dot_flip = win.flip()
-                if first_flip:
-                    dot_perf = time.perf_counter()
-                    _commit_trial_start_signal(dot_perf)
-                    _set_initiation_time(dot_perf)
-                    logger.log_frame_flip(
-                        trial_num=trial_num,
-                        event=_frame_event_name("dot"),
-                        timestamp_perf_s=dot_perf,
-                        requested_duration=isi_s,
-                    )
-                    first_flip = False
+            with frame_timing_monitor.continuous_sequence():
+                for _ in range(isi_frames):
+                    if _abort_from_input("experimenter_exit_during_isi"):
+                        return True, None
+                    bg_rect.draw()
+                    for d in dots:
+                        d.draw()
+                    if fix is not None:
+                        fix.draw()
+                    dot_flip = win.flip()
+                    if first_flip:
+                        dot_perf = time.perf_counter()
+                        _commit_trial_start_signal(dot_perf)
+                        _set_initiation_time(dot_perf)
+                        logger.log_frame_flip(
+                            trial_num=trial_num,
+                            event=_frame_event_name("dot"),
+                            timestamp_perf_s=dot_perf,
+                            requested_duration=isi_s,
+                        )
+                        first_flip = False
 
         _show_preview(preview_images)
         if not _arm_trial_start_signal():
@@ -1982,29 +2004,30 @@ def present_trial_with_persistent_dots(
         first_flip = True
         flip_ps = None
         flip_perf = None
-        for _ in range(stim_frames if is_memory else 1):
-            if _abort_from_input("experimenter_exit_during_stimulus"):
-                return True, None
-            bg_rect.draw()
-            for d in dots:
-                d.draw()
-            for s in stims:
-                s.draw()
-            if fix is not None:
-                fix.draw()
-            flip_ps = win.flip()
-            if first_flip:
-                flip_perf = time.perf_counter()
-                _commit_trial_start_signal(flip_perf)
-                _set_initiation_time(flip_perf)
-                stim_request = stim_s if is_memory else choice_s
-                logger.log_frame_flip(
-                    trial_num=trial_num,
-                    event=_frame_event_name("stim"),
-                    timestamp_perf_s=flip_perf,
-                    requested_duration=stim_request,
-                )
-                first_flip = False
+        with frame_timing_monitor.continuous_sequence():
+            for _ in range(stim_frames if is_memory else 1):
+                if _abort_from_input("experimenter_exit_during_stimulus"):
+                    return True, None
+                bg_rect.draw()
+                for d in dots:
+                    d.draw()
+                for s in stims:
+                    s.draw()
+                if fix is not None:
+                    fix.draw()
+                flip_ps = win.flip()
+                if first_flip:
+                    flip_perf = time.perf_counter()
+                    _commit_trial_start_signal(flip_perf)
+                    _set_initiation_time(flip_perf)
+                    stim_request = stim_s if is_memory else choice_s
+                    logger.log_frame_flip(
+                        trial_num=trial_num,
+                        event=_frame_event_name("stim"),
+                        timestamp_perf_s=flip_perf,
+                        requested_duration=stim_request,
+                    )
+                    first_flip = False
         if flip_perf is None:
             flip_perf = time.perf_counter()
         if not is_memory:

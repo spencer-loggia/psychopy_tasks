@@ -430,6 +430,7 @@ def run_task(
             fullscreen=fullscreen,
             size=experimenter_win_size,
             screen_info=experimenter_screen,
+            sync_to_refresh=False,
         )
         pylogging.console.setLevel(pylogging.CRITICAL)
         try:

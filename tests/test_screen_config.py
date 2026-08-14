@@ -6,17 +6,20 @@ from unittest.mock import Mock, patch
 from bin.screen import (
     ExperimenterPreview,
     MAIN_SCREEN_ENV,
+    MainDisplayFrameTimingMonitor,
     SECONDARY_SCREEN_ENV,
     ScreenGeometry,
     _parse_xrandr_query,
     build_reward_hit_boxes,
     compute_aspect_cover_size,
     compute_centered_aspect_fit,
+    configure_window_vsync,
     enforce_window_vsync,
     format_experimenter_label,
     get_psychopy_window_kwargs,
     load_screen_config,
     reward_level_color,
+    resolve_window_frame_rate,
     resolve_task_screens,
     resolve_scene_size,
     scale_scene_point,
@@ -25,6 +28,23 @@ from bin.screen import (
 
 
 class ScreenConfigTests(unittest.TestCase):
+    def test_configure_window_vsync_can_disable_experimenter_blocking(self):
+        class WindowHandle:
+            def __init__(self):
+                self.vsync_calls = []
+
+            def set_vsync(self, enabled):
+                self.vsync_calls.append(enabled)
+
+        win = Mock()
+        win.waitBlanking = True
+        win.winHandle = WindowHandle()
+        win.backend = None
+
+        self.assertTrue(configure_window_vsync(win, False))
+        self.assertFalse(win.waitBlanking)
+        self.assertEqual(win.winHandle.vsync_calls, [False])
+
     def test_enforce_window_vsync_enables_blanking_and_native_swap_interval(self):
         class WindowHandle:
             def __init__(self):
@@ -41,6 +61,61 @@ class ScreenConfigTests(unittest.TestCase):
         self.assertTrue(enforce_window_vsync(win))
         self.assertTrue(win.waitBlanking)
         self.assertEqual(win.winHandle.vsync_calls, [True])
+
+    def test_refresh_override_is_measured_and_compared(self):
+        win = Mock()
+        win.getActualFrameRate.return_value = 59.94
+        logger = Mock()
+
+        fps, frame_duration = resolve_window_frame_rate(
+            win,
+            configured_fps=60.0,
+            msg_logger=logger,
+            context="match2cue",
+        )
+
+        self.assertEqual(fps, 60.0)
+        self.assertAlmostEqual(frame_duration, 1.0 / 60.0)
+        messages = [call.args[1] for call in logger.log.call_args_list]
+        self.assertTrue(any("status=match" in message for message in messages))
+
+    def test_refresh_override_logs_mismatch_but_remains_authoritative(self):
+        win = Mock()
+        win.getActualFrameRate.return_value = 28.3
+        logger = Mock()
+
+        fps, _ = resolve_window_frame_rate(
+            win,
+            configured_fps=60.0,
+            msg_logger=logger,
+            context="active_foraging",
+        )
+
+        self.assertEqual(fps, 60.0)
+        logger.log.assert_any_call(
+            "WARN",
+            (
+                "refresh_rate_comparison context=active_foraging "
+                "configured_fps=60.000000 measured_fps=28.300000 "
+                "difference_hz=31.700000 tolerance_hz=0.600000 status=mismatch"
+            ),
+        )
+
+    def test_frame_timing_monitor_excludes_time_between_sequences(self):
+        win = Mock()
+        win.recordFrameIntervals = False
+        win.nDroppedFrames = 3
+        monitor = MainDisplayFrameTimingMonitor(win, 1.0 / 60.0)
+
+        with monitor.continuous_sequence():
+            win.nDroppedFrames = 5
+        win.nDroppedFrames = 20
+        with monitor.continuous_sequence():
+            win.nDroppedFrames = 21
+
+        self.assertEqual(monitor.missed_refreshes, 3)
+        self.assertFalse(win.recordFrameIntervals)
+        self.assertAlmostEqual(win.refreshThreshold, 0.025)
 
     def test_reward_level_colors_match_active_foraging_legend(self):
         self.assertEqual(reward_level_color(0), (220, 60, 60))

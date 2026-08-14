@@ -16,10 +16,10 @@ Launch the touch interface with an interface configuration:
 python interface/touch_interface.py --config config_files/interface/rpi_launch_config.json
 ```
 
-The interface opens on a root menu with Start Experiment, the context-dependent Rig Mode/Portable Mode switch,
-Desktop, and Shutdown actions. Start Experiment opens subject selection. The launch config's `subjects` object maps
-each displayed full name to the short subject code used in directory names. Selecting a subject starts a new
-experiment under `logs`:
+The interface opens on a root menu with Start Experiment, Run System Diagnostic, the context-dependent Rig
+Mode/Portable Mode switch, Desktop, and Shutdown actions. Start Experiment opens subject selection. The launch
+config's `subjects` object maps each displayed full name to the short subject code used in directory names.
+Selecting a subject starts a new experiment under `logs`:
 
 `exp_[subject_code]_[YYYYMMDD]_[incrementing_id]`
 
@@ -99,6 +99,26 @@ still activates its button while a swipe does not accidentally launch it.
 
 The top-level task menu has an End Experiment button. It closes the current experiment and returns to the root
 menu; Desktop, Shutdown, and mode switching are available only from that root menu.
+
+Run System Diagnostic uses the configured `environment.python` interpreter and does not create an experiment or
+block. It checks that PsychoPy can import, `lgpio` can open GPIO chip 0, and the Pi-Plates DAQC2 driver can read the
+board supply voltage on ADC channel 8. It then pins the diagnostic subprocess to CPU 0, opens a PsychoPy window on
+the resolved main monitor, requests blocking vsync, measures the monitor refresh rate, and records 120 independent
+flip intervals. The flip-lock check passes when at least 90% of those intervals match one measured monitor refresh
+and the median interval also matches the expected frame period. The completion dialog always includes the measured
+refresh rate (or `unavailable`) and a per-check list, followed by explicit errors for failed checks.
+
+The DAQC2 check uses board address 0 by default. A rig with a different address or module name can set optional
+top-level launcher settings:
+
+```json
+{
+  "diagnostic": {
+    "daq_address": 0,
+    "daq_module": "piplates.DAQC2plate"
+  }
+}
+```
 
 Experiment-managed task/subprocess policies:
 
@@ -392,16 +412,18 @@ On exit, the task writes `calibration.json` in its session log directory. The fi
 `eye_tracker_calibration` object containing `x_scale`, `y_scale`, `x_offset`, and `y_offset`, plus DAQ/filter
 metadata. The same directory contains its message and pump signal event logs.
 
-CPU Affinity for `active_foraging`
-----------------------------------
-The `active_foraging` task treats CPU core `0` as the timing-critical presentation core.
+CPU Affinity for Timing-Critical Tasks
+--------------------------------------
+The `active_foraging` and `play_video` tasks treat CPU core `0` as the timing-critical presentation core.
 
 - The main `active_foraging` process, including stimulus presentation and touch-event detection, pins itself to CPU `0` before entering the trial loop.
-- Non-timing-critical child processes such as the background trial-generation worker and the experimenter preview process inherit the remaining CPU cores.
+- The main `play_video` process pins itself to CPU `0` after measuring the main display and starting the experimenter preview, but before entering the playback loop.
+- Non-timing-critical child processes such as the background trial-generation worker and the experimenter preview process inherit the remaining CPU cores. This keeps the `play_video` experimenter preview off CPU `0` as well.
 - This is necessary because `multiprocessing` children inherit the parent's CPU affinity by default. To prevent workers from inheriting CPU `0`, the parent process is first moved onto the non-zero worker-core pool, the child processes are spawned, and then the parent is pinned back to CPU `0`.
 - For the intended timing behavior on Linux or Raspberry Pi, CPU `0` should also be isolated from normal OS scheduling at the kernel level, for example with `isolcpus`, `nohz_full`, `rcu_nocbs`, or an equivalent cpuset-based setup.
 - Launch the task from a shell or service whose affinity mask still includes CPU `0` and the worker cores. If the launcher has already removed CPU `0` from the process affinity mask, the task cannot pin the main presentation process onto that core.
 - Event, message, and behavior logs for `active_foraging` are buffered during the timing-critical portion of a trial and flushed only in the between-trial gap, so synchronous disk flushes do not run while the initiation cue, stimulus presentation, touch detection, and reward delivery are active.
+- The root-menu system diagnostic uses the same CPU 0 placement for its refresh-rate and flip-lock measurements and reports affinity failure as a diagnostic error.
 
 Active Foraging Hardware Signals
 --------------------------------

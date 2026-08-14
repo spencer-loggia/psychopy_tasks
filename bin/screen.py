@@ -3,6 +3,7 @@ Shared helpers for resolving monitor selectors and managing experimenter display
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import io
 import multiprocessing as mp
@@ -61,11 +62,12 @@ def set_window_mouse_visible(win, visible: bool) -> bool:
     return applied
 
 
-def enforce_window_vsync(win) -> bool:
-    """Request blocking, refresh-synchronized swaps for a PsychoPy window."""
+def configure_window_vsync(win, enabled: bool) -> bool:
+    """Configure blanking waits and the native swap interval when available."""
     applied = False
+    enabled = bool(enabled)
     try:
-        win.waitBlanking = True
+        win.waitBlanking = enabled
         applied = True
     except Exception:
         pass
@@ -78,12 +80,154 @@ def enforce_window_vsync(win) -> bool:
             try:
                 method = getattr(target, method_name, None)
                 if callable(method):
-                    method(True)
+                    method(enabled)
                     applied = True
                     break
             except Exception:
                 continue
     return applied
+
+
+def enforce_window_vsync(win) -> bool:
+    """Request blocking, refresh-synchronized swaps for a PsychoPy window."""
+    return configure_window_vsync(win, True)
+
+
+def resolve_window_frame_rate(
+    win,
+    *,
+    configured_fps: Optional[float] = None,
+    msg_logger=None,
+    context: str = "task",
+    fallback_fps: float = 60.0,
+) -> tuple[float, float]:
+    """Measure main-window flips and compare them with an optional override."""
+    measured_fps = None
+    try:
+        measured_fps = win.getActualFrameRate(
+            nIdentical=20,
+            nMaxFrames=120,
+            nWarmUpFrames=10,
+            threshold=1,
+        )
+        if measured_fps is not None:
+            measured_fps = float(measured_fps)
+            if not np.isfinite(measured_fps) or measured_fps <= 0.0:
+                measured_fps = None
+    except Exception:
+        measured_fps = None
+
+    configured = None
+    if configured_fps is not None:
+        configured = float(configured_fps)
+        if not np.isfinite(configured) or configured <= 0.0:
+            raise ValueError("configured refresh_rate must be a positive finite value")
+
+    if configured is not None:
+        used_fps = configured
+        if measured_fps is None:
+            _safe_log_message(
+                msg_logger,
+                "WARN",
+                (
+                    f"refresh_rate_comparison context={context} "
+                    f"configured_fps={configured:.6f} measured_fps=unavailable "
+                    "status=unverified"
+                ),
+            )
+        else:
+            difference_hz = abs(measured_fps - configured)
+            tolerance_hz = max(0.5, configured * 0.01)
+            status = "match" if difference_hz <= tolerance_hz else "mismatch"
+            _safe_log_message(
+                msg_logger,
+                "INFO" if status == "match" else "WARN",
+                (
+                    f"refresh_rate_comparison context={context} "
+                    f"configured_fps={configured:.6f} "
+                    f"measured_fps={measured_fps:.6f} "
+                    f"difference_hz={difference_hz:.6f} "
+                    f"tolerance_hz={tolerance_hz:.6f} status={status}"
+                ),
+            )
+    elif measured_fps is not None:
+        used_fps = measured_fps
+    else:
+        used_fps = float(fallback_fps)
+        _safe_log_message(
+            msg_logger,
+            "WARN",
+            (
+                f"frame_rate_detection_failed context={context} "
+                f"fallback_fps={used_fps:.6f}"
+            ),
+        )
+
+    frame_duration_s = 1.0 / used_fps
+    _safe_log_message(
+        msg_logger,
+        "INFO",
+        (
+            f"frame_timing context={context} fps={used_fps:.6f} "
+            f"frame_dur_s={frame_duration_s:.9f} "
+            f"measured_fps={measured_fps if measured_fps is not None else 'unavailable'} "
+            f"configured_fps={configured if configured is not None else 'none'}"
+        ),
+    )
+    return float(used_fps), float(frame_duration_s)
+
+
+def _safe_log_message(msg_logger, level: str, message: str) -> None:
+    if msg_logger is None:
+        return
+    try:
+        msg_logger.log(level, message)
+    except Exception:
+        pass
+
+
+class MainDisplayFrameTimingMonitor:
+    """Count missed refreshes only inside continuous flip sequences."""
+
+    def __init__(self, win, frame_duration_s: float):
+        self.win = win
+        self.frame_duration_s = float(frame_duration_s)
+        if not np.isfinite(self.frame_duration_s) or self.frame_duration_s <= 0.0:
+            raise ValueError("frame_duration_s must be a positive finite value")
+        self.missed_refreshes = 0
+
+    @contextmanager
+    def continuous_sequence(self):
+        previous_recording = bool(
+            getattr(self.win, "recordFrameIntervals", False)
+        )
+        count_before = None
+        try:
+            self.win.recordFrameIntervals = False
+            self.win.refreshThreshold = self.frame_duration_s * 1.5
+            count_before = int(getattr(self.win, "nDroppedFrames", 0))
+            self.win.recordFrameIntervals = True
+        except Exception:
+            count_before = None
+
+        try:
+            yield
+        finally:
+            if count_before is not None:
+                try:
+                    self.missed_refreshes += max(
+                        0,
+                        int(getattr(self.win, "nDroppedFrames", 0))
+                        - count_before,
+                    )
+                except Exception:
+                    pass
+            try:
+                self.win.recordFrameIntervals = False
+                if previous_recording:
+                    self.win.recordFrameIntervals = True
+            except Exception:
+                pass
 
 
 @dataclass(frozen=True)
@@ -1363,9 +1507,9 @@ def _experimenter_preview_process(
         color=_preview_rgb255_to_psychopy((0, 0, 0)),
         allowStencil=False,
         allowGUI=False,
-        waitBlanking=True,
+        waitBlanking=False,
     )
-    enforce_window_vsync(win)
+    configure_window_vsync(win, False)
     last_cursor_apply_s = 0.0
     if mouse_visible is not None:
         set_window_mouse_visible(win, bool(mouse_visible))
@@ -1500,6 +1644,7 @@ def _experimenter_preview_process(
         )
 
         while not stop_event.is_set():
+            redraw_requested = False
             if mouse_visible is not None and time.perf_counter() - last_cursor_apply_s >= 0.5:
                 set_window_mouse_visible(win, bool(mouse_visible))
                 last_cursor_apply_s = time.perf_counter()
@@ -1512,6 +1657,7 @@ def _experimenter_preview_process(
 
                 try:
                     command_type = str(payload.get("type", "")).strip().lower()
+                    redraw_requested = True
                     if "reward_counts" in payload:
                         current_reward_counts = _normalize_reward_counts(payload.get("reward_counts"))
                     if "status_counts" in payload:
@@ -1654,15 +1800,18 @@ def _experimenter_preview_process(
                     win.flip()
                     if bool(getattr(movie, "isFinished", False)):
                         _release_movie()
+                    core.wait(0.005)
                     continue
 
                 if shared_movie_active:
+                    shared_frame_updated = False
                     if shared_movie_reader is not None:
                         shared_frame = shared_movie_reader.read_latest(
                             shared_movie_sequence,
                             minimum_sequence=shared_movie_minimum_sequence,
                         )
                         if shared_frame is not None:
+                            shared_frame_updated = True
                             shared_movie_sequence = shared_frame.sequence
                             left, top, right, bottom = shared_movie_crop_bounds
                             cropped_view = shared_frame.rgba[top:bottom, left:right]
@@ -1700,6 +1849,9 @@ def _experimenter_preview_process(
                                 shared_movie_stim,
                                 shared_movie_upload_buffer,
                             )
+                    if not shared_frame_updated and not redraw_requested:
+                        core.wait(0.002)
+                        continue
                     if movie_bg_rect is not None:
                         movie_bg_rect.draw()
                     if shared_movie_stim is not None:

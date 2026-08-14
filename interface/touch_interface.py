@@ -7,8 +7,9 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Mapping, Optional
 import tkinter as tk
 from tkinter import messagebox
 import urllib.request
@@ -83,6 +84,47 @@ def load_launcher_config(path: Path) -> Dict[str, Any]:
     if not isinstance(cfg, dict):
         raise ValueError("Launcher config must contain a top-level JSON object")
     return cfg
+
+
+def format_diagnostic_report(result: Mapping[str, Any]) -> str:
+    """Format a complete, touch-dialog-friendly system diagnostic report."""
+    success = bool(result.get("success", False))
+    refresh_rate = result.get("refresh_rate_hz")
+    try:
+        refresh_text = f"{float(refresh_rate):.3f} Hz" if refresh_rate is not None else "unavailable"
+    except (TypeError, ValueError):
+        refresh_text = "unavailable"
+
+    lines = [
+        "SYSTEM DIAGNOSTIC PASSED" if success else "SYSTEM DIAGNOSTIC FOUND ERRORS",
+        f"Main monitor refresh rate: {refresh_text}",
+        "",
+        "Checks:",
+    ]
+    checks = result.get("checks", [])
+    if not isinstance(checks, list):
+        checks = []
+    failures = []
+    for check in checks:
+        if not isinstance(check, dict):
+            continue
+        status = str(check.get("status", "fail")).strip().lower()
+        label = {"pass": "PASS", "fail": "FAIL", "skip": "SKIP"}.get(
+            status,
+            status.upper() or "FAIL",
+        )
+        name = str(check.get("name", "Unnamed check"))
+        detail = str(check.get("detail", "")).strip()
+        lines.append(f"[{label}] {name}: {detail}" if detail else f"[{label}] {name}")
+        if status == "fail":
+            error = str(check.get("error", "")).strip() or detail or "Unknown error"
+            failures.append(f"- {name}: {error}")
+
+    if not checks:
+        failures.append("- Diagnostic runner: no check results were produced")
+    if failures:
+        lines.extend(("", "Errors:", *failures))
+    return "\n".join(lines)
 
 
 def _resolve_candidate(path_value: str, search_roots: Iterable[Path]) -> Path:
@@ -540,9 +582,10 @@ class TouchInterfaceApp:
         self.status_var.set("Choose an action")
 
         self._create_start_experiment_button(0)
-        self._create_rig_mode_button(1)
-        self._create_desktop_button(2)
-        self._create_shutdown_button(3)
+        self._create_diagnostic_button(1)
+        self._create_rig_mode_button(2)
+        self._create_desktop_button(3)
+        self._create_shutdown_button(4)
 
     def _create_start_experiment_button(self, row_idx: int) -> None:
         button = tk.Button(
@@ -552,6 +595,113 @@ class TouchInterfaceApp:
             **self._button_kwargs(),
         )
         self._place_button(button, row_idx)
+
+    def _create_diagnostic_button(self, row_idx: int) -> None:
+        button = tk.Button(
+            self.button_container,
+            text="Run System Diagnostic",
+            command=self._run_system_diagnostic,
+            **self._button_kwargs(),
+        )
+        self._place_button(button, row_idx)
+
+    def _run_system_diagnostic(self) -> None:
+        if self.task_active:
+            self.status_var.set("Cannot run diagnostic while a task is running")
+            return
+
+        diagnostic_path = self.working_dir / "task" / "system_diagnostic.py"
+        if not diagnostic_path.is_file():
+            self.status_var.set("Diagnostic unavailable")
+            messagebox.showerror(
+                "System Diagnostic",
+                f"Diagnostic script not found: {diagnostic_path}",
+            )
+            return
+
+        self.task_active = True
+        self.status_var.set("Running system diagnostic on the main monitor...")
+        self.root.update_idletasks()
+        result: Dict[str, Any]
+        try:
+            with tempfile.TemporaryDirectory(prefix="neuro_tasks_diagnostic_") as temp_dir:
+                temp_path = Path(temp_dir)
+                result_path = temp_path / "result.json"
+                ready_path = temp_path / ".task_window_ready"
+                cmd = [
+                    self.python_cmd,
+                    str(diagnostic_path),
+                    "--config",
+                    str(self.config_path),
+                    "--result",
+                    str(result_path),
+                ]
+                env = os.environ.copy()
+                if self.idle_guard is not None:
+                    env[TASK_WINDOW_READY_ENV] = str(ready_path)
+
+                process: Optional[subprocess.Popen] = None
+                try:
+                    process = subprocess.Popen(cmd, cwd=self.working_dir, env=env)
+                    try:
+                        returncode = wait_for_task_process(
+                            process,
+                            ready_path=(
+                                ready_path if self.idle_guard is not None else None
+                            ),
+                            on_window_ready=(
+                                self.idle_guard.task_window_ready
+                                if self.idle_guard is not None
+                                else None
+                            ),
+                        )
+                    except BaseException:
+                        stop_task_process(process)
+                        raise
+                finally:
+                    if self.idle_guard is not None:
+                        self.idle_guard.enter_idle()
+
+                if not result_path.is_file():
+                    raise RuntimeError(
+                        f"Diagnostic exited with status {returncode} without producing a result"
+                    )
+                loaded_result = json.loads(result_path.read_text(encoding="utf-8"))
+                if not isinstance(loaded_result, dict):
+                    raise ValueError("Diagnostic result must contain a JSON object")
+                result = loaded_result
+        except Exception as exc:
+            result = {
+                "success": False,
+                "refresh_rate_hz": None,
+                "checks": [
+                    {
+                        "name": "Diagnostic runner",
+                        "status": "fail",
+                        "detail": "The system diagnostic could not be launched or read",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                ],
+            }
+        finally:
+            self.task_active = False
+
+        refresh_rate = result.get("refresh_rate_hz")
+        try:
+            refresh_status = (
+                f"{float(refresh_rate):.3f} Hz"
+                if refresh_rate is not None
+                else "refresh unavailable"
+            )
+        except (TypeError, ValueError):
+            refresh_status = "refresh unavailable"
+        report = format_diagnostic_report(result)
+        if bool(result.get("success", False)):
+            self.status_var.set(f"Diagnostic passed — {refresh_status}")
+            messagebox.showinfo("System Diagnostic", report)
+        else:
+            self.status_var.set(f"Diagnostic found errors — {refresh_status}")
+            messagebox.showerror("System Diagnostic", report)
 
     def _render_subject_selection(self) -> None:
         self._clear_buttons()

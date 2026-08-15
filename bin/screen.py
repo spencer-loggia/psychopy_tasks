@@ -747,11 +747,14 @@ def _bind_linux_pyglet_display(
     screen_info: ScreenGeometry,
     *,
     strict: bool = True,
+    wm_managed: bool = True,
 ):
     """Make PsychoPy screen 0 select the target, retaining its Xinerama index."""
     import pyglet
 
     original_display = pyglet.canvas.Display
+    override_key = "xlib_fullscreen_override_redirect"
+    previous_override = pyglet.options.get(override_key, _UNSET)
     selection: Dict[str, Any] = {}
 
     def target_first_display(*args: Any, **kwargs: Any) -> Any:
@@ -775,44 +778,16 @@ def _bind_linux_pyglet_display(
         ]
         return display
 
+    pyglet.options[override_key] = not wm_managed
     pyglet.canvas.Display = target_first_display
     try:
         yield selection
     finally:
         pyglet.canvas.Display = original_display
-
-
-def _request_x11_fullscreen_monitor(win: Any, monitor_index: int) -> None:
-    """Ask the window manager to fullscreen on one original Xinerama monitor."""
-    try:
-        from Xlib import X, display, protocol
-    except ImportError as exc:
-        raise RuntimeError(
-            "X11 fullscreen monitor selection requires the python-xlib package"
-        ) from exc
-
-    handle = getattr(win, "winHandle", None)
-    window_id = getattr(handle, "_window", None)
-    x_screen = getattr(handle, "_x_screen_id", 0)
-    if window_id is None:
-        raise RuntimeError("PsychoPy's X11 window ID is unavailable")
-
-    connection = display.Display()
-    try:
-        root = connection.screen(int(getattr(x_screen, "value", x_screen))).root
-        message_type = connection.intern_atom("_NET_WM_FULLSCREEN_MONITORS")
-        event = protocol.event.ClientMessage(
-            window=int(getattr(window_id, "value", window_id)),
-            client_type=message_type,
-            data=(32, [int(monitor_index)] * 4 + [1]),
-        )
-        root.send_event(
-            event,
-            event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask,
-        )
-        connection.sync()
-    finally:
-        connection.close()
+        if previous_override is _UNSET:
+            pyglet.options.pop(override_key, None)
+        else:
+            pyglet.options[override_key] = previous_override
 
 
 def _x11_window_rect(win: Any) -> tuple[int, int, int, int]:
@@ -902,17 +877,6 @@ def _wait_for_psychopy_window_screen(
         time.sleep(0.01)
 
 
-def _place_native_x11_fullscreen(
-    win: Any,
-    screen_info: ScreenGeometry,
-    monitor_index: Optional[int],
-) -> str:
-    """Select the monitor through the window manager, then verify placement."""
-    if monitor_index is not None:
-        _request_x11_fullscreen_monitor(win, monitor_index)
-    return _wait_for_psychopy_window_screen(win, screen_info)
-
-
 def _psychopy_window_kwargs(
     screen_info: ScreenGeometry,
     *,
@@ -954,6 +918,7 @@ def open_psychopy_window(
     fullscreen: bool,
     size: Optional[Sequence[int]] = None,
     require_correct_placement: bool = True,
+    wm_managed: bool = True,
     **kwargs: Any,
 ) -> Any:
     """Open and verify a PsychoPy window on one resolved physical display."""
@@ -983,6 +948,7 @@ def open_psychopy_window(
         with _bind_linux_pyglet_display(
             screen_info,
             strict=require_correct_placement,
+            wm_managed=wm_managed,
         ) as pyglet_selection:
             win = visual_module.Window(**window_kwargs)
         pyglet_selection = pyglet_selection or {}
@@ -994,11 +960,7 @@ def open_psychopy_window(
         placement_error = None
         try:
             placement = (
-                _place_native_x11_fullscreen(
-                    win,
-                    screen_info,
-                    pyglet_selection.get("monitor_index"),
-                )
+                _wait_for_psychopy_window_screen(win, screen_info)
                 if native_x11_fullscreen
                 else verify_psychopy_window_screen(win, screen_info)
             )
@@ -1025,7 +987,7 @@ def open_psychopy_window(
             else f"target selection unavailable; candidates {available_rects}"
         )
         win._neuro_tasks_fullscreen_path = (
-            "native managed PsychoPy fullscreen"
+            f"native {'managed' if wm_managed else 'unmanaged'} PsychoPy fullscreen"
             if native_x11_fullscreen
             else "window-manager fullscreen"
         )
@@ -1816,6 +1778,7 @@ def _experimenter_preview_process(
         visual,
         screen_info,
         fullscreen=True,
+        wm_managed=False,
         units="pix",
         colorSpace="rgb",
         color=_preview_rgb255_to_psychopy((0, 0, 0)),

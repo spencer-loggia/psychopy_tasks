@@ -396,13 +396,14 @@ Set either value to `null` to inherit the process environment defaults: `screens
 to those environment variables for the diagnostic and launched tasks. Resolution is consistently CLI override,
 then the current process's config (`screens.main`/`screens.experimenter`, including legacy aliases), then the
 environment. Output names such as `HDMI-2` are rig configuration values, not constants in the display code.
-PsychoPy presentation windows default to true fullscreen. X11 windows use PsychoPy's native,
-window-manager-controlled fullscreen path, preserving the GLX path that produced reliable refresh locking. The
-configured output is matched by geometry and its original Xinerama monitor index is retained before PsychoPy's
-Linux `screen=0` workaround reorders the Pyglet view. The standard `_NET_WM_FULLSCREEN_MONITORS` request uses that
-original index; the window is not manually moved and override-redirect is not used. The realized native rectangle
-is verified, and normal task opening aborts with a display-placement error if the selected output is not covered
-exactly. The diagnostic reports placement failure but continues its timing checks on any realized window.
+PsychoPy presentation windows default to true fullscreen. Main X11 windows use PsychoPy's native,
+window-manager-controlled fullscreen path, preserving the GLX path that produced reliable refresh locking. Before
+launching a task or diagnostic, the interface is withdrawn from the experimenter output so the window manager does
+not relocate the new fullscreen window to that active display. The configured output is matched by exact geometry
+before PsychoPy's Linux `screen=0` workaround reorders the Pyglet view. The non-vsync experimenter preview uses the
+same native fullscreen creation with scoped override-redirect so it remains on its configured output without
+altering the subject window's presentation path. Every realized native rectangle is verified; a normal task aborts
+on incorrect placement, while the diagnostic reports placement failure and continues timing any realized window.
 The launcher, main-screen curtain, and experimenter controls likewise request true fullscreen after first being
 positioned on their assigned output.
 Display positions and sizes are read from the OS when each task starts. If display enumeration is unavailable, only

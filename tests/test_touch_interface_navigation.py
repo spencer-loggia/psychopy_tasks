@@ -85,6 +85,25 @@ class TouchInterfaceNavigationTests(unittest.TestCase):
             "Cannot end experiment while a task is running"
         )
 
+    def test_process_launch_hides_the_interface(self):
+        app = self._app()
+        app.root = Mock()
+
+        app._hide_interface_for_process()
+
+        app.root.withdraw.assert_called_once_with()
+        app.root.update_idletasks.assert_called_once_with()
+
+    def test_process_completion_restores_the_guarded_interface(self):
+        app = self._app()
+        app.root = Mock()
+        app.idle_guard = Mock()
+
+        app._restore_interface_after_process()
+
+        app.idle_guard.enter_idle.assert_called_once_with()
+        app.root.deiconify.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

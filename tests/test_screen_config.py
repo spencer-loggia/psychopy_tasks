@@ -14,7 +14,6 @@ from bin.screen import (
     _bind_linux_pyglet_display,
     _parse_xrandr_listactivemonitors,
     _parse_xrandr_query,
-    _request_x11_fullscreen_monitor,
     build_reward_hit_boxes,
     compute_aspect_cover_size,
     compute_centered_aspect_fit,
@@ -51,9 +50,11 @@ class ScreenConfigTests(unittest.TestCase):
 
         pyglet = types.ModuleType("pyglet")
         pyglet.canvas = types.SimpleNamespace(Display=FakeDisplay)
+        pyglet.options = {"xlib_fullscreen_override_redirect": False}
 
         with patch.dict("sys.modules", {"pyglet": pyglet}):
             with _bind_linux_pyglet_display(target_info) as selection:
+                self.assertFalse(pyglet.options["xlib_fullscreen_override_redirect"])
                 display = pyglet.canvas.Display(x_screen=0)
                 self.assertIs(display.get_screens()[0], target)
 
@@ -63,7 +64,15 @@ class ScreenConfigTests(unittest.TestCase):
             selection["available_rects"],
             [(1600, 0, 1920, 1080), (0, 0, 1600, 2560)],
         )
+        self.assertFalse(pyglet.options["xlib_fullscreen_override_redirect"])
         self.assertIs(pyglet.canvas.Display, FakeDisplay)
+
+        with patch.dict("sys.modules", {"pyglet": pyglet}):
+            with _bind_linux_pyglet_display(target_info, wm_managed=False):
+                self.assertTrue(pyglet.options["xlib_fullscreen_override_redirect"])
+                pyglet.canvas.Display(x_screen=0)
+
+        self.assertFalse(pyglet.options["xlib_fullscreen_override_redirect"])
 
     def test_psychopy_display_constructor_can_fall_back_for_diagnostic(self):
         target_info = ScreenGeometry(
@@ -80,6 +89,7 @@ class ScreenConfigTests(unittest.TestCase):
 
         pyglet = types.ModuleType("pyglet")
         pyglet.canvas = types.SimpleNamespace(Display=FakeDisplay)
+        pyglet.options = {"xlib_fullscreen_override_redirect": False}
 
         with patch.dict("sys.modules", {"pyglet": pyglet}):
             with _bind_linux_pyglet_display(target_info, strict=False):
@@ -524,11 +534,11 @@ class ScreenConfigTests(unittest.TestCase):
                         ],
                     }
                 ),
-            ),
+            ) as bind_display,
             patch(
-                "bin.screen._place_native_x11_fullscreen",
+                "bin.screen._wait_for_psychopy_window_screen",
                 return_value="HDMI-2 at (0, 0, 1600, 2560)",
-            ) as place_fullscreen,
+            ) as wait_for_screen,
         ):
             opened = open_psychopy_window(
                 visual,
@@ -547,39 +557,12 @@ class ScreenConfigTests(unittest.TestCase):
         )
         self.assertIn("Xinerama monitor 1", opened._neuro_tasks_pyglet_selection)
         self.assertIsNone(win._neuro_tasks_screen_placement_error)
-        place_fullscreen.assert_called_once_with(win, screen, 1)
-
-    def test_x11_fullscreen_monitor_request_uses_original_xinerama_index(self):
-        root = Mock()
-        connection = Mock()
-        connection.screen.return_value.root = root
-        connection.intern_atom.return_value = 10
-        event = object()
-        client_message = Mock(return_value=event)
-        xlib = types.ModuleType("Xlib")
-        xlib.X = types.SimpleNamespace(
-            SubstructureRedirectMask=1,
-            SubstructureNotifyMask=2,
+        bind_display.assert_called_once_with(
+            screen,
+            strict=True,
+            wm_managed=True,
         )
-        xlib.display = types.SimpleNamespace(Display=Mock(return_value=connection))
-        xlib.protocol = types.SimpleNamespace(
-            event=types.SimpleNamespace(ClientMessage=client_message)
-        )
-        win = types.SimpleNamespace(
-            winHandle=types.SimpleNamespace(_window=42, _x_screen_id=0)
-        )
-
-        with patch.dict("sys.modules", {"Xlib": xlib}):
-            _request_x11_fullscreen_monitor(win, 1)
-
-        client_message.assert_called_once_with(
-            window=42,
-            client_type=10,
-            data=(32, [1, 1, 1, 1, 1]),
-        )
-        root.send_event.assert_called_once_with(event, event_mask=3)
-        connection.sync.assert_called_once_with()
-        connection.close.assert_called_once_with()
+        wait_for_screen.assert_called_once_with(win, screen)
 
     def test_linux_placement_uses_native_geometry_not_pyglet_cache(self):
         screen = ScreenGeometry(

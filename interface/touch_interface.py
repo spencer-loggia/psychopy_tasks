@@ -609,6 +609,19 @@ class TouchInterfaceApp:
         )
         self._place_button(button, row_idx)
 
+    def _hide_interface_for_process(self) -> None:
+        self.root.withdraw()
+        self.root.update_idletasks()
+
+    def _restore_interface_after_process(self) -> None:
+        if self.idle_guard is not None:
+            self.idle_guard.enter_idle()
+            return
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+        self.root.update_idletasks()
+
     def _run_system_diagnostic(self) -> None:
         if self.task_active:
             self.status_var.set("Cannot run diagnostic while a task is running")
@@ -625,7 +638,7 @@ class TouchInterfaceApp:
 
         self.task_active = True
         self.status_var.set("Running system diagnostic on the main monitor...")
-        self.root.update_idletasks()
+        self._hide_interface_for_process()
         result: Dict[str, Any]
         try:
             with tempfile.TemporaryDirectory(prefix="neuro_tasks_diagnostic_") as temp_dir:
@@ -644,28 +657,22 @@ class TouchInterfaceApp:
                 if self.idle_guard is not None:
                     env[TASK_WINDOW_READY_ENV] = str(ready_path)
 
-                process: Optional[subprocess.Popen] = None
+                process = subprocess.Popen(cmd, cwd=self.working_dir, env=env)
                 try:
-                    process = subprocess.Popen(cmd, cwd=self.working_dir, env=env)
-                    try:
-                        returncode = wait_for_task_process(
-                            process,
-                            ready_path=(
-                                ready_path if self.idle_guard is not None else None
-                            ),
-                            on_window_ready=(
-                                self.idle_guard.task_window_ready
-                                if self.idle_guard is not None
-                                else None
-                            ),
-                        )
-                    except BaseException:
-                        stop_task_process(process)
-                        raise
-                finally:
-                    if self.idle_guard is not None:
-                        self.idle_guard.enter_idle()
-
+                    returncode = wait_for_task_process(
+                        process,
+                        ready_path=(
+                            ready_path if self.idle_guard is not None else None
+                        ),
+                        on_window_ready=(
+                            self.idle_guard.task_window_ready
+                            if self.idle_guard is not None
+                            else None
+                        ),
+                    )
+                except BaseException:
+                    stop_task_process(process)
+                    raise
                 if not result_path.is_file():
                     raise RuntimeError(
                         f"Diagnostic exited with status {returncode} without producing a result"
@@ -689,6 +696,7 @@ class TouchInterfaceApp:
             }
         finally:
             self.task_active = False
+            self._restore_interface_after_process()
 
         refresh_rate = result.get("refresh_rate_hz")
         try:
@@ -922,8 +930,7 @@ class TouchInterfaceApp:
             raise RuntimeError("Select a subject before launching a task")
         cmd = [self.python_cmd, str(block.launch_path), "--config", str(block.config_path)]
         self.status_var.set(f"Running block {block.block_num}: {block.block_name}")
-        self.root.update_idletasks()
-        self.root.withdraw()
+        self._hide_interface_for_process()
         ready_path = block.output_dir / ".task_window_ready"
         env = self.experiment.subprocess_environment(block)
         if self.idle_guard is not None:
@@ -951,11 +958,7 @@ class TouchInterfaceApp:
             return subprocess.CompletedProcess(cmd, returncode)
         finally:
             try:
-                if self.idle_guard is not None:
-                    self.idle_guard.enter_idle()
-                else:
-                    self.root.deiconify()
-                    self.root.lift()
+                self._restore_interface_after_process()
             finally:
                 try:
                     ready_path.unlink(missing_ok=True)

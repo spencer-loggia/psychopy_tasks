@@ -392,9 +392,11 @@ Set either value to `null` to inherit the process environment defaults: `screens
 to those environment variables for launched tasks.
 PsychoPy presentation windows default to true fullscreen. Output names are first resolved with xrandr, then matched
 to PsychoPy's pyglet screen list by exact position and size; the xrandr ordinal is not assumed to be PsychoPy's
-screen ordinal. Each realized fullscreen window is checked against that same rectangle and aborts with a display
-placement error if it opened on the wrong output or at the wrong size. The launcher, main-screen curtain, and
-experimenter controls likewise request true fullscreen after first being positioned on their assigned output.
+screen ordinal. On X11, a misplaced fullscreen window is redirected with the standard
+`_NET_WM_FULLSCREEN_MONITORS` request. Each realized fullscreen window is then checked against the selected
+rectangle and aborts with a display placement error if it remains on the wrong output or at the wrong size. The
+launcher, main-screen curtain, and experimenter controls likewise request true fullscreen after first being
+positioned on their assigned output.
 For `active_foraging`, setting `screens.main` and `screens.experimenter` to the same display is allowed and disables
 the experimenter preview, so only the main task content is shown.
 

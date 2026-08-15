@@ -833,10 +833,21 @@ def open_psychopy_window(
 
     if fullscreen and screen_info is not None and sys.platform.startswith("linux"):
         # PsychoPy 2025.1 uses `screen` as both an X screen number and a
-        # pyglet monitor index. Bind the target to index 0 to remove that ambiguity.
+        # pyglet monitor index. Create wholly inside the target first so the
+        # window manager applies standard fullscreen to that monitor.
         with _bind_linux_pyglet_fullscreen(screen_info):
-            window_kwargs["screen"] = 0
+            window_kwargs.update(
+                screen=0,
+                fullscr=False,
+                size=(
+                    min(int(screen_info.width), 800),
+                    min(int(screen_info.height), 600),
+                ),
+                pos=(0, 0),
+                checkTiming=False,
+            )
             win = visual_module.Window(**window_kwargs)
+            win.fullscr = True
     else:
         win = visual_module.Window(**window_kwargs)
 

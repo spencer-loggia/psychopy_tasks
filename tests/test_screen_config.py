@@ -358,7 +358,7 @@ class ScreenConfigTests(unittest.TestCase):
 
         self.assertEqual(kwargs["screen"], 1)
 
-    def test_linux_window_binds_target_to_screen_zero_during_creation(self):
+    def test_linux_window_stages_on_target_before_standard_fullscreen(self):
         screen = ScreenGeometry(index=0, x=0, y=0, width=1600, height=2560, name="HDMI-2")
         other = types.SimpleNamespace(x=1600, y=0, width=1920, height=1080)
         target = types.SimpleNamespace(x=0, y=0, width=1600, height=2560)
@@ -395,8 +395,13 @@ class ScreenConfigTests(unittest.TestCase):
 
         self.assertIs(opened, win)
         self.assertEqual(captured["kwargs"]["screen"], 0)
+        self.assertFalse(captured["kwargs"]["fullscr"])
+        self.assertEqual(captured["kwargs"]["size"], (800, 600))
+        self.assertEqual(captured["kwargs"]["pos"], (0, 0))
+        self.assertFalse(captured["kwargs"]["checkTiming"])
         self.assertIs(captured["screens"][0], target)
         self.assertIs(FakeDisplay().get_screens()[0], other)
+        self.assertTrue(win.fullscr)
 
     def test_psychopy_screen_requires_an_exact_geometry_match(self):
         screen = ScreenGeometry(index=0, x=1920, y=0, width=800, height=480, name="HDMI-2")

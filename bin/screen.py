@@ -731,9 +731,19 @@ def get_psychopy_window_kwargs(
 
 
 def _get_pyglet_screens() -> list[Any]:
+    return list(_get_pyglet_display().get_screens())
+
+
+def _get_pyglet_display() -> Any:
     from pyglet import canvas
 
-    return list(canvas.get_display().get_screens())
+    return canvas.get_display()
+
+
+def _get_pyglet_options() -> Dict[str, Any]:
+    import pyglet
+
+    return pyglet.options
 
 
 def _screen_rect(screen: Any) -> tuple[int, int, int, int]:
@@ -766,6 +776,39 @@ def _get_pyglet_screen_index(screen_info: ScreenGeometry) -> int:
     )
 
 
+@contextmanager
+def _bind_linux_pyglet_fullscreen(screen_info: ScreenGeometry):
+    """Make PsychoPy screen 0 mean the requested X11 monitor during creation."""
+    display_class = type(_get_pyglet_display())
+    original_get_screens = display_class.get_screens
+    target = _screen_rect(screen_info)
+
+    def target_first(display) -> list[Any]:
+        screens = list(original_get_screens(display))
+        matches = [screen for screen in screens if _screen_rect(screen) == target]
+        if len(matches) != 1:
+            available = ", ".join(str(_screen_rect(screen)) for screen in screens) or "none"
+            raise RuntimeError(
+                f"Pyglet lost main output {screen_info.name or '<unnamed>'} at {target}; "
+                f"available displays: {available}"
+            )
+        return matches + [screen for screen in screens if screen is not matches[0]]
+
+    options = _get_pyglet_options()
+    option_name = "xlib_fullscreen_override_redirect"
+    previous_option = options.get(option_name, _UNSET)
+    display_class.get_screens = target_first
+    options[option_name] = True
+    try:
+        yield
+    finally:
+        display_class.get_screens = original_get_screens
+        if previous_option is _UNSET:
+            options.pop(option_name, None)
+        else:
+            options[option_name] = previous_option
+
+
 def verify_psychopy_window_screen(win: Any, screen_info: ScreenGeometry) -> str:
     """Confirm that a realized pyglet fullscreen window covers one output."""
     handle = getattr(win, "winHandle", None)
@@ -782,6 +825,43 @@ def verify_psychopy_window_screen(win: Any, screen_info: ScreenGeometry) -> str:
             f"{screen_info.name or '<unnamed>'} at {expected}"
         )
     return f"{screen_info.name or 'main output'} at {expected}"
+
+
+def open_psychopy_window(
+    visual_module: Any,
+    screen_info: Optional[ScreenGeometry],
+    *,
+    fullscreen: bool,
+    size: Optional[Sequence[int]] = None,
+    **kwargs: Any,
+) -> Any:
+    """Open and verify a PsychoPy window on one resolved physical display."""
+    window_kwargs = dict(kwargs)
+    window_kwargs.update(
+        get_psychopy_window_kwargs(
+            screen_info,
+            fullscreen=fullscreen,
+            size=size,
+        )
+    )
+
+    if fullscreen and screen_info is not None and sys.platform.startswith("linux"):
+        # PsychoPy 2025.1 uses `screen` as both an X screen number and a
+        # pyglet monitor index. Bind the target to index 0 to remove that ambiguity.
+        with _bind_linux_pyglet_fullscreen(screen_info):
+            window_kwargs["screen"] = 0
+            win = visual_module.Window(**window_kwargs)
+    else:
+        win = visual_module.Window(**window_kwargs)
+
+    if fullscreen and screen_info is not None:
+        try:
+            placement = verify_psychopy_window_screen(win, screen_info)
+        except Exception:
+            win.close()
+            raise
+        win._neuro_tasks_screen_placement = placement
+    return win
 
 
 def set_tk_window_fullscreen(window, screen_info: ScreenGeometry) -> None:
@@ -1564,8 +1644,10 @@ def _experimenter_preview_process(
         exit_button_rect.draw()
         exit_button_text.draw()
 
-    win = visual.Window(
-        **get_psychopy_window_kwargs(screen_info, fullscreen=True),
+    win = open_psychopy_window(
+        visual,
+        screen_info,
+        fullscreen=True,
         units="pix",
         colorSpace="rgb",
         color=_preview_rgb255_to_psychopy((0, 0, 0)),
@@ -1573,11 +1655,6 @@ def _experimenter_preview_process(
         allowGUI=False,
         waitBlanking=False,
     )
-    try:
-        verify_psychopy_window_screen(win, screen_info)
-    except Exception:
-        win.close()
-        raise
     configure_window_vsync(win, False)
     last_cursor_apply_s = 0.0
     if mouse_visible is not None:

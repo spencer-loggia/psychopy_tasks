@@ -369,10 +369,9 @@ def run_display_diagnostic(
     try:
         from bin.screen import (
             enforce_window_vsync,
-            get_psychopy_window_kwargs,
             load_screen_config,
+            open_psychopy_window,
             resolve_task_screens,
-            verify_psychopy_window_screen,
         )
         from bin.task_lifecycle import signal_task_window_ready
 
@@ -392,12 +391,14 @@ def run_display_diagnostic(
             "allowStencil": False,
             "waitBlanking": True,
         }
-        win_kwargs.update(
-            get_psychopy_window_kwargs(main_screen, fullscreen=True)
+        window_mode = "fullscreen"
+        win = open_psychopy_window(
+            visual_module,
+            main_screen,
+            fullscreen=True,
+            **win_kwargs,
         )
-        window_mode = "fullscreen" if win_kwargs.get("fullscr") else "borderless"
-        win = visual_module.Window(**win_kwargs)
-        placement_detail = verify_psychopy_window_screen(win, main_screen)
+        placement_detail = win._neuro_tasks_screen_placement
         signal_task_window_ready()
     except Exception as exc:
         error = _error_text(exc)

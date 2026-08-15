@@ -104,6 +104,7 @@ DSI-1 connected 1280x800+1920+0
 
     def test_display_diagnostic_compares_independent_flips_to_measured_rate(self):
         win = Mock()
+        win._neuro_tasks_screen_placement = "HDMI-1 at (0, 0, 1920, 1080)"
         win.waitBlanking = True
         win.getActualFrameRate.return_value = 120.0
         visual = types.SimpleNamespace(Window=Mock(return_value=win))
@@ -111,10 +112,9 @@ DSI-1 connected 1280x800+1920+0
         with (
             patch("bin.screen.load_screen_config", return_value={}),
             patch("bin.screen.resolve_task_screens", return_value=(Mock(), None)),
-            patch("bin.screen.get_psychopy_window_kwargs", return_value={}),
             patch(
-                "bin.screen.verify_psychopy_window_screen",
-                return_value="HDMI-1 at (0, 0, 1920, 1080)",
+                "bin.screen.open_psychopy_window",
+                return_value=win,
             ),
             patch("bin.screen.enforce_window_vsync", return_value=True),
             patch(
@@ -143,6 +143,7 @@ DSI-1 connected 1280x800+1920+0
 
     def test_display_diagnostic_does_not_self_validate_an_estimated_rate(self):
         win = Mock()
+        win._neuro_tasks_screen_placement = "HDMI-1 at (0, 0, 1920, 1080)"
         win.waitBlanking = True
         win.getActualFrameRate.return_value = None
         visual = types.SimpleNamespace(Window=Mock(return_value=win))
@@ -150,10 +151,9 @@ DSI-1 connected 1280x800+1920+0
         with (
             patch("bin.screen.load_screen_config", return_value={}),
             patch("bin.screen.resolve_task_screens", return_value=(Mock(), None)),
-            patch("bin.screen.get_psychopy_window_kwargs", return_value={}),
             patch(
-                "bin.screen.verify_psychopy_window_screen",
-                return_value="HDMI-1 at (0, 0, 1920, 1080)",
+                "bin.screen.open_psychopy_window",
+                return_value=win,
             ),
             patch("bin.screen.enforce_window_vsync", return_value=True),
             patch(
@@ -184,6 +184,7 @@ DSI-1 connected 1280x800+1920+0
 
     def test_xrandr_rate_exposes_psychopy_every_other_refresh_failure(self):
         win = Mock()
+        win._neuro_tasks_screen_placement = "HDMI-1 at (0, 0, 1920, 1080)"
         win.waitBlanking = True
         win.getActualFrameRate.return_value = 28.827
         visual = types.SimpleNamespace(Window=Mock(return_value=win))
@@ -191,10 +192,9 @@ DSI-1 connected 1280x800+1920+0
         with (
             patch("bin.screen.load_screen_config", return_value={}),
             patch("bin.screen.resolve_task_screens", return_value=(Mock(), None)),
-            patch("bin.screen.get_psychopy_window_kwargs", return_value={}),
             patch(
-                "bin.screen.verify_psychopy_window_screen",
-                return_value="HDMI-1 at (0, 0, 1920, 1080)",
+                "bin.screen.open_psychopy_window",
+                return_value=win,
             ),
             patch("bin.screen.enforce_window_vsync", return_value=True),
             patch(
@@ -233,9 +233,8 @@ DSI-1 connected 1280x800+1920+0
         with (
             patch("bin.screen.load_screen_config", return_value={}),
             patch("bin.screen.resolve_task_screens", return_value=(Mock(), None)),
-            patch("bin.screen.get_psychopy_window_kwargs", return_value={}),
             patch(
-                "bin.screen.verify_psychopy_window_screen",
+                "bin.screen.open_psychopy_window",
                 side_effect=RuntimeError("window realized on HDMI-1"),
             ),
             patch(
@@ -257,7 +256,6 @@ DSI-1 connected 1280x800+1920+0
         self.assertEqual(refresh_rate, 60.33)
         self.assertIsNone(metrics)
         measure.assert_not_called()
-        win.close.assert_called_once_with()
 
     def test_report_places_refresh_rate_and_errors_in_completion_summary(self):
         report = format_diagnostic_report(

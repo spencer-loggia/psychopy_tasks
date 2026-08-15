@@ -31,11 +31,10 @@ from .screen import (
     compute_aspect_cover_size,
     configure_window_vsync,
     enforce_window_vsync,
-    get_psychopy_window_kwargs,
     MainDisplayFrameTimingMonitor,
+    open_psychopy_window,
     resolve_window_frame_rate,
     serialize_preview_image,
-    verify_psychopy_window_screen,
 )
 from .video_playback import (
     RandomFramePulseSchedule,
@@ -125,14 +124,13 @@ def setup_window(
     )
     if monitor:
         win_kwargs["monitor"] = monitor
-    win_kwargs.update(get_psychopy_window_kwargs(screen_info, fullscreen=fullscreen, size=size))
-    win = visual.Window(**win_kwargs)
-    if fullscreen and screen_info is not None:
-        try:
-            verify_psychopy_window_screen(win, screen_info)
-        except Exception:
-            win.close()
-            raise
+    win = open_psychopy_window(
+        visual,
+        screen_info,
+        fullscreen=fullscreen,
+        size=size,
+        **win_kwargs,
+    )
     handle = getattr(win, "winHandle", None)
     activate = getattr(handle, "activate", None)
     if callable(activate):

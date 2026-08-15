@@ -19,6 +19,7 @@ from bin.screen import (
     format_experimenter_label,
     get_psychopy_window_kwargs,
     load_screen_config,
+    open_psychopy_window,
     reward_level_color,
     resolve_window_frame_rate,
     resolve_task_screens,
@@ -356,6 +357,51 @@ class ScreenConfigTests(unittest.TestCase):
             kwargs = get_psychopy_window_kwargs(screen, fullscreen=True)
 
         self.assertEqual(kwargs["screen"], 1)
+
+    def test_linux_window_binds_target_to_screen_zero_during_creation(self):
+        screen = ScreenGeometry(index=0, x=0, y=0, width=1600, height=2560, name="HDMI-2")
+        other = types.SimpleNamespace(x=1600, y=0, width=1920, height=1080)
+        target = types.SimpleNamespace(x=0, y=0, width=1600, height=2560)
+
+        class FakeDisplay:
+            def get_screens(self):
+                return [other, target]
+
+        display = FakeDisplay()
+        options = {}
+        captured = {}
+        win = types.SimpleNamespace(
+            winHandle=types.SimpleNamespace(
+                get_location=lambda: (0, 0),
+                get_size=lambda: (1600, 2560),
+            ),
+            close=Mock(),
+        )
+
+        def create_window(**kwargs):
+            captured["kwargs"] = kwargs
+            captured["screens"] = FakeDisplay().get_screens()
+            captured["override_redirect"] = options["xlib_fullscreen_override_redirect"]
+            return win
+
+        visual = types.SimpleNamespace(Window=Mock(side_effect=create_window))
+        with (
+            patch("bin.screen.sys.platform", "linux"),
+            patch("bin.screen._get_pyglet_display", return_value=display),
+            patch("bin.screen._get_pyglet_options", return_value=options),
+        ):
+            opened = open_psychopy_window(
+                visual,
+                screen,
+                fullscreen=True,
+            )
+
+        self.assertIs(opened, win)
+        self.assertEqual(captured["kwargs"]["screen"], 0)
+        self.assertIs(captured["screens"][0], target)
+        self.assertTrue(captured["override_redirect"])
+        self.assertNotIn("xlib_fullscreen_override_redirect", options)
+        self.assertIs(FakeDisplay().get_screens()[0], other)
 
     def test_psychopy_screen_requires_an_exact_geometry_match(self):
         screen = ScreenGeometry(index=0, x=1920, y=0, width=800, height=480, name="HDMI-2")

@@ -28,6 +28,7 @@ ScreenSelector = Optional[Union[int, str]]
 _UNSET = object()
 MAIN_SCREEN_ENV = "MAIN_SCREEN"
 SECONDARY_SCREEN_ENV = "SECONDARY_SCREEN"
+_DEFAULT_MAIN_SIZE = (1600, 2560)
 
 
 def set_window_mouse_visible(win, visible: bool) -> bool:
@@ -609,7 +610,18 @@ def resolve_task_screens(
     cfg = screen_config or {}
     screens = get_monitor_screens()
     if not screens:
-        screens = [ScreenGeometry(index=0, x=0, y=0, width=0, height=0, name="primary")]
+        selector = cfg.get("main")
+        return (
+            ScreenGeometry(
+                index=selector if isinstance(selector, int) else 0,
+                x=0,
+                y=0,
+                width=_DEFAULT_MAIN_SIZE[0],
+                height=_DEFAULT_MAIN_SIZE[1],
+                name=selector if isinstance(selector, str) else "main-fallback",
+            ),
+            None,
+        )
 
     main_screen = select_screen(
         screens,
@@ -620,6 +632,16 @@ def resolve_task_screens(
     )
     if main_screen is None:
         raise RuntimeError("Unable to resolve a main task screen")
+    if main_screen.width <= 1 or main_screen.height <= 1:
+        main_screen = ScreenGeometry(
+            index=main_screen.index,
+            x=main_screen.x,
+            y=main_screen.y,
+            width=_DEFAULT_MAIN_SIZE[0],
+            height=_DEFAULT_MAIN_SIZE[1],
+            name=main_screen.name,
+            rotation=main_screen.rotation,
+        )
 
     default_experimenter_index = None
     for candidate in screens:
@@ -742,10 +764,12 @@ def _bind_linux_pyglet_fullscreen(screen_info: ScreenGeometry):
         display_class.get_screens = original_get_screens
 
 
-def _send_x11_fullscreen_state(
+def _set_x11_fullscreen_state(
     window_id: int,
     x_screen: int,
     enabled: bool,
+    *,
+    timeout_s: float = 1.0,
 ) -> None:
     try:
         from Xlib import X, display, protocol
@@ -756,12 +780,13 @@ def _send_x11_fullscreen_state(
 
     connection = display.Display()
     try:
+        window_id = int(getattr(window_id, "value", window_id))
         root = connection.screen(int(getattr(x_screen, "value", x_screen))).root
-        message_type = connection.intern_atom("_NET_WM_STATE")
+        state = connection.intern_atom("_NET_WM_STATE")
         fullscreen = connection.intern_atom("_NET_WM_STATE_FULLSCREEN")
         event = protocol.event.ClientMessage(
-            window=int(getattr(window_id, "value", window_id)),
-            client_type=message_type,
+            window=window_id,
+            client_type=state,
             data=(32, [1 if enabled else 0, fullscreen, 0, 1, 0]),
         )
         root.send_event(
@@ -769,6 +794,19 @@ def _send_x11_fullscreen_state(
             event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask,
         )
         connection.sync()
+        window = connection.create_resource_object("window", window_id)
+        deadline = time.monotonic() + float(timeout_s)
+        while True:
+            value = window.get_full_property(state, X.AnyPropertyType)
+            active = value is not None and fullscreen in value.value
+            if active == enabled:
+                return
+            if time.monotonic() >= deadline:
+                action = "enter" if enabled else "leave"
+                raise RuntimeError(
+                    f"Window manager did not acknowledge the request to {action} fullscreen"
+                )
+            time.sleep(0.01)
     finally:
         connection.close()
 
@@ -812,9 +850,9 @@ def _reenter_x11_fullscreen(win: Any, screen_info: ScreenGeometry) -> None:
     x_screen = getattr(handle, "_x_screen_id", 0)
     if window_id is None:
         raise RuntimeError("PsychoPy's X11 window ID is unavailable")
-    _send_x11_fullscreen_state(window_id, x_screen, False)
+    _set_x11_fullscreen_state(window_id, x_screen, False)
     _move_x11_window_to_screen(win, screen_info)
-    _send_x11_fullscreen_state(window_id, x_screen, True)
+    _set_x11_fullscreen_state(window_id, x_screen, True)
 
 
 def verify_psychopy_window_screen(win: Any, screen_info: ScreenGeometry) -> str:
@@ -865,28 +903,20 @@ def _ensure_psychopy_window_screen(win: Any, screen_info: ScreenGeometry) -> str
 
 
 def _psychopy_window_kwargs(
-    screen_info: Optional[ScreenGeometry],
+    screen_info: ScreenGeometry,
     *,
     fullscreen: bool,
     size: Optional[Sequence[int]],
 ) -> Dict[str, Any]:
     if fullscreen:
         kwargs: Dict[str, Any] = {"winType": "pyglet", "fullscr": True}
-        if (
-            screen_info is not None
-            and screen_info.width > 0
-            and screen_info.height > 0
-        ):
+        if screen_info.width > 0 and screen_info.height > 0:
             kwargs["size"] = (int(screen_info.width), int(screen_info.height))
         elif size is not None:
             kwargs["size"] = (int(size[0]), int(size[1]))
         return kwargs
 
-    has_geometry = (
-        screen_info is not None
-        and int(screen_info.width) > 0
-        and int(screen_info.height) > 0
-    )
+    has_geometry = int(screen_info.width) > 0 and int(screen_info.height) > 0
     if size is not None:
         resolved_size = (int(size[0]), int(size[1]))
     elif has_geometry:
@@ -894,7 +924,7 @@ def _psychopy_window_kwargs(
     else:
         resolved_size = (1024, 768)
     kwargs: Dict[str, Any] = {"size": resolved_size, "fullscr": False}
-    if screen_info is not None and not sys.platform.startswith("linux"):
+    if not sys.platform.startswith("linux"):
         kwargs["screen"] = int(screen_info.index)
     if has_geometry:
         x = max(0, (int(screen_info.width) - resolved_size[0]) // 2)
@@ -915,6 +945,11 @@ def open_psychopy_window(
     **kwargs: Any,
 ) -> Any:
     """Open and verify a PsychoPy window on one resolved physical display."""
+    if screen_info is None:
+        screen_info = resolve_task_screens(
+            load_screen_config({}),
+            allow_same_screen=True,
+        )[0]
     window_kwargs = dict(kwargs)
     window_kwargs.update(
         _psychopy_window_kwargs(
@@ -924,12 +959,12 @@ def open_psychopy_window(
         )
     )
 
-    if fullscreen and screen_info is not None and sys.platform.startswith("linux"):
+    if fullscreen and sys.platform.startswith("linux"):
         with _bind_linux_pyglet_fullscreen(screen_info):
             window_kwargs.update(screen=0, checkTiming=False)
             win = visual_module.Window(**window_kwargs)
     else:
-        if fullscreen and screen_info is not None:
+        if fullscreen:
             screens = list(_get_pyglet_display().get_screens())
             window_kwargs["screen"] = _match_screen_geometry(
                 screens,
@@ -938,7 +973,7 @@ def open_psychopy_window(
             )[0]
         win = visual_module.Window(**window_kwargs)
 
-    if fullscreen and screen_info is not None:
+    if fullscreen:
         try:
             placement = _ensure_psychopy_window_screen(win, screen_info)
         except Exception:

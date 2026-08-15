@@ -397,6 +397,8 @@ fullscreen, moves onto the selected output, and re-enters window-manager fullscr
 context. Each realized fullscreen window is then checked against the selected rectangle and aborts with a display
 placement error if it remains on the wrong output or at the wrong size. The launcher, main-screen curtain, and
 experimenter controls likewise request true fullscreen after first being positioned on their assigned output.
+Display positions and sizes are read from the OS when each task starts. If display enumeration is unavailable, only
+the main display is created from the `1600x2560` fallback; detected OS dimensions always take precedence.
 For `active_foraging`, setting `screens.main` and `screens.experimenter` to the same display is allowed and disables
 the experimenter preview, so only the main task content is shown.
 

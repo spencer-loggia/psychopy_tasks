@@ -11,7 +11,7 @@ from bin.screen import (
     SECONDARY_SCREEN_ENV,
     ScreenGeometry,
     _parse_xrandr_query,
-    _send_x11_fullscreen_state,
+    _set_x11_fullscreen_state,
     build_reward_hit_boxes,
     compute_aspect_cover_size,
     compute_centered_aspect_fit,
@@ -325,6 +325,30 @@ class ScreenConfigTests(unittest.TestCase):
         self.assertEqual(main_screen.index, 0)
         self.assertIsNone(experimenter_screen)
 
+    def test_main_screen_uses_os_geometry(self):
+        screens = [
+            ScreenGeometry(index=0, x=0, y=0, width=1440, height=900, name="DP-1"),
+            ScreenGeometry(index=1, x=1440, y=0, width=1920, height=1080, name="HDMI-1"),
+        ]
+
+        with patch("bin.screen.get_monitor_screens", return_value=screens):
+            main, secondary = resolve_task_screens(
+                {"main": "DP-1", "experimenter": "HDMI-1"}
+            )
+
+        self.assertEqual((main.width, main.height), (1440, 900))
+        self.assertEqual((secondary.width, secondary.height), (1920, 1080))
+
+    def test_main_screen_size_falls_back_only_when_os_query_fails(self):
+        with patch("bin.screen.get_monitor_screens", return_value=[]):
+            main, secondary = resolve_task_screens(
+                {"main": "HDMI-2", "experimenter": "HDMI-1"}
+            )
+
+        self.assertEqual((main.width, main.height), (1600, 2560))
+        self.assertEqual(main.name, "HDMI-2")
+        self.assertIsNone(secondary)
+
     def test_hdmi_names_do_not_cross_match_by_off_by_one_alias(self):
         screens = [
             ScreenGeometry(index=0, x=0, y=0, width=800, height=480, name="HDMI-A-1"),
@@ -361,6 +385,52 @@ class ScreenConfigTests(unittest.TestCase):
 
         self.assertEqual(captured["screen"], 1)
         self.assertTrue(captured["fullscr"])
+
+    def test_psychopy_window_resolves_os_screens_when_not_supplied(self):
+        main = ScreenGeometry(
+            index=0,
+            x=0,
+            y=0,
+            width=1440,
+            height=900,
+            name="DP-1",
+        )
+        secondary = ScreenGeometry(
+            index=1,
+            x=1440,
+            y=0,
+            width=1920,
+            height=1080,
+            name="HDMI-1",
+        )
+        display = types.SimpleNamespace(
+            get_screens=lambda: [
+                types.SimpleNamespace(x=0, y=0, width=1440, height=900),
+                types.SimpleNamespace(x=1440, y=0, width=1920, height=1080),
+            ]
+        )
+        captured = {}
+        win = types.SimpleNamespace(
+            winHandle=types.SimpleNamespace(
+                get_location=lambda: (0, 0),
+                get_size=lambda: (1440, 900),
+            ),
+            close=Mock(),
+        )
+        visual = types.SimpleNamespace(
+            Window=lambda **kwargs: captured.update(kwargs) or win
+        )
+
+        with (
+            patch("bin.screen.sys.platform", "darwin"),
+            patch("bin.screen.get_monitor_screens", return_value=[main, secondary]),
+            patch("bin.screen._get_pyglet_display", return_value=display),
+            patch.dict(os.environ, {}, clear=True),
+        ):
+            open_psychopy_window(visual, None, fullscreen=True)
+
+        self.assertEqual(captured["size"], (1440, 900))
+        self.assertEqual(captured["screen"], 0)
 
     def test_linux_fullscreen_reenters_on_the_target_monitor(self):
         screen = ScreenGeometry(index=0, x=0, y=0, width=1600, height=2560, name="HDMI-2")
@@ -408,7 +478,7 @@ class ScreenConfigTests(unittest.TestCase):
             patch("bin.screen.sys.platform", "linux"),
             patch("bin.screen._get_pyglet_display", return_value=display),
             patch(
-                "bin.screen._send_x11_fullscreen_state",
+                "bin.screen._set_x11_fullscreen_state",
                 side_effect=set_fullscreen,
             ) as fullscreen_state,
         ):
@@ -430,15 +500,18 @@ class ScreenConfigTests(unittest.TestCase):
             [call(42, 0, False), call(42, 0, True)],
         )
 
-    def test_x11_fullscreen_state_uses_standard_wm_message(self):
+    def test_x11_fullscreen_state_waits_for_wm_acknowledgment(self):
         root = Mock()
         connection = Mock()
         connection.screen.return_value.root = root
         connection.intern_atom.side_effect = [10, 11]
+        x_window = connection.create_resource_object.return_value
+        x_window.get_full_property.return_value = types.SimpleNamespace(value=[11])
         event = object()
         client_message = Mock(return_value=event)
         xlib = types.ModuleType("Xlib")
         xlib.X = types.SimpleNamespace(
+            AnyPropertyType=0,
             SubstructureRedirectMask=1,
             SubstructureNotifyMask=2,
         )
@@ -448,7 +521,7 @@ class ScreenConfigTests(unittest.TestCase):
         )
 
         with patch.dict("sys.modules", {"Xlib": xlib}):
-            _send_x11_fullscreen_state(42, 0, True)
+            _set_x11_fullscreen_state(42, 0, True)
 
         client_message.assert_called_once_with(
             window=42,
@@ -457,6 +530,8 @@ class ScreenConfigTests(unittest.TestCase):
         )
         root.send_event.assert_called_once_with(event, event_mask=3)
         connection.sync.assert_called_once_with()
+        connection.create_resource_object.assert_called_once_with("window", 42)
+        x_window.get_full_property.assert_called_once_with(10, 0)
         connection.close.assert_called_once_with()
 
     def test_psychopy_screen_requires_an_exact_geometry_match(self):

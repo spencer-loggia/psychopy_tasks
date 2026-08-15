@@ -129,7 +129,6 @@ def setup_window(
         screen_info,
         fullscreen=fullscreen,
         size=size,
-        timing_critical=bool(sync_to_refresh),
         **win_kwargs,
     )
     handle = getattr(win, "winHandle", None)

@@ -390,22 +390,19 @@ Screen Selection
 ----------------
 Multi-screen tasks use `screens.main` for the subject display and `screens.experimenter` for the secondary display.
 Each value can be a detected screen index or an output name such as `HDMI-1` or `DSI-1`.
-Use output names on X11 rigs: changing the primary output can reorder numeric monitor indices.
+Use output names on X11 rigs because numeric monitor order is not stable across display changes.
 Set either value to `null` to inherit the process environment defaults: `screens.main` reads `MAIN_SCREEN`, and
 `screens.experimenter` reads `SECONDARY_SCREEN`. The touch launcher exports its resolved global `screens` values
 to those environment variables for the diagnostic and launched tasks. Resolution is consistently CLI override,
 then the current process's config (`screens.main`/`screens.experimenter`, including legacy aliases), then the
 environment. Output names such as `HDMI-2` are rig configuration values, not constants in the display code.
-PsychoPy presentation windows default to true fullscreen. Before a timing-critical X11 window is created, its
-configured main output is made the XRandR primary output without changing resolution, rotation, or position. This
-makes it Xinerama screen 0, which works around PsychoPy 2025.1.1 interpreting Linux `screen=0` as X screen `:0.0`.
-The new pyglet display instance is also made to enumerate the selected output first. The resulting native
-fullscreen GLX window is created with X11 override-redirect so the window manager cannot relocate it to the active
-secondary display. It must realize directly on the configured output and is never moved afterward. Non-timing
-experimenter windows are created at their output's exact OS-reported rectangle before compositor bypass and
-window-manager fullscreen are requested.
-The realized native rectangle is verified in both cases, and opening aborts with a display-placement error if the
-selected output is not covered exactly.
+PsychoPy presentation windows default to true fullscreen. X11 windows use PsychoPy's native,
+window-manager-controlled fullscreen path, preserving the GLX path that produced reliable refresh locking. The
+configured output is matched by geometry and its original Xinerama monitor index is retained before PsychoPy's
+Linux `screen=0` workaround reorders the Pyglet view. The standard `_NET_WM_FULLSCREEN_MONITORS` request uses that
+original index; the window is not manually moved and override-redirect is not used. The realized native rectangle
+is verified, and normal task opening aborts with a display-placement error if the selected output is not covered
+exactly. The diagnostic reports placement failure but continues its timing checks on any realized window.
 The launcher, main-screen curtain, and experimenter controls likewise request true fullscreen after first being
 positioned on their assigned output.
 Display positions and sizes are read from the OS when each task starts. If display enumeration is unavailable, only

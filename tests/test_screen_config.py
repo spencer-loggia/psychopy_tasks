@@ -1,5 +1,6 @@
 import os
 import queue
+import types
 import unittest
 from unittest.mock import Mock, patch
 
@@ -25,6 +26,7 @@ from bin.screen import (
     scale_scene_point,
     select_screen,
     set_tk_window_fullscreen,
+    verify_psychopy_window_screen,
 )
 
 
@@ -333,19 +335,63 @@ class ScreenConfigTests(unittest.TestCase):
 
     def test_linux_psychopy_window_uses_true_fullscreen_screen(self):
         screen = ScreenGeometry(index=1, x=800, y=0, width=2560, height=1600, name="HDMI-A-2")
+        pyglet_screens = [
+            types.SimpleNamespace(x=0, y=0, width=800, height=480),
+            types.SimpleNamespace(x=800, y=0, width=2560, height=1600),
+        ]
 
-        with patch("bin.screen.sys.platform", "linux"):
+        with patch("bin.screen._get_pyglet_screens", return_value=pyglet_screens):
             kwargs = get_psychopy_window_kwargs(screen, fullscreen=True)
 
-        self.assertEqual(kwargs, {"screen": 1, "fullscr": True})
+        self.assertEqual(kwargs, {"screen": 1, "winType": "pyglet", "fullscr": True})
 
-    def test_non_linux_psychopy_fullscreen_uses_screen_index(self):
-        screen = ScreenGeometry(index=1, x=800, y=0, width=2560, height=1600, name="HDMI-A-2")
+    def test_psychopy_screen_order_is_resolved_by_geometry(self):
+        screen = ScreenGeometry(index=0, x=1920, y=0, width=800, height=480, name="HDMI-2")
+        pyglet_screens = [
+            types.SimpleNamespace(x=0, y=0, width=1920, height=1080),
+            types.SimpleNamespace(x=1920, y=0, width=800, height=480),
+        ]
 
-        with patch("bin.screen.sys.platform", "darwin"):
+        with patch("bin.screen._get_pyglet_screens", return_value=pyglet_screens):
             kwargs = get_psychopy_window_kwargs(screen, fullscreen=True)
 
-        self.assertEqual(kwargs, {"screen": 1, "fullscr": True})
+        self.assertEqual(kwargs["screen"], 1)
+
+    def test_psychopy_screen_requires_an_exact_geometry_match(self):
+        screen = ScreenGeometry(index=0, x=1920, y=0, width=800, height=480, name="HDMI-2")
+        pyglet_screens = [types.SimpleNamespace(x=0, y=0, width=1920, height=1080)]
+
+        with (
+            patch("bin.screen._get_pyglet_screens", return_value=pyglet_screens),
+            self.assertRaisesRegex(RuntimeError, "could not uniquely match main output HDMI-2"),
+        ):
+            get_psychopy_window_kwargs(screen, fullscreen=True)
+
+    def test_realized_psychopy_window_must_cover_requested_screen(self):
+        screen = ScreenGeometry(index=0, x=1920, y=0, width=800, height=480, name="HDMI-2")
+        win = types.SimpleNamespace(
+            winHandle=types.SimpleNamespace(
+                get_location=lambda: (0, 0),
+                get_size=lambda: (1920, 1080),
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "not main output HDMI-2"):
+            verify_psychopy_window_screen(win, screen)
+
+    def test_realized_psychopy_window_confirms_requested_screen(self):
+        screen = ScreenGeometry(index=0, x=1920, y=0, width=800, height=480, name="HDMI-2")
+        win = types.SimpleNamespace(
+            winHandle=types.SimpleNamespace(
+                get_location=lambda: (1920, 0),
+                get_size=lambda: (800, 480),
+            )
+        )
+
+        self.assertEqual(
+            verify_psychopy_window_screen(win, screen),
+            "HDMI-2 at (1920, 0, 800, 480)",
+        )
 
     def test_tk_window_is_positioned_before_true_fullscreen(self):
         screen = ScreenGeometry(

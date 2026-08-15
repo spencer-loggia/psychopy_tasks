@@ -35,6 +35,7 @@ from .screen import (
     MainDisplayFrameTimingMonitor,
     resolve_window_frame_rate,
     serialize_preview_image,
+    verify_psychopy_window_screen,
 )
 from .video_playback import (
     RandomFramePulseSchedule,
@@ -47,6 +48,7 @@ from .stimulus_files import (
     load_shape_definitions as _load_shape_definitions,
     split_background_from_palette as _split_background_from_palette,
 )
+from .touch_input import MousePressTracker
 
 # Global debug flag: when True, utilities may write debug files (PNG) to logs/
 # Default is False; tasks can enable it via CLI (--debug) or config.
@@ -125,6 +127,12 @@ def setup_window(
         win_kwargs["monitor"] = monitor
     win_kwargs.update(get_psychopy_window_kwargs(screen_info, fullscreen=fullscreen, size=size))
     win = visual.Window(**win_kwargs)
+    if fullscreen and screen_info is not None:
+        try:
+            verify_psychopy_window_screen(win, screen_info)
+        except Exception:
+            win.close()
+            raise
     handle = getattr(win, "winHandle", None)
     activate = getattr(handle, "activate", None)
     if callable(activate):
@@ -1349,6 +1357,7 @@ def present_trial_with_persistent_dots(
 
     from psychopy import event as _event
     mouse = _event.Mouse(win=win)
+    mouse_presses = MousePressTracker(mouse)
     trial_start_signal_armed_s: Optional[float] = None
     trial_start_signal_sent = False
 
@@ -1514,6 +1523,9 @@ def present_trial_with_persistent_dots(
             pass
         if not _arm_trial_start_signal():
             return True, None
+        # Arm before the vsync-blocked flip so even a press and release that
+        # both arrive during the flip remain observable through click timing.
+        mouse_presses.reset()
         oc_flip = win.flip()
         oc_perf = time.perf_counter()
         _commit_trial_start_signal(oc_perf)
@@ -1529,9 +1541,9 @@ def present_trial_with_persistent_dots(
             if _should_abort("experimenter_exit_during_onset_cue"):
                 return True, None
 
-            click_pos = mouse.getPos()
-            buttons = mouse.getPressed()
-            if any(buttons):
+            touch_sample = mouse_presses.poll()
+            click_pos = touch_sample.position
+            if touch_sample.active:
                 try:
                     oc_w, oc_h = onset_cue.size
                 except Exception:
@@ -1647,7 +1659,6 @@ def present_trial_with_persistent_dots(
     click_registered = False
     click_perf_capture = None
     click_meta = None
-    prev_touch_down = False
     poll_interval_s = 0.002
     touch_acquire_window_s = 0.050
     choice_started = False
@@ -1655,6 +1666,7 @@ def present_trial_with_persistent_dots(
     choice_perf = None
     choice_window_s = float(choice_s)
     choice_deadline = None
+    choice_input_armed = False
     pos_list = list(positions)
     stims: List[visual.ImageStim] = []
     names: List[str] = []
@@ -1749,24 +1761,35 @@ def present_trial_with_persistent_dots(
         click_meta = {"idx": chosen_idx}
         click_registered = True
 
+    def _arm_choice_input() -> None:
+        nonlocal choice_input_armed
+        if choice_input_armed:
+            return
+        mouse_presses.reset()
+        choice_input_armed = True
+
     def _start_choice_window(start_flip_ps, start_perf: float) -> None:
-        nonlocal choice_started, choice_flip, choice_perf, choice_window_s, choice_deadline, prev_touch_down
+        nonlocal choice_started, choice_flip, choice_perf, choice_window_s, choice_deadline
         if choice_started:
             return
+        if not choice_input_armed:
+            # Defensive fallback for future presentation branches. Existing
+            # paths arm immediately before the response-opening flip.
+            _arm_choice_input()
         choice_started = True
         choice_flip = start_flip_ps
         choice_perf = float(start_perf)
         choice_window_s = max(0.0, float(choice_s))
         choice_deadline = choice_perf + choice_window_s
-        start_click_pos = mouse.getPos()
-        prev_touch_down = any(mouse.getPressed())
+        start_touch = mouse_presses.poll()
+        start_click_pos = start_touch.position
         logger.log_frame_flip(
             trial_num=trial_num,
             event=_frame_event_name("choice_start"),
             timestamp_perf_s=choice_perf,
         )
 
-        if prev_touch_down and choice_perf is not None:
+        if start_touch.active and choice_perf is not None:
             touch_onset_perf = time.perf_counter()
             chosen_idx = _match_choice_target(start_click_pos)
             start_click_pos_acquired, chosen_idx = _acquire_choice_target(
@@ -1774,7 +1797,12 @@ def present_trial_with_persistent_dots(
                 chosen_idx,
                 touch_onset_perf,
             )
-            _log_choice_touch_attempt(start_click_pos_acquired, chosen_idx, origin="choice_start_active_touch")
+            start_origin = (
+                "choice_start_buffered_touch"
+                if start_touch.buffered_press and not start_touch.down
+                else "choice_start_active_touch"
+            )
+            _log_choice_touch_attempt(start_click_pos_acquired, chosen_idx, origin=start_origin)
             if chosen_idx is not None:
                 _commit_choice(chosen_idx, start_click_pos_acquired, touch_onset_perf)
 
@@ -1785,18 +1813,16 @@ def present_trial_with_persistent_dots(
         return _should_abort(reason)
 
     def _poll_choice_until(deadline_perf: float) -> bool:
-        nonlocal click_registered, click_perf_capture, click_meta, prev_touch_down, chosen_info
+        nonlocal click_registered, click_perf_capture, click_meta, chosen_info
         while time.perf_counter() < deadline_perf and not click_registered:
             if _abort_from_input("experimenter_exit_during_choice"):
                 return True
 
-            click_pos = mouse.getPos()
-            buttons = mouse.getPressed()
-            touch_down = any(buttons)
-            touch_started = touch_down and (not prev_touch_down)
-            prev_touch_down = touch_down
+            touch_sample = mouse_presses.poll()
+            click_pos = touch_sample.position
+            touch_started = touch_sample.press_started
 
-            if touch_down and choice_perf is not None:
+            if touch_sample.active and choice_perf is not None:
                 touch_onset_perf = time.perf_counter()
                 chosen_idx = _match_choice_target(click_pos)
 
@@ -1944,6 +1970,7 @@ def present_trial_with_persistent_dots(
                     s.draw()
                 if fix is not None:
                     fix.draw()
+                _arm_choice_input()
                 off_flip = win.flip()
                 off_perf = time.perf_counter()
                 _build_choice_hit_targets()
@@ -2017,6 +2044,8 @@ def present_trial_with_persistent_dots(
                     s.draw()
                 if fix is not None:
                     fix.draw()
+                if first_flip and not is_memory:
+                    _arm_choice_input()
                 flip_ps = win.flip()
                 if first_flip:
                     flip_perf = time.perf_counter()
@@ -2071,6 +2100,7 @@ def present_trial_with_persistent_dots(
                     s.draw()
             if fix is not None:
                 fix.draw()
+            _arm_choice_input()
             choice_flip = win.flip()
             choice_perf_now = time.perf_counter()
             _build_choice_hit_targets()
@@ -2541,10 +2571,7 @@ def present_delayed_afc_trial(
         )
 
     mouse = event.Mouse(win=win)
-    try:
-        mouse.clickReset()
-    except Exception:
-        pass
+    mouse_presses = MousePressTracker(mouse)
     try:
         event.clearEvents(eventType="mouse")
     except Exception:
@@ -2632,6 +2659,7 @@ def present_delayed_afc_trial(
         pass
     bg_rect.draw()
     onset_cue.draw()
+    mouse_presses.reset()
     win.flip()
     oc_perf = time.perf_counter()
     logger.log_frame_flip(
@@ -2639,20 +2667,12 @@ def present_delayed_afc_trial(
         event="onset_cue_on",
         timestamp_perf_s=oc_perf,
     )
-    try:
-        event.clearEvents(eventType="mouse")
-        mouse.clickReset()
-    except Exception:
-        pass
-    prev_touch_down = any(mouse.getPressed())
     while True:
         if _abort_from_input("during_onset_cue"):
             return True, None
-        click_pos = tuple(float(v) for v in mouse.getPos())
-        touch_down = any(mouse.getPressed())
-        touch_started = touch_down and not prev_touch_down
-        prev_touch_down = touch_down
-        if touch_started:
+        touch_sample = mouse_presses.poll()
+        click_pos = touch_sample.position
+        if touch_sample.press_started:
             try:
                 oc_w, oc_h = onset_cue.size
             except Exception:
@@ -2679,11 +2699,7 @@ def present_delayed_afc_trial(
                     if _abort_from_input("waiting_for_onset_cue_release"):
                         return True, None
                     _core.wait(0.005)
-                try:
-                    mouse.clickReset()
-                    event.clearEvents(eventType="mouse")
-                except Exception:
-                    pass
+                mouse_presses.reset()
                 break
         _core.wait(0.01)
 
@@ -2760,6 +2776,7 @@ def present_delayed_afc_trial(
     for stim in choice_stims:
         stim.draw()
     _draw_fixation_if_requested()
+    mouse_presses.reset()
     win.flip()
     choice_perf = time.perf_counter()
     if trial_meta is not None:
@@ -2779,10 +2796,10 @@ def present_delayed_afc_trial(
 
     choice_deadline = choice_perf + float(choice_s)
     choice_info: Optional[Dict[str, Any]] = None
-    prev_touch_down = any(mouse.getPressed())
+    start_touch = mouse_presses.poll()
 
-    if prev_touch_down:
-        start_pos = tuple(float(v) for v in mouse.getPos())
+    if start_touch.active:
+        start_pos = start_touch.position
         immediate_idx = _match_choice(start_pos)
         if immediate_idx is not None:
             click_perf = time.perf_counter()
@@ -2817,11 +2834,9 @@ def present_delayed_afc_trial(
     while time.perf_counter() < choice_deadline and choice_info is None:
         if _abort_from_input("during_choice"):
             return True, None
-        click_pos = tuple(float(v) for v in mouse.getPos())
-        touch_down = any(mouse.getPressed())
-        touch_started = touch_down and not prev_touch_down
-        prev_touch_down = touch_down
-        if touch_started:
+        touch_sample = mouse_presses.poll()
+        click_pos = touch_sample.position
+        if touch_sample.press_started:
             chosen_idx = _match_choice(click_pos)
             _log_message(
                 msg_logger,

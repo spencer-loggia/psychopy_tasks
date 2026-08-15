@@ -390,9 +390,11 @@ Each value can be a detected screen index or an output name such as `HDMI-1` or 
 Set either value to `null` to inherit the process environment defaults: `screens.main` reads `MAIN_SCREEN`, and
 `screens.experimenter` reads `SECONDARY_SCREEN`. The touch launcher exports its resolved global `screens` values
 to those environment variables for launched tasks.
-PsychoPy presentation windows default to true fullscreen and pass the resolved physical screen index to the
-backend on Linux as well as other platforms. The launcher, main-screen curtain, and experimenter controls likewise
-request true fullscreen after first being positioned on their assigned output.
+PsychoPy presentation windows default to true fullscreen. Output names are first resolved with xrandr, then matched
+to PsychoPy's pyglet screen list by exact position and size; the xrandr ordinal is not assumed to be PsychoPy's
+screen ordinal. Each realized fullscreen window is checked against that same rectangle and aborts with a display
+placement error if it opened on the wrong output or at the wrong size. The launcher, main-screen curtain, and
+experimenter controls likewise request true fullscreen after first being positioned on their assigned output.
 For `active_foraging`, setting `screens.main` and `screens.experimenter` to the same display is allowed and disables
 the experimenter preview, so only the main task content is shown.
 

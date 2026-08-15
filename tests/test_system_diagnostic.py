@@ -112,6 +112,10 @@ DSI-1 connected 1280x800+1920+0
             patch("bin.screen.load_screen_config", return_value={}),
             patch("bin.screen.resolve_task_screens", return_value=(Mock(), None)),
             patch("bin.screen.get_psychopy_window_kwargs", return_value={}),
+            patch(
+                "bin.screen.verify_psychopy_window_screen",
+                return_value="HDMI-1 at (0, 0, 1920, 1080)",
+            ),
             patch("bin.screen.enforce_window_vsync", return_value=True),
             patch(
                 "task.system_diagnostic.query_glx_swap_interval",
@@ -132,7 +136,7 @@ DSI-1 connected 1280x800+1920+0
                 visual_module=visual,
             )
 
-        self.assertEqual([check["status"] for check in checks], ["pass"] * 3)
+        self.assertEqual([check["status"] for check in checks], ["pass"] * 4)
         self.assertEqual(refresh_rate, 120.0)
         self.assertEqual(metrics["locked_fraction"], 1.0)
         win.close.assert_called_once_with()
@@ -147,6 +151,10 @@ DSI-1 connected 1280x800+1920+0
             patch("bin.screen.load_screen_config", return_value={}),
             patch("bin.screen.resolve_task_screens", return_value=(Mock(), None)),
             patch("bin.screen.get_psychopy_window_kwargs", return_value={}),
+            patch(
+                "bin.screen.verify_psychopy_window_screen",
+                return_value="HDMI-1 at (0, 0, 1920, 1080)",
+            ),
             patch("bin.screen.enforce_window_vsync", return_value=True),
             patch(
                 "task.system_diagnostic.query_glx_swap_interval",
@@ -169,7 +177,7 @@ DSI-1 connected 1280x800+1920+0
 
         self.assertEqual(
             [check["status"] for check in checks],
-            ["pass", "fail", "skip"],
+            ["pass", "pass", "fail", "skip"],
         )
         self.assertIsNone(refresh_rate)
         self.assertIsNone(metrics)
@@ -184,6 +192,10 @@ DSI-1 connected 1280x800+1920+0
             patch("bin.screen.load_screen_config", return_value={}),
             patch("bin.screen.resolve_task_screens", return_value=(Mock(), None)),
             patch("bin.screen.get_psychopy_window_kwargs", return_value={}),
+            patch(
+                "bin.screen.verify_psychopy_window_screen",
+                return_value="HDMI-1 at (0, 0, 1920, 1080)",
+            ),
             patch("bin.screen.enforce_window_vsync", return_value=True),
             patch(
                 "task.system_diagnostic.query_glx_swap_interval",
@@ -207,12 +219,45 @@ DSI-1 connected 1280x800+1920+0
         self.assertEqual(refresh_rate, 60.33)
         self.assertEqual(
             [check["status"] for check in checks],
-            ["fail", "pass", "fail"],
+            ["pass", "fail", "pass", "fail"],
         )
-        self.assertIn("swap interval 2", checks[0]["detail"])
+        self.assertIn("swap interval 2", checks[1]["detail"])
         self.assertEqual(metrics["locked_fraction"], 0.0)
-        self.assertIn("PsychoPy measured 28.827 Hz", checks[2]["detail"])
-        self.assertIn("median interval error", checks[2]["error"])
+        self.assertIn("PsychoPy measured 28.827 Hz", checks[3]["detail"])
+        self.assertIn("median interval error", checks[3]["error"])
+
+    def test_wrong_realized_monitor_stops_timing_but_reports_main_rate(self):
+        win = Mock()
+        visual = types.SimpleNamespace(Window=Mock(return_value=win))
+
+        with (
+            patch("bin.screen.load_screen_config", return_value={}),
+            patch("bin.screen.resolve_task_screens", return_value=(Mock(), None)),
+            patch("bin.screen.get_psychopy_window_kwargs", return_value={}),
+            patch(
+                "bin.screen.verify_psychopy_window_screen",
+                side_effect=RuntimeError("window realized on HDMI-1"),
+            ),
+            patch(
+                "task.system_diagnostic.query_main_monitor_refresh_rate",
+                return_value=(60.33, "xrandr active mode for output HDMI-2"),
+            ),
+            patch("task.system_diagnostic._measure_flip_intervals") as measure,
+        ):
+            checks, refresh_rate, metrics = run_display_diagnostic(
+                cfg={},
+                visual_module=visual,
+            )
+
+        self.assertEqual(
+            [check["status"] for check in checks],
+            ["fail", "skip", "pass", "skip"],
+        )
+        self.assertIn("window realized on HDMI-1", checks[0]["error"])
+        self.assertEqual(refresh_rate, 60.33)
+        self.assertIsNone(metrics)
+        measure.assert_not_called()
+        win.close.assert_called_once_with()
 
     def test_report_places_refresh_rate_and_errors_in_completion_summary(self):
         report = format_diagnostic_report(

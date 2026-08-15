@@ -699,7 +699,12 @@ def get_psychopy_window_kwargs(
 
     if fullscreen:
         if screen_info is not None:
-            kwargs["screen"] = int(screen_info.index)
+            kwargs["screen"] = (
+                _get_pyglet_screen_index(screen_info)
+                if has_geometry
+                else int(screen_info.index)
+            )
+        kwargs["winType"] = "pyglet"
         kwargs["fullscr"] = True
         return kwargs
 
@@ -723,6 +728,60 @@ def get_psychopy_window_kwargs(
             y += int(screen_info.y)
         kwargs["pos"] = (x, y)
     return kwargs
+
+
+def _get_pyglet_screens() -> list[Any]:
+    from pyglet import canvas
+
+    return list(canvas.get_display().get_screens())
+
+
+def _screen_rect(screen: Any) -> tuple[int, int, int, int]:
+    return (
+        int(screen.x),
+        int(screen.y),
+        int(screen.width),
+        int(screen.height),
+    )
+
+
+def _get_pyglet_screen_index(screen_info: ScreenGeometry) -> int:
+    """Map an xrandr output to PsychoPy's screen list by geometry."""
+    target = _screen_rect(screen_info)
+    try:
+        screens = _get_pyglet_screens()
+    except Exception as exc:
+        raise RuntimeError(
+            f"PsychoPy could not enumerate displays while selecting {screen_info.name or target}: {exc}"
+        ) from exc
+
+    matches = [index for index, screen in enumerate(screens) if _screen_rect(screen) == target]
+    if len(matches) == 1:
+        return matches[0]
+
+    available = ", ".join(str(_screen_rect(screen)) for screen in screens) or "none"
+    raise RuntimeError(
+        f"PsychoPy could not uniquely match main output {screen_info.name or '<unnamed>'} "
+        f"at {target}; pyglet displays: {available}"
+    )
+
+
+def verify_psychopy_window_screen(win: Any, screen_info: ScreenGeometry) -> str:
+    """Confirm that a realized pyglet fullscreen window covers one output."""
+    handle = getattr(win, "winHandle", None)
+    get_location = getattr(handle, "get_location", None)
+    get_size = getattr(handle, "get_size", None)
+    if not callable(get_location) or not callable(get_size):
+        raise RuntimeError("PsychoPy's pyglet window does not expose its realized geometry")
+
+    actual = (*map(int, get_location()), *map(int, get_size()))
+    expected = _screen_rect(screen_info)
+    if actual != expected:
+        raise RuntimeError(
+            f"PsychoPy window realized at {actual}, not main output "
+            f"{screen_info.name or '<unnamed>'} at {expected}"
+        )
+    return f"{screen_info.name or 'main output'} at {expected}"
 
 
 def set_tk_window_fullscreen(window, screen_info: ScreenGeometry) -> None:
@@ -1514,6 +1573,11 @@ def _experimenter_preview_process(
         allowGUI=False,
         waitBlanking=False,
     )
+    try:
+        verify_psychopy_window_screen(win, screen_info)
+    except Exception:
+        win.close()
+        raise
     configure_window_vsync(win, False)
     last_cursor_apply_s = 0.0
     if mouse_visible is not None:

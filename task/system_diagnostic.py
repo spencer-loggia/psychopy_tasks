@@ -351,6 +351,7 @@ def _diagnostic_settings(cfg: Mapping[str, Any]) -> tuple[int, str]:
 
 def _skipped_display_checks(reason: str) -> list[dict[str, Any]]:
     return [
+        _check("Main display placement", "skip", reason),
         _check("Vsync request", "skip", reason),
         _check("Monitor refresh rate", "skip", reason),
         _check("Flip synchronization", "skip", reason),
@@ -363,12 +364,15 @@ def run_display_diagnostic(
     visual_module: object,
 ) -> tuple[list[dict[str, Any]], Optional[float], Optional[dict[str, Any]]]:
     win = None
+    monitor_refresh_rate_hz = None
+    monitor_rate_detail = "main output was not resolved"
     try:
         from bin.screen import (
             enforce_window_vsync,
             get_psychopy_window_kwargs,
             load_screen_config,
             resolve_task_screens,
+            verify_psychopy_window_screen,
         )
         from bin.task_lifecycle import signal_task_window_ready
 
@@ -393,6 +397,7 @@ def run_display_diagnostic(
         )
         window_mode = "fullscreen" if win_kwargs.get("fullscr") else "borderless"
         win = visual_module.Window(**win_kwargs)
+        placement_detail = verify_psychopy_window_screen(win, main_screen)
         signal_task_window_ready()
     except Exception as exc:
         error = _error_text(exc)
@@ -401,27 +406,42 @@ def run_display_diagnostic(
                 win.close()
             except Exception:
                 pass
+        if monitor_refresh_rate_hz is not None:
+            refresh_check = _check(
+                "Monitor refresh rate",
+                "pass",
+                f"Main monitor refresh rate: {monitor_refresh_rate_hz:.3f} Hz ({monitor_rate_detail})",
+            )
+        else:
+            refresh_check = _check(
+                "Monitor refresh rate",
+                "fail",
+                "The resolved main output has no confirmed xrandr active-mode rate",
+                error=monitor_rate_detail,
+            )
         checks = [
             _check(
-                "Vsync request",
+                "Main display placement",
                 "fail",
-                "PsychoPy could not open a diagnostic window on the main monitor",
+                "PsychoPy could not place a fullscreen window on the resolved main monitor",
                 error=error,
             ),
-            _check(
-                "Monitor refresh rate",
-                "skip",
-                "Skipped because the main-monitor window could not be opened",
-            ),
+            _check("Vsync request", "skip", "Skipped because main-display placement failed"),
+            refresh_check,
             _check(
                 "Flip synchronization",
                 "skip",
-                "Skipped because the main-monitor window could not be opened",
+                "Skipped because main-display placement failed",
             ),
         ]
-        return checks, None, None
+        return checks, monitor_refresh_rate_hz, None
 
     try:
+        placement_check = _check(
+            "Main display placement",
+            "pass",
+            f"Fullscreen PsychoPy window verified on {placement_detail}",
+        )
         vsync_requested = bool(enforce_window_vsync(win)) and bool(
             getattr(win, "waitBlanking", False)
         )
@@ -515,7 +535,7 @@ def run_display_diagnostic(
                     "an independently measured main-monitor refresh rate"
                 ),
             )
-            return [vsync_check, refresh_check, flip_check], refresh_rate_hz, None
+            return [placement_check, vsync_check, refresh_check, flip_check], refresh_rate_hz, None
 
         refresh_rate_hz = monitor_refresh_rate_hz
         source = monitor_rate_detail
@@ -572,20 +592,34 @@ def run_display_diagnostic(
                 detail,
                 error="; ".join(failure_reasons),
             )
-        return [vsync_check, refresh_check, flip_check], refresh_rate_hz, metrics
+        return [placement_check, vsync_check, refresh_check, flip_check], refresh_rate_hz, metrics
     except Exception as exc:
         error = _error_text(exc)
+        if monitor_refresh_rate_hz is not None:
+            refresh_check = _check(
+                "Monitor refresh rate",
+                "pass",
+                f"Main monitor refresh rate: {monitor_refresh_rate_hz:.3f} Hz ({monitor_rate_detail})",
+            )
+        else:
+            refresh_check = _check(
+                "Monitor refresh rate",
+                "fail",
+                "The resolved main output has no confirmed xrandr active-mode rate",
+                error=monitor_rate_detail,
+            )
         checks = [
+            placement_check,
             _check(
                 "Vsync request",
                 "fail",
                 "The main-display timing diagnostic did not complete",
                 error=error,
             ),
-            _check("Monitor refresh rate", "skip", "Timing diagnostic did not complete"),
+            refresh_check,
             _check("Flip synchronization", "skip", "Timing diagnostic did not complete"),
         ]
-        return checks, None, None
+        return checks, monitor_refresh_rate_hz, None
     finally:
         if win is not None:
             try:

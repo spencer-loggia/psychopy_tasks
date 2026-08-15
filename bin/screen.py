@@ -742,28 +742,6 @@ def _match_screen_geometry(
     )
 
 
-@contextmanager
-def _bind_linux_pyglet_fullscreen(screen_info: ScreenGeometry):
-    """Make PsychoPy screen 0 mean the requested X11 monitor during creation."""
-    display_class = type(_get_pyglet_display())
-    original_get_screens = display_class.get_screens
-
-    def target_first(display) -> list[Any]:
-        screens = list(original_get_screens(display))
-        _index, match = _match_screen_geometry(
-            screens,
-            screen_info,
-            source="Pyglet",
-        )
-        return [match] + [screen for screen in screens if screen is not match]
-
-    display_class.get_screens = target_first
-    try:
-        yield
-    finally:
-        display_class.get_screens = original_get_screens
-
-
 def _set_x11_fullscreen_state(
     window_id: int,
     x_screen: int,
@@ -807,6 +785,26 @@ def _set_x11_fullscreen_state(
                     f"Window manager did not acknowledge the request to {action} fullscreen"
                 )
             time.sleep(0.01)
+    finally:
+        connection.close()
+
+
+def _request_x11_compositor_bypass(window_id: int) -> None:
+    """Tell an X11 compositor that this timing window should scan out directly."""
+    try:
+        from Xlib import Xatom, display
+    except ImportError as exc:
+        raise RuntimeError(
+            "X11 fullscreen placement requires the python-xlib package"
+        ) from exc
+
+    connection = display.Display()
+    try:
+        window_id = int(getattr(window_id, "value", window_id))
+        window = connection.create_resource_object("window", window_id)
+        bypass = connection.intern_atom("_NET_WM_BYPASS_COMPOSITOR")
+        window.change_property(bypass, Xatom.CARDINAL, 32, [1])
+        connection.sync()
     finally:
         connection.close()
 
@@ -880,31 +878,15 @@ def _move_x11_window_to_screen(
         time.sleep(0.01)
 
 
-def _reenter_x11_fullscreen(win: Any, screen_info: ScreenGeometry) -> None:
+def _enter_x11_fullscreen(win: Any, screen_info: ScreenGeometry) -> None:
     handle = getattr(win, "winHandle", None)
     window_id = getattr(handle, "_window", None)
     x_screen = getattr(handle, "_x_screen_id", 0)
     if window_id is None:
         raise RuntimeError("PsychoPy's X11 window ID is unavailable")
-    _set_x11_fullscreen_state(window_id, x_screen, False)
+    _request_x11_compositor_bypass(window_id)
     _move_x11_window_to_screen(win, screen_info)
     _set_x11_fullscreen_state(window_id, x_screen, True)
-    _configure_x11_window(win, screen_info)
-
-
-def _sync_psychopy_window_size(win: Any, width: int, height: int) -> None:
-    handle = getattr(win, "winHandle", None)
-    cached_size = getattr(handle, "get_size", lambda: (width, height))()
-    if tuple(map(int, cached_size)) == (width, height):
-        return
-    handle._width, handle._height = int(width), int(height)
-    update_view = getattr(handle, "_update_view_size", None)
-    if callable(update_view):
-        update_view()
-    backend = getattr(win, "backend", None) or getattr(win, "_backend", None)
-    set_fullscreen = getattr(backend, "setFullScr", None)
-    if callable(set_fullscreen):
-        set_fullscreen(True)
 
 
 def verify_psychopy_window_screen(win: Any, screen_info: ScreenGeometry) -> str:
@@ -932,8 +914,6 @@ def verify_psychopy_window_screen(win: Any, screen_info: ScreenGeometry) -> str:
             f"PsychoPy native window realized at {actual}, not main output "
             f"{screen_info.name or '<unnamed>'} at {expected}{cache_detail}"
         )
-    if sys.platform.startswith("linux"):
-        _sync_psychopy_window_size(win, actual[2], actual[3])
     return f"{screen_info.name or 'main output'} at {expected}"
 
 
@@ -957,12 +937,9 @@ def _wait_for_psychopy_window_screen(
 
 
 def _ensure_psychopy_window_screen(win: Any, screen_info: ScreenGeometry) -> str:
-    try:
+    if not sys.platform.startswith("linux"):
         return verify_psychopy_window_screen(win, screen_info)
-    except RuntimeError:
-        if not sys.platform.startswith("linux"):
-            raise
-    _reenter_x11_fullscreen(win, screen_info)
+    _enter_x11_fullscreen(win, screen_info)
     return _wait_for_psychopy_window_screen(win, screen_info)
 
 
@@ -973,11 +950,17 @@ def _psychopy_window_kwargs(
     size: Optional[Sequence[int]],
 ) -> Dict[str, Any]:
     if fullscreen:
-        kwargs: Dict[str, Any] = {"winType": "pyglet", "fullscr": True}
+        # PsychoPy/pyglet can create an X11 fullscreen drawable on the wrong
+        # CRTC and only then move it. Create it at the final geometry first;
+        # _enter_x11_fullscreen applies and verifies real EWMH fullscreen.
+        x11 = sys.platform.startswith("linux")
+        kwargs: Dict[str, Any] = {"winType": "pyglet", "fullscr": not x11}
         if screen_info.width > 0 and screen_info.height > 0:
             kwargs["size"] = (int(screen_info.width), int(screen_info.height))
         elif size is not None:
             kwargs["size"] = (int(size[0]), int(size[1]))
+        if x11:
+            kwargs["pos"] = (int(screen_info.x), int(screen_info.y))
         return kwargs
 
     has_geometry = int(screen_info.width) > 0 and int(screen_info.height) > 0
@@ -1023,19 +1006,16 @@ def open_psychopy_window(
         )
     )
 
-    if fullscreen and sys.platform.startswith("linux"):
-        with _bind_linux_pyglet_fullscreen(screen_info):
-            window_kwargs.update(screen=0, checkTiming=False)
-            win = visual_module.Window(**window_kwargs)
-    else:
-        if fullscreen:
+    if fullscreen:
+        window_kwargs["checkTiming"] = False
+        if not sys.platform.startswith("linux"):
             screens = list(_get_pyglet_display().get_screens())
             window_kwargs["screen"] = _match_screen_geometry(
                 screens,
                 screen_info,
                 source="Pyglet",
             )[0]
-        win = visual_module.Window(**window_kwargs)
+    win = visual_module.Window(**window_kwargs)
 
     if fullscreen:
         try:

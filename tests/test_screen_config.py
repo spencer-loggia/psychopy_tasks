@@ -2,7 +2,7 @@ import os
 import queue
 import types
 import unittest
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, patch
 
 from bin.screen import (
     ExperimenterPreview,
@@ -12,7 +12,6 @@ from bin.screen import (
     ScreenGeometry,
     _parse_xrandr_query,
     _set_x11_fullscreen_state,
-    _sync_psychopy_window_size,
     build_reward_hit_boxes,
     compute_aspect_cover_size,
     compute_centered_aspect_fit,
@@ -433,21 +432,12 @@ class ScreenConfigTests(unittest.TestCase):
         self.assertEqual(captured["size"], (1440, 900))
         self.assertEqual(captured["screen"], 0)
 
-    def test_linux_fullscreen_reenters_on_the_target_monitor(self):
+    def test_linux_fullscreen_is_created_at_target_before_wm_fullscreen(self):
         screen = ScreenGeometry(index=0, x=0, y=0, width=1600, height=2560, name="HDMI-2")
-        other = types.SimpleNamespace(x=1600, y=0, width=1920, height=1080)
-        target = types.SimpleNamespace(x=0, y=0, width=1600, height=2560)
         state = {"rect": (1600, 0, 1920, 1080), "fullscreen": True}
-
-        class FakeDisplay:
-            def get_screens(self):
-                return [other, target]
-
-        display = FakeDisplay()
         captured = {}
 
         handle = types.SimpleNamespace(
-            display=display,
             _window=42,
             _x_screen_id=0,
             get_location=lambda: state["rect"][:2],
@@ -460,27 +450,20 @@ class ScreenConfigTests(unittest.TestCase):
 
         def create_window(**kwargs):
             captured["kwargs"] = kwargs
-            captured["screens"] = FakeDisplay().get_screens()
             return win
 
         visual = types.SimpleNamespace(Window=Mock(side_effect=create_window))
 
-        def set_fullscreen(_window_id, _x_screen, enabled):
-            state["fullscreen"] = enabled
-            if enabled and state["rect"][:2] == (0, 0):
-                state["rect"] = (0, 0, 1600, 2560)
-
         with (
             patch("bin.screen.sys.platform", "linux"),
-            patch("bin.screen._get_pyglet_display", return_value=display),
             patch(
                 "bin.screen._configure_x11_window",
                 side_effect=lambda *_args: state.update(rect=(0, 0, 1600, 2560)),
             ),
             patch("bin.screen._x11_window_rect", side_effect=lambda _win: state["rect"]),
+            patch("bin.screen._request_x11_compositor_bypass") as bypass,
             patch(
                 "bin.screen._set_x11_fullscreen_state",
-                side_effect=set_fullscreen,
             ) as fullscreen_state,
         ):
             opened = open_psychopy_window(
@@ -490,16 +473,13 @@ class ScreenConfigTests(unittest.TestCase):
             )
 
         self.assertIs(opened, win)
-        self.assertEqual(captured["kwargs"]["screen"], 0)
-        self.assertTrue(captured["kwargs"]["fullscr"])
+        self.assertFalse(captured["kwargs"]["fullscr"])
         self.assertEqual(captured["kwargs"]["size"], (1600, 2560))
+        self.assertEqual(captured["kwargs"]["pos"], (0, 0))
         self.assertFalse(captured["kwargs"]["checkTiming"])
-        self.assertIs(captured["screens"][0], target)
-        self.assertIs(FakeDisplay().get_screens()[0], other)
-        self.assertEqual(
-            fullscreen_state.call_args_list,
-            [call(42, 0, False), call(42, 0, True)],
-        )
+        self.assertNotIn("screen", captured["kwargs"])
+        bypass.assert_called_once_with(42)
+        fullscreen_state.assert_called_once_with(42, 0, True)
 
     def test_x11_fullscreen_state_waits_for_wm_acknowledgment(self):
         root = Mock()
@@ -535,22 +515,6 @@ class ScreenConfigTests(unittest.TestCase):
         x_window.get_full_property.assert_called_once_with(10, 0)
         connection.close.assert_called_once_with()
 
-    def test_psychopy_cache_is_synchronized_to_native_x11_size(self):
-        handle = types.SimpleNamespace(
-            _width=1920,
-            _height=1080,
-            get_size=lambda: (1920, 1080),
-            _update_view_size=Mock(),
-        )
-        backend = types.SimpleNamespace(setFullScr=Mock())
-        win = types.SimpleNamespace(winHandle=handle, backend=backend)
-
-        _sync_psychopy_window_size(win, 1600, 2560)
-
-        self.assertEqual((handle._width, handle._height), (1600, 2560))
-        handle._update_view_size.assert_called_once_with()
-        backend.setFullScr.assert_called_once_with(True)
-
     def test_linux_placement_uses_native_geometry_not_pyglet_cache(self):
         screen = ScreenGeometry(
             index=0,
@@ -570,12 +534,10 @@ class ScreenConfigTests(unittest.TestCase):
         with (
             patch("bin.screen.sys.platform", "linux"),
             patch("bin.screen._x11_window_rect", return_value=(0, 0, 1600, 2560)),
-            patch("bin.screen._sync_psychopy_window_size") as sync_size,
         ):
             placement = verify_psychopy_window_screen(win, screen)
 
         self.assertEqual(placement, "HDMI-2 at (0, 0, 1600, 2560)")
-        sync_size.assert_called_once_with(win, 1600, 2560)
 
     def test_psychopy_screen_requires_an_exact_geometry_match(self):
         screen = ScreenGeometry(index=0, x=1920, y=0, width=800, height=480, name="HDMI-2")

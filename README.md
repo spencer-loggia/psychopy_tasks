@@ -390,13 +390,13 @@ Each value can be a detected screen index or an output name such as `HDMI-1` or 
 Set either value to `null` to inherit the process environment defaults: `screens.main` reads `MAIN_SCREEN`, and
 `screens.experimenter` reads `SECONDARY_SCREEN`. The touch launcher exports its resolved global `screens` values
 to those environment variables for launched tasks.
-PsychoPy presentation windows default to true fullscreen. Output names are first resolved with xrandr, then matched
-to PsychoPy's pyglet screen list by exact position and size; the xrandr ordinal is not assumed to be PsychoPy's
-screen ordinal. If an X11 window manager places fullscreen on the wrong output, the same native window exits
-fullscreen, moves onto the selected output, and re-enters window-manager fullscreen without recreating its OpenGL
-context. Each realized fullscreen window is then checked against the selected rectangle and aborts with a display
-placement error if it remains on the wrong output or at the wrong size. The launcher, main-screen curtain, and
-experimenter controls likewise request true fullscreen after first being positioned on their assigned output.
+PsychoPy presentation windows default to true fullscreen. Output names are resolved with xrandr; the xrandr ordinal
+is not assumed to be PsychoPy's screen ordinal. On X11, the OpenGL window is created at the selected output's exact
+OS-reported position and size before compositor bypass and window-manager fullscreen are requested. Fullscreen
+acknowledgment and the realized native rectangle are both verified; opening aborts with a display-placement error
+if either check fails. This avoids creating the GLX drawable on one monitor and moving it to another afterward.
+The launcher, main-screen curtain, and experimenter controls likewise request true fullscreen after first being
+positioned on their assigned output.
 Display positions and sizes are read from the OS when each task starts. If display enumeration is unavailable, only
 the main display is created from the `1600x2560` fallback; detected OS dimensions always take precedence.
 For `active_foraging`, setting `screens.main` and `screens.experimenter` to the same display is allowed and disables

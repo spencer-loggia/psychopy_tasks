@@ -368,7 +368,6 @@ class ScreenConfigTests(unittest.TestCase):
                 return [other, target]
 
         display = FakeDisplay()
-        options = {}
         captured = {}
         win = types.SimpleNamespace(
             winHandle=types.SimpleNamespace(
@@ -381,14 +380,12 @@ class ScreenConfigTests(unittest.TestCase):
         def create_window(**kwargs):
             captured["kwargs"] = kwargs
             captured["screens"] = FakeDisplay().get_screens()
-            captured["override_redirect"] = options["xlib_fullscreen_override_redirect"]
             return win
 
         visual = types.SimpleNamespace(Window=Mock(side_effect=create_window))
         with (
             patch("bin.screen.sys.platform", "linux"),
             patch("bin.screen._get_pyglet_display", return_value=display),
-            patch("bin.screen._get_pyglet_options", return_value=options),
         ):
             opened = open_psychopy_window(
                 visual,
@@ -399,8 +396,6 @@ class ScreenConfigTests(unittest.TestCase):
         self.assertIs(opened, win)
         self.assertEqual(captured["kwargs"]["screen"], 0)
         self.assertIs(captured["screens"][0], target)
-        self.assertTrue(captured["override_redirect"])
-        self.assertNotIn("xlib_fullscreen_override_redirect", options)
         self.assertIs(FakeDisplay().get_screens()[0], other)
 
     def test_psychopy_screen_requires_an_exact_geometry_match(self):

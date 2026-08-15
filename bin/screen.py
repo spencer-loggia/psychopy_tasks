@@ -740,12 +740,6 @@ def _get_pyglet_display() -> Any:
     return canvas.get_display()
 
 
-def _get_pyglet_options() -> Dict[str, Any]:
-    import pyglet
-
-    return pyglet.options
-
-
 def _screen_rect(screen: Any) -> tuple[int, int, int, int]:
     return (
         int(screen.x),
@@ -794,19 +788,11 @@ def _bind_linux_pyglet_fullscreen(screen_info: ScreenGeometry):
             )
         return matches + [screen for screen in screens if screen is not matches[0]]
 
-    options = _get_pyglet_options()
-    option_name = "xlib_fullscreen_override_redirect"
-    previous_option = options.get(option_name, _UNSET)
     display_class.get_screens = target_first
-    options[option_name] = True
     try:
         yield
     finally:
         display_class.get_screens = original_get_screens
-        if previous_option is _UNSET:
-            options.pop(option_name, None)
-        else:
-            options[option_name] = previous_option
 
 
 def verify_psychopy_window_screen(win: Any, screen_info: ScreenGeometry) -> str:

@@ -366,6 +366,8 @@ def run_display_diagnostic(
     win = None
     monitor_refresh_rate_hz = None
     monitor_rate_detail = "main output was not resolved"
+    timing_refresh_rate_hz = None
+    timing_rate_detail = "timing output was not resolved"
     try:
         from bin.screen import (
             enforce_window_vsync,
@@ -396,9 +398,30 @@ def run_display_diagnostic(
             main_screen,
             fullscreen=True,
             timing_critical=True,
+            require_correct_placement=False,
             **win_kwargs,
         )
         placement_detail = win._neuro_tasks_screen_placement
+        placement_error = getattr(win, "_neuro_tasks_screen_placement_error", None)
+        if not isinstance(placement_error, str):
+            placement_error = None
+        primary_detail = getattr(win, "_neuro_tasks_primary_output", "")
+        if not isinstance(primary_detail, str):
+            primary_detail = ""
+        realized_screen = getattr(win, "_neuro_tasks_realized_screen", None)
+        if placement_error and realized_screen is not None:
+            timing_refresh_rate_hz, timing_rate_detail = query_main_monitor_refresh_rate(
+                realized_screen
+            )
+        elif placement_error:
+            timing_refresh_rate_hz = monitor_refresh_rate_hz
+            timing_rate_detail = (
+                "fallback main-output reference because the realized output could "
+                f"not be identified; {monitor_rate_detail}"
+            )
+        else:
+            timing_refresh_rate_hz = monitor_refresh_rate_hz
+            timing_rate_detail = monitor_rate_detail
         window_mode = getattr(
             win,
             "_neuro_tasks_fullscreen_path",
@@ -434,22 +457,33 @@ def run_display_diagnostic(
                 "PsychoPy could not place a fullscreen window on the resolved main monitor",
                 error=error,
             ),
-            _check("Vsync request", "skip", "Skipped because main-display placement failed"),
+            _check("Vsync request", "skip", "Skipped because the PsychoPy window could not be created"),
             refresh_check,
             _check(
                 "Flip synchronization",
                 "skip",
-                "Skipped because main-display placement failed",
+                "Skipped because the PsychoPy window could not be created",
             ),
         ]
         return checks, monitor_refresh_rate_hz, None
 
     try:
-        placement_check = _check(
-            "Main display placement",
-            "pass",
-            f"{window_mode} verified on {placement_detail}",
-        )
+        if placement_error:
+            placement_check = _check(
+                "Main display placement",
+                "fail",
+                (
+                    f"{window_mode} realized on {placement_detail}; timing checks "
+                    f"continue on that realized output; {primary_detail}"
+                ),
+                error=placement_error,
+            )
+        else:
+            placement_check = _check(
+                "Main display placement",
+                "pass",
+                f"{window_mode} verified on {placement_detail}; {primary_detail}",
+            )
         vsync_requested = bool(enforce_window_vsync(win)) and bool(
             getattr(win, "waitBlanking", False)
         )
@@ -477,7 +511,7 @@ def run_display_diagnostic(
                     "PsychoPy requested blocking vsync, but the driver reports "
                     f"swap interval {swap_interval} ({swap_interval_detail})"
                 ),
-                error="The main window was not acknowledged for one swap per refresh",
+                error="The diagnostic window was not acknowledged for one swap per refresh",
             )
         elif vsync_requested:
             vsync_check = _check(
@@ -490,7 +524,7 @@ def run_display_diagnostic(
             vsync_check = _check(
                 "Vsync request",
                 "fail",
-                "PsychoPy did not accept a blocking vsync request for the main monitor",
+                "PsychoPy did not accept a blocking vsync request for the diagnostic window",
                 error="waitBlanking/vsync could not be enabled on the active window backend",
             )
 
@@ -516,8 +550,8 @@ def run_display_diagnostic(
             if median_interval_s is not None and median_interval_s > 0.0
             else None
         )
+        refresh_rate_hz = monitor_refresh_rate_hz
         if monitor_refresh_rate_hz is None:
-            refresh_rate_hz = None
             estimate_detail = (
                 f" PsychoPy observed {psychopy_rate:.3f} Hz;"
                 if psychopy_rate is not None
@@ -535,31 +569,47 @@ def run_display_diagnostic(
                 ),
                 error=monitor_rate_detail,
             )
+        else:
+            observed = (
+                f"; PsychoPy observed {psychopy_rate:.3f} Hz"
+                if psychopy_rate is not None
+                else "; PsychoPy stable-rate measurement unavailable"
+            )
+            refresh_check = _check(
+                "Monitor refresh rate",
+                "pass",
+                (
+                    f"Main monitor refresh rate: {refresh_rate_hz:.3f} Hz "
+                    f"({monitor_rate_detail}){observed}"
+                ),
+            )
+
+        if timing_refresh_rate_hz is None:
+            psychopy_rate_text = (
+                f"{psychopy_rate:.3f} Hz" if psychopy_rate is not None else "unavailable"
+            )
+            interval_rate_text = (
+                f"{interval_rate:.3f} Hz" if interval_rate is not None else "unavailable"
+            )
             flip_check = _check(
                 "Flip synchronization",
-                "skip",
+                "fail",
                 (
-                    "Flip intervals were recorded, but lock cannot be confirmed without "
-                    "an independently measured main-monitor refresh rate"
+                    f"Recorded {len(intervals)} flip intervals; PsychoPy measured "
+                    f"{psychopy_rate_text}; median interval rate {interval_rate_text}. "
+                    "Lock cannot be confirmed without an independent monitor rate"
                 ),
+                error=timing_rate_detail,
             )
             return [placement_check, vsync_check, refresh_check, flip_check], refresh_rate_hz, None
 
-        refresh_rate_hz = monitor_refresh_rate_hz
-        source = monitor_rate_detail
-        observed = (
-            f"; PsychoPy observed {psychopy_rate:.3f} Hz"
-            if psychopy_rate is not None
-            else "; PsychoPy stable-rate measurement unavailable"
-        )
-        refresh_check = _check(
-            "Monitor refresh rate",
-            "pass",
-            f"Main monitor refresh rate: {refresh_rate_hz:.3f} Hz ({source}){observed}",
-        )
-
-        flip_passed, metrics = evaluate_flip_lock(refresh_rate_hz, intervals)
+        flip_passed, metrics = evaluate_flip_lock(timing_refresh_rate_hz, intervals)
         metrics["monitor_refresh_rate_hz"] = refresh_rate_hz
+        metrics["timing_output_refresh_rate_hz"] = timing_refresh_rate_hz
+        metrics["timing_output_name"] = str(
+            getattr(realized_screen, "name", "unmatched output") or "unmatched output"
+        )
+        metrics["main_display_placement_verified"] = not bool(placement_error)
         metrics["psychopy_measured_rate_hz"] = psychopy_rate
         metrics["observed_median_rate_hz"] = interval_rate
         metrics["glx_swap_interval"] = swap_interval
@@ -571,14 +621,22 @@ def run_display_diagnostic(
         interval_rate_text = (
             f"{interval_rate:.3f} Hz" if interval_rate is not None else "unavailable"
         )
+        if not placement_error:
+            timing_label = f"main output {getattr(main_screen, 'name', '')}"
+        elif realized_screen is not None:
+            timing_label = f"WRONG-OUTPUT TIMING ONLY ({placement_detail})"
+        else:
+            timing_label = f"UNMATCHED-OUTPUT TIMING ONLY ({placement_detail})"
         detail = (
-            f"{window_mode} window; target {refresh_rate_hz:.3f} Hz "
+            f"{timing_label}; {window_mode} window; "
+            f"target {timing_refresh_rate_hz:.3f} Hz "
             f"({metrics['expected_interval_ms']:.3f} ms); "
             f"PsychoPy measured {psychopy_rate_text}; median flip interval "
             f"{metrics['median_interval_ms']:.3f} ms ({interval_rate_text}); "
             f"{locked_percent:.1f}% of {metrics['sample_count']} intervals within "
             f"±{metrics['interval_tolerance_ms']:.3f} ms; "
             f"long/dropped intervals {metrics['dropped_interval_count']}"
+            f" ({timing_rate_detail})"
         )
         if flip_passed:
             flip_check = _check("Flip synchronization", "pass", detail)

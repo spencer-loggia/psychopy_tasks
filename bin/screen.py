@@ -240,6 +240,7 @@ class ScreenGeometry:
     height: int
     name: str = ""
     rotation: str = "normal"
+    primary: bool = False
 
 
 def parse_screen_selector(value: Any, name: str) -> ScreenSelector:
@@ -359,13 +360,13 @@ def _run_monitor_query(cmd: Sequence[str]) -> str:
 def _parse_xrandr_listactivemonitors(output: str) -> list[ScreenGeometry]:
     screens: list[ScreenGeometry] = []
     pattern = re.compile(
-        r"^\s*(\d+):\s+\S+\s+(\d+)(?:/\d+)?x(\d+)(?:/\d+)?([+-]\d+)([+-]\d+)\s+(\S+)\s*$"
+        r"^\s*(\d+):\s+(\S+)\s+(\d+)(?:/\d+)?x(\d+)(?:/\d+)?([+-]\d+)([+-]\d+)\s+(\S+)\s*$"
     )
     for line in output.splitlines():
         match = pattern.match(line)
         if not match:
             continue
-        index, width, height, x, y, name = match.groups()
+        index, flags, width, height, x, y, name = match.groups()
         screens.append(
             ScreenGeometry(
                 index=int(index),
@@ -374,6 +375,7 @@ def _parse_xrandr_listactivemonitors(output: str) -> list[ScreenGeometry]:
                 width=max(int(width), 1),
                 height=max(int(height), 1),
                 name=str(name or ""),
+                primary="*" in flags,
             )
         )
     return screens
@@ -382,13 +384,13 @@ def _parse_xrandr_listactivemonitors(output: str) -> list[ScreenGeometry]:
 def _parse_xrandr_query(output: str) -> list[ScreenGeometry]:
     screens: list[ScreenGeometry] = []
     pattern = re.compile(
-        r"^(\S+)\s+connected(?:\s+primary)?(?:\s+(\d+)x(\d+)\+(-?\d+)\+(-?\d+))?(?:\s+(normal|left|right|inverted))?"
+        r"^(\S+)\s+connected(\s+primary)?(?:\s+(\d+)x(\d+)\+(-?\d+)\+(-?\d+))?(?:\s+(normal|left|right|inverted))?"
     )
     for line in output.splitlines():
         match = pattern.match(line.strip())
         if not match:
             continue
-        name, width, height, x, y, rotation = match.groups()
+        name, primary, width, height, x, y, rotation = match.groups()
         if not width or not height:
             continue
         width_i = max(int(width), 1)
@@ -403,6 +405,7 @@ def _parse_xrandr_query(output: str) -> list[ScreenGeometry]:
                 height=height_i,
                 name=str(name or ""),
                 rotation=rotation_i,
+                primary=bool(primary),
             )
         )
     return screens
@@ -434,6 +437,7 @@ def _merge_screen_lists(
                 height=screen.height,
                 name=screen.name,
                 rotation=screen.rotation,
+                primary=screen.primary,
             )
             for index, screen in enumerate(override_screens)
         ]
@@ -478,6 +482,7 @@ def _merge_screen_lists(
                 height=override.height if override.height > 0 else base.height,
                 name=base.name or override.name,
                 rotation=override.rotation or base.rotation,
+                primary=override.primary or base.primary,
             )
         )
 
@@ -494,6 +499,7 @@ def _merge_screen_lists(
                 height=candidate.height,
                 name=candidate.name,
                 rotation=candidate.rotation,
+                primary=candidate.primary,
             )
         )
         next_index += 1
@@ -522,6 +528,62 @@ def get_monitor_screens() -> list[ScreenGeometry]:
 
     linux_active_screens = _get_linux_active_screens()
     return _merge_screen_lists(base_screens, linux_active_screens)
+
+
+def _find_matching_screen(
+    screens: Sequence[ScreenGeometry],
+    target: ScreenGeometry,
+) -> Optional[ScreenGeometry]:
+    if target.name:
+        aliases = _screen_name_aliases(target.name)
+        named = [
+            screen
+            for screen in screens
+            if screen.name and aliases & _screen_name_aliases(screen.name)
+        ]
+        if len(named) == 1:
+            return named[0]
+    target_rect = (target.x, target.y, target.width, target.height)
+    geometry_matches = [
+        screen
+        for screen in screens
+        if (screen.x, screen.y, screen.width, screen.height) == target_rect
+    ]
+    return geometry_matches[0] if len(geometry_matches) == 1 else None
+
+
+def ensure_x11_primary_output(screen_info: ScreenGeometry) -> str:
+    """Make the configured main output Xinerama screen 0 without changing geometry."""
+    if not sys.platform.startswith("linux"):
+        return "X11 primary-output selection is not required"
+    if not os.environ.get("DISPLAY"):
+        raise RuntimeError("X11 DISPLAY is not set")
+
+    current = _find_matching_screen(_get_linux_active_screens(), screen_info)
+    if current is None or not current.name:
+        raise RuntimeError(
+            f"xrandr could not match configured main output {screen_info.name or '<unnamed>'}"
+        )
+    if not current.primary:
+        try:
+            subprocess.run(
+                ["xrandr", "--output", current.name, "--primary"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except Exception as exc:
+            detail = getattr(exc, "stderr", None) or str(exc)
+            raise RuntimeError(
+                f"xrandr could not make {current.name} primary: {str(detail).strip()}"
+            ) from exc
+
+    confirmed = _find_matching_screen(_get_linux_active_screens(), screen_info)
+    if confirmed is None or not confirmed.primary:
+        raise RuntimeError(
+            f"xrandr did not confirm {current.name} as the primary output"
+        )
+    return f"{confirmed.name} is the confirmed XRandR primary output"
 
 
 def get_tk_screens(root) -> list[ScreenGeometry]:
@@ -641,6 +703,7 @@ def resolve_task_screens(
             height=_DEFAULT_MAIN_SIZE[1],
             name=main_screen.name,
             rotation=main_screen.rotation,
+            primary=main_screen.primary,
         )
 
     default_experimenter_index = None
@@ -742,6 +805,44 @@ def _match_screen_geometry(
     )
 
 
+@contextmanager
+def _bind_linux_pyglet_display(
+    screen_info: ScreenGeometry,
+    *,
+    strict: bool = True,
+):
+    """Make PsychoPy's newly opened X11 display enumerate the target first."""
+    import pyglet
+
+    original_display = pyglet.canvas.Display
+
+    def target_first_display(*args: Any, **kwargs: Any) -> Any:
+        display = original_display(*args, **kwargs)
+        screens = list(display.get_screens())
+        try:
+            _index, target = _match_screen_geometry(
+                screens,
+                screen_info,
+                source="Pyglet",
+            )
+        except RuntimeError:
+            if strict:
+                raise
+            return display
+        # Pyglet caches this list. Reorder the new display instance itself so
+        # PsychoPy's Linux-specific Display(x_screen=0) path selects target.
+        display._screens = [target] + [
+            screen for screen in screens if screen is not target
+        ]
+        return display
+
+    pyglet.canvas.Display = target_first_display
+    try:
+        yield
+    finally:
+        pyglet.canvas.Display = original_display
+
+
 def _set_x11_fullscreen_state(
     window_id: int,
     x_screen: int,
@@ -829,6 +930,24 @@ def _x11_window_rect(win: Any) -> tuple[int, int, int, int]:
         raise RuntimeError("X11 could not read PsychoPy's native window geometry")
     x, y = map(int, get_location())
     return x, y, int(attributes.width), int(attributes.height)
+
+
+def identify_psychopy_window_screen(
+    win: Any,
+) -> tuple[Optional[ScreenGeometry], tuple[int, int, int, int]]:
+    """Return the OS output exactly covered by a realized PsychoPy window."""
+    handle = getattr(win, "winHandle", None)
+    if sys.platform.startswith("linux"):
+        actual = _x11_window_rect(win)
+    else:
+        actual = (
+            *map(int, handle.get_location()),
+            *map(int, handle.get_size()),
+        )
+    matches = [
+        screen for screen in get_monitor_screens() if _screen_rect(screen) == actual
+    ]
+    return (matches[0] if len(matches) == 1 else None), actual
 
 
 def _configure_x11_window(win: Any, screen_info: ScreenGeometry) -> None:
@@ -958,7 +1077,7 @@ def _psychopy_window_kwargs(
             return {
                 "winType": "pyglet",
                 "fullscr": True,
-                "screen": int(screen_info.index),
+                "screen": 0,
             }
         # PsychoPy/pyglet can create an X11 fullscreen drawable on the wrong
         # CRTC and only then move it. For non-timing windows, create it at the
@@ -1000,6 +1119,7 @@ def open_psychopy_window(
     fullscreen: bool,
     size: Optional[Sequence[int]] = None,
     timing_critical: bool = False,
+    require_correct_placement: bool = True,
     **kwargs: Any,
 ) -> Any:
     """Open and verify a PsychoPy window on one resolved physical display."""
@@ -1021,6 +1141,15 @@ def open_psychopy_window(
     native_x11_fullscreen = bool(
         fullscreen and timing_critical and sys.platform.startswith("linux")
     )
+    primary_detail = "XRandR primary-output selection is not required"
+    if native_x11_fullscreen:
+        try:
+            primary_detail = ensure_x11_primary_output(screen_info)
+        except Exception as exc:
+            primary_detail = (
+                "XRandR primary-output selection failed: "
+                f"{type(exc).__name__}: {str(exc).strip()}"
+            )
     if fullscreen and not native_x11_fullscreen:
         window_kwargs["checkTiming"] = False
         if not sys.platform.startswith("linux"):
@@ -1030,19 +1159,38 @@ def open_psychopy_window(
                 screen_info,
                 source="Pyglet",
             )[0]
-    win = visual_module.Window(**window_kwargs)
+    if native_x11_fullscreen:
+        with _bind_linux_pyglet_display(
+            screen_info,
+            strict=require_correct_placement,
+        ):
+            win = visual_module.Window(**window_kwargs)
+    else:
+        win = visual_module.Window(**window_kwargs)
 
     if fullscreen:
+        placement_error = None
         try:
             placement = (
                 _wait_for_psychopy_window_screen(win, screen_info)
                 if native_x11_fullscreen
                 else _ensure_psychopy_window_screen(win, screen_info)
             )
-        except Exception:
-            win.close()
-            raise
+        except Exception as exc:
+            placement_error = f"{type(exc).__name__}: {str(exc).strip()}"
+            if require_correct_placement:
+                win.close()
+                raise
+            realized_screen, actual = identify_psychopy_window_screen(win)
+            realized_name = realized_screen.name if realized_screen is not None else "unmatched output"
+            placement = f"{realized_name} at {actual}"
+        else:
+            realized_screen, actual = screen_info, _screen_rect(screen_info)
         win._neuro_tasks_screen_placement = placement
+        win._neuro_tasks_screen_placement_error = placement_error
+        win._neuro_tasks_realized_screen = realized_screen
+        win._neuro_tasks_realized_rect = actual
+        win._neuro_tasks_primary_output = primary_detail
         win._neuro_tasks_fullscreen_path = (
             "native PsychoPy fullscreen"
             if native_x11_fullscreen
@@ -1232,10 +1380,11 @@ def describe_screen(screen_info: Optional[ScreenGeometry]) -> str:
         return "none"
     label = screen_info.name or f"screen{screen_info.index}"
     rotation = "" if screen_info.rotation == "normal" else f" rotation={screen_info.rotation}"
+    primary = " primary" if screen_info.primary else ""
     return (
         f"{label}(index={int(screen_info.index)} "
         f"size={int(screen_info.width)}x{int(screen_info.height)} "
-        f"pos={int(screen_info.x)},{int(screen_info.y)}{rotation})"
+        f"pos={int(screen_info.x)},{int(screen_info.y)}{rotation}{primary})"
     )
 
 

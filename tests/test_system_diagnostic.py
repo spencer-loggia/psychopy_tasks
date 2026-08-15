@@ -177,10 +177,11 @@ DSI-1 connected 1280x800+1920+0
 
         self.assertEqual(
             [check["status"] for check in checks],
-            ["pass", "pass", "fail", "skip"],
+            ["pass", "pass", "fail", "fail"],
         )
         self.assertIsNone(refresh_rate)
         self.assertIsNone(metrics)
+        self.assertIn("Recorded 120 flip intervals", checks[3]["detail"])
 
     def test_xrandr_rate_exposes_psychopy_every_other_refresh_failure(self):
         win = Mock()
@@ -226,7 +227,7 @@ DSI-1 connected 1280x800+1920+0
         self.assertIn("PsychoPy measured 28.827 Hz", checks[3]["detail"])
         self.assertIn("median interval error", checks[3]["error"])
 
-    def test_wrong_realized_monitor_stops_timing_but_reports_main_rate(self):
+    def test_window_creation_failure_stops_timing_but_reports_main_rate(self):
         win = Mock()
         visual = types.SimpleNamespace(Window=Mock(return_value=win))
 
@@ -256,6 +257,58 @@ DSI-1 connected 1280x800+1920+0
         self.assertEqual(refresh_rate, 60.33)
         self.assertIsNone(metrics)
         measure.assert_not_called()
+
+    def test_wrong_monitor_still_runs_labeled_timing_checks(self):
+        main = types.SimpleNamespace(name="HDMI-2")
+        realized = types.SimpleNamespace(name="HDMI-1")
+        win = Mock()
+        win._neuro_tasks_screen_placement = "HDMI-1 at (1600, 0, 1920, 1080)"
+        win._neuro_tasks_screen_placement_error = (
+            "RuntimeError: native window did not cover HDMI-2"
+        )
+        win._neuro_tasks_realized_screen = realized
+        win._neuro_tasks_fullscreen_path = "native PsychoPy fullscreen"
+        win.waitBlanking = True
+        win.getActualFrameRate.return_value = 60.0
+        visual = types.SimpleNamespace(Window=Mock(return_value=win))
+
+        with (
+            patch("bin.screen.load_screen_config", return_value={}),
+            patch("bin.screen.resolve_task_screens", return_value=(main, None)),
+            patch("bin.screen.open_psychopy_window", return_value=win) as open_window,
+            patch("bin.screen.enforce_window_vsync", return_value=True),
+            patch(
+                "task.system_diagnostic.query_glx_swap_interval",
+                return_value=(1, "GLX_EXT_swap_control"),
+            ),
+            patch("bin.task_lifecycle.signal_task_window_ready"),
+            patch(
+                "task.system_diagnostic.query_main_monitor_refresh_rate",
+                side_effect=[
+                    (60.33, "xrandr main HDMI-2"),
+                    (60.0, "xrandr realized HDMI-1"),
+                ],
+            ),
+            patch(
+                "task.system_diagnostic._measure_flip_intervals",
+                return_value=[1.0 / 60.0] * 120,
+            ) as measure,
+        ):
+            checks, refresh_rate, metrics = run_display_diagnostic(
+                cfg={},
+                visual_module=visual,
+            )
+
+        self.assertEqual(
+            [check["status"] for check in checks],
+            ["fail", "pass", "pass", "pass"],
+        )
+        self.assertEqual(refresh_rate, 60.33)
+        self.assertEqual(metrics["timing_output_name"], "HDMI-1")
+        self.assertFalse(metrics["main_display_placement_verified"])
+        self.assertIn("WRONG-OUTPUT TIMING ONLY", checks[3]["detail"])
+        measure.assert_called_once_with(win)
+        self.assertFalse(open_window.call_args.kwargs["require_correct_placement"])
 
     def test_report_places_refresh_rate_and_errors_in_completion_summary(self):
         report = format_diagnostic_report(

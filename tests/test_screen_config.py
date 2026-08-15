@@ -2,6 +2,7 @@ import os
 import queue
 import types
 import unittest
+from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
 from bin.screen import (
@@ -10,6 +11,8 @@ from bin.screen import (
     MainDisplayFrameTimingMonitor,
     SECONDARY_SCREEN_ENV,
     ScreenGeometry,
+    _bind_linux_pyglet_display,
+    _parse_xrandr_listactivemonitors,
     _parse_xrandr_query,
     _set_x11_fullscreen_state,
     build_reward_hit_boxes,
@@ -17,6 +20,7 @@ from bin.screen import (
     compute_centered_aspect_fit,
     configure_window_vsync,
     enforce_window_vsync,
+    ensure_x11_primary_output,
     format_experimenter_label,
     load_screen_config,
     open_psychopy_window,
@@ -32,6 +36,95 @@ from bin.screen import (
 
 
 class ScreenConfigTests(unittest.TestCase):
+    def test_xrandr_active_monitors_preserve_primary_flag(self):
+        screens = _parse_xrandr_listactivemonitors(
+            "Monitors: 2\n"
+            " 0: +*HDMI-2 1600/256x2560/160+0+0  HDMI-2\n"
+            " 1: +HDMI-1 1920/531x1080/299+1600+0  HDMI-1\n"
+        )
+
+        self.assertTrue(screens[0].primary)
+        self.assertFalse(screens[1].primary)
+
+    def test_configured_main_is_made_xrandr_primary(self):
+        target = ScreenGeometry(
+            index=1, x=0, y=0, width=1600, height=2560, name="HDMI-2"
+        )
+        before = [target]
+        after = [
+            ScreenGeometry(
+                index=0,
+                x=0,
+                y=0,
+                width=1600,
+                height=2560,
+                name="HDMI-2",
+                primary=True,
+            )
+        ]
+
+        with (
+            patch("bin.screen.sys.platform", "linux"),
+            patch.dict(os.environ, {"DISPLAY": ":0"}),
+            patch("bin.screen._get_linux_active_screens", side_effect=[before, after]),
+            patch("bin.screen.subprocess.run") as run,
+        ):
+            detail = ensure_x11_primary_output(target)
+
+        run.assert_called_once_with(
+            ["xrandr", "--output", "HDMI-2", "--primary"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertIn("confirmed XRandR primary", detail)
+
+    def test_psychopy_display_constructor_enumerates_target_first(self):
+        target_info = ScreenGeometry(
+            index=1, x=0, y=0, width=1600, height=2560, name="HDMI-2"
+        )
+        other = types.SimpleNamespace(x=1600, y=0, width=1920, height=1080)
+        target = types.SimpleNamespace(x=0, y=0, width=1600, height=2560)
+
+        class FakeDisplay:
+            def __init__(self, *args, **kwargs):
+                self._screens = None
+
+            def get_screens(self):
+                return self._screens or [other, target]
+
+        pyglet = types.ModuleType("pyglet")
+        pyglet.canvas = types.SimpleNamespace(Display=FakeDisplay)
+
+        with patch.dict("sys.modules", {"pyglet": pyglet}):
+            with _bind_linux_pyglet_display(target_info):
+                display = pyglet.canvas.Display(x_screen=0)
+                self.assertIs(display.get_screens()[0], target)
+
+        self.assertIs(pyglet.canvas.Display, FakeDisplay)
+
+    def test_psychopy_display_constructor_can_fall_back_for_diagnostic(self):
+        target_info = ScreenGeometry(
+            index=0, x=0, y=0, width=1600, height=2560, name="HDMI-2"
+        )
+        other = types.SimpleNamespace(x=1600, y=0, width=1920, height=1080)
+
+        class FakeDisplay:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def get_screens(self):
+                return [other]
+
+        pyglet = types.ModuleType("pyglet")
+        pyglet.canvas = types.SimpleNamespace(Display=FakeDisplay)
+
+        with patch.dict("sys.modules", {"pyglet": pyglet}):
+            with _bind_linux_pyglet_display(target_info, strict=False):
+                display = pyglet.canvas.Display(x_screen=0)
+
+        self.assertEqual(display.get_screens(), [other])
+
     def test_configure_window_vsync_can_disable_experimenter_blocking(self):
         class WindowHandle:
             def __init__(self):
@@ -504,6 +597,14 @@ class ScreenConfigTests(unittest.TestCase):
 
         with (
             patch("bin.screen.sys.platform", "linux"),
+            patch(
+                "bin.screen.ensure_x11_primary_output",
+                return_value="HDMI-2 is primary",
+            ),
+            patch(
+                "bin.screen._bind_linux_pyglet_display",
+                return_value=nullcontext(),
+            ),
             patch("bin.screen._x11_window_rect", return_value=(0, 0, 1600, 2560)),
             patch("bin.screen._enter_x11_fullscreen") as enter_fullscreen,
         ):
@@ -520,6 +621,45 @@ class ScreenConfigTests(unittest.TestCase):
         self.assertNotIn("pos", captured)
         self.assertNotIn("checkTiming", captured)
         enter_fullscreen.assert_not_called()
+
+    def test_verified_native_placement_survives_primary_command_failure(self):
+        screen = ScreenGeometry(
+            index=0,
+            x=0,
+            y=0,
+            width=1600,
+            height=2560,
+            name="HDMI-2",
+        )
+        win = types.SimpleNamespace(close=Mock())
+        visual = types.SimpleNamespace(Window=Mock(return_value=win))
+
+        with (
+            patch("bin.screen.sys.platform", "linux"),
+            patch(
+                "bin.screen.ensure_x11_primary_output",
+                side_effect=RuntimeError("xrandr failed"),
+            ),
+            patch(
+                "bin.screen._bind_linux_pyglet_display",
+                return_value=nullcontext(),
+            ),
+            patch(
+                "bin.screen._wait_for_psychopy_window_screen",
+                return_value="HDMI-2 at (0, 0, 1600, 2560)",
+            ),
+        ):
+            opened = open_psychopy_window(
+                visual,
+                screen,
+                fullscreen=True,
+                timing_critical=True,
+            )
+
+        self.assertIs(opened, win)
+        self.assertIsNone(win._neuro_tasks_screen_placement_error)
+        self.assertIn("xrandr failed", win._neuro_tasks_primary_output)
+        win.close.assert_not_called()
 
     def test_x11_fullscreen_state_waits_for_wm_acknowledgment(self):
         root = Mock()
@@ -650,6 +790,7 @@ class ScreenConfigTests(unittest.TestCase):
         main = select_screen(screens, "HDMI-2", role="main")
         self.assertEqual((main.width, main.height), (1600, 2560))
         self.assertEqual(main.rotation, "right")
+        self.assertTrue(main.primary)
 
     def test_fullscreen_scene_size_uses_rotated_framebuffer_size(self):
         screen = ScreenGeometry(

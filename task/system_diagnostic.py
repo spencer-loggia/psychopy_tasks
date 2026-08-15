@@ -391,14 +391,21 @@ def run_display_diagnostic(
             "allowStencil": False,
             "waitBlanking": True,
         }
-        window_mode = "fullscreen"
         win = open_psychopy_window(
             visual_module,
             main_screen,
             fullscreen=True,
+            timing_critical=True,
             **win_kwargs,
         )
         placement_detail = win._neuro_tasks_screen_placement
+        window_mode = getattr(
+            win,
+            "_neuro_tasks_fullscreen_path",
+            "native PsychoPy fullscreen",
+        )
+        if not isinstance(window_mode, str):
+            window_mode = "native PsychoPy fullscreen"
         signal_task_window_ready()
     except Exception as exc:
         error = _error_text(exc)
@@ -441,7 +448,7 @@ def run_display_diagnostic(
         placement_check = _check(
             "Main display placement",
             "pass",
-            f"Fullscreen PsychoPy window verified on {placement_detail}",
+            f"{window_mode} verified on {placement_detail}",
         )
         vsync_requested = bool(enforce_window_vsync(win)) and bool(
             getattr(win, "waitBlanking", False)

@@ -948,11 +948,21 @@ def _psychopy_window_kwargs(
     *,
     fullscreen: bool,
     size: Optional[Sequence[int]],
+    timing_critical: bool,
 ) -> Dict[str, Any]:
     if fullscreen:
+        if sys.platform.startswith("linux") and timing_critical:
+            # Preserve PsychoPy's native fullscreen/GLX presentation path.
+            # Moving that drawable between X11 outputs after creation breaks
+            # reliable refresh locking on the target output.
+            return {
+                "winType": "pyglet",
+                "fullscr": True,
+                "screen": int(screen_info.index),
+            }
         # PsychoPy/pyglet can create an X11 fullscreen drawable on the wrong
-        # CRTC and only then move it. Create it at the final geometry first;
-        # _enter_x11_fullscreen applies and verifies real EWMH fullscreen.
+        # CRTC and only then move it. For non-timing windows, create it at the
+        # final geometry before applying and verifying EWMH fullscreen.
         x11 = sys.platform.startswith("linux")
         kwargs: Dict[str, Any] = {"winType": "pyglet", "fullscr": not x11}
         if screen_info.width > 0 and screen_info.height > 0:
@@ -989,6 +999,7 @@ def open_psychopy_window(
     *,
     fullscreen: bool,
     size: Optional[Sequence[int]] = None,
+    timing_critical: bool = False,
     **kwargs: Any,
 ) -> Any:
     """Open and verify a PsychoPy window on one resolved physical display."""
@@ -1003,10 +1014,14 @@ def open_psychopy_window(
             screen_info,
             fullscreen=fullscreen,
             size=size,
+            timing_critical=timing_critical,
         )
     )
 
-    if fullscreen:
+    native_x11_fullscreen = bool(
+        fullscreen and timing_critical and sys.platform.startswith("linux")
+    )
+    if fullscreen and not native_x11_fullscreen:
         window_kwargs["checkTiming"] = False
         if not sys.platform.startswith("linux"):
             screens = list(_get_pyglet_display().get_screens())
@@ -1019,11 +1034,20 @@ def open_psychopy_window(
 
     if fullscreen:
         try:
-            placement = _ensure_psychopy_window_screen(win, screen_info)
+            placement = (
+                _wait_for_psychopy_window_screen(win, screen_info)
+                if native_x11_fullscreen
+                else _ensure_psychopy_window_screen(win, screen_info)
+            )
         except Exception:
             win.close()
             raise
         win._neuro_tasks_screen_placement = placement
+        win._neuro_tasks_fullscreen_path = (
+            "native PsychoPy fullscreen"
+            if native_x11_fullscreen
+            else "window-manager fullscreen"
+        )
     return win
 
 

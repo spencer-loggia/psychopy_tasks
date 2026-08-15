@@ -481,6 +481,46 @@ class ScreenConfigTests(unittest.TestCase):
         bypass.assert_called_once_with(42)
         fullscreen_state.assert_called_once_with(42, 0, True)
 
+    def test_linux_timing_window_uses_native_psychopy_fullscreen(self):
+        screen = ScreenGeometry(
+            index=0,
+            x=0,
+            y=0,
+            width=1600,
+            height=2560,
+            name="HDMI-2",
+        )
+        captured = {}
+        win = types.SimpleNamespace(
+            winHandle=types.SimpleNamespace(
+                get_location=lambda: (0, 0),
+                get_size=lambda: (1600, 2560),
+            ),
+            close=Mock(),
+        )
+        visual = types.SimpleNamespace(
+            Window=lambda **kwargs: captured.update(kwargs) or win
+        )
+
+        with (
+            patch("bin.screen.sys.platform", "linux"),
+            patch("bin.screen._x11_window_rect", return_value=(0, 0, 1600, 2560)),
+            patch("bin.screen._enter_x11_fullscreen") as enter_fullscreen,
+        ):
+            open_psychopy_window(
+                visual,
+                screen,
+                fullscreen=True,
+                timing_critical=True,
+            )
+
+        self.assertTrue(captured["fullscr"])
+        self.assertEqual(captured["screen"], 0)
+        self.assertNotIn("size", captured)
+        self.assertNotIn("pos", captured)
+        self.assertNotIn("checkTiming", captured)
+        enter_fullscreen.assert_not_called()
+
     def test_x11_fullscreen_state_waits_for_wm_acknowledgment(self):
         root = Mock()
         connection = Mock()

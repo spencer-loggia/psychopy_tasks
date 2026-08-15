@@ -390,11 +390,12 @@ Each value can be a detected screen index or an output name such as `HDMI-1` or 
 Set either value to `null` to inherit the process environment defaults: `screens.main` reads `MAIN_SCREEN`, and
 `screens.experimenter` reads `SECONDARY_SCREEN`. The touch launcher exports its resolved global `screens` values
 to those environment variables for launched tasks.
-PsychoPy presentation windows default to true fullscreen. Output names are resolved with xrandr; the xrandr ordinal
-is not assumed to be PsychoPy's screen ordinal. On X11, the OpenGL window is created at the selected output's exact
-OS-reported position and size before compositor bypass and window-manager fullscreen are requested. Fullscreen
-acknowledgment and the realized native rectangle are both verified; opening aborts with a display-placement error
-if either check fails. This avoids creating the GLX drawable on one monitor and moving it to another afterward.
+PsychoPy presentation windows default to true fullscreen. Timing-critical X11 windows use PsychoPy's native
+fullscreen path on the resolved OS screen index and must realize directly on the selected output; they are never
+moved between outputs after their GLX context is created. Non-timing experimenter windows are created at their
+output's exact OS-reported rectangle before compositor bypass and window-manager fullscreen are requested.
+The realized native rectangle is verified in both cases, and opening aborts with a display-placement error if the
+selected output is not covered exactly.
 The launcher, main-screen curtain, and experimenter controls likewise request true fullscreen after first being
 positioned on their assigned output.
 Display positions and sizes are read from the OS when each task starts. If display enumeration is unavailable, only

@@ -12,6 +12,7 @@ from bin.screen import (
     ScreenGeometry,
     _parse_xrandr_query,
     _set_x11_fullscreen_state,
+    _sync_psychopy_window_size,
     build_reward_hit_boxes,
     compute_aspect_cover_size,
     compute_centered_aspect_fit,
@@ -445,15 +446,10 @@ class ScreenConfigTests(unittest.TestCase):
         display = FakeDisplay()
         captured = {}
 
-        def set_location(x, y):
-            if not state["fullscreen"]:
-                state["rect"] = (x, y, *state["rect"][2:])
-
         handle = types.SimpleNamespace(
             display=display,
             _window=42,
             _x_screen_id=0,
-            set_location=set_location,
             get_location=lambda: state["rect"][:2],
             get_size=lambda: state["rect"][2:],
         )
@@ -477,6 +473,11 @@ class ScreenConfigTests(unittest.TestCase):
         with (
             patch("bin.screen.sys.platform", "linux"),
             patch("bin.screen._get_pyglet_display", return_value=display),
+            patch(
+                "bin.screen._configure_x11_window",
+                side_effect=lambda *_args: state.update(rect=(0, 0, 1600, 2560)),
+            ),
+            patch("bin.screen._x11_window_rect", side_effect=lambda _win: state["rect"]),
             patch(
                 "bin.screen._set_x11_fullscreen_state",
                 side_effect=set_fullscreen,
@@ -534,6 +535,48 @@ class ScreenConfigTests(unittest.TestCase):
         x_window.get_full_property.assert_called_once_with(10, 0)
         connection.close.assert_called_once_with()
 
+    def test_psychopy_cache_is_synchronized_to_native_x11_size(self):
+        handle = types.SimpleNamespace(
+            _width=1920,
+            _height=1080,
+            get_size=lambda: (1920, 1080),
+            _update_view_size=Mock(),
+        )
+        backend = types.SimpleNamespace(setFullScr=Mock())
+        win = types.SimpleNamespace(winHandle=handle, backend=backend)
+
+        _sync_psychopy_window_size(win, 1600, 2560)
+
+        self.assertEqual((handle._width, handle._height), (1600, 2560))
+        handle._update_view_size.assert_called_once_with()
+        backend.setFullScr.assert_called_once_with(True)
+
+    def test_linux_placement_uses_native_geometry_not_pyglet_cache(self):
+        screen = ScreenGeometry(
+            index=0,
+            x=0,
+            y=0,
+            width=1600,
+            height=2560,
+            name="HDMI-2",
+        )
+        win = types.SimpleNamespace(
+            winHandle=types.SimpleNamespace(
+                get_location=lambda: (0, 0),
+                get_size=lambda: (1920, 1080),
+            )
+        )
+
+        with (
+            patch("bin.screen.sys.platform", "linux"),
+            patch("bin.screen._x11_window_rect", return_value=(0, 0, 1600, 2560)),
+            patch("bin.screen._sync_psychopy_window_size") as sync_size,
+        ):
+            placement = verify_psychopy_window_screen(win, screen)
+
+        self.assertEqual(placement, "HDMI-2 at (0, 0, 1600, 2560)")
+        sync_size.assert_called_once_with(win, 1600, 2560)
+
     def test_psychopy_screen_requires_an_exact_geometry_match(self):
         screen = ScreenGeometry(index=0, x=1920, y=0, width=800, height=480, name="HDMI-2")
         display = types.SimpleNamespace(
@@ -561,7 +604,10 @@ class ScreenConfigTests(unittest.TestCase):
             )
         )
 
-        with self.assertRaisesRegex(RuntimeError, "not main output HDMI-2"):
+        with (
+            patch("bin.screen.sys.platform", "darwin"),
+            self.assertRaisesRegex(RuntimeError, "not main output HDMI-2"),
+        ):
             verify_psychopy_window_screen(win, screen)
 
     def test_realized_psychopy_window_confirms_requested_screen(self):
@@ -573,10 +619,11 @@ class ScreenConfigTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(
-            verify_psychopy_window_screen(win, screen),
-            "HDMI-2 at (1920, 0, 800, 480)",
-        )
+        with patch("bin.screen.sys.platform", "darwin"):
+            self.assertEqual(
+                verify_psychopy_window_screen(win, screen),
+                "HDMI-2 at (1920, 0, 800, 480)",
+            )
 
     def test_tk_window_is_positioned_before_true_fullscreen(self):
         screen = ScreenGeometry(

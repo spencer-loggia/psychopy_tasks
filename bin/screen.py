@@ -811,26 +811,62 @@ def _set_x11_fullscreen_state(
         connection.close()
 
 
+def _x11_window_rect(win: Any) -> tuple[int, int, int, int]:
+    import ctypes
+    from pyglet.libs.x11 import xlib
+
+    handle = getattr(win, "winHandle", None)
+    get_location = getattr(handle, "get_location", None)
+    x_display = getattr(handle, "_x_display", None)
+    window_id = getattr(handle, "_window", None)
+    if not callable(get_location) or x_display is None or window_id is None:
+        raise RuntimeError("PsychoPy's native X11 geometry is unavailable")
+
+    attributes = xlib.XWindowAttributes()
+    if not xlib.XGetWindowAttributes(
+        x_display,
+        window_id,
+        ctypes.byref(attributes),
+    ):
+        raise RuntimeError("X11 could not read PsychoPy's native window geometry")
+    x, y = map(int, get_location())
+    return x, y, int(attributes.width), int(attributes.height)
+
+
+def _configure_x11_window(win: Any, screen_info: ScreenGeometry) -> None:
+    from pyglet.libs.x11 import xlib
+
+    handle = getattr(win, "winHandle", None)
+    x_display = getattr(handle, "_x_display", None)
+    window_id = getattr(handle, "_window", None)
+    if x_display is None or window_id is None:
+        raise RuntimeError("PsychoPy's native X11 window is unavailable")
+    xlib.XMoveResizeWindow(
+        x_display,
+        window_id,
+        int(screen_info.x),
+        int(screen_info.y),
+        int(screen_info.width),
+        int(screen_info.height),
+    )
+    xlib.XSync(x_display, False)
+
+
 def _move_x11_window_to_screen(
     win: Any,
     screen_info: ScreenGeometry,
     *,
     timeout_s: float = 1.0,
 ) -> None:
-    handle = getattr(win, "winHandle", None)
-    set_location = getattr(handle, "set_location", None)
-    get_location = getattr(handle, "get_location", None)
-    if not callable(set_location) or not callable(get_location):
-        raise RuntimeError("PsychoPy's X11 window cannot be moved between displays")
-
     target_x, target_y = int(screen_info.x), int(screen_info.y)
     deadline = time.monotonic() + float(timeout_s)
     while True:
-        set_location(target_x, target_y)
+        _configure_x11_window(win, screen_info)
+        handle = getattr(win, "winHandle", None)
         dispatch = getattr(handle, "dispatch_events", None)
         if callable(dispatch):
             dispatch()
-        x, y = map(int, get_location())
+        x, y, _width, _height = _x11_window_rect(win)
         if (
             target_x <= x < target_x + int(screen_info.width)
             and target_y <= y < target_y + int(screen_info.height)
@@ -853,6 +889,22 @@ def _reenter_x11_fullscreen(win: Any, screen_info: ScreenGeometry) -> None:
     _set_x11_fullscreen_state(window_id, x_screen, False)
     _move_x11_window_to_screen(win, screen_info)
     _set_x11_fullscreen_state(window_id, x_screen, True)
+    _configure_x11_window(win, screen_info)
+
+
+def _sync_psychopy_window_size(win: Any, width: int, height: int) -> None:
+    handle = getattr(win, "winHandle", None)
+    cached_size = getattr(handle, "get_size", lambda: (width, height))()
+    if tuple(map(int, cached_size)) == (width, height):
+        return
+    handle._width, handle._height = int(width), int(height)
+    update_view = getattr(handle, "_update_view_size", None)
+    if callable(update_view):
+        update_view()
+    backend = getattr(win, "backend", None) or getattr(win, "_backend", None)
+    set_fullscreen = getattr(backend, "setFullScr", None)
+    if callable(set_fullscreen):
+        set_fullscreen(True)
 
 
 def verify_psychopy_window_screen(win: Any, screen_info: ScreenGeometry) -> str:
@@ -863,13 +915,25 @@ def verify_psychopy_window_screen(win: Any, screen_info: ScreenGeometry) -> str:
     if not callable(get_location) or not callable(get_size):
         raise RuntimeError("PsychoPy's pyglet window does not expose its realized geometry")
 
-    actual = (*map(int, get_location()), *map(int, get_size()))
+    actual = (
+        _x11_window_rect(win)
+        if sys.platform.startswith("linux")
+        else (*map(int, get_location()), *map(int, get_size()))
+    )
     expected = _screen_rect(screen_info)
     if actual != expected:
-        raise RuntimeError(
-            f"PsychoPy window realized at {actual}, not main output "
-            f"{screen_info.name or '<unnamed>'} at {expected}"
+        cached = tuple(map(int, get_size()))
+        cache_detail = (
+            f"; pyglet cached size {cached}"
+            if sys.platform.startswith("linux") and cached != actual[2:]
+            else ""
         )
+        raise RuntimeError(
+            f"PsychoPy native window realized at {actual}, not main output "
+            f"{screen_info.name or '<unnamed>'} at {expected}{cache_detail}"
+        )
+    if sys.platform.startswith("linux"):
+        _sync_psychopy_window_size(win, actual[2], actual[3])
     return f"{screen_info.name or 'main output'} at {expected}"
 
 

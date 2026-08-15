@@ -4,9 +4,11 @@ from unittest.mock import Mock, patch
 
 from interface.touch_interface import format_diagnostic_report
 from task.system_diagnostic import (
+    _measure_flip_phase,
     evaluate_flip_lock,
     parse_xrandr_active_refresh_rate,
     pin_diagnostic_to_cpu_zero,
+    prepare_diagnostic_affinity,
     probe_gpio,
     probe_piplate,
     query_main_monitor_refresh_rate,
@@ -60,6 +62,28 @@ DSI-1 connected 1280x800+1920+0
         self.assertEqual(metrics["locked_fraction"], 0.0)
         self.assertEqual(metrics["dropped_interval_count"], 120)
 
+    def test_flip_phase_reports_retraces_per_completed_swap(self):
+        with (
+            patch(
+                "task.system_diagnostic.query_glx_sync_values",
+                side_effect=[
+                    ({"ust": 1_000_000, "msc": 60, "sbc": 10}, "OML"),
+                    ({"ust": 3_000_000, "msc": 180, "sbc": 70}, "OML"),
+                ],
+            ),
+            patch(
+                "task.system_diagnostic._measure_flip_intervals",
+                return_value=[1.0 / 30.0] * 60,
+            ),
+        ):
+            _intervals, progress, detail = _measure_flip_phase(Mock())
+
+        self.assertEqual(detail, "OML")
+        self.assertEqual(progress["delta_msc"], 120)
+        self.assertEqual(progress["delta_sbc"], 60)
+        self.assertEqual(progress["msc_per_completed_swap"], 2.0)
+        self.assertEqual(progress["msc_rate_hz"], 60.0)
+
     def test_gpio_probe_opens_and_closes_chip_zero(self):
         calls = []
         fake_lgpio = types.SimpleNamespace(
@@ -102,11 +126,32 @@ DSI-1 connected 1280x800+1920+0
         self.assertEqual(result["status"], "pass")
         set_affinity.assert_called_once_with([0])
 
+    def test_diagnostic_stages_window_creation_off_cpu_zero(self):
+        plan = {
+            "supported": True,
+            "main_cpu_affinity": [0],
+            "worker_cpu_affinity": [1, 2, 3],
+        }
+        with (
+            patch(
+                "bin.affinity.build_main_and_worker_affinity_plan",
+                return_value=plan,
+            ),
+            patch(
+                "bin.affinity.set_process_cpu_affinity",
+                return_value=(True, "current process cpu_affinity=[1,2,3]"),
+            ) as set_affinity,
+        ):
+            actual_plan, preparation = prepare_diagnostic_affinity()
+
+        self.assertIs(actual_plan, plan)
+        self.assertTrue(preparation[0])
+        set_affinity.assert_called_once_with([1, 2, 3])
+
     def test_display_diagnostic_compares_independent_flips_to_measured_rate(self):
         win = Mock()
         win._neuro_tasks_screen_placement = "HDMI-1 at (0, 0, 1920, 1080)"
         win.waitBlanking = True
-        win.getActualFrameRate.return_value = 120.0
         visual = types.SimpleNamespace(Window=Mock(return_value=win))
 
         with (
@@ -145,7 +190,6 @@ DSI-1 connected 1280x800+1920+0
         win = Mock()
         win._neuro_tasks_screen_placement = "HDMI-1 at (0, 0, 1920, 1080)"
         win.waitBlanking = True
-        win.getActualFrameRate.return_value = None
         visual = types.SimpleNamespace(Window=Mock(return_value=win))
 
         with (
@@ -187,7 +231,6 @@ DSI-1 connected 1280x800+1920+0
         win = Mock()
         win._neuro_tasks_screen_placement = "HDMI-1 at (0, 0, 1920, 1080)"
         win.waitBlanking = True
-        win.getActualFrameRate.return_value = 28.827
         visual = types.SimpleNamespace(Window=Mock(return_value=win))
 
         with (
@@ -224,7 +267,7 @@ DSI-1 connected 1280x800+1920+0
         )
         self.assertIn("swap interval 2", checks[1]["detail"])
         self.assertEqual(metrics["locked_fraction"], 0.0)
-        self.assertIn("PsychoPy measured 28.827 Hz", checks[3]["detail"])
+        self.assertIn("simple-flip median 31.253 ms (31.997 Hz)", checks[3]["detail"])
         self.assertIn("median interval error", checks[3]["error"])
 
     def test_window_creation_failure_stops_timing_but_reports_main_rate(self):
@@ -269,7 +312,6 @@ DSI-1 connected 1280x800+1920+0
         win._neuro_tasks_realized_screen = realized
         win._neuro_tasks_fullscreen_path = "native PsychoPy fullscreen"
         win.waitBlanking = True
-        win.getActualFrameRate.return_value = 60.0
         visual = types.SimpleNamespace(Window=Mock(return_value=win))
 
         with (

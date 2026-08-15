@@ -43,7 +43,11 @@ from interface.experiment_manager import (
     task_run_sequence,
 )
 from interface.experiment_quiet_mode import create_experiment_quiet_mode
-from bin.task_lifecycle import TASK_WINDOW_READY_ENV, USER_EXIT_CODE
+from bin.task_lifecycle import (
+    TASK_WINDOW_READY_ENV,
+    TASK_WINDOW_RELEASE_ENV,
+    USER_EXIT_CODE,
+)
 from interface.x11_idle_guard import (
     ExperimentIdleGuard,
     create_experiment_idle_guard,
@@ -645,6 +649,7 @@ class TouchInterfaceApp:
                 temp_path = Path(temp_dir)
                 result_path = temp_path / "result.json"
                 ready_path = temp_path / ".task_window_ready"
+                release_path = temp_path / ".task_window_released"
                 cmd = [
                     self.python_cmd,
                     str(diagnostic_path),
@@ -656,6 +661,7 @@ class TouchInterfaceApp:
                 env = os.environ.copy()
                 if self.idle_guard is not None:
                     env[TASK_WINDOW_READY_ENV] = str(ready_path)
+                    env[TASK_WINDOW_RELEASE_ENV] = str(release_path)
 
                 process = subprocess.Popen(cmd, cwd=self.working_dir, env=env)
                 try:
@@ -663,6 +669,9 @@ class TouchInterfaceApp:
                         process,
                         ready_path=(
                             ready_path if self.idle_guard is not None else None
+                        ),
+                        release_path=(
+                            release_path if self.idle_guard is not None else None
                         ),
                         on_window_ready=(
                             self.idle_guard.task_window_ready
@@ -932,9 +941,13 @@ class TouchInterfaceApp:
         self.status_var.set(f"Running block {block.block_num}: {block.block_name}")
         self._hide_interface_for_process()
         ready_path = block.output_dir / ".task_window_ready"
+        release_path = block.output_dir / ".task_window_released"
+        ready_path.unlink(missing_ok=True)
+        release_path.unlink(missing_ok=True)
         env = self.experiment.subprocess_environment(block)
         if self.idle_guard is not None:
             env[TASK_WINDOW_READY_ENV] = str(ready_path)
+            env[TASK_WINDOW_RELEASE_ENV] = str(release_path)
         process: Optional[subprocess.Popen] = None
         try:
             process = subprocess.Popen(
@@ -946,6 +959,9 @@ class TouchInterfaceApp:
                 returncode = wait_for_task_process(
                     process,
                     ready_path=ready_path if self.idle_guard is not None else None,
+                    release_path=(
+                        release_path if self.idle_guard is not None else None
+                    ),
                     on_window_ready=(
                         self.idle_guard.task_window_ready
                         if self.idle_guard is not None
@@ -963,7 +979,10 @@ class TouchInterfaceApp:
                 try:
                     ready_path.unlink(missing_ok=True)
                 finally:
-                    self.experiment.finish_block(block)
+                    try:
+                        release_path.unlink(missing_ok=True)
+                    finally:
+                        self.experiment.finish_block(block)
 
     def _run_task(self, task_name: str, task_cfg: Dict[str, Any]) -> None:
         if self.task_active:

@@ -63,6 +63,18 @@ def set_window_mouse_visible(win, visible: bool) -> bool:
     return applied
 
 
+def activate_psychopy_window(win) -> bool:
+    """Best-effort activation of a PsychoPy window's native handle."""
+    try:
+        activate = getattr(getattr(win, "winHandle", None), "activate", None)
+        if callable(activate):
+            activate()
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def configure_window_vsync(win, enabled: bool) -> bool:
     """Configure blanking waits and the native swap interval when available."""
     applied = False
@@ -94,6 +106,24 @@ def enforce_window_vsync(win) -> bool:
     return configure_window_vsync(win, True)
 
 
+def measure_window_flip_rate(
+    win,
+    *,
+    warmup_frames: int = 10,
+    sample_frames: int = 60,
+) -> Optional[float]:
+    """Measure a low-overhead median rate from consecutive blank flips."""
+    for _ in range(max(0, int(warmup_frames))):
+        win.flip()
+    timestamps = []
+    for _ in range(max(1, int(sample_frames)) + 1):
+        win.flip()
+        timestamps.append(time.perf_counter())
+    intervals = np.diff(timestamps)
+    intervals = intervals[np.isfinite(intervals) & (intervals > 0.0)]
+    return float(1.0 / np.median(intervals)) if intervals.size else None
+
+
 def resolve_window_frame_rate(
     win,
     *,
@@ -103,18 +133,8 @@ def resolve_window_frame_rate(
     fallback_fps: float = 60.0,
 ) -> tuple[float, float]:
     """Measure main-window flips and compare them with an optional override."""
-    measured_fps = None
     try:
-        measured_fps = win.getActualFrameRate(
-            nIdentical=20,
-            nMaxFrames=120,
-            nWarmUpFrames=10,
-            threshold=1,
-        )
-        if measured_fps is not None:
-            measured_fps = float(measured_fps)
-            if not np.isfinite(measured_fps) or measured_fps <= 0.0:
-                measured_fps = None
+        measured_fps = measure_window_flip_rate(win)
     except Exception:
         measured_fps = None
 
@@ -928,6 +948,7 @@ def open_psychopy_window(
             allow_same_screen=True,
         )[0]
     window_kwargs = dict(kwargs)
+    window_kwargs.setdefault("checkTiming", False)
     window_kwargs.update(
         _psychopy_window_kwargs(
             screen_info,

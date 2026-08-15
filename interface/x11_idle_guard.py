@@ -256,6 +256,7 @@ def wait_for_task_process(
     process: subprocess.Popen,
     *,
     ready_path: Optional[Path] = None,
+    release_path: Optional[Path] = None,
     on_window_ready: Optional[Callable[[], None]] = None,
     poll_interval_s: float = 0.025,
 ) -> int:
@@ -270,6 +271,8 @@ def wait_for_task_process(
             and ready_path.is_file()
         ):
             on_window_ready()
+            if release_path is not None:
+                release_path.write_text("released\n", encoding="utf-8")
             window_released = True
             continue
         try:

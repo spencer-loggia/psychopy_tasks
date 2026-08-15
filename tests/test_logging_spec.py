@@ -2,12 +2,18 @@ import csv
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from bin.logger import EventCodeLibrary, MessageLogger, SessionClock, SessionLogBundle, load_task_event_definitions
-from bin.task_lifecycle import TASK_WINDOW_READY_ENV, signal_task_window_ready
+from bin.task_lifecycle import (
+    TASK_WINDOW_READY_ENV,
+    TASK_WINDOW_RELEASE_ENV,
+    signal_task_window_ready,
+)
 
 
 class LoggingSpecTests(unittest.TestCase):
@@ -19,6 +25,55 @@ class LoggingSpecTests(unittest.TestCase):
             ready_path = Path(tmpdir) / "task-ready"
             with patch.dict(os.environ, {TASK_WINDOW_READY_ENV: str(ready_path)}):
                 self.assertTrue(signal_task_window_ready())
+            self.assertEqual(ready_path.read_text(encoding="utf-8"), "ready\n")
+
+    def test_task_window_signal_waits_for_a_fresh_launcher_release(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ready_path = Path(tmpdir) / "task-ready"
+            release_path = Path(tmpdir) / "task-released"
+            release_path.write_text("stale\n", encoding="utf-8")
+            finished = threading.Event()
+
+            def signal() -> None:
+                signal_task_window_ready()
+                finished.set()
+
+            with patch.dict(
+                os.environ,
+                {
+                    TASK_WINDOW_READY_ENV: str(ready_path),
+                    TASK_WINDOW_RELEASE_ENV: str(release_path),
+                },
+            ):
+                thread = threading.Thread(target=signal)
+                thread.start()
+                deadline = time.monotonic() + 1.0
+                while not ready_path.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.001)
+                self.assertTrue(ready_path.is_file())
+                self.assertFalse(finished.is_set())
+                release_path.write_text("released\n", encoding="utf-8")
+                thread.join(timeout=1.0)
+
+            self.assertTrue(finished.is_set())
+
+    def test_task_window_signal_times_out_without_launcher_release(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ready_path = Path(tmpdir) / "task-ready"
+            release_path = Path(tmpdir) / "task-released"
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        TASK_WINDOW_READY_ENV: str(ready_path),
+                        TASK_WINDOW_RELEASE_ENV: str(release_path),
+                    },
+                ),
+                patch("bin.task_lifecycle.time.monotonic", side_effect=[0.0, 11.0]),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "launcher to uncover"):
+                    signal_task_window_ready()
+
             self.assertEqual(ready_path.read_text(encoding="utf-8"), "ready\n")
 
     def test_session_bundle_exposes_optional_calibration_path(self):

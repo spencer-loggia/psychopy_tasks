@@ -162,16 +162,40 @@ class X11IdleGuardTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             ready_path = Path(tmpdir) / "ready"
-            callback = Mock()
+            release_path = Path(tmpdir) / "released"
+            callback = Mock(
+                side_effect=lambda: self.assertFalse(release_path.exists())
+            )
             returncode = wait_for_task_process(
                 FakeProcess(ready_path),
                 ready_path=ready_path,
+                release_path=release_path,
                 on_window_ready=callback,
                 poll_interval_s=0.01,
             )
+            release_text = release_path.read_text(encoding="utf-8")
 
         self.assertEqual(returncode, 0)
         callback.assert_called_once_with()
+        self.assertEqual(release_text, "released\n")
+
+    def test_process_wait_does_not_acknowledge_failed_window_release(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ready_path = Path(tmpdir) / "ready"
+            release_path = Path(tmpdir) / "released"
+            ready_path.write_text("ready\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "curtain failure"):
+                wait_for_task_process(
+                    Mock(),
+                    ready_path=ready_path,
+                    release_path=release_path,
+                    on_window_ready=Mock(
+                        side_effect=RuntimeError("curtain failure")
+                    ),
+                )
+
+            self.assertFalse(release_path.exists())
 
     def test_interface_block_passes_ready_marker_and_restores_idle_guard(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -216,12 +240,20 @@ class X11IdleGuardTests(unittest.TestCase):
             str(block.output_dir / ".task_window_ready"),
         )
         self.assertEqual(
+            child_env["NEURO_TASK_WINDOW_RELEASE_PATH"],
+            str(block.output_dir / ".task_window_released"),
+        )
+        self.assertEqual(
             wait_for_process.call_args.kwargs["ready_path"],
             block.output_dir / ".task_window_ready",
         )
         self.assertIs(
             wait_for_process.call_args.kwargs["on_window_ready"],
             app.idle_guard.task_window_ready,
+        )
+        self.assertEqual(
+            wait_for_process.call_args.kwargs["release_path"],
+            block.output_dir / ".task_window_released",
         )
         app.idle_guard.enter_idle.assert_called_once_with()
         app.experiment.finish_block.assert_called_once_with(block)

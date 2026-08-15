@@ -21,6 +21,7 @@ from bin.screen import (
     enforce_window_vsync,
     format_experimenter_label,
     load_screen_config,
+    measure_window_flip_rate,
     open_psychopy_window,
     reward_level_color,
     resolve_window_frame_rate,
@@ -133,32 +134,47 @@ class ScreenConfigTests(unittest.TestCase):
 
     def test_refresh_override_is_measured_and_compared(self):
         win = Mock()
-        win.getActualFrameRate.return_value = 59.94
         logger = Mock()
 
-        fps, frame_duration = resolve_window_frame_rate(
-            win,
-            configured_fps=60.0,
-            msg_logger=logger,
-            context="match2cue",
-        )
+        with patch("bin.screen.measure_window_flip_rate", return_value=59.94):
+            fps, frame_duration = resolve_window_frame_rate(
+                win,
+                configured_fps=60.0,
+                msg_logger=logger,
+                context="match2cue",
+            )
 
         self.assertEqual(fps, 60.0)
         self.assertAlmostEqual(frame_duration, 1.0 / 60.0)
         messages = [call.args[1] for call in logger.log.call_args_list]
         self.assertTrue(any("status=match" in message for message in messages))
 
+    def test_low_overhead_flip_rate_uses_post_flip_timestamps(self):
+        win = Mock()
+        with patch(
+            "bin.screen.time.perf_counter",
+            side_effect=[0.0, 1.0 / 60.0, 2.0 / 60.0, 3.0 / 60.0],
+        ):
+            measured = measure_window_flip_rate(
+                win,
+                warmup_frames=2,
+                sample_frames=3,
+            )
+
+        self.assertAlmostEqual(measured, 60.0)
+        self.assertEqual(win.flip.call_count, 6)
+
     def test_refresh_override_logs_mismatch_but_remains_authoritative(self):
         win = Mock()
-        win.getActualFrameRate.return_value = 28.3
         logger = Mock()
 
-        fps, _ = resolve_window_frame_rate(
-            win,
-            configured_fps=60.0,
-            msg_logger=logger,
-            context="active_foraging",
-        )
+        with patch("bin.screen.measure_window_flip_rate", return_value=28.3):
+            fps, _ = resolve_window_frame_rate(
+                win,
+                configured_fps=60.0,
+                msg_logger=logger,
+                context="active_foraging",
+            )
 
         self.assertEqual(fps, 60.0)
         logger.log.assert_any_call(
@@ -550,7 +566,7 @@ class ScreenConfigTests(unittest.TestCase):
         self.assertEqual(captured["screen"], 0)
         self.assertNotIn("size", captured)
         self.assertNotIn("pos", captured)
-        self.assertNotIn("checkTiming", captured)
+        self.assertFalse(captured["checkTiming"])
         self.assertEqual(
             opened._neuro_tasks_fullscreen_path,
             "native managed PsychoPy fullscreen",

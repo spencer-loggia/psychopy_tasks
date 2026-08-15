@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import ctypes
-import ctypes.util
 import importlib
 import json
 import math
@@ -21,6 +19,8 @@ from typing import Any, Iterable, Mapping, Optional
 _project_root = Path(__file__).resolve().parents[1]
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
+
+from bin.glx_timing import query_glx_swap_interval, query_glx_sync_values
 
 
 DEFAULT_DAQ_ADDRESS = 0
@@ -140,7 +140,27 @@ def probe_piplate(
         )
 
 
-def pin_diagnostic_to_cpu_zero() -> dict[str, Any]:
+def prepare_diagnostic_affinity() -> tuple[dict[str, Any], tuple[bool, str]]:
+    """Stage GL/window initialization off the presentation core."""
+    from bin.affinity import (
+        build_main_and_worker_affinity_plan,
+        set_process_cpu_affinity,
+    )
+
+    plan = build_main_and_worker_affinity_plan(main_core=0)
+    if not plan.get("supported"):
+        return plan, (False, str(plan.get("reason") or "CPU affinity is unavailable"))
+    worker_cores = plan.get("worker_cpu_affinity") or []
+    if not worker_cores:
+        return plan, (True, str(plan.get("warning") or "no worker cores available"))
+    return plan, set_process_cpu_affinity(worker_cores)
+
+
+def pin_diagnostic_to_cpu_zero(
+    affinity_plan: Optional[Mapping[str, Any]] = None,
+    *,
+    preparation: Optional[tuple[bool, str]] = None,
+) -> dict[str, Any]:
     """Pin the timing-diagnostic process to the presentation CPU."""
     try:
         from bin.affinity import (
@@ -148,16 +168,31 @@ def pin_diagnostic_to_cpu_zero() -> dict[str, Any]:
             set_process_cpu_affinity,
         )
 
-        plan = build_main_and_worker_affinity_plan(main_core=0)
+        plan = (
+            dict(affinity_plan)
+            if affinity_plan is not None
+            else build_main_and_worker_affinity_plan(main_core=0)
+        )
         if not plan.get("supported"):
             raise RuntimeError(str(plan.get("reason") or "CPU affinity is unavailable"))
-        applied, detail = set_process_cpu_affinity([0])
+        main_cores = plan.get("main_cpu_affinity") or [0]
+        applied, detail = set_process_cpu_affinity(main_cores)
         if not applied:
             raise RuntimeError(detail)
+        if preparation is not None and not preparation[0]:
+            raise RuntimeError(
+                f"{detail}; GL/window initialization was not staged off CPU 0: "
+                f"{preparation[1]}"
+            )
+        preparation_detail = (
+            f"; before window creation: {preparation[1]}"
+            if preparation is not None
+            else ""
+        )
         return _check(
             "CPU 0 affinity",
             "pass",
-            f"Diagnostic frame-timing process pinned successfully: {detail}",
+            f"Diagnostic frame-timing process pinned successfully: {detail}{preparation_detail}",
         )
     except Exception as exc:
         error = _error_text(exc)
@@ -269,59 +304,29 @@ def query_main_monitor_refresh_rate(
     )
 
 
-def query_glx_swap_interval() -> tuple[Optional[int], str]:
-    """Read the swap interval acknowledged for the current X11 drawable."""
-    if not sys.platform.startswith("linux"):
-        return None, "native GLX swap-interval queries are available only on Linux/X11"
-    try:
-        libgl = ctypes.CDLL(ctypes.util.find_library("GL") or "libGL.so.1")
-        libx11 = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+def _measure_flip_phase(
+    win,
+) -> tuple[list[float], Optional[dict[str, float | int]], str]:
+    before, before_detail = query_glx_sync_values()
+    intervals = _measure_flip_intervals(win)
+    after, after_detail = query_glx_sync_values()
 
-        libgl.glXGetCurrentDisplay.restype = ctypes.c_void_p
-        libgl.glXGetCurrentDrawable.restype = ctypes.c_ulong
-        display = libgl.glXGetCurrentDisplay()
-        drawable = libgl.glXGetCurrentDrawable()
-        if not display or not drawable:
-            return None, "the PsychoPy window has no current GLX display/drawable"
-
-        libx11.XDefaultScreen.argtypes = [ctypes.c_void_p]
-        libx11.XDefaultScreen.restype = ctypes.c_int
-        libgl.glXQueryExtensionsString.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        libgl.glXQueryExtensionsString.restype = ctypes.c_char_p
-        raw_extensions = libgl.glXQueryExtensionsString(
-            display,
-            libx11.XDefaultScreen(display),
-        )
-        extensions = set((raw_extensions or b"").decode("ascii", "replace").split())
-
-        if "GLX_EXT_swap_control" in extensions:
-            value = ctypes.c_uint()
-            libgl.glXQueryDrawable.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_ulong,
-                ctypes.c_int,
-                ctypes.POINTER(ctypes.c_uint),
-            ]
-            libgl.glXQueryDrawable(
-                display,
-                drawable,
-                0x20F1,  # GLX_SWAP_INTERVAL_EXT
-                ctypes.byref(value),
-            )
-            return int(value.value), "GLX_EXT_swap_control"
-
-        if "GLX_MESA_swap_control" in extensions:
-            libgl.glXGetProcAddressARB.argtypes = [ctypes.c_char_p]
-            libgl.glXGetProcAddressARB.restype = ctypes.c_void_p
-            address = libgl.glXGetProcAddressARB(b"glXGetSwapIntervalMESA")
-            if address:
-                get_interval = ctypes.CFUNCTYPE(ctypes.c_int)(address)
-                return int(get_interval()), "GLX_MESA_swap_control"
-            return None, "GLX_MESA_swap_control is advertised but not callable"
-
-        return None, "the current GLX driver exposes no queryable swap-control extension"
-    except Exception as exc:
-        return None, f"GLX swap-interval query failed: {_error_text(exc)}"
+    if before is None or after is None:
+        return intervals, None, before_detail if before is None else after_detail
+    delta_ust = int(after["ust"]) - int(before["ust"])
+    delta_msc = int(after["msc"]) - int(before["msc"])
+    delta_sbc = int(after["sbc"]) - int(before["sbc"])
+    progress: dict[str, float | int] = {
+        "delta_ust_us": delta_ust,
+        "delta_msc": delta_msc,
+        "delta_sbc": delta_sbc,
+        "submitted_swaps": FLIP_WARMUP_FRAMES + FLIP_TEST_INTERVALS + 1,
+    }
+    if delta_ust > 0:
+        progress["msc_rate_hz"] = delta_msc * 1_000_000.0 / delta_ust
+    if delta_sbc > 0:
+        progress["msc_per_completed_swap"] = delta_msc / delta_sbc
+    return intervals, progress, after_detail
 
 
 def _measure_flip_intervals(win, *, interval_count: int = FLIP_TEST_INTERVALS) -> list[float]:
@@ -362,14 +367,22 @@ def run_display_diagnostic(
     *,
     cfg: Mapping[str, Any],
     visual_module: object,
+    affinity_plan: Optional[Mapping[str, Any]] = None,
+    affinity_preparation: Optional[tuple[bool, str]] = None,
 ) -> tuple[list[dict[str, Any]], Optional[float], Optional[dict[str, Any]]]:
     win = None
     monitor_refresh_rate_hz = None
     monitor_rate_detail = "main output was not resolved"
     timing_refresh_rate_hz = None
     timing_rate_detail = "timing output was not resolved"
+    affinity_check = None
+
+    def _with_affinity(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return ([affinity_check] if affinity_check is not None else []) + checks
+
     try:
         from bin.screen import (
+            activate_psychopy_window,
             enforce_window_vsync,
             load_screen_config,
             open_psychopy_window,
@@ -429,8 +442,20 @@ def run_display_diagnostic(
         if not isinstance(window_mode, str):
             window_mode = "native PsychoPy fullscreen"
         signal_task_window_ready()
+        activate_psychopy_window(win)
+        if affinity_plan is not None:
+            affinity_check = pin_diagnostic_to_cpu_zero(
+                affinity_plan,
+                preparation=affinity_preparation,
+            )
     except Exception as exc:
         error = _error_text(exc)
+        if affinity_plan is not None and affinity_check is None:
+            affinity_check = _check(
+                "CPU 0 affinity",
+                "skip",
+                "Skipped because no main-display frame checks could run",
+            )
         if win is not None:
             try:
                 win.close()
@@ -464,7 +489,7 @@ def run_display_diagnostic(
                 "Skipped because the PsychoPy window could not be created",
             ),
         ]
-        return checks, monitor_refresh_rate_hz, None
+        return _with_affinity(checks), monitor_refresh_rate_hz, None
 
     try:
         if placement_error:
@@ -498,8 +523,8 @@ def run_display_diagnostic(
                 "Vsync request",
                 "pass",
                 (
-                    "PsychoPy requested blocking vsync and the driver acknowledged "
-                    f"swap interval 1 ({swap_interval_detail})"
+                    "PsychoPy requested vsync and the driver stored swap interval 1 "
+                    f"({swap_interval_detail}); completed-swap timing is checked separately"
                 ),
             )
         elif vsync_requested and swap_interval is not None:
@@ -510,7 +535,7 @@ def run_display_diagnostic(
                     "PsychoPy requested blocking vsync, but the driver reports "
                     f"swap interval {swap_interval} ({swap_interval_detail})"
                 ),
-                error="The diagnostic window was not acknowledged for one swap per refresh",
+                error="The diagnostic window did not store the requested swap interval 1",
             )
         elif vsync_requested:
             vsync_check = _check(
@@ -527,22 +552,7 @@ def run_display_diagnostic(
                 error="waitBlanking/vsync could not be enabled on the active window backend",
             )
 
-        psychopy_rate = None
-        try:
-            measured = win.getActualFrameRate(
-                nIdentical=20,
-                nMaxFrames=180,
-                nWarmUpFrames=20,
-                threshold=1,
-            )
-            if measured is not None:
-                measured = float(measured)
-                if math.isfinite(measured) and measured > 0.0:
-                    psychopy_rate = measured
-        except Exception:
-            pass
-
-        intervals = _measure_flip_intervals(win)
+        intervals, sync_progress, sync_progress_detail = _measure_flip_phase(win)
         median_interval_s = statistics.median(intervals) if intervals else None
         interval_rate = (
             1.0 / float(median_interval_s)
@@ -552,11 +562,7 @@ def run_display_diagnostic(
         refresh_rate_hz = monitor_refresh_rate_hz
         if monitor_refresh_rate_hz is None:
             estimate_detail = (
-                f" PsychoPy observed {psychopy_rate:.3f} Hz;"
-                if psychopy_rate is not None
-                else ""
-            ) + (
-                f" the diagnostic intervals suggest {interval_rate:.3f} Hz."
+                f" PsychoPy simple flips observed {interval_rate:.3f} Hz."
                 if interval_rate is not None else ""
             )
             refresh_check = _check(
@@ -570,8 +576,8 @@ def run_display_diagnostic(
             )
         else:
             observed = (
-                f"; PsychoPy observed {psychopy_rate:.3f} Hz"
-                if psychopy_rate is not None
+                f"; PsychoPy simple flips observed {interval_rate:.3f} Hz"
+                if interval_rate is not None
                 else "; PsychoPy stable-rate measurement unavailable"
             )
             refresh_check = _check(
@@ -584,9 +590,6 @@ def run_display_diagnostic(
             )
 
         if timing_refresh_rate_hz is None:
-            psychopy_rate_text = (
-                f"{psychopy_rate:.3f} Hz" if psychopy_rate is not None else "unavailable"
-            )
             interval_rate_text = (
                 f"{interval_rate:.3f} Hz" if interval_rate is not None else "unavailable"
             )
@@ -594,13 +597,15 @@ def run_display_diagnostic(
                 "Flip synchronization",
                 "fail",
                 (
-                    f"Recorded {len(intervals)} flip intervals; PsychoPy measured "
-                    f"{psychopy_rate_text}; median interval rate {interval_rate_text}. "
+                    f"Recorded {len(intervals)} flip intervals; median interval rate "
+                    f"{interval_rate_text}. "
                     "Lock cannot be confirmed without an independent monitor rate"
                 ),
                 error=timing_rate_detail,
             )
-            return [placement_check, vsync_check, refresh_check, flip_check], refresh_rate_hz, None
+            return _with_affinity(
+                [placement_check, vsync_check, refresh_check, flip_check]
+            ), refresh_rate_hz, None
 
         flip_passed, metrics = evaluate_flip_lock(timing_refresh_rate_hz, intervals)
         metrics["monitor_refresh_rate_hz"] = refresh_rate_hz
@@ -609,14 +614,12 @@ def run_display_diagnostic(
             getattr(realized_screen, "name", "unmatched output") or "unmatched output"
         )
         metrics["main_display_placement_verified"] = not bool(placement_error)
-        metrics["psychopy_measured_rate_hz"] = psychopy_rate
         metrics["observed_median_rate_hz"] = interval_rate
         metrics["glx_swap_interval"] = swap_interval
+        metrics["glx_sync_progress"] = sync_progress
+        metrics["glx_sync_progress_detail"] = sync_progress_detail
         metrics["window_mode"] = window_mode
         locked_percent = float(metrics["locked_fraction"]) * 100.0
-        psychopy_rate_text = (
-            f"{psychopy_rate:.3f} Hz" if psychopy_rate is not None else "unavailable"
-        )
         interval_rate_text = (
             f"{interval_rate:.3f} Hz" if interval_rate is not None else "unavailable"
         )
@@ -630,13 +633,33 @@ def run_display_diagnostic(
             f"{timing_label}; {window_mode} window; "
             f"target {timing_refresh_rate_hz:.3f} Hz "
             f"({metrics['expected_interval_ms']:.3f} ms); "
-            f"PsychoPy measured {psychopy_rate_text}; median flip interval "
-            f"{metrics['median_interval_ms']:.3f} ms ({interval_rate_text}); "
+            f"simple-flip median {metrics['median_interval_ms']:.3f} ms "
+            f"({interval_rate_text}); "
             f"{locked_percent:.1f}% of {metrics['sample_count']} intervals within "
             f"±{metrics['interval_tolerance_ms']:.3f} ms; "
             f"long/dropped intervals {metrics['dropped_interval_count']}"
             f" ({timing_rate_detail})"
         )
+        if sync_progress is not None:
+            msc_per_swap = sync_progress.get("msc_per_completed_swap")
+            msc_rate = sync_progress.get("msc_rate_hz")
+            detail += (
+                f"; GLX counters ΔMSC={sync_progress['delta_msc']}, "
+                f"ΔSBC={sync_progress['delta_sbc']} completed / "
+                f"{sync_progress['submitted_swaps']} submitted"
+                + (
+                    f", {float(msc_per_swap):.3f} GLX retraces/completed swap"
+                    if msc_per_swap is not None
+                    else ""
+                )
+                + (
+                    f", counter rate {float(msc_rate):.3f} Hz"
+                    if msc_rate is not None
+                    else ""
+                )
+            )
+        else:
+            detail += f"; GLX presentation counters unavailable ({sync_progress_detail})"
         if flip_passed:
             flip_check = _check("Flip synchronization", "pass", detail)
         else:
@@ -657,7 +680,9 @@ def run_display_diagnostic(
                 detail,
                 error="; ".join(failure_reasons),
             )
-        return [placement_check, vsync_check, refresh_check, flip_check], refresh_rate_hz, metrics
+        return _with_affinity(
+            [placement_check, vsync_check, refresh_check, flip_check]
+        ), refresh_rate_hz, metrics
     except Exception as exc:
         error = _error_text(exc)
         if monitor_refresh_rate_hz is not None:
@@ -684,7 +709,7 @@ def run_display_diagnostic(
             refresh_check,
             _check("Flip synchronization", "skip", "Timing diagnostic did not complete"),
         ]
-        return checks, monitor_refresh_rate_hz, None
+        return _with_affinity(checks), monitor_refresh_rate_hz, None
     finally:
         if win is not None:
             try:
@@ -712,10 +737,6 @@ def run_system_diagnostic(cfg: Mapping[str, Any]) -> dict[str, Any]:
             )
         )
 
-    # Match active_foraging's timing-critical placement before opening the
-    # PsychoPy window or measuring any main-display flips.
-    checks.append(pin_diagnostic_to_cpu_zero())
-
     refresh_rate_hz = None
     flip_metrics = None
     if visual_module is None:
@@ -723,9 +744,12 @@ def run_system_diagnostic(cfg: Mapping[str, Any]) -> dict[str, Any]:
             _skipped_display_checks("Skipped because PsychoPy is unavailable")
         )
     else:
+        affinity_plan, affinity_preparation = prepare_diagnostic_affinity()
         display_checks, refresh_rate_hz, flip_metrics = run_display_diagnostic(
             cfg=cfg,
             visual_module=visual_module,
+            affinity_plan=affinity_plan,
+            affinity_preparation=affinity_preparation,
         )
         checks.extend(display_checks)
 

@@ -27,6 +27,7 @@ import threading
 from psychopy import visual, event
 import time
 from .screen import (
+    activate_psychopy_window,
     build_reward_hit_boxes,
     compute_aspect_cover_size,
     configure_window_vsync,
@@ -131,13 +132,6 @@ def setup_window(
         size=size,
         **win_kwargs,
     )
-    handle = getattr(win, "winHandle", None)
-    activate = getattr(handle, "activate", None)
-    if callable(activate):
-        try:
-            activate()
-        except Exception:
-            pass
     sync_request_applied = (
         enforce_window_vsync(win)
         if sync_to_refresh
@@ -147,6 +141,7 @@ def setup_window(
         sync_to_refresh and sync_request_applied
     )
     signal_task_window_ready()
+    activate_psychopy_window(win)
     return win
 
 
@@ -768,8 +763,8 @@ def resolve_frame_rate(
 def detect_frame_rate(win: visual.Window, msg_logger=None) -> Tuple[float, float]:
     """Detect the display refresh rate and return (fps, frameDur_s).
 
-    Attempts to use Window.getActualFrameRate(); falls back to 60 Hz if unavailable.
-    Logs detection to the optional message logger.
+    Uses low-overhead blank flips and falls back to 60 Hz if unavailable.
+    Logs the result to the optional message logger.
     """
     return resolve_frame_rate(win, msg_logger=msg_logger)
 

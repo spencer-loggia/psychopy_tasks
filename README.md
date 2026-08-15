@@ -102,13 +102,15 @@ menu; Desktop, Shutdown, and mode switching are available only from that root me
 
 Run System Diagnostic uses the configured `environment.python` interpreter and does not create an experiment or
 block. It checks that PsychoPy can import, `lgpio` can open GPIO chip 0, and the Pi-Plates DAQC2 driver can read the
-board supply voltage on ADC channel 8. It then pins the diagnostic subprocess to CPU 0, reads the resolved main
-output's starred active-mode refresh rate from `xrandr`, opens a PsychoPy window on that output, requests blocking
-vsync, confirms that the X11/GLX driver acknowledged swap interval 1, and records 120 independent flip intervals.
-PsychoPy's `getActualFrameRate()` result is reported separately as an observed flip rate; it is never substituted
-for the main output's xrandr hardware rate. The flip-lock check passes when at least 90% of those intervals match
-one hardware refresh and the median interval also matches
-the expected frame period. The completion dialog always includes the monitor refresh rate (or `unavailable`) and a
+board supply voltage on ADC channel 8. It creates the GL/window stack on worker cores, waits until the launcher has
+uncovered and released the main window, then pins the timing process to CPU 0. The diagnostic reads the resolved
+main output's starred active-mode refresh rate from `xrandr`, requests blocking vsync, confirms that the X11/GLX
+driver stored swap interval 1, and records 120 low-overhead PsychoPy flip intervals. PsychoPy's implicit
+constructor timing test is disabled; the reported observed rate comes from this same controlled flip population
+and is never substituted for the main output's xrandr hardware rate. When `GLX_OML_sync_control` is available, the
+report also includes GLX retrace and completed-swap deltas. The flip-lock check passes when at least 90% of those
+intervals match one hardware refresh and the median interval also matches the expected frame period. The
+completion dialog always includes the monitor refresh rate (or `unavailable`) and a
 per-check list, followed by explicit errors for failed checks. If native fullscreen placement fails but a window
 exists, vsync and flip timing still run. Results on an identified different output are labeled
 `WRONG-OUTPUT TIMING ONLY` and use that output's independently queried xrandr rate. An unmatched window uses the
@@ -139,9 +141,10 @@ Experiment-managed task/subprocess policies:
   option and are not used by the Raspberry Pi interface.
 - A state-producing task writes `calibration.json` in its block directory. Its top-level keys are state-field names,
   and each value is an object containing at least the subfields declared by that state history.
-- When main-input masking is enabled, a task that opens a subject window must signal readiness only after that
-  window exists and has requested focus. Tasks using `bin.utils.setup_window()` do this automatically. A task with
-  a custom window implementation must call `bin.task_lifecycle.signal_task_window_ready()` itself.
+- When main-input masking is enabled, a task must signal readiness after its subject window exists but before
+  timing-sensitive work. The call waits for the launcher to remove the curtain; the task then activates the
+  window. `bin.utils.setup_window()` handles this sequence. A custom window must call
+  `bin.task_lifecycle.signal_task_window_ready()` and activate its native handle afterward.
 
 X11 Main-Screen Idle Masking
 ----------------------------
@@ -171,8 +174,10 @@ fields:
 
 While the interface is idle, the manager runs `xinput disable` only for that named touchscreen and covers the main
 display with a fullscreen black window. The experimenter touchscreen and physical mouse are not modified. A task
-subprocess creates and focuses its main window, then emits a private readiness marker. The manager removes the
-black window, maps the touchscreen to the resolved main RandR output with `xinput map-to-output`, and enables it.
+subprocess creates its main window, then emits a private readiness marker. The manager removes the black window,
+maps the touchscreen to the resolved main RandR output with `xinput map-to-output`, enables it, and acknowledges
+release. The task waits for that acknowledgment and then activates its window before beginning timing-sensitive
+work.
 After every block—including errors and user exits—the manager disables the touchscreen again, restores the black
 window, and returns focus to the interface. Choosing **Desktop**, closing the interface window, or otherwise
 leaving the interface normally re-enables the touchscreen before exit.
@@ -397,13 +402,15 @@ to those environment variables for the diagnostic and launched tasks. Resolution
 then the current process's config (`screens.main`/`screens.experimenter`, including legacy aliases), then the
 environment. Output names such as `HDMI-2` are rig configuration values, not constants in the display code.
 PsychoPy presentation windows default to true fullscreen. Main X11 windows use PsychoPy's native,
-window-manager-controlled fullscreen path, preserving the GLX path that produced reliable refresh locking. Before
+window-manager-controlled fullscreen path without post-creation moves or resizing. Before
 launching a task or diagnostic, the interface is withdrawn from the experimenter output so the window manager does
 not relocate the new fullscreen window to that active display. The configured output is matched by exact geometry
 before PsychoPy's Linux `screen=0` workaround reorders the Pyglet view. The non-vsync experimenter preview uses the
 same native fullscreen creation with scoped override-redirect so it remains on its configured output without
 altering the subject window's presentation path. Every realized native rectangle is verified; a normal task aborts
 on incorrect placement, while the diagnostic reports placement failure and continues timing any realized window.
+The shared window factory disables PsychoPy's implicit constructor timing benchmark; timing begins only after the
+launcher has released and the task has reactivated the subject window.
 The launcher, main-screen curtain, and experimenter controls likewise request true fullscreen after first being
 positioned on their assigned output.
 Display positions and sizes are read from the OS when each task starts. If display enumeration is unavailable, only

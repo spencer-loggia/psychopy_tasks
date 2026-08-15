@@ -393,14 +393,17 @@ Each value can be a detected screen index or an output name such as `HDMI-1` or 
 Use output names on X11 rigs: changing the primary output can reorder numeric monitor indices.
 Set either value to `null` to inherit the process environment defaults: `screens.main` reads `MAIN_SCREEN`, and
 `screens.experimenter` reads `SECONDARY_SCREEN`. The touch launcher exports its resolved global `screens` values
-to those environment variables for launched tasks.
+to those environment variables for the diagnostic and launched tasks. Resolution is consistently CLI override,
+then the current process's config (`screens.main`/`screens.experimenter`, including legacy aliases), then the
+environment. Output names such as `HDMI-2` are rig configuration values, not constants in the display code.
 PsychoPy presentation windows default to true fullscreen. Before a timing-critical X11 window is created, its
 configured main output is made the XRandR primary output without changing resolution, rotation, or position. This
 makes it Xinerama screen 0, which works around PsychoPy 2025.1.1 interpreting Linux `screen=0` as X screen `:0.0`.
 The new pyglet display instance is also made to enumerate the selected output first. The resulting native
-fullscreen GLX window must realize directly on that output and is never moved afterward. Non-timing experimenter
-windows are created at their output's exact OS-reported rectangle before compositor bypass and window-manager
-fullscreen are requested.
+fullscreen GLX window is created with X11 override-redirect so the window manager cannot relocate it to the active
+secondary display. It must realize directly on the configured output and is never moved afterward. Non-timing
+experimenter windows are created at their output's exact OS-reported rectangle before compositor bypass and
+window-manager fullscreen are requested.
 The realized native rectangle is verified in both cases, and opening aborts with a display-placement error if the
 selected output is not covered exactly.
 The launcher, main-screen curtain, and experimenter controls likewise request true fullscreen after first being

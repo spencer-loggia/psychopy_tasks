@@ -95,12 +95,18 @@ class ScreenConfigTests(unittest.TestCase):
 
         pyglet = types.ModuleType("pyglet")
         pyglet.canvas = types.SimpleNamespace(Display=FakeDisplay)
+        pyglet.options = {"xlib_fullscreen_override_redirect": False}
 
         with patch.dict("sys.modules", {"pyglet": pyglet}):
-            with _bind_linux_pyglet_display(target_info):
+            with _bind_linux_pyglet_display(target_info) as selection:
+                self.assertTrue(
+                    pyglet.options["xlib_fullscreen_override_redirect"]
+                )
                 display = pyglet.canvas.Display(x_screen=0)
                 self.assertIs(display.get_screens()[0], target)
 
+        self.assertEqual(selection["selected_rect"], (0, 0, 1600, 2560))
+        self.assertFalse(pyglet.options["xlib_fullscreen_override_redirect"])
         self.assertIs(pyglet.canvas.Display, FakeDisplay)
 
     def test_psychopy_display_constructor_can_fall_back_for_diagnostic(self):
@@ -118,6 +124,7 @@ class ScreenConfigTests(unittest.TestCase):
 
         pyglet = types.ModuleType("pyglet")
         pyglet.canvas = types.SimpleNamespace(Display=FakeDisplay)
+        pyglet.options = {"xlib_fullscreen_override_redirect": False}
 
         with patch.dict("sys.modules", {"pyglet": pyglet}):
             with _bind_linux_pyglet_display(target_info, strict=False):
@@ -606,9 +613,10 @@ class ScreenConfigTests(unittest.TestCase):
                 return_value=nullcontext(),
             ),
             patch("bin.screen._x11_window_rect", return_value=(0, 0, 1600, 2560)),
+            patch("bin.screen._x11_window_override_redirect", return_value=True),
             patch("bin.screen._enter_x11_fullscreen") as enter_fullscreen,
         ):
-            open_psychopy_window(
+            opened = open_psychopy_window(
                 visual,
                 screen,
                 fullscreen=True,
@@ -620,6 +628,7 @@ class ScreenConfigTests(unittest.TestCase):
         self.assertNotIn("size", captured)
         self.assertNotIn("pos", captured)
         self.assertNotIn("checkTiming", captured)
+        self.assertIn("override-redirect=1", opened._neuro_tasks_fullscreen_path)
         enter_fullscreen.assert_not_called()
 
     def test_verified_native_placement_survives_primary_command_failure(self):

@@ -408,6 +408,9 @@ def run_display_diagnostic(
         primary_detail = getattr(win, "_neuro_tasks_primary_output", "")
         if not isinstance(primary_detail, str):
             primary_detail = ""
+        selection_detail = getattr(win, "_neuro_tasks_pyglet_selection", "")
+        if not isinstance(selection_detail, str) or not selection_detail:
+            selection_detail = "selection details unavailable"
         realized_screen = getattr(win, "_neuro_tasks_realized_screen", None)
         if placement_error and realized_screen is not None:
             timing_refresh_rate_hz, timing_rate_detail = query_main_monitor_refresh_rate(
@@ -474,7 +477,8 @@ def run_display_diagnostic(
                 "fail",
                 (
                     f"{window_mode} realized on {placement_detail}; timing checks "
-                    f"continue on that realized output; {primary_detail}"
+                    f"continue on that realized output; {primary_detail}; "
+                    f"pyglet {selection_detail}"
                 ),
                 error=placement_error,
             )
@@ -482,7 +486,10 @@ def run_display_diagnostic(
             placement_check = _check(
                 "Main display placement",
                 "pass",
-                f"{window_mode} verified on {placement_detail}; {primary_detail}",
+                (
+                    f"{window_mode} verified on {placement_detail}; {primary_detail}; "
+                    f"pyglet {selection_detail}"
+                ),
             )
         vsync_requested = bool(enforce_window_vsync(win)) and bool(
             getattr(win, "waitBlanking", False)

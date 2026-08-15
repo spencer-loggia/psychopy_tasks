@@ -811,14 +811,18 @@ def _bind_linux_pyglet_display(
     *,
     strict: bool = True,
 ):
-    """Make PsychoPy's newly opened X11 display enumerate the target first."""
+    """Select the target and keep X11's window manager from relocating it."""
     import pyglet
 
     original_display = pyglet.canvas.Display
+    override_key = "xlib_fullscreen_override_redirect"
+    previous_override = pyglet.options.get(override_key, _UNSET)
+    selection: Dict[str, Any] = {}
 
     def target_first_display(*args: Any, **kwargs: Any) -> Any:
         display = original_display(*args, **kwargs)
         screens = list(display.get_screens())
+        selection["available_rects"] = [_screen_rect(screen) for screen in screens]
         try:
             _index, target = _match_screen_geometry(
                 screens,
@@ -829,6 +833,7 @@ def _bind_linux_pyglet_display(
             if strict:
                 raise
             return display
+        selection["selected_rect"] = _screen_rect(target)
         # Pyglet caches this list. Reorder the new display instance itself so
         # PsychoPy's Linux-specific Display(x_screen=0) path selects target.
         display._screens = [target] + [
@@ -836,11 +841,16 @@ def _bind_linux_pyglet_display(
         ]
         return display
 
+    pyglet.options[override_key] = True
     pyglet.canvas.Display = target_first_display
     try:
-        yield
+        yield selection
     finally:
         pyglet.canvas.Display = original_display
+        if previous_override is _UNSET:
+            pyglet.options.pop(override_key, None)
+        else:
+            pyglet.options[override_key] = previous_override
 
 
 def _set_x11_fullscreen_state(
@@ -910,7 +920,7 @@ def _request_x11_compositor_bypass(window_id: int) -> None:
         connection.close()
 
 
-def _x11_window_rect(win: Any) -> tuple[int, int, int, int]:
+def _x11_window_attributes(win: Any) -> tuple[int, int, Any]:
     import ctypes
     from pyglet.libs.x11 import xlib
 
@@ -929,7 +939,17 @@ def _x11_window_rect(win: Any) -> tuple[int, int, int, int]:
     ):
         raise RuntimeError("X11 could not read PsychoPy's native window geometry")
     x, y = map(int, get_location())
+    return x, y, attributes
+
+
+def _x11_window_rect(win: Any) -> tuple[int, int, int, int]:
+    x, y, attributes = _x11_window_attributes(win)
     return x, y, int(attributes.width), int(attributes.height)
+
+
+def _x11_window_override_redirect(win: Any) -> bool:
+    _x, _y, attributes = _x11_window_attributes(win)
+    return bool(attributes.override_redirect)
 
 
 def identify_psychopy_window_screen(
@@ -1163,9 +1183,11 @@ def open_psychopy_window(
         with _bind_linux_pyglet_display(
             screen_info,
             strict=require_correct_placement,
-        ):
+        ) as pyglet_selection:
             win = visual_module.Window(**window_kwargs)
+        pyglet_selection = pyglet_selection or {}
     else:
+        pyglet_selection = {}
         win = visual_module.Window(**window_kwargs)
 
     if fullscreen:
@@ -1191,11 +1213,32 @@ def open_psychopy_window(
         win._neuro_tasks_realized_screen = realized_screen
         win._neuro_tasks_realized_rect = actual
         win._neuro_tasks_primary_output = primary_detail
-        win._neuro_tasks_fullscreen_path = (
-            "native PsychoPy fullscreen"
-            if native_x11_fullscreen
-            else "window-manager fullscreen"
+        selected_rect = pyglet_selection.get("selected_rect")
+        available_rects = pyglet_selection.get("available_rects", [])
+        win._neuro_tasks_pyglet_selection = (
+            f"selected {selected_rect} from {available_rects}"
+            if selected_rect is not None
+            else f"target selection unavailable; candidates {available_rects}"
         )
+        try:
+            override_redirect = (
+                _x11_window_override_redirect(win) if native_x11_fullscreen else None
+            )
+        except Exception:
+            override_redirect = None
+        win._neuro_tasks_x11_override_redirect = override_redirect
+        if native_x11_fullscreen and override_redirect is not None:
+            fullscreen_path = (
+                "native PsychoPy fullscreen "
+                f"(X11 override-redirect={int(override_redirect)})"
+            )
+        elif native_x11_fullscreen:
+            fullscreen_path = (
+                "native PsychoPy fullscreen (X11 override-redirect unverified)"
+            )
+        else:
+            fullscreen_path = "window-manager fullscreen"
+        win._neuro_tasks_fullscreen_path = fullscreen_path
     return win
 
 

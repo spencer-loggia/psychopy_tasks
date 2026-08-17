@@ -217,7 +217,6 @@ def _queue_get_until_stopped(input_queue, stop_event) -> Optional[int]:
 
 def _build_video_filter(
     crop_bounds: Sequence[int],
-    frame_rate: float,
 ) -> str:
     left, top, right, bottom = (int(value) for value in crop_bounds)
     width = right - left
@@ -229,10 +228,7 @@ def _build_video_filter(
             f"yuv420p crop bounds must have even offsets and dimensions: "
             f"{tuple(crop_bounds)}"
         )
-    return (
-        f"crop={width}:{height}:{left}:{top},"
-        f"fps=fps={float(frame_rate):.12g}:round=near"
-    )
+    return f"crop={width}:{height}:{left}:{top}"
 
 
 def _decode_worker(
@@ -249,11 +245,12 @@ def _decode_worker(
 ) -> None:
     shm = None
     player = None
+    slot = None
     try:
         from ffpyplayer.player import MediaPlayer
 
         shm = shared_memory.SharedMemory(name=shared_memory_name, create=False)
-        video_filter = _build_video_filter(crop_bounds, layout.frame_rate)
+        video_filter = _build_video_filter(crop_bounds)
         ff_opts = {
             "an": True,
             "sn": True,
@@ -383,6 +380,7 @@ def _decode_worker(
             )
             if not _queue_put_until_stopped(ready_chunks, message, stop_event):
                 return
+            slot = None
 
         if not stop_event.is_set():
             _queue_put_until_stopped(
@@ -408,6 +406,7 @@ def _decode_worker(
                 pass
         if shm is not None:
             try:
+                slot = None
                 shm.close()
             except Exception:
                 pass
@@ -458,32 +457,63 @@ class BufferedVideoFrameStream:
             memory_budget_bytes=memory_budget_bytes,
         )
         self._context = mp.get_context(context_name)
-        self._shm = shared_memory.SharedMemory(
-            create=True,
-            size=self.layout.total_bytes,
-        )
-        self._free_slots = self._context.Queue(maxsize=self.layout.slot_count)
-        self._ready_chunks = self._context.Queue(
-            maxsize=self.layout.slot_count + 4
-        )
-        self._stop_event = self._context.Event()
-        for slot_index in range(self.layout.slot_count):
-            self._free_slots.put(slot_index)
-        self._process = self._context.Process(
-            target=_decode_worker,
-            kwargs={
-                "video_path": str(self.video_path),
-                "shared_memory_name": self._shm.name,
-                "layout": self.layout,
-                "crop_bounds": self.crop_bounds,
-                "clip_start_s": self.clip_start_s,
-                "seek_timeout_s": self.seek_timeout_s,
-                "free_slots": self._free_slots,
-                "ready_chunks": self._ready_chunks,
-                "stop_event": self._stop_event,
-            },
-            name="ffpyplayer-video-preparer",
-        )
+        shm = None
+        free_slots = None
+        ready_chunks = None
+        try:
+            shm = shared_memory.SharedMemory(
+                create=True,
+                size=self.layout.total_bytes,
+            )
+            free_slots = self._context.Queue(maxsize=self.layout.slot_count)
+            ready_chunks = self._context.Queue(
+                maxsize=self.layout.slot_count + 4
+            )
+            stop_event = self._context.Event()
+            for slot_index in range(self.layout.slot_count):
+                free_slots.put(slot_index)
+            process = self._context.Process(
+                target=_decode_worker,
+                kwargs={
+                    "video_path": str(self.video_path),
+                    "shared_memory_name": shm.name,
+                    "layout": self.layout,
+                    "crop_bounds": self.crop_bounds,
+                    "clip_start_s": self.clip_start_s,
+                    "seek_timeout_s": self.seek_timeout_s,
+                    "free_slots": free_slots,
+                    "ready_chunks": ready_chunks,
+                    "stop_event": stop_event,
+                },
+                name="ffpyplayer-video-preparer",
+            )
+        except BaseException:
+            for managed_queue in (free_slots, ready_chunks):
+                if managed_queue is None:
+                    continue
+                try:
+                    managed_queue.cancel_join_thread()
+                except Exception:
+                    pass
+                try:
+                    managed_queue.close()
+                except Exception:
+                    pass
+            if shm is not None:
+                try:
+                    shm.close()
+                finally:
+                    try:
+                        shm.unlink()
+                    except FileNotFoundError:
+                        pass
+            raise
+
+        self._shm = shm
+        self._free_slots = free_slots
+        self._ready_chunks = ready_chunks
+        self._stop_event = stop_event
+        self._process = process
         self._started = False
         self._closed = False
         self._pending_chunks: deque[PreparedChunk] = deque()

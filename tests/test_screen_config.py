@@ -309,6 +309,7 @@ class ScreenConfigTests(unittest.TestCase):
     def test_frame_timing_monitor_excludes_time_between_sequences(self):
         win = Mock()
         win.recordFrameIntervals = False
+        win.refreshThreshold = 0.04
         win.nDroppedFrames = 3
         monitor = MainDisplayFrameTimingMonitor(win, 1.0 / 60.0)
 
@@ -320,7 +321,7 @@ class ScreenConfigTests(unittest.TestCase):
 
         self.assertEqual(monitor.missed_refreshes, 3)
         self.assertFalse(win.recordFrameIntervals)
-        self.assertAlmostEqual(win.refreshThreshold, 0.025)
+        self.assertAlmostEqual(win.refreshThreshold, 0.04)
 
     def test_reward_level_colors_match_active_foraging_legend(self):
         self.assertEqual(reward_level_color(0), (220, 60, 60))

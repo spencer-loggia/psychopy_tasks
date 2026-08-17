@@ -229,6 +229,12 @@ class MainDisplayFrameTimingMonitor:
         previous_recording = bool(
             getattr(self.win, "recordFrameIntervals", False)
         )
+        had_refresh_threshold = hasattr(self.win, "refreshThreshold")
+        previous_refresh_threshold = getattr(
+            self.win,
+            "refreshThreshold",
+            None,
+        )
         count_before = None
         try:
             self.win.recordFrameIntervals = False
@@ -254,6 +260,13 @@ class MainDisplayFrameTimingMonitor:
                 self.win.recordFrameIntervals = False
                 if previous_recording:
                     self.win.recordFrameIntervals = True
+            except Exception:
+                pass
+            try:
+                if had_refresh_threshold:
+                    self.win.refreshThreshold = previous_refresh_threshold
+                else:
+                    delattr(self.win, "refreshThreshold")
             except Exception:
                 pass
 

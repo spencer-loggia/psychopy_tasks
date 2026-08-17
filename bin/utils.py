@@ -46,6 +46,7 @@ from .video_playback import (
     center_crop_bounds,
     upload_rgb_texture,
     video_duration_seconds,
+    video_time_origin_seconds,
 )
 from .stimulus_files import (
     load_color_palette as _load_color_palette,
@@ -191,7 +192,7 @@ def probe_video_stream(video_path: Path, ffprobe_bin: str = "ffprobe") -> Dict[s
         "-show_entries",
         (
             "stream=codec_name,profile,level,width,height,pix_fmt,"
-            "r_frame_rate,avg_frame_rate,duration:format=duration"
+            "r_frame_rate,avg_frame_rate,start_time,duration:format=duration"
         ),
         "-of",
         "json",
@@ -213,10 +214,6 @@ def probe_video_stream(video_path: Path, ffprobe_bin: str = "ffprobe") -> Dict[s
         if format_duration not in (None, "", "N/A"):
             stream["duration"] = format_duration
     return stream
-
-
-# Compatibility for callers which used the original private helper.
-_probe_video_stream = probe_video_stream
 
 
 def _is_hevc_codec_name(codec_name: Optional[str]) -> bool:
@@ -250,6 +247,11 @@ def _set_gpio_level_on_flip(lgpio_module, chip, pin: int, level: int) -> None:
         raise RuntimeError(
             f"GPIO write failed with code {result} on pin {int(pin)}"
         )
+
+
+def _capture_perf_counter_on_flip(target: Dict[str, float]) -> None:
+    """Capture the flip callback time before slower hardware callbacks run."""
+    target["actual_perf_s"] = time.perf_counter()
 
 
 def play_video_fill_screen(
@@ -304,21 +306,26 @@ def play_video_fill_screen(
     if frame_publish_interval_s < 0.0:
         raise ValueError("frame_publish_interval_s cannot be negative")
     source_duration_s = video_duration_seconds(stream)
+    source_time_origin_s = video_time_origin_seconds(stream)
     clip_start_s = float(clip_start_s)
     if clip_duration_s is None:
-        clip_duration_s = source_duration_s - clip_start_s
+        clip_duration_s = (
+            source_time_origin_s + source_duration_s - clip_start_s
+        )
     clip_duration_s = float(clip_duration_s)
     if not math.isfinite(clip_start_s) or clip_start_s < 0.0:
         raise ValueError("clip_start_s must be a finite non-negative value")
     if not math.isfinite(clip_duration_s) or clip_duration_s <= 0.0:
         raise ValueError("clip_duration_s must be a positive finite value")
+    source_end_s = source_time_origin_s + source_duration_s
     if source_duration_s > 0.0 and (
-        clip_start_s + clip_duration_s > source_duration_s + 1e-6
+        clip_start_s < source_time_origin_s - 1e-6
+        or clip_start_s + clip_duration_s > source_end_s + 1e-6
     ):
         raise ValueError(
             f"Requested clip {clip_start_s:.6f}-"
-            f"{clip_start_s + clip_duration_s:.6f}s exceeds source duration "
-            f"{source_duration_s:.6f}s"
+            f"{clip_start_s + clip_duration_s:.6f}s exceeds source PTS range "
+            f"{source_time_origin_s:.6f}-{source_end_s:.6f}s"
         )
 
     video_frame_rate = float(video_frame_rate)
@@ -408,11 +415,14 @@ def play_video_fill_screen(
     scheduled_video_slots_skipped = 0
     late_frame_count = 0
     maximum_frame_lateness_s = 0.0
+    clip_offset_lateness_s = 0.0
+    timing_failure_threshold_s = 0.25 * video_frame_period_s
     frame_timing_monitor = MainDisplayFrameTimingMonitor(
         win,
         video_frame_period_s,
     )
     frame_stream = None
+    prepared_frame = None
     clear_flip_completed = False
 
     def _poll_abort_reason():
@@ -558,6 +568,11 @@ def play_video_fill_screen(
                         if first_flip_perf is not None
                         else None
                     )
+                    flip_perf_capture: Dict[str, float] = {}
+                    win.callOnFlip(
+                        _capture_perf_counter_on_flip,
+                        flip_perf_capture,
+                    )
                     sync_edges = ()
                     if sync_schedule is not None:
                         sync_edges = sync_schedule.edges_for_frame(
@@ -583,9 +598,13 @@ def play_video_fill_screen(
                         )
                         if remaining_s > 0.0:
                             time.sleep(remaining_s)
-                    flip_timing = flip_with_timestamps(win)
-                    flip_ps = flip_timing.psychopy_s
-                    flip_perf = flip_timing.actual_perf_s
+                    flip_requested_perf = time.perf_counter()
+                    flip_ps = win.flip()
+                    flip_return_perf = time.perf_counter()
+                    flip_perf = flip_perf_capture.get(
+                        "actual_perf_s",
+                        flip_return_perf,
+                    )
                     last_flip_perf = flip_perf
                     frames_presented += 1
                     current_source_time_s = float(
@@ -601,7 +620,7 @@ def play_video_fill_screen(
                                 "interval_frames": edge.interval_frames,
                                 "timestamp_perf_s": flip_perf,
                                 "requested_timestamp_perf_s": (
-                                    flip_timing.requested_perf_s
+                                    flip_requested_perf
                                 ),
                             }
                         )
@@ -610,7 +629,7 @@ def play_video_fill_screen(
                         first_flip_ps = flip_ps
                         first_flip_perf = flip_perf
                         first_flip_requested_perf = (
-                            flip_timing.requested_perf_s
+                            flip_requested_perf
                         )
                         actual_source_start_s = current_source_time_s
                         if logger is not None:
@@ -654,8 +673,20 @@ def play_video_fill_screen(
                             maximum_frame_lateness_s,
                             lateness_s,
                         )
-                        if lateness_s > 0.5 * video_frame_period_s:
+                        if lateness_s > timing_failure_threshold_s:
                             late_frame_count += 1
+                            _log_message(
+                                msg_logger,
+                                "ERROR",
+                                f"video_flip_missed trial_num={trial_num} "
+                                f"file={video_file.name} "
+                                f"frame_index={display_frame_index} "
+                                f"lateness_s={lateness_s:.6f}",
+                            )
+                            raise RuntimeError(
+                                f"Video frame {display_frame_index} missed its "
+                                f"scheduled display flip by {lateness_s:.6f}s"
+                            )
 
                     if (
                         frame_publisher is not None
@@ -665,7 +696,10 @@ def play_video_fill_screen(
                             prepared_frame.rgb,
                             source_frame_index=int(
                                 round(
-                                    current_source_time_s
+                                    (
+                                        current_source_time_s
+                                        - source_time_origin_s
+                                    )
                                     * video_frame_rate
                                 )
                             ),
@@ -678,7 +712,12 @@ def play_video_fill_screen(
                         )
     finally:
         final_sync_edge = None
+        clear_flip_perf_capture: Dict[str, float] = {}
         try:
+            win.callOnFlip(
+                _capture_perf_counter_on_flip,
+                clear_flip_perf_capture,
+            )
             if sync_schedule is not None:
                 final_sync_edge = sync_schedule.mark_forced_low(
                     frames_presented
@@ -716,14 +755,24 @@ def play_video_fill_screen(
                 if remaining_s > 0.0:
                     time.sleep(remaining_s)
 
-            clear_flip_timing = flip_with_timestamps(win)
+            clear_flip_requested_perf = time.perf_counter()
+            win.flip()
+            clear_flip_return_perf = time.perf_counter()
             clear_flip_completed = True
             end_requested_perf = (
                 requested_clear_perf
                 if requested_clear_perf is not None
-                else clear_flip_timing.requested_perf_s
+                else clear_flip_requested_perf
             )
-            end_perf = clear_flip_timing.actual_perf_s
+            end_perf = clear_flip_perf_capture.get(
+                "actual_perf_s",
+                clear_flip_return_perf,
+            )
+            if requested_clear_perf is not None:
+                clip_offset_lateness_s = max(
+                    0.0,
+                    end_perf - requested_clear_perf,
+                )
             if final_sync_edge is not None:
                 sync_records.append(
                     {
@@ -741,6 +790,18 @@ def play_video_fill_screen(
                     timestamp_perf_s=end_perf,
                     requested_timestamp_perf_s=end_requested_perf,
                 )
+            if clip_offset_lateness_s > timing_failure_threshold_s:
+                _log_message(
+                    msg_logger,
+                    "ERROR",
+                    f"video_offset_flip_missed trial_num={trial_num} "
+                    f"file={video_file.name} "
+                    f"lateness_s={clip_offset_lateness_s:.6f}",
+                )
+                raise RuntimeError(
+                    "Video clip offset flip missed its scheduled deadline by "
+                    f"{clip_offset_lateness_s:.6f}s"
+                )
         finally:
             if sync_schedule is not None and not clear_flip_completed:
                 try:
@@ -753,6 +814,8 @@ def play_video_fill_screen(
                 except Exception:
                     pass
             if frame_stream is not None:
+                # Drop the final NumPy export before closing its SharedMemory.
+                prepared_frame = None
                 frame_stream.close()
 
             _log_message(
@@ -767,6 +830,7 @@ def play_video_fill_screen(
                     f"late_frames={late_frame_count} "
                     f"maximum_lateness_s="
                     f"{maximum_frame_lateness_s:.6f} "
+                    f"offset_lateness_s={clip_offset_lateness_s:.6f} "
                     f"long_video_intervals="
                     f"{frame_timing_monitor.missed_refreshes}"
                 ),
@@ -824,6 +888,8 @@ def play_video_fill_screen(
                 f"{clip_start_s + clip_duration_s:.6f} "
                 f"actual_source_last_frame_s="
                 f"{actual_source_last_frame_s} "
+                f"last_frame_on_perf_s={last_flip_perf} "
+                f"clip_offset_perf_s={end_perf} "
                 f"frames_presented={frames_presented} "
                 f"dropped_frames={dropped_frames} "
                 f"late_frames={late_frame_count} "
@@ -843,6 +909,7 @@ def play_video_fill_screen(
         "video_name": video_file.name,
         "video_path": video_file,
         "source_duration_s": source_duration_s,
+        "source_time_origin_s": source_time_origin_s,
         "clip_start_s": clip_start_s,
         "clip_end_s": clip_start_s + clip_duration_s,
         "clip_duration_s": clip_duration_s,
@@ -851,6 +918,7 @@ def play_video_fill_screen(
         "start_flip_perf_s": first_flip_perf,
         "start_flip_requested_perf_s": first_flip_requested_perf,
         "end_time_perf_s": end_perf,
+        "clip_offset_perf_s": end_perf,
         "end_requested_perf_s": end_requested_perf,
         "requested_end_perf_s": (
             first_flip_perf + clip_duration_s
@@ -860,6 +928,7 @@ def play_video_fill_screen(
         "last_frame_end_perf_s": (
             end_perf if first_flip_perf is not None else None
         ),
+        "last_frame_on_perf_s": last_flip_perf,
         "actual_source_start_s": actual_source_start_s,
         "actual_source_last_frame_s": actual_source_last_frame_s,
         "frames_presented": int(frames_presented),
@@ -885,6 +954,7 @@ def play_video_fill_screen(
         "maximum_frame_lateness_s": float(
             maximum_frame_lateness_s
         ),
+        "clip_offset_lateness_s": float(clip_offset_lateness_s),
         "long_video_intervals": int(
             frame_timing_monitor.missed_refreshes
         ),

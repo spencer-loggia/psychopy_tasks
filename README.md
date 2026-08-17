@@ -364,11 +364,11 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
   aligned to the configured video-frame timebase, and presents the
   fixed-duration clip without extracting a temporary file. A dedicated
   `multiprocessing` `spawn` worker uses ffpyplayer directly to seek, decode,
-  center-crop, normalize to the configured rate, and prepare that clip.
-  `frame_rate` is authoritative and defaults to `30`, even when container
-  metadata reports another rate. The requested duration is rounded only to the
-  nearest count of configured video frames; both the original request and
-  scheduled duration are logged.
+  center-crop, and prepare that clip. `frame_rate` defaults to `30` and must
+  match the probed source rate; rate conversion belongs in offline
+  preprocessing so runtime playback never synthesizes or discards a source
+  frame. The requested duration is rounded only to the nearest count of video
+  frames; both the original request and scheduled duration are logged.
 - Sources must be HEVC Main/yuv420p. The task probes each unique path once and
   refuses incompatible media or sources shorter than the requested clip.
 - The behavior row for each trial records the full source path, requested and
@@ -379,12 +379,12 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
 - Video flips use absolute `1 / frame_rate` deadlines. The task draws the
   next prepared frame, waits until `flip_request_lead_seconds` (default
   `0.015`) before its deadline, and then submits a refresh-synchronized
-  PsychoPy flip. A completed clip presents every normalized frame exactly once
-  in index order; a late flip does not skip an expired frame slot or substitute
-  a newer decoded frame. If the next chunk is unavailable at a boundary,
-  playback stops with `video_buffer_underrun` before the missing frame instead
-  of waiting or skipping it. A monitor whose refresh is not a near-integer
-  multiple of `frame_rate` produces an explicit cadence warning.
+  PsychoPy flip. A completed clip presents every source frame exactly once in
+  index order; a late flip does not skip an expired frame slot or substitute a
+  newer decoded frame. A missed flip or unavailable next chunk is a fatal
+  timing error, stopping before any missing frame is skipped. The task also
+  rejects a monitor rate that is not an integer-compatible multiple of
+  `frame_rate`, avoiding uneven refresh cadence.
 - The ffpyplayer worker writes prepared RGB24 frames into parent-owned shared
   memory. The prepared-frame budget is configured by
   `video_buffer_megabytes` and defaults to 512 MiB. If the complete prepared

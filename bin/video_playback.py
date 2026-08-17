@@ -50,9 +50,27 @@ def video_duration_seconds(stream: dict[str, Any]) -> float:
     return duration
 
 
+def video_time_origin_seconds(stream: dict[str, Any]) -> float:
+    """Return the non-negative media PTS origin reported by ffprobe."""
+    raw_value = stream.get("start_time", 0.0)
+    if raw_value in (None, "", "N/A"):
+        return 0.0
+    try:
+        origin = float(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("video start_time is invalid") from exc
+    if not math.isfinite(origin) or origin < 0.0:
+        raise ValueError(
+            "video start_time must be finite and non-negative; "
+            "rebase the source timestamps during preprocessing"
+        )
+    return origin
+
+
 @dataclass(frozen=True)
 class VideoClipSelection:
     source_duration_s: float
+    source_time_origin_s: float
     start_s: float
     end_s: float
     duration_s: float
@@ -77,6 +95,7 @@ def select_random_video_clip(
     source_duration_s = video_duration_seconds(stream)
     if source_duration_s <= 0.0:
         raise ValueError("video duration is missing or invalid")
+    source_time_origin_s = video_time_origin_seconds(stream)
     configured_frame_rate = float(frame_rate)
     if not math.isfinite(configured_frame_rate) or configured_frame_rate <= 0.0:
         raise ValueError("frame_rate must be a positive finite value")
@@ -99,10 +118,13 @@ def select_random_video_clip(
         int(math.floor((maximum_start_s * configured_frame_rate) + 1e-9)),
     )
     start_frame = chooser.randint(0, maximum_start_frame)
-    start_s = float(start_frame) / configured_frame_rate
+    start_s = source_time_origin_s + (
+        float(start_frame) / configured_frame_rate
+    )
     end_s = start_s + scheduled_duration_s
     return VideoClipSelection(
         source_duration_s=source_duration_s,
+        source_time_origin_s=source_time_origin_s,
         start_s=start_s,
         end_s=end_s,
         duration_s=scheduled_duration_s,

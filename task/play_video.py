@@ -32,6 +32,7 @@ from bin.video_playback import (
     select_random_video_clip,
     validate_hevc_stream,
     video_duration_seconds,
+    video_time_origin_seconds,
 )
 from bin.screen import (
     ExperimenterPreview,
@@ -189,12 +190,25 @@ def run_task(
             require_pi5_compatible=bool(raspi),
         )
         source_duration_s = video_duration_seconds(stream)
+        source_time_origin_s = video_time_origin_seconds(stream)
         if source_duration_s <= 0.0:
             raise ValueError(f"Video duration is missing or invalid: {video_path}")
         if source_duration_s + 1e-9 < clip_duration_seconds:
             raise ValueError(
                 f"Video is shorter than clip_duration_seconds: {video_path} "
                 f"({source_duration_s:.6f}s < {clip_duration_seconds:.6f}s)"
+            )
+        stream["start_time"] = source_time_origin_s
+        probed_rate = parse_frame_rate(
+            stream.get("avg_frame_rate") or stream.get("r_frame_rate")
+        )
+        if probed_rate <= 0.0:
+            raise ValueError(f"Video frame rate is missing or invalid: {video_path}")
+        if abs(probed_rate - frame_rate) > 0.001:
+            raise ValueError(
+                f"Video frame rate {probed_rate:.6f} does not match configured "
+                f"frame_rate {frame_rate:.6f}: {video_path}. Normalize the "
+                "source offline or use its exact configured rate."
             )
         video_streams[video_path] = stream
         maximum_frame_bytes = max(
@@ -324,20 +338,6 @@ def run_task(
             "INFO",
             f"session_start task=play_video config_name={resolved_config_name} session_dir={session_logs.session_dir}",
         )
-        for video_path, stream in video_streams.items():
-            probed_rate = parse_frame_rate(
-                stream.get("avg_frame_rate") or stream.get("r_frame_rate")
-            )
-            if probed_rate > 0.0 and abs(probed_rate - frame_rate) > 0.01:
-                msg_logger.log(
-                    "WARN",
-                    (
-                        f"video_source_rate_normalized file={video_path.name} "
-                        f"probed_fps={probed_rate:.6f} "
-                        f"configured_fps={frame_rate:.6f}"
-                    ),
-                )
-
         # Keep CPU 0 free while multiprocessing children and decoder threads
         # are created. The preview and ffpyplayer worker inherit this worker-only
         # mask. Only the main presentation thread is later moved to CPU 0.
@@ -443,14 +443,20 @@ def run_task(
                 "schedule=absolute_deadline source_frames=never_skip"
             ),
         )
-        if abs(cadence_error_hz) > 0.05:
+        cadence_tolerance_hz = max(0.005, frame_rate * 0.0005)
+        if abs(cadence_error_hz) > cadence_tolerance_hz:
             msg_logger.log(
-                "WARN",
+                "ERROR",
                 (
                     "video_monitor_cadence_mismatch "
                     f"configured_video_fps={frame_rate:.6f} monitor_fps={fps:.6f} "
-                    f"nearest_refresh_ratio={nearest_refreshes_per_video_frame}:1"
+                    f"nearest_refresh_ratio={nearest_refreshes_per_video_frame}:1 "
+                    f"tolerance_hz={cadence_tolerance_hz:.6f}"
                 ),
+            )
+            raise ValueError(
+                f"Monitor rate {fps:.6f} Hz is not an integer-compatible "
+                f"multiple of video frame_rate {frame_rate:.6f} Hz"
             )
 
         if experimenter_screen is not None:

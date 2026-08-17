@@ -402,7 +402,7 @@ class VideoPlaybackTests(unittest.TestCase):
         )
 
 
-class PlayVideoTaskRotationTests(unittest.TestCase):
+class PlayVideoTaskTests(unittest.TestCase):
     @staticmethod
     def _load_task_module(fake_utils, fake_screen, fake_psychopy):
         import bin as bin_package
@@ -429,6 +429,149 @@ class PlayVideoTaskRotationTests(unittest.TestCase):
         ):
             spec.loader.exec_module(module)
         return module
+
+    def _make_validation_harness(self, *, source_rate, monitor_rate):
+        mouse = types.SimpleNamespace(
+            getPressed=Mock(return_value=(False, False, False)),
+            clickReset=Mock(),
+        )
+        fake_event = types.SimpleNamespace(
+            Mouse=Mock(return_value=mouse),
+            clearEvents=Mock(),
+        )
+        fake_psychopy = types.ModuleType("psychopy")
+        fake_psychopy.event = fake_event
+        fake_psychopy.logging = types.SimpleNamespace(
+            CRITICAL=50,
+            console=types.SimpleNamespace(setLevel=Mock()),
+        )
+
+        main_screen = types.SimpleNamespace(
+            index=0,
+            x=0,
+            y=0,
+            width=2560,
+            height=1600,
+            name="MAIN",
+            rotation="normal",
+        )
+        win = types.SimpleNamespace(
+            size=(2560, 1600),
+            _neuro_tasks_refresh_sync_requested=True,
+            close=Mock(),
+        )
+        fake_screen = types.ModuleType("bin.screen")
+        fake_screen.ExperimenterPreview = Mock()
+        fake_screen.describe_screen = lambda screen: screen.name if screen else "none"
+        fake_screen.load_screen_config = Mock()
+        fake_screen.oriented_size = Mock(return_value=(1600, 2560))
+        fake_screen.resolve_scene_size = Mock(return_value=(2560, 1600))
+        fake_screen.software_stimulus_rotation = Mock(return_value=90)
+
+        stream = {
+            "codec_name": "hevc",
+            "profile": "Main",
+            "pix_fmt": "yuv420p",
+            "width": 1920,
+            "height": 1080,
+            "duration": "60.0",
+            "avg_frame_rate": source_rate,
+        }
+        fake_utils = types.ModuleType("bin.utils")
+        fake_utils.probe_video_stream = Mock(return_value=stream)
+        fake_utils.setup_task_window = Mock(
+            return_value=(win, main_screen, None)
+        )
+        fake_utils.make_bg_rect = Mock(return_value=object())
+        fake_utils.resolve_frame_rate = Mock(
+            return_value=(float(monitor_rate), 1.0 / float(monitor_rate))
+        )
+        fake_utils.play_video_fill_screen = Mock()
+
+        module = self._load_task_module(
+            fake_utils,
+            fake_screen,
+            fake_psychopy,
+        )
+        messages = []
+        session_logs = types.SimpleNamespace(
+            event_logger=types.SimpleNamespace(
+                seconds_since_session_start=lambda timestamp: timestamp
+            ),
+            message_logger=types.SimpleNamespace(
+                log=lambda level, message: messages.append((level, message))
+            ),
+            behavior_logger=types.SimpleNamespace(writerow=Mock()),
+            session_dir=Path("test-session"),
+            flush=Mock(),
+            close=Mock(),
+        )
+        module.SessionLogBundle = Mock(return_value=session_logs)
+        module.build_main_and_worker_affinity_plan = Mock(
+            return_value={
+                "supported": False,
+                "reason": "test",
+                "current_affinity": None,
+                "main_cpu_affinity": None,
+                "worker_cpu_affinity": None,
+            }
+        )
+        return module, fake_utils, messages
+
+    def test_run_task_rejects_source_frame_rate_mismatch_before_window(self):
+        module, fake_utils, _ = self._make_validation_harness(
+            source_rate="24000/1001",
+            monitor_rate=60.0,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_path = Path(tmpdir) / "clip.mp4"
+            video_path.touch()
+            with self.assertRaisesRegex(
+                ValueError,
+                "does not match configured frame_rate 30.000000",
+            ):
+                module.run_task(
+                    video_files=[str(video_path)],
+                    clip_duration_seconds=2.0,
+                    output_dir=tmpdir,
+                    num_clips=1,
+                    frame_rate=30.0,
+                )
+
+        fake_utils.setup_task_window.assert_not_called()
+        fake_utils.play_video_fill_screen.assert_not_called()
+
+    def test_run_task_rejects_noninteger_monitor_cadence_before_decode(self):
+        module, fake_utils, messages = self._make_validation_harness(
+            source_rate="30/1",
+            monitor_rate=59.94,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_path = Path(tmpdir) / "clip.mp4"
+            video_path.touch()
+            with self.assertRaisesRegex(
+                ValueError,
+                "Monitor rate 59.940000 Hz is not an integer-compatible multiple",
+            ):
+                module.run_task(
+                    video_files=[str(video_path)],
+                    clip_duration_seconds=2.0,
+                    output_dir=tmpdir,
+                    num_clips=1,
+                    frame_rate=30.0,
+                )
+
+        fake_utils.setup_task_window.assert_called_once()
+        fake_utils.play_video_fill_screen.assert_not_called()
+        self.assertTrue(
+            any(
+                level == "ERROR"
+                and message.startswith("video_monitor_cadence_mismatch")
+                for level, message in messages
+            )
+        )
 
     def test_run_task_propagates_native_geometry_and_clockwise_rotation(self):
         mouse = types.SimpleNamespace(

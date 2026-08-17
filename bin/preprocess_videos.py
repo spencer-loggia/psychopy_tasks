@@ -65,6 +65,12 @@ def parse_args() -> argparse.Namespace:
         default=720,
         help="Target size for the shorter output dimension after cropping",
     )
+    parser.add_argument(
+        "--frame_rate",
+        type=float,
+        default=30.0,
+        help="Constant output frame rate required by runtime playback",
+    )
     parser.add_argument("--codec", default="auto", help="HEVC video codec to use, or 'auto' to prefer hardware")
     parser.add_argument("--preset", default="veryfast", help="Encoder preset used by software HEVC encoders")
     parser.add_argument("--crf", type=int, default=20, help="Quality level for libx265-style encoders (lower is higher quality)")
@@ -184,7 +190,10 @@ def probe_video(ffprobe_bin: str, path: Path) -> dict:
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=width,height,pix_fmt,r_frame_rate,avg_frame_rate,codec_name",
+        (
+            "stream=width,height,pix_fmt,r_frame_rate,avg_frame_rate,"
+            "start_time,codec_name"
+        ),
         "-of",
         "json",
         str(path),
@@ -205,14 +214,28 @@ def parse_frame_rate(stream: dict) -> float:
         return 0.0
 
 
-def build_filter(screen_width: int, screen_height: int, out_width: int, out_height: int) -> str:
+def build_filter(
+    screen_width: int,
+    screen_height: int,
+    out_width: int,
+    out_height: int,
+    *,
+    frame_rate: float | None = None,
+) -> str:
     aspect = float(screen_width) / float(screen_height)
     crop_w = f"if(gte(iw/ih\\,{aspect:.12f})\\,ih*{aspect:.12f}\\,iw)"
     crop_h = f"if(gte(iw/ih\\,{aspect:.12f})\\,ih\\,iw/{aspect:.12f})"
-    return (
-        f"crop={crop_w}:{crop_h}:(iw-ow)/2:(ih-oh)/2,"
+    filters = [
+        f"crop={crop_w}:{crop_h}:(iw-ow)/2:(ih-oh)/2",
         f"scale={out_width}:{out_height}:flags=fast_bilinear"
-    )
+    ]
+    if frame_rate is not None:
+        resolved_rate = float(frame_rate)
+        if not math.isfinite(resolved_rate) or resolved_rate <= 0.0:
+            raise ValueError("frame_rate must be a positive finite value")
+        filters.append(f"fps=fps={resolved_rate:.12g}:round=near")
+    filters.append("setpts=PTS-STARTPTS")
+    return ",".join(filters)
 
 
 def output_path_for(video_path: Path, output_dir: Path) -> Path:
@@ -233,6 +256,7 @@ def preprocess_video(
     gop_frames: int,
     overwrite: bool,
     expected_size: tuple[int, int],
+    expected_frame_rate: float,
 ) -> str:
     if output_path.exists() and not overwrite:
         print(f"Skipping existing file: {output_path}")
@@ -313,6 +337,18 @@ def preprocess_video(
                     f"Processed video has unexpected size: {output_path} "
                     f"({stream.get('width')}x{stream.get('height')} vs expected {expected_size[0]}x{expected_size[1]})"
                 )
+            output_rate = parse_frame_rate(stream)
+            if abs(output_rate - float(expected_frame_rate)) > 0.001:
+                raise RuntimeError(
+                    f"Processed video has unexpected frame rate: {output_path} "
+                    f"({output_rate:.6f} vs expected {float(expected_frame_rate):.6f})"
+                )
+            start_time_s = float(stream.get("start_time", 0.0) or 0.0)
+            if not math.isfinite(start_time_s) or abs(start_time_s) > 1e-6:
+                raise RuntimeError(
+                    f"Processed video timestamps were not rebased to zero: "
+                    f"{output_path} (start_time={start_time_s})"
+                )
             return codec
         except Exception as exc:
             last_error = exc
@@ -341,8 +377,17 @@ def main() -> None:
     screen_width, screen_height = (int(v) for v in args.screen_size)
     if not math.isfinite(float(args.gop_seconds)) or not float(args.gop_seconds) > 0.0:
         raise ValueError("gop_seconds must be a positive finite value")
+    output_frame_rate = float(args.frame_rate)
+    if not math.isfinite(output_frame_rate) or output_frame_rate <= 0.0:
+        raise ValueError("frame_rate must be a positive finite value")
     out_width, out_height = compute_target_size(screen_width, screen_height, int(args.short_dim))
-    filter_chain = build_filter(screen_width, screen_height, out_width, out_height)
+    filter_chain = build_filter(
+        screen_width,
+        screen_height,
+        out_width,
+        out_height,
+        frame_rate=output_frame_rate,
+    )
 
     videos = find_video_files(input_dir)
     if not videos:
@@ -350,7 +395,8 @@ def main() -> None:
 
     print(
         f"Preprocessing {len(videos)} videos from {input_dir} to {output_dir} "
-        f"with target size {out_width}x{out_height}"
+        f"with target size {out_width}x{out_height} at "
+        f"{output_frame_rate:.6f} fps"
     )
     for video_path in videos:
         input_stream = probe_video(ffprobe_bin, video_path)
@@ -368,7 +414,10 @@ def main() -> None:
         input_fps = parse_frame_rate(input_stream)
         if input_fps <= 0.0:
             raise ValueError(f"Could not determine source frame rate: {video_path}")
-        gop_frames = max(1, int(round(input_fps * float(args.gop_seconds))))
+        gop_frames = max(
+            1,
+            int(round(output_frame_rate * float(args.gop_seconds))),
+        )
         used_codec = preprocess_video(
             ffmpeg_bin=ffmpeg_bin,
             ffprobe_bin=ffprobe_bin,
@@ -383,6 +432,7 @@ def main() -> None:
             gop_frames=gop_frames,
             overwrite=bool(args.overwrite),
             expected_size=(out_width, out_height),
+            expected_frame_rate=output_frame_rate,
         )
         if used_codec in HARDWARE_HEVC_ENCODER_NAMES:
             print(f"Encoded {video_path.name} with hardware HEVC encoder {used_codec}")

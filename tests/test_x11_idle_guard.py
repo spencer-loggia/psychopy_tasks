@@ -9,6 +9,7 @@ from interface.experiment_manager import PreparedBlock
 from interface.touch_interface import TouchInterfaceApp
 from interface.x11_idle_guard import (
     ExperimentIdleGuard,
+    MainScreenCurtain,
     XInputControlError,
     XInputTouchscreen,
     configured_main_touchscreen,
@@ -147,6 +148,44 @@ class X11IdleGuardTests(unittest.TestCase):
         )
         self.assertGreaterEqual(root.focus_force.call_count, 2)
 
+    def test_curtain_focus_barrier_processes_and_verifies_focus(self):
+        root = Mock()
+        window = Mock()
+        window.focus_displayof.return_value = window
+        tk_module = Mock()
+        tk_module.Toplevel.return_value = window
+
+        curtain = MainScreenCurtain(root, self.main_screen, tk_module=tk_module)
+        curtain.focus_for_task_launch()
+
+        window.deiconify.assert_called_once_with()
+        window.lift.assert_called_once_with()
+        window.focus_force.assert_called_once_with()
+        window.update.assert_called_once_with()
+        window.focus_displayof.assert_called_once_with()
+
+    def test_curtain_focus_barrier_rejects_ambiguous_active_display(self):
+        root = Mock()
+        window = Mock()
+        window.focus_displayof.return_value = None
+        tk_module = Mock()
+        tk_module.Toplevel.return_value = window
+
+        curtain = MainScreenCurtain(root, self.main_screen, tk_module=tk_module)
+        with self.assertRaisesRegex(RuntimeError, "ambiguous placement"):
+            curtain.focus_for_task_launch(timeout_s=0.0)
+
+    def test_guard_prepares_subject_focus_only_from_covered_idle_state(self):
+        curtain = Mock()
+        guard = ExperimentIdleGuard(Mock(), Mock(), curtain)
+
+        with self.assertRaisesRegex(RuntimeError, "covered idle state"):
+            guard.prepare_task_launch()
+
+        guard.idle = True
+        guard.prepare_task_launch()
+        curtain.focus_for_task_launch.assert_called_once_with()
+
     def test_process_wait_releases_input_when_ready_marker_appears(self):
         class FakeProcess:
             def __init__(self, ready_path):
@@ -233,6 +272,7 @@ class X11IdleGuardTests(unittest.TestCase):
                     result = app._run_block(block)
 
         self.assertEqual(result.returncode, 0)
+        app.idle_guard.prepare_task_launch.assert_called_once_with()
         child_env = popen.call_args.kwargs["env"]
         self.assertEqual(child_env["BASE"], "1")
         self.assertEqual(

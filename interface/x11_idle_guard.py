@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
@@ -128,7 +129,11 @@ class MainScreenCurtain:
         self.screen_info = screen_info
         self.window = tk_module.Toplevel(root)
         self.window.withdraw()
-        self.window.configure(bg="black", cursor="none", takefocus=False)
+        # The curtain is also the launch-time X11 focus anchor.  Keeping focus
+        # on the experimenter window until it is withdrawn leaves the window
+        # manager's active monitor undefined and can send a new managed
+        # fullscreen window to either output.
+        self.window.configure(bg="black", cursor="none", takefocus=True)
         set_tk_window_fullscreen(self.window, self.screen_info)
         try:
             self.window.attributes("-topmost", True)
@@ -143,6 +148,27 @@ class MainScreenCurtain:
     def hide(self) -> None:
         self.window.withdraw()
         self.window.update_idletasks()
+
+    def focus_for_task_launch(self, *, timeout_s: float = 1.0) -> None:
+        """Make the subject output the verified active X11 display."""
+        self.show()
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while True:
+            self.window.focus_force()
+            # Unlike update_idletasks(), update() processes the FocusIn event
+            # before the task subprocess is allowed to create its window.
+            self.window.update()
+            focused = self.window.focus_displayof()
+            if focused is self.window or (
+                focused is not None and str(focused) == str(self.window)
+            ):
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "Could not focus the main-screen launch curtain; refusing "
+                    "to create a fullscreen task window with ambiguous placement"
+                )
+            time.sleep(0.01)
 
     def close(self) -> None:
         try:
@@ -187,6 +213,14 @@ class ExperimentIdleGuard:
         else:
             self.curtain.show()
         self.restore_interface_focus()
+
+    def prepare_task_launch(self) -> None:
+        """Transfer focus to the covered subject output before child startup."""
+        if self.released:
+            raise RuntimeError("The main-screen guard has already been released")
+        if not self.idle:
+            raise RuntimeError("The main-screen guard is not in its covered idle state")
+        self.curtain.focus_for_task_launch()
 
     def task_window_ready(self) -> None:
         if self.released:

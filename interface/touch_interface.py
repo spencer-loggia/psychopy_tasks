@@ -617,6 +617,14 @@ class TouchInterfaceApp:
     def _hide_interface_for_process(self) -> None:
         self.root.withdraw()
         self.root.update_idletasks()
+        if self.idle_guard is not None:
+            try:
+                self.idle_guard.prepare_task_launch()
+            except Exception:
+                # Do not leave the manager inaccessible when the focus barrier
+                # rejects a launch before a child process exists.
+                self.idle_guard.restore_interface_focus()
+                raise
 
     def _restore_interface_after_process(self) -> None:
         if self.idle_guard is not None:
@@ -643,9 +651,9 @@ class TouchInterfaceApp:
 
         self.task_active = True
         self.status_var.set("Running system diagnostic on the main monitor...")
-        self._hide_interface_for_process()
         result: Dict[str, Any]
         try:
+            self._hide_interface_for_process()
             with tempfile.TemporaryDirectory(prefix="neuro_tasks_diagnostic_") as temp_dir:
                 temp_path = Path(temp_dir)
                 result_path = temp_path / "result.json"
@@ -940,7 +948,6 @@ class TouchInterfaceApp:
             raise RuntimeError("Select a subject before launching a task")
         cmd = [self.python_cmd, str(block.launch_path), "--config", str(block.config_path)]
         self.status_var.set(f"Running block {block.block_num}: {block.block_name}")
-        self._hide_interface_for_process()
         ready_path = block.output_dir / ".task_window_ready"
         release_path = block.output_dir / ".task_window_released"
         ready_path.unlink(missing_ok=True)
@@ -951,6 +958,7 @@ class TouchInterfaceApp:
             env[TASK_WINDOW_RELEASE_ENV] = str(release_path)
         process: Optional[subprocess.Popen] = None
         try:
+            self._hide_interface_for_process()
             process = subprocess.Popen(
                 cmd,
                 cwd=self.working_dir,

@@ -88,11 +88,24 @@ class TouchInterfaceNavigationTests(unittest.TestCase):
     def test_process_launch_hides_the_interface(self):
         app = self._app()
         app.root = Mock()
+        app.idle_guard = Mock()
 
         app._hide_interface_for_process()
 
         app.root.withdraw.assert_called_once_with()
         app.root.update_idletasks.assert_called_once_with()
+        app.idle_guard.prepare_task_launch.assert_called_once_with()
+
+    def test_failed_launch_focus_barrier_restores_interface(self):
+        app = self._app()
+        app.root = Mock()
+        app.idle_guard = Mock()
+        app.idle_guard.prepare_task_launch.side_effect = RuntimeError("focus failed")
+
+        with self.assertRaisesRegex(RuntimeError, "focus failed"):
+            app._hide_interface_for_process()
+
+        app.idle_guard.restore_interface_focus.assert_called_once_with()
 
     def test_process_completion_restores_the_guarded_interface(self):
         app = self._app()

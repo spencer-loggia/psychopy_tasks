@@ -453,10 +453,12 @@ each manager-generated block config. CLI selectors remain highest priority. Outs
 retain priority over ordinary environment defaults.
 Output names such as `HDMI-2` are rig configuration values, not constants in the display code.
 PsychoPy presentation windows default to true fullscreen. Main X11 windows use PsychoPy's native,
-window-manager-controlled fullscreen path without post-creation moves or resizing. Before
-launching a task or diagnostic, the interface is withdrawn from the experimenter output so the window manager does
-not relocate the new fullscreen window to that active display. Pyglet preselection is best-effort during
-PsychoPy's Linux `screen=0` workaround; the realized native rectangle is the authoritative check. The non-vsync experimenter preview uses the
+window-manager-controlled fullscreen path without post-creation moves or resizing. On dual-screen launcher runs
+with main-input masking, the interface is withdrawn and the already-visible subject-screen curtain becomes a
+verified X11 focus anchor before launching a task or diagnostic. A child is not started unless that focus transfer
+completes, so the window manager cannot inherit the experimenter output as its active display. Pyglet preselection
+is best-effort during PsychoPy's Linux `screen=0` workaround; the realized native rectangle is the authoritative
+check. The non-vsync experimenter preview uses the
 same native fullscreen creation with scoped override-redirect so it remains on its configured output without
 altering the subject window's presentation path. Every realized native rectangle is verified; tasks, diagnostics,
 and experimenter previews all reject incorrect placement before timing begins. A preview reports ready only after

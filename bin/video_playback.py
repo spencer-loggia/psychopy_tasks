@@ -15,6 +15,8 @@ from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
 
+from .frame_timing import plan_frame_duration
+
 
 REQUIRED_VIDEO_CODEC = "hevc"
 REQUIRED_VIDEO_PIXEL_FORMAT = "yuv420p"
@@ -61,6 +63,9 @@ class VideoClipSelection:
     end_s: float
     duration_s: float
     start_frame: Optional[int] = None
+    frame_count: int = 0
+    frame_rate: float = 30.0
+    requested_duration_s: float = 0.0
 
 
 def select_random_video_clip(
@@ -68,12 +73,9 @@ def select_random_video_clip(
     clip_duration_s: float,
     *,
     rng: Optional[random.Random] = None,
+    frame_rate: float = 30.0,
 ) -> VideoClipSelection:
-    """Select a uniformly random valid temporal clip from a probed stream.
-
-    When frame rate metadata is available, the start is snapped to a source
-    frame boundary while preserving a uniform choice over all valid starts.
-    """
+    """Select a random clip on the configured video-frame timebase."""
     clip_duration_s = float(clip_duration_s)
     if not math.isfinite(clip_duration_s) or clip_duration_s <= 0.0:
         raise ValueError("clip_duration_seconds must be a positive finite value")
@@ -81,36 +83,70 @@ def select_random_video_clip(
     source_duration_s = video_duration_seconds(stream)
     if source_duration_s <= 0.0:
         raise ValueError("video duration is missing or invalid")
-    if clip_duration_s > source_duration_s + 1e-9:
+    configured_frame_rate = float(frame_rate)
+    if not math.isfinite(configured_frame_rate) or configured_frame_rate <= 0.0:
+        raise ValueError("frame_rate must be a positive finite value")
+    duration_plan = plan_frame_duration(
+        clip_duration_s,
+        configured_frame_rate,
+        minimum_frames=1,
+    )
+    scheduled_duration_s = duration_plan.scheduled_s
+    if scheduled_duration_s > source_duration_s + 1e-9:
         raise ValueError(
             f"clip_duration_seconds={clip_duration_s:.6f} exceeds "
             f"source duration {source_duration_s:.6f}"
         )
 
     chooser = rng or random.Random()
-    maximum_start_s = max(0.0, source_duration_s - clip_duration_s)
-    frame_rate = parse_frame_rate(
-        stream.get("avg_frame_rate") or stream.get("r_frame_rate")
+    maximum_start_s = max(0.0, source_duration_s - scheduled_duration_s)
+    maximum_start_frame = max(
+        0,
+        int(math.floor((maximum_start_s * configured_frame_rate) + 1e-9)),
     )
-    start_frame: Optional[int] = None
-    if frame_rate > 0.0:
-        maximum_start_frame = max(
-            0,
-            int(math.floor((maximum_start_s * frame_rate) + 1e-9)),
-        )
-        start_frame = chooser.randint(0, maximum_start_frame)
-        start_s = float(start_frame) / frame_rate
-    else:
-        start_s = chooser.uniform(0.0, maximum_start_s)
-
-    end_s = start_s + clip_duration_s
+    start_frame = chooser.randint(0, maximum_start_frame)
+    start_s = float(start_frame) / configured_frame_rate
+    end_s = start_s + scheduled_duration_s
     return VideoClipSelection(
         source_duration_s=source_duration_s,
         start_s=start_s,
         end_s=end_s,
-        duration_s=clip_duration_s,
+        duration_s=scheduled_duration_s,
         start_frame=start_frame,
+        frame_count=duration_plan.frame_count,
+        frame_rate=configured_frame_rate,
+        requested_duration_s=clip_duration_s,
     )
+
+
+def next_video_frame_slot(
+    *,
+    first_flip_perf_s: float,
+    next_slot: int,
+    now_perf_s: float,
+    frame_rate: float,
+    request_lead_s: float,
+) -> tuple[int, int]:
+    """Return the earliest still-schedulable absolute video-frame slot.
+
+    The second result is the number of expired slots skipped. No relative
+    sleep is carried forward, so a slow decode/draw iteration cannot create
+    cumulative playback lag.
+    """
+    period_s = 1.0 / float(frame_rate)
+    earliest = int(
+        math.ceil(
+            (
+                float(now_perf_s)
+                + float(request_lead_s)
+                - float(first_flip_perf_s)
+            )
+            / period_s
+            - 1e-9
+        )
+    )
+    selected = max(int(next_slot), earliest)
+    return selected, max(0, selected - int(next_slot))
 
 
 def _wait_for_seekable_vlc_player(movie, deadline_perf_s: float) -> bool:

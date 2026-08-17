@@ -5,6 +5,8 @@
   ],
   "clip_duration_seconds": 60.0,
   "seek_timeout_seconds": 30.0,
+  "frame_rate": 30,
+  "flip_request_lead_seconds": 0.015,
   "output_dir": "./logs",
   "screens": {
     "main": null,
@@ -14,5 +16,8 @@
   "bg": [0, 0, 0],
   "sync_pin": 18,
   "sync_interval_frames": [100, 300],
-  "sync_pulse_frames": 1
+  "sync_pulse_frames": 1,
+  "pump_pin": 0,
+  "pump_pulse_time_seconds": 0.25,
+  "pump_interval": 60.0
 }

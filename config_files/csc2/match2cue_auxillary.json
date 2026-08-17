@@ -9,6 +9,13 @@
 
   "pump_delay_time": 0.2,
   "pump_pulse_time_seconds": 0.6,
+  "inter_pump_interval": 0.2, 
+
+  "reward_match_cue_prob": 0.7,
+  "correct_num_pulse": 2,
+  "tie_mode": "all",
+
+
   "daq": {
     "address": 0
   },
@@ -37,7 +44,7 @@
   "delay_time": 0.0,
   "iti": 0.5,
   "duration": 0.0,
-  "num_afc": 3,
+  "num_afc": 2,
   "choice_time": 2.0,
   "isi": 0.0,
   "fixed_positions": false,

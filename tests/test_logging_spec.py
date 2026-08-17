@@ -275,6 +275,8 @@ class LoggingSpecTests(unittest.TestCase):
         self.assertEqual(definitions["video_sync_signal_on"].code, 302)
         self.assertEqual(definitions["video_sync_signal_off"].code, 303)
         self.assertEqual(definitions["video_sync_signal_on"].default_type, "signal")
+        self.assertEqual(definitions["pump_on"].code, 310)
+        self.assertEqual(definitions["pump_off"].code, 311)
 
 
 if __name__ == "__main__":

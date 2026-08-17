@@ -1,8 +1,9 @@
 import types
+import time
 import unittest
 from unittest.mock import patch
 
-from bin.daqc2_outputs import DAQC2DigitalOutputs
+from bin.daqc2_outputs import DAQC2DigitalOutputs, PeriodicDOUTPulseController
 
 
 class DAQC2DigitalOutputsTests(unittest.TestCase):
@@ -46,6 +47,44 @@ class DAQC2DigitalOutputsTests(unittest.TestCase):
         outputs = DAQC2DigitalOutputs(enabled=False)
         with self.assertRaises(ValueError):
             outputs.write(24, True)
+
+    def test_periodic_controller_pulses_on_worker_thread_and_clears_on_stop(self):
+        writes = []
+        fake_module = types.SimpleNamespace(
+            setDOUTbit=lambda addr, bit: writes.append((True, addr, bit, time.perf_counter())),
+            clrDOUTbit=lambda addr, bit: writes.append((False, addr, bit, time.perf_counter())),
+        )
+        with patch("importlib.import_module", return_value=fake_module):
+            controller = PeriodicDOUTPulseController(
+                DAQC2DigitalOutputs(address=2),
+                bit=3,
+                interval_s=0.03,
+                pulse_duration_s=0.005,
+            )
+            controller.start()
+            deadline = time.perf_counter() + 0.5
+            while (
+                sum(active for active, *_ in writes) < 2
+                and time.perf_counter() < deadline
+            ):
+                time.sleep(0.005)
+            controller.stop()
+
+        edges = controller.drain_edges()
+        self.assertGreaterEqual(sum(edge.active for edge in edges), 2)
+        self.assertEqual([edge.active for edge in edges[:4]], [True, False, True, False])
+        self.assertFalse(writes[-1][0])
+        self.assertTrue(all(write[1:3] == (2, 3) for write in writes))
+
+    def test_periodic_controller_rejects_overlapping_pulses(self):
+        outputs = DAQC2DigitalOutputs(enabled=False)
+        with self.assertRaisesRegex(ValueError, "shorter than pump_interval"):
+            PeriodicDOUTPulseController(
+                outputs,
+                bit=0,
+                interval_s=0.25,
+                pulse_duration_s=0.25,
+            )
 
 
 if __name__ == "__main__":

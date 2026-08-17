@@ -16,6 +16,7 @@ from bin.video_playback import (
     SharedVideoFrameReader,
     center_crop_bounds,
     find_pi_hevc_decoder_device,
+    next_video_frame_slot,
     parse_frame_rate,
     prepare_vlc_clip,
     select_random_video_clip,
@@ -72,6 +73,33 @@ class VideoPlaybackTests(unittest.TestCase):
         self.assertLessEqual(clip.end_s, 120.0)
         self.assertAlmostEqual(clip.end_s - clip.start_s, 10.0)
         self.assertAlmostEqual(clip.start_s * 30.0, clip.start_frame)
+        self.assertEqual(clip.frame_count, 300)
+        self.assertEqual(clip.frame_rate, 30.0)
+
+    def test_configured_frame_rate_is_authoritative_for_clip_selection(self):
+        clip = select_random_video_clip(
+            {"duration": "10.0", "avg_frame_rate": "24000/1001"},
+            0.11,
+            rng=random.Random(4),
+            frame_rate=30.0,
+        )
+
+        self.assertEqual(clip.frame_count, 3)
+        self.assertAlmostEqual(clip.duration_s, 0.1)
+        self.assertAlmostEqual(clip.start_s * 30.0, clip.start_frame)
+        self.assertAlmostEqual(clip.requested_duration_s, 0.11)
+
+    def test_absolute_video_schedule_skips_expired_slots_without_lag(self):
+        slot, skipped = next_video_frame_slot(
+            first_flip_perf_s=100.0,
+            next_slot=3,
+            now_perf_s=100.2,
+            frame_rate=30.0,
+            request_lead_s=0.015,
+        )
+
+        self.assertEqual(slot, 7)
+        self.assertEqual(skipped, 4)
 
     def test_random_clip_rejects_source_shorter_than_requested_clip(self):
         with self.assertRaisesRegex(ValueError, "exceeds source duration"):
@@ -372,7 +400,6 @@ class PlayVideoTaskRotationTests(unittest.TestCase):
             "aborted": True,
             "abort_reason": "mouse_click",
             "dropped_frames": 0,
-            "main_display_dropped_frames": 0,
             "sync_pulses": 0,
         }
         play_video_fill_screen = Mock(return_value=playback_result)
@@ -480,6 +507,9 @@ class PlayVideoTaskRotationTests(unittest.TestCase):
         playback_kwargs = play_video_fill_screen.call_args.kwargs
         self.assertEqual(playback_kwargs["native_target_size"], (2560, 1600))
         self.assertEqual(playback_kwargs["stimulus_rotation_degrees"], 90)
+        self.assertEqual(playback_kwargs["video_frame_rate"], 30.0)
+        self.assertEqual(playback_kwargs["video_frame_count"], 60)
+        self.assertEqual(playback_kwargs["flip_request_lead_s"], 0.015)
 
         preview = preview_instances[0]
         self.assertEqual(len(preview.play_calls), 1)

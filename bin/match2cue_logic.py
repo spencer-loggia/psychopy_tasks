@@ -1,11 +1,15 @@
 """Pure trial generation and scoring for the match2cue task."""
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 from bin.afc_stimuli import StimulusKey
+
+
+VALID_TIE_MODES = ("all", "random")
 
 
 @dataclass(frozen=True)
@@ -13,6 +17,10 @@ class Match2CueTrial:
     cue: StimulusKey
     options: tuple[StimulusKey, ...]
     reward_draw: float
+    # Kept separate from reward_draw so cue-tap and choice rewards are
+    # independent. The default preserves compatibility with callers that
+    # construct trials directly and only score the option choice.
+    cue_reward_draw: float = 1.0
 
     @property
     def matching_count(self) -> int:
@@ -25,6 +33,104 @@ class Match2CueOutcome:
     matching_count: int
     reward_probability: float
     reward_delivered: bool
+
+
+@dataclass(frozen=True)
+class Match2CueRewardSettings:
+    reward_match_cue_prob: float
+    correct_num_pulse: int
+    inter_pump_interval: float
+    tie_mode: str
+
+
+def normalize_tie_mode(value: Any) -> str:
+    """Return a validated match2cue tie mode."""
+    if not isinstance(value, str):
+        raise ValueError("tie_mode must be 'all' or 'random'")
+    mode = value.strip().lower()
+    if mode not in VALID_TIE_MODES:
+        raise ValueError("tie_mode must be 'all' or 'random'")
+    return mode
+
+
+def resolve_match2cue_reward_settings(
+    *,
+    reward_match_cue_prob: Any = 0.0,
+    correct_num_pulse: Any = 1,
+    inter_pump_interval: Any = None,
+    pump_pulse_time_seconds: Any = 0.25,
+    tie_mode: Any = "random",
+) -> Match2CueRewardSettings:
+    """Validate reward options and apply backward-compatible defaults."""
+    try:
+        cue_probability = float(reward_match_cue_prob)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("reward_match_cue_prob must be a number from 0 to 1") from exc
+    if not math.isfinite(cue_probability) or not 0.0 <= cue_probability <= 1.0:
+        raise ValueError("reward_match_cue_prob must be a finite number from 0 to 1")
+
+    if isinstance(correct_num_pulse, bool) or not isinstance(
+        correct_num_pulse, (int, float)
+    ):
+        raise ValueError("correct_num_pulse must be a positive integer")
+    pulse_count_value = float(correct_num_pulse)
+    if (
+        not math.isfinite(pulse_count_value)
+        or not pulse_count_value.is_integer()
+        or pulse_count_value < 1.0
+    ):
+        raise ValueError("correct_num_pulse must be a positive integer")
+    pulse_count = int(pulse_count_value)
+
+    try:
+        pump_pulse_time = float(pump_pulse_time_seconds)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "pump_pulse_time_seconds must be a finite non-negative value"
+        ) from exc
+    if not math.isfinite(pump_pulse_time) or pump_pulse_time < 0.0:
+        raise ValueError(
+            "pump_pulse_time_seconds must be a finite non-negative value"
+        )
+
+    interval_value = (
+        pump_pulse_time if inter_pump_interval is None else inter_pump_interval
+    )
+    try:
+        interval = float(interval_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "inter_pump_interval must be a finite non-negative value"
+        ) from exc
+    if not math.isfinite(interval) or interval < 0.0:
+        raise ValueError("inter_pump_interval must be a finite non-negative value")
+
+    return Match2CueRewardSettings(
+        reward_match_cue_prob=cue_probability,
+        correct_num_pulse=pulse_count,
+        inter_pump_interval=interval,
+        tie_mode=normalize_tie_mode(tie_mode),
+    )
+
+
+def reward_train_duration(
+    num_pulses: int,
+    pump_pulse_time_seconds: float,
+    inter_pump_interval: float,
+) -> float:
+    """Return the wall-clock duration of a repeated pump-pulse train."""
+    count = int(num_pulses)
+    return float(count * pump_pulse_time_seconds) + float(
+        max(0, count - 1) * inter_pump_interval
+    )
+
+
+def should_deliver_cue_tap_reward(
+    trial: Match2CueTrial,
+    reward_probability: float,
+) -> bool:
+    """Apply the trial's independent random draw to the cue-tap lottery."""
+    return bool(trial.cue_reward_draw < float(reward_probability))
 
 
 def generate_match2cue_trial(
@@ -55,14 +161,20 @@ def generate_match2cue_trial(
         cue=cue,
         options=tuple(options),
         reward_draw=chooser.random(),
+        # Draw this after the legacy choice-reward draw so seeded cue/options
+        # and choice rewards retain their prior random sequence.
+        cue_reward_draw=chooser.random(),
     )
 
 
 def score_match2cue_choice(
     trial: Match2CueTrial,
     chosen_index_1based: Optional[int],
+    *,
+    tie_mode: str = "random",
 ) -> Match2CueOutcome:
-    """Score a selection and apply the duplicate-match reward probability."""
+    """Score a selection according to the configured duplicate-match policy."""
+    resolved_tie_mode = normalize_tie_mode(tie_mode)
     if chosen_index_1based is None:
         return Match2CueOutcome(
             correct=None,
@@ -76,7 +188,12 @@ def score_match2cue_choice(
             f"chosen_index_1based must be between 1 and {len(trial.options)}"
         )
     correct = trial.options[chosen_index - 1] == trial.cue
-    reward_probability = (1.0 / float(trial.matching_count)) if correct else 0.0
+    if not correct:
+        reward_probability = 0.0
+    elif resolved_tie_mode == "all":
+        reward_probability = 1.0
+    else:
+        reward_probability = 1.0 / float(trial.matching_count)
     return Match2CueOutcome(
         correct=correct,
         matching_count=trial.matching_count,

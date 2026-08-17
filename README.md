@@ -143,9 +143,14 @@ Experiment-managed task/subprocess policies:
   and each value is an object containing at least the subfields declared by that state history.
 - When main-input masking is enabled, a task must signal readiness after its subject window exists but before
   timing-sensitive work. The call waits for the launcher to remove the curtain; the task then activates the
-  window. `bin.utils.setup_task_window()` resolves the canonical outputs and handles this sequence for every main
-  task window. `bin.utils.setup_window()` remains only for an already-resolved auxiliary window. A custom window
-  must call `bin.task_lifecycle.signal_task_window_ready()` and activate its native handle afterward.
+  window. `bin.utils.setup_task_window()` is the privileged and mandatory entry point for every subject-facing
+  task window. Task code must never construct `visual.Window`, resolve its own main output, or call
+  `setup_window()`, `initialize_psychopy_window()`, or `open_psychopy_window()` for the subject window. This one
+  path owns canonical selector resolution, launcher readiness, Pyglet output binding, refresh synchronization,
+  native activation, and final realized-rectangle verification. `bin.utils.setup_window()` is reserved for an
+  already-resolved auxiliary calibration window; the diagnostic and preview process are the only other low-level
+  window-factory users. `tests/test_screen_path_policy.py` enforces this invariant for every current task and
+  rejects future direct window-factory bypasses.
 
 X11 Main-Screen Idle Masking
 ----------------------------
@@ -353,15 +358,27 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
 - `afc_trial_sequence` logs one behavior row per trial, including the option list and any choice touch.
 - `play_video` takes an explicit `video_files` list and a required
   `clip_duration_seconds`. Each trial randomly selects one source, uniformly
-  selects a valid frame-aligned temporal start, seeks within that source, and
-  presents the fixed-duration clip without extracting a temporary file.
+  selects a valid temporal start aligned to the configured video-frame
+  timebase, seeks within that source, and presents the fixed-duration clip
+  without extracting a temporary file. `frame_rate` is authoritative and
+  defaults to `30`, even when container metadata reports another rate. The
+  requested duration is rounded only to the nearest count of configured video
+  frames; both the original request and scheduled duration are logged.
 - Sources must be HEVC Main/yuv420p. The task probes each unique path once and
   refuses incompatible media or sources shorter than the requested clip. On
   Raspberry Pi, it also requires an accessible HEVC V4L2 hardware decoder.
 - The behavior row for each trial records the full source path, requested and
   actual source timestamps, first-frame display time, last-frame end time,
-  displayed duration, and displayed frame count. The corresponding event-log
+  requested and scheduled duration, configured rate, scheduled/displayed frame
+  counts, skipped schedule slots, and displayed duration. The corresponding event-log
   start/end records are main-display flips; the end flip removes the last frame.
+- Video flips use absolute `1 / frame_rate` deadlines. The task draws the
+  latest decoded frame, waits until `flip_request_lead_seconds` (default
+  `0.015`) before the deadline, and then submits a refresh-synchronized
+  PsychoPy flip. If work overruns a deadline, expired video slots are skipped
+  instead of shifting subsequent deadlines and accumulating lag. A monitor
+  whose refresh is not a near-integer multiple of `frame_rate` produces an
+  explicit cadence warning.
 - `play_video` decodes each clip once. Every newly displayed decoded frame is
   published to a four-slot, latest-frame-wins shared-memory ring; the
   experimenter process displays the newest complete frame without creating a
@@ -378,11 +395,20 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
   For efficient random access over a mounted network filesystem, preprocess
   sources with `bin/preprocess_videos.py`; outputs use MP4 fast-start metadata
   and a default two-second maximum keyframe interval.
-- On Raspberry Pi, `play_video` sends one-display-frame sync pulses on BCM GPIO
+- On Raspberry Pi, `play_video` sends one-video-presentation-frame sync pulses on BCM GPIO
   `sync_pin` (default `18`). Pulse onsets are frame locked and their successive
   intervals are sampled inclusively from `sync_interval_frames` (default
   `[100, 300]`) for each interval. `sync_pulse_frames` controls pulse width and
   defaults to `1`.
+- On Raspberry Pi, `play_video` also drives the reward pump through Pi-Plates
+  DAQC2 `DOUT pump_pin`. Both `pump_interval` and
+  `pump_pulse_time_seconds` are required. The first onset occurs one
+  `pump_interval` after task startup and subsequent onsets remain on one
+  absolute session schedule across clip boundaries. Pump writes run on a
+  worker thread so DAQC2 I/O cannot stall display flips; delayed intervals are
+  skipped rather than replayed. `pump_on` and `pump_off` log rows contain both
+  requested and actual edge timestamps. Optional `daq.address`/`daq_address`
+  and `daq.module_name`/`daq_module_name` select the board and driver.
 - `play_video` treats each randomly selected temporal clip as a trial. It logs
   clip start/end and video sync on/off edges, but does not log every displayed
   video frame.
@@ -396,12 +422,23 @@ A minimal video-source portion of the configuration is:
     "/mnt/experiment-videos/source_02.mp4"
   ],
   "clip_duration_seconds": 5.0,
-  "seek_timeout_seconds": 30.0
+  "seek_timeout_seconds": 30.0,
+  "frame_rate": 30,
+  "flip_request_lead_seconds": 0.015,
+  "pump_pin": 0,
+  "pump_pulse_time_seconds": 0.25,
+  "pump_interval": 60.0
 }
 ```
 
 Screen Selection
 ----------------
+**Invariant: a subject window is opened only by `bin.utils.setup_task_window()`.**
+This is a privileged task boundary, not a convenience wrapper. Any change to
+screen discovery, synchronization, task startup, or window placement must
+retain that call in every subject-facing task and run
+`tests/test_screen_path_policy.py`. Do not add a task-local fallback path.
+
 Multi-screen tasks use `screens.main` for the subject display and `screens.experimenter` for the secondary display.
 Each value can be a detected screen index or an output name such as `HDMI-1` or `DSI-1`.
 Use output names on X11 rigs because numeric monitor order is not stable across display changes.

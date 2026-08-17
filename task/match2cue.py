@@ -43,7 +43,10 @@ from bin.logger import SessionLogBundle
 from bin.match2cue_logic import (
     Match2CueTrial,
     generate_match2cue_trial,
+    resolve_match2cue_reward_settings,
+    reward_train_duration,
     score_match2cue_choice,
+    should_deliver_cue_tap_reward,
 )
 from bin.screen import (
     ExperimenterPreview,
@@ -93,6 +96,7 @@ def _generate_trial_payload(trial_idx: int, config: dict) -> dict:
         "cue": stimulus_to_json(trial.cue),
         "options": [stimulus_to_json(value) for value in trial.options],
         "reward_draw": float(trial.reward_draw),
+        "cue_reward_draw": float(trial.cue_reward_draw),
         "rendered": {
             stimulus_storage_key(key): value for key, value in rendered.items()
         },
@@ -112,6 +116,7 @@ def _decode_trial_payload(
         cue=cue,
         options=options,
         reward_draw=float(payload["reward_draw"]),
+        cue_reward_draw=float(payload.get("cue_reward_draw", 1.0)),
     )
     rendered = {
         stimulus_from_storage_key(key): value
@@ -138,6 +143,7 @@ def _build_behavior_fieldnames(num_afc: int) -> List[str]:
         "cue_color",
         "cue_lum",
         "matching_option_count",
+        "tie_mode",
     ]
     for option_idx in range(int(num_afc)):
         fields.extend(
@@ -154,8 +160,11 @@ def _build_behavior_fieldnames(num_afc: int) -> List[str]:
             "choice_made_color",
             "choice_made_lum",
             "choice_correct",
+            "cue_reward_probability",
+            "cue_reward_delivered",
             "reward_probability",
             "reward_delivered",
+            "choice_reward_pulse_count",
             "choice_touch_x",
             "choice_touch_y",
             "choice_reaction_time",
@@ -244,6 +253,13 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     pump_pin = int(cfg.get("pump_pin", 0))
     pump_delay_time = max(0.0, float(cfg.get("pump_delay_time", 0.0)))
     pump_pulse_time = max(0.0, float(cfg.get("pump_pulse_time_seconds", 0.25)))
+    reward_settings = resolve_match2cue_reward_settings(
+        reward_match_cue_prob=cfg.get("reward_match_cue_prob", 0.0),
+        correct_num_pulse=cfg.get("correct_num_pulse", 1),
+        inter_pump_interval=cfg.get("inter_pump_interval"),
+        pump_pulse_time_seconds=pump_pulse_time,
+        tie_mode=cfg.get("tie_mode", "random"),
+    )
     if raspi:
         DAQC2DigitalOutputs.validate_address(daq_address)
         DAQC2DigitalOutputs.validate_bit(pump_pin)
@@ -463,9 +479,41 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
             )
         status_counts["Rewards delivered"] += 1
         update_preview_counts()
+        msg_logger.log(
+            "INFO",
+            f"reward_pulse trial_num={trial_num} context={context}",
+        )
         if aborted:
             task_end_status = "experimenter_exit"
         return aborted
+
+    def deliver_reward_train(
+        trial_num: int,
+        *,
+        num_pulses: int,
+        context: str,
+    ) -> bool:
+        """Deliver an abort-aware pulse train with gaps only between pulses."""
+        nonlocal task_end_status
+        for pulse_num in range(1, int(num_pulses) + 1):
+            if deliver_reward(trial_num, context=context):
+                return True
+            if pulse_num >= int(num_pulses):
+                continue
+            if wait_or_abort(
+                reward_settings.inter_pump_interval,
+                allow_manual_reward=False,
+            ):
+                task_end_status = "experimenter_exit"
+                msg_logger.log(
+                    "WARN",
+                    (
+                        "experimenter_exit_during_inter_pump_interval "
+                        f"trial_num={trial_num} pulse={pulse_num}"
+                    ),
+                )
+                return True
+        return False
 
     worker_config = {
         "n_trials": n_trials,
@@ -538,6 +586,19 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                     f"position_assigned trial_num={trial_num} option_num={option_num} screen_px={screen_pos} psychopy_pos={psycho_pos}",
                 )
 
+            cue_reward_state = {"delivered": False}
+            cue_reward_won = bool(
+                self_initiation
+                and should_deliver_cue_tap_reward(
+                    trial,
+                    reward_settings.reward_match_cue_prob,
+                )
+            )
+
+            def deliver_won_cue_reward() -> bool:
+                cue_reward_state["delivered"] = True
+                return deliver_reward(trial_num, context="cue_tap_reward")
+
             trial_meta: Dict[str, Any] = {}
             aborted, choice_info = utils.present_trial_with_persistent_dots(
                 win=win,
@@ -556,6 +617,9 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 init_dot_color=init_dot_color,
                 bg_rgb_255=space.bg,
                 onset_cue=onset_stim,
+                on_onset_cue_touch=(
+                    deliver_won_cue_reward if cue_reward_won else None
+                ),
                 msg_logger=msg_logger,
                 fps=fps,
                 raspi=bool(raspi and pigpio_chip is not None),
@@ -585,16 +649,28 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                             "scope=continuous_frame_sequences"
                         ),
                     )
-                task_end_status = "experimenter_exit" if poll_controls() else "aborted"
+                if task_end_status != "experimenter_exit":
+                    task_end_status = (
+                        "experimenter_exit" if poll_controls() else "aborted"
+                    )
                 break
 
             chosen_index = choice_info.get("chosen_index") if choice_info is not None else None
-            outcome = score_match2cue_choice(trial, chosen_index)
+            outcome = score_match2cue_choice(
+                trial,
+                chosen_index,
+                tie_mode=reward_settings.tie_mode,
+            )
             gray_start_perf = trial_meta.get("gray_flip_perf_s")
             if gray_start_perf is not None:
                 gray_duration = float(iti)
                 if outcome.reward_delivered:
-                    gray_duration += pump_delay_time + pump_pulse_time
+                    gray_duration += pump_delay_time
+                    gray_duration += reward_train_duration(
+                        reward_settings.correct_num_pulse,
+                        pump_pulse_time,
+                        reward_settings.inter_pump_interval,
+                    )
                 logger.log_frame_flip(
                     trial_num=trial_num,
                     event="gray_inter_trial_interval",
@@ -614,7 +690,11 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 if pump_delay_time > 0 and wait_or_abort(pump_delay_time):
                     task_end_status = "experimenter_exit"
                     break
-                if deliver_reward(trial_num, context="task_reward"):
+                if deliver_reward_train(
+                    trial_num,
+                    num_pulses=reward_settings.correct_num_pulse,
+                    context="correct_choice_reward",
+                ):
                     break
 
             cue_shape, cue_color, cue_lum = _meta_values(space, trial.cue)
@@ -634,13 +714,21 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 "cue_color": cue_color,
                 "cue_lum": cue_lum,
                 "matching_option_count": outcome.matching_count,
+                "tie_mode": reward_settings.tie_mode,
                 "choice_made_index": (int(chosen_index) - 1 if chosen_index is not None else ""),
                 "choice_made_shape": chosen_shape,
                 "choice_made_color": chosen_color,
                 "choice_made_lum": chosen_lum,
                 "choice_correct": (int(outcome.correct) if outcome.correct is not None else ""),
+                "cue_reward_probability": f"{reward_settings.reward_match_cue_prob:.9f}",
+                "cue_reward_delivered": int(cue_reward_state["delivered"]),
                 "reward_probability": f"{outcome.reward_probability:.9f}",
                 "reward_delivered": int(outcome.reward_delivered),
+                "choice_reward_pulse_count": (
+                    reward_settings.correct_num_pulse
+                    if outcome.reward_delivered
+                    else 0
+                ),
                 "choice_touch_x": _optional_float(
                     choice_info.get("touch_x") if choice_info is not None else None
                 ),

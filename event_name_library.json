@@ -124,12 +124,12 @@
     "pump_on": {
       "code": 310,
       "event_type": "signal",
-      "description": "Pump GPIO signal onset."
+      "description": "Pump output signal onset."
     },
     "pump_off": {
       "code": 311,
       "event_type": "signal",
-      "description": "Pump GPIO signal offset."
+      "description": "Pump output signal offset."
     },
     "buzzer_on": {
       "code": 320,
@@ -163,7 +163,9 @@
       "video_clip_start",
       "video_clip_end",
       "video_sync_signal_on",
-      "video_sync_signal_off"
+      "video_sync_signal_off",
+      "pump_on",
+      "pump_off"
     ],
     "calibrate_eye_tracker": [
       "pump_on",

@@ -37,6 +37,7 @@ from .frame_timing import flip_with_timestamps, plan_frame_duration
 from .video_playback import (
     RandomFramePulseSchedule,
     SharedVideoFrameBuffer,
+    next_video_frame_slot,
     prepare_vlc_clip,
     video_duration_seconds,
 )
@@ -263,7 +264,6 @@ def play_video_fill_screen(
     sync_gpio_module=None,
     sync_gpio_chip=None,
     sync_pin: int = 18,
-    frame_duration_s: Optional[float] = None,
     frame_publish_interval_s: float = 0.0,
     clip_start_s: float = 0.0,
     clip_duration_s: Optional[float] = None,
@@ -273,6 +273,10 @@ def play_video_fill_screen(
     decoder_ready_callback: Optional[Callable[[], None]] = None,
     stimulus_rotation_degrees: float = 0.0,
     native_target_size: Optional[Sequence[float]] = None,
+    video_frame_rate: float = 30.0,
+    video_frame_count: Optional[int] = None,
+    requested_clip_duration_s: Optional[float] = None,
+    flip_request_lead_s: float = 0.015,
 ) -> Dict[str, Any]:
     video_file = Path(video_path)
     if stream_info is None and not video_file.is_file():
@@ -308,8 +312,38 @@ def play_video_fill_screen(
             f"Requested clip {clip_start_s:.6f}-{clip_start_s + clip_duration_s:.6f}s "
             f"exceeds source duration {source_duration_s:.6f}s"
         )
-    if frame_duration_s is not None and float(frame_duration_s) <= 0.0:
-        raise ValueError("frame_duration_s must be positive when provided")
+    video_frame_rate = float(video_frame_rate)
+    if not math.isfinite(video_frame_rate) or video_frame_rate <= 0.0:
+        raise ValueError("video_frame_rate must be a positive finite value")
+    video_frame_period_s = 1.0 / video_frame_rate
+    flip_request_lead_s = float(flip_request_lead_s)
+    if (
+        not math.isfinite(flip_request_lead_s)
+        or flip_request_lead_s < 0.0
+        or flip_request_lead_s >= video_frame_period_s
+    ):
+        raise ValueError(
+            "flip_request_lead_s must be finite, non-negative, and shorter than one video frame"
+        )
+    requested_clip_duration_s = float(
+        clip_duration_s
+        if requested_clip_duration_s is None
+        else requested_clip_duration_s
+    )
+    if (
+        not math.isfinite(requested_clip_duration_s)
+        or requested_clip_duration_s <= 0.0
+    ):
+        raise ValueError("requested_clip_duration_s must be positive and finite")
+    if video_frame_count is None:
+        video_frame_count = plan_frame_duration(
+            clip_duration_s,
+            video_frame_rate,
+            minimum_frames=1,
+        ).frame_count
+    video_frame_count = int(video_frame_count)
+    if video_frame_count <= 0:
+        raise ValueError("video_frame_count must be positive")
     rotation_degrees = float(stimulus_rotation_degrees)
     if not math.isfinite(rotation_degrees):
         raise ValueError("stimulus_rotation_degrees must be finite")
@@ -387,6 +421,9 @@ def play_video_fill_screen(
                     f"video_size={video_size} native_target_size={native_size} "
                     f"subject_target_size={subject_target_size} rotation_deg={rotation_degrees:g} "
                     f"win_size={tuple(win.size)} draw_size={draw_size} "
+                    f"video_frame_rate={video_frame_rate:.6f} "
+                    f"video_frame_count={video_frame_count} "
+                    f"flip_request_lead_s={flip_request_lead_s:.6f} "
                     f"scale_mode=uniform_cover backend={backend_used} "
                     f"codec={stream.get('codec_name')} pix_fmt={stream.get('pix_fmt')}"
                 ),
@@ -406,25 +443,13 @@ def play_video_fill_screen(
     last_published_frame_idx = None
     next_frame_publish_perf = 0.0
     frames_presented = 0
-    duration_plan = (
-        plan_frame_duration(
-            clip_duration_s,
-            1.0 / float(frame_duration_s),
-            minimum_frames=1,
-        )
-        if frame_duration_s is not None
-        else None
-    )
     sync_records: List[Dict[str, Any]] = []
     backend_drop_count = None
-    expected_duration_s = clip_duration_s
+    expected_duration_s = requested_clip_duration_s
     actual_source_start_s = None
     actual_source_last_frame_s = None
-    previous_record_frame_intervals = bool(
-        getattr(win, "recordFrameIntervals", False)
-    )
-    main_display_dropped_frames = None
-    main_drop_count_before = None
+    scheduled_video_slots_skipped = 0
+    next_video_slot = 0
     try:
         prepared_source_time_s = prepare_vlc_clip(
             movie,
@@ -440,14 +465,6 @@ def play_video_fill_screen(
         raise
 
     try:
-        if frame_duration_s is not None:
-            win.refreshThreshold = float(frame_duration_s) * 1.5
-        main_drop_count_before = int(getattr(win, "nDroppedFrames", 0))
-        win.recordFrameIntervals = True
-    except Exception:
-        main_drop_count_before = None
-
-    try:
         while True:
             if allow_escape and event.getKeys(["escape"]):
                 aborted = True
@@ -457,10 +474,15 @@ def play_video_fill_screen(
 
             if external_abort_checker is not None:
                 try:
-                    if external_abort_checker():
+                    external_abort = external_abort_checker()
+                    if external_abort:
                         aborted = True
-                        abort_reason = "experimenter_exit"
-                        _log_message(msg_logger, "WARN", f"video_abort trial_num={trial_num} file={video_file.name} reason=experimenter_exit")
+                        abort_reason = (
+                            str(external_abort)
+                            if isinstance(external_abort, str)
+                            else "external_abort"
+                        )
+                        _log_message(msg_logger, "WARN", f"video_abort trial_num={trial_num} file={video_file.name} reason={abort_reason}")
                         break
                 except Exception:
                     pass
@@ -486,6 +508,22 @@ def play_video_fill_screen(
                 )
                 break
 
+            scheduled_flip_perf = None
+            if first_flip_perf is not None:
+                next_video_slot, skipped_now = next_video_frame_slot(
+                    first_flip_perf_s=first_flip_perf,
+                    next_slot=next_video_slot,
+                    now_perf_s=time.perf_counter(),
+                    frame_rate=video_frame_rate,
+                    request_lead_s=flip_request_lead_s,
+                )
+                scheduled_video_slots_skipped += skipped_now
+                if next_video_slot >= video_frame_count:
+                    break
+                scheduled_flip_perf = (
+                    first_flip_perf + next_video_slot * video_frame_period_s
+                )
+
             sync_edges = ()
             if sync_schedule is not None:
                 sync_edges = sync_schedule.edges_for_frame(display_frame_index)
@@ -501,6 +539,11 @@ def play_video_fill_screen(
             if bg_rect is not None:
                 bg_rect.draw()
             movie.draw()
+            if scheduled_flip_perf is not None:
+                request_perf_s = scheduled_flip_perf - flip_request_lead_s
+                remaining_s = request_perf_s - time.perf_counter()
+                if remaining_s > 0.0:
+                    time.sleep(remaining_s)
             flip_timing = flip_with_timestamps(win)
             flip_ps = flip_timing.psychopy_s
             flip_perf = flip_timing.actual_perf_s
@@ -562,28 +605,16 @@ def play_video_fill_screen(
                             f"video_start trial_num={trial_num} file={video_file.name} "
                             f"source_path={video_file} requested_source_start_s={clip_start_s:.6f} "
                             f"actual_source_start_s={actual_source_start_s:.6f} "
+                            f"configured_video_fps={video_frame_rate:.6f} "
+                            f"scheduled_video_frames={video_frame_count} "
                             f"video_size={video_size} draw_size=({draw_size[0]:.1f},{draw_size[1]:.1f}) "
                             f"backend={backend_used}"
                         ),
                     )
 
-            if frame_duration_s is not None and first_flip_perf is not None:
-                # Transition on the refresh nearest the exact requested end.
-                # Re-evaluating from observed flips also recovers after a missed
-                # refresh instead of blindly presenting the original frame count.
-                predicted_clear_perf = flip_perf + float(frame_duration_s)
-                requested_clear_perf = first_flip_perf + clip_duration_s
-                duration_reached = predicted_clear_perf >= (
-                    requested_clear_perf - (float(frame_duration_s) / 2.0)
-                )
-            else:
-                duration_reached = (
-                    first_flip_perf is not None
-                    and flip_perf - first_flip_perf >= clip_duration_s
-                )
             if (
                 frames_presented == 1
-                and not duration_reached
+                and video_frame_count > 1
                 and bool(getattr(movie, "isPaused", False))
             ):
                 movie.play(log=False)
@@ -604,7 +635,8 @@ def play_video_fill_screen(
             if frame_idx is not None:
                 prev_frame_idx = int(frame_idx)
 
-            if duration_reached:
+            next_video_slot += 1
+            if next_video_slot >= video_frame_count:
                 break
             if bool(getattr(movie, "isFinished", False)):
                 aborted = True
@@ -632,8 +664,25 @@ def play_video_fill_screen(
                 )
         if bg_rect is not None:
             bg_rect.draw()
+        requested_clear_perf = (
+            first_flip_perf + (video_frame_count * video_frame_period_s)
+            if first_flip_perf is not None and not aborted
+            else None
+        )
+        if requested_clear_perf is not None:
+            remaining_s = (
+                requested_clear_perf
+                - flip_request_lead_s
+                - time.perf_counter()
+            )
+            if remaining_s > 0.0:
+                time.sleep(remaining_s)
         clear_flip_timing = flip_with_timestamps(win)
-        end_requested_perf = clear_flip_timing.requested_perf_s
+        end_requested_perf = (
+            requested_clear_perf
+            if requested_clear_perf is not None
+            else clear_flip_timing.requested_perf_s
+        )
         end_perf = clear_flip_timing.actual_perf_s
         if final_sync_edge is not None:
             sync_records.append(
@@ -667,28 +716,15 @@ def play_video_fill_screen(
                 ),
             )
     finally:
-        if main_drop_count_before is not None:
-            try:
-                main_display_dropped_frames = max(
-                    0,
-                    int(getattr(win, "nDroppedFrames", 0))
-                    - main_drop_count_before,
-                )
-            except Exception:
-                main_display_dropped_frames = None
         _log_message(
             msg_logger,
             "INFO",
             (
                 f"video_main_display_timing trial_num={trial_num} "
                 f"file={video_file.name} "
-                f"missed_refreshes={main_display_dropped_frames}"
+                f"scheduled_video_slots_skipped={scheduled_video_slots_skipped}"
             ),
         )
-        try:
-            win.recordFrameIntervals = previous_record_frame_intervals
-        except Exception:
-            pass
         if sync_schedule is not None and sync_schedule.high:
             try:
                 _set_gpio_level_on_flip(
@@ -724,8 +760,8 @@ def play_video_fill_screen(
                 pass
         if logger is not None:
             pulse_duration = (
-                float(frame_duration_s) * int(sync_schedule.pulse_width_frames)
-                if sync_schedule is not None and frame_duration_s is not None
+                video_frame_period_s * int(sync_schedule.pulse_width_frames)
+                if sync_schedule is not None
                 else None
             )
             for record in sync_records:
@@ -791,12 +827,12 @@ def play_video_fill_screen(
         "native_target_size": tuple(native_size),
         "subject_target_size": tuple(subject_target_size),
         "stimulus_rotation_degrees": rotation_degrees,
-        "scheduled_duration_s": (
-            duration_plan.scheduled_s if duration_plan is not None else None
-        ),
+        "scheduled_duration_s": clip_duration_s,
         "backend_used": backend_used,
         "backend_dropped_frames": backend_drop_count,
-        "main_display_dropped_frames": main_display_dropped_frames,
+        "scheduled_video_slots_skipped": int(scheduled_video_slots_skipped),
+        "configured_video_frame_rate": video_frame_rate,
+        "scheduled_video_frame_count": video_frame_count,
         "sync_pulses": sum(1 for record in sync_records if int(record["level"]) == 1),
         "movie_stim": movie if keep_movie_loaded else None,
     }
@@ -1303,6 +1339,7 @@ def present_trial_with_persistent_dots(
     init_dot_color: Optional[Tuple[int, int, int]] = None,
     bg_rgb_255: Optional[Tuple[int, int, int]] = None,
     onset_cue: Optional[visual.ImageStim] = None,
+    on_onset_cue_touch: Optional[Callable[[], bool]] = None,
     msg_logger=None,
     fps: Optional[float] = None,
     raspi: bool = False,
@@ -1335,6 +1372,10 @@ def present_trial_with_persistent_dots(
         - choice_time_perf_s: perf_counter timestamp when the choice was made
         - reaction_time_s: time from choice_start to option_touch
         - touch_x / touch_y: screen coordinates of the option touch
+
+    When provided, ``on_onset_cue_touch`` runs after a successful onset-cue
+    touch and after the onset cue has been cleared from the main display. A
+    truthy return value aborts the trial.
     """
     from psychopy import core as _core
 
@@ -1593,6 +1634,16 @@ def present_trial_with_persistent_dots(
                         timestamp_perf_s=click_perf,
                     )
                     _show_preview([])
+                    if on_onset_cue_touch is not None:
+                        # Clear the checkerboard before a potentially blocking
+                        # callback (for example, reward delivery) so its visible
+                        # duration is not extended by that work.
+                        bg_rect.draw()
+                        if fix is not None:
+                            fix.draw()
+                        flip_with_timestamps(win)
+                        if on_onset_cue_touch():
+                            return True, None
                     break
 
             _core.wait(0.01)

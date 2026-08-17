@@ -42,7 +42,6 @@ from bin.screen import (
     describe_screen,
     load_screen_config,
     resolve_scene_size,
-    resolve_task_screens,
 )
 
 
@@ -416,7 +415,13 @@ def run_task(
     latest_state = None
 
     try:
-        main_screen, experimenter_screen = resolve_task_screens(screen_config)
+        main_win, main_screen, experimenter_screen = utils.setup_task_window(
+            screen_config,
+            bg_rgb_255=bg,
+            fullscreen=fullscreen,
+            size=win_size,
+            allow_same_screen=False,
+        )
         if experimenter_screen is None:
             raise RuntimeError("calibrate_eye_tracker requires a configured or detected experimenter screen")
         msg_logger.log(
@@ -424,7 +429,6 @@ def run_task(
             f"resolved_screens main={describe_screen(main_screen)} experimenter={describe_screen(experimenter_screen)}",
         )
 
-        main_win = utils.setup_window(bg_rgb_255=bg, fullscreen=fullscreen, size=win_size, screen_info=main_screen)
         exp_win = utils.setup_window(
             bg_rgb_255=(30, 30, 30),
             fullscreen=fullscreen,
@@ -527,7 +531,6 @@ def run_task(
         screen_top = exp_h * 0.5
         screen_bottom = -exp_h * 0.5
         box_left = float(layout["box_left"])
-        box_right = float(layout["box_right"])
         box_top = float(layout["box_top"])
         box_bottom = float(layout["box_bottom"])
         left_margin = float(layout["left_margin"])

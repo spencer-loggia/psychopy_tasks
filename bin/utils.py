@@ -43,7 +43,9 @@ from .buffered_video import (
 from .video_playback import (
     RandomFramePulseSchedule,
     SharedVideoFrameBuffer,
+    VideoRefreshCadence,
     center_crop_bounds,
+    plan_video_refresh_cadence,
     upload_rgb_texture,
     video_duration_seconds,
     video_time_origin_seconds,
@@ -282,7 +284,8 @@ def play_video_fill_screen(
     video_frame_rate: float = 30.0,
     video_frame_count: Optional[int] = None,
     requested_clip_duration_s: Optional[float] = None,
-    flip_request_lead_s: float = 0.015,
+    display_refresh_rate: Optional[float] = None,
+    refresh_cadence: Optional[VideoRefreshCadence] = None,
     video_buffer_bytes: int = DEFAULT_BUFFER_BYTES,
 ) -> Dict[str, Any]:
     """Present an exact frame sequence prepared by an ffpyplayer worker."""
@@ -331,17 +334,16 @@ def play_video_fill_screen(
     video_frame_rate = float(video_frame_rate)
     if not math.isfinite(video_frame_rate) or video_frame_rate <= 0.0:
         raise ValueError("video_frame_rate must be a positive finite value")
-    video_frame_period_s = 1.0 / video_frame_rate
-    flip_request_lead_s = float(flip_request_lead_s)
-    if (
-        not math.isfinite(flip_request_lead_s)
-        or flip_request_lead_s < 0.0
-        or flip_request_lead_s >= video_frame_period_s
-    ):
+    display_refresh_rate = float(
+        video_frame_rate
+        if display_refresh_rate is None
+        else display_refresh_rate
+    )
+    if not math.isfinite(display_refresh_rate) or display_refresh_rate <= 0.0:
         raise ValueError(
-            "flip_request_lead_s must be finite, non-negative, and shorter "
-            "than one video frame"
+            "display_refresh_rate must be a positive finite value"
         )
+    display_frame_period_s = 1.0 / display_refresh_rate
     requested_clip_duration_s = float(
         clip_duration_s
         if requested_clip_duration_s is None
@@ -361,6 +363,36 @@ def play_video_fill_screen(
     video_frame_count = int(video_frame_count)
     if video_frame_count <= 0:
         raise ValueError("video_frame_count must be positive")
+    if refresh_cadence is None:
+        refresh_cadence = plan_video_refresh_cadence(
+            video_frame_count,
+            video_frame_rate,
+            display_refresh_rate,
+        )
+    elif (
+        refresh_cadence.video_frame_count != video_frame_count
+        or not math.isclose(
+            refresh_cadence.video_frame_rate,
+            video_frame_rate,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        or not math.isclose(
+            refresh_cadence.display_refresh_rate,
+            display_refresh_rate,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+    ):
+        raise ValueError(
+            "refresh_cadence does not match this clip and display"
+        )
+    scheduled_display_duration_s = (
+        refresh_cadence.scheduled_display_duration_s
+    )
+    effective_video_frame_rate = (
+        video_frame_count / scheduled_display_duration_s
+    )
     video_buffer_bytes = int(video_buffer_bytes)
     if video_buffer_bytes <= 0:
         raise ValueError("video_buffer_bytes must be positive")
@@ -401,6 +433,8 @@ def play_video_fill_screen(
     first_flip_perf = None
     first_flip_requested_perf = None
     last_flip_perf = None
+    final_repeat_flip_perf = None
+    previous_refresh_flip_perf = None
     end_perf = None
     end_requested_perf = None
     dropped_frames = 0
@@ -408,6 +442,8 @@ def play_video_fill_screen(
     abort_reason = ""
     next_frame_publish_perf = 0.0
     frames_presented = 0
+    source_frame_holds_completed = 0
+    display_refreshes_presented = 0
     sync_records: List[Dict[str, Any]] = []
     expected_duration_s = requested_clip_duration_s
     actual_source_start_s = None
@@ -416,10 +452,13 @@ def play_video_fill_screen(
     late_frame_count = 0
     maximum_frame_lateness_s = 0.0
     clip_offset_lateness_s = 0.0
-    timing_failure_threshold_s = 0.25 * video_frame_period_s
+    clip_offset_timing_error_s = 0.0
+    clear_flip_submitted_perf_s = None
+    maximum_refresh_interval_s = 0.0
+    timing_failure_threshold_s = 0.5 * display_frame_period_s
     frame_timing_monitor = MainDisplayFrameTimingMonitor(
         win,
-        video_frame_period_s,
+        display_frame_period_s,
     )
     frame_stream = None
     prepared_frame = None
@@ -503,6 +542,7 @@ def play_video_fill_screen(
                     f"video_playback file={video_file.name} "
                     f"source_path={video_file} clip_start_s={clip_start_s:.6f} "
                     f"clip_end_s={clip_start_s + clip_duration_s:.6f} "
+                    f"source_time_origin_s={source_time_origin_s:.6f} "
                     f"video_size={video_size} crop_bounds={crop_bounds} "
                     f"prepared_size={prepared_size} "
                     f"native_target_size={native_size} "
@@ -511,7 +551,15 @@ def play_video_fill_screen(
                     f"win_size={tuple(win.size)} draw_size={draw_size} "
                     f"video_frame_rate={video_frame_rate:.6f} "
                     f"video_frame_count={video_frame_count} "
-                    f"flip_request_lead_s={flip_request_lead_s:.6f} "
+                    f"display_refresh_rate={display_refresh_rate:.6f} "
+                    f"nominal_refreshes_per_video_frame="
+                    f"{refresh_cadence.nominal_refreshes_per_video_frame:.9f} "
+                    f"refresh_hold_histogram="
+                    f"{dict(refresh_cadence.refresh_count_histogram)} "
+                    f"maximum_cadence_phase_error_s="
+                    f"{refresh_cadence.maximum_absolute_phase_error_s:.9f} "
+                    f"scheduled_display_duration_s="
+                    f"{scheduled_display_duration_s:.6f} "
                     f"backend={backend_used} buffer_mode={buffer_mode} "
                     f"chunk_frames={frame_stream.layout.frames_per_chunk} "
                     f"buffer_bytes={frame_stream.layout.total_bytes} "
@@ -562,154 +610,181 @@ def play_video_fill_screen(
                     # the following next_frame() call.
                     upload_rgb_texture(video_stim, prepared_frame.rgb)
                     display_frame_index = int(prepared_frame.frame_index)
-                    scheduled_flip_perf = (
-                        first_flip_perf
-                        + (display_frame_index * video_frame_period_s)
-                        if first_flip_perf is not None
-                        else None
-                    )
-                    flip_perf_capture: Dict[str, float] = {}
-                    win.callOnFlip(
-                        _capture_perf_counter_on_flip,
-                        flip_perf_capture,
+                    current_source_time_s = float(
+                        prepared_frame.source_pts_s
                     )
                     sync_edges = ()
                     if sync_schedule is not None:
                         sync_edges = sync_schedule.edges_for_frame(
                             display_frame_index
                         )
-                        for edge in sync_edges:
-                            win.callOnFlip(
-                                _set_gpio_level_on_flip,
-                                sync_gpio_module,
-                                sync_gpio_chip,
-                                int(sync_pin),
-                                int(edge.level),
-                            )
 
-                    if bg_rect is not None:
-                        bg_rect.draw()
-                    video_stim.draw()
-                    if scheduled_flip_perf is not None:
-                        remaining_s = (
-                            scheduled_flip_perf
-                            - flip_request_lead_s
-                            - time.perf_counter()
-                        )
-                        if remaining_s > 0.0:
-                            time.sleep(remaining_s)
-                    flip_requested_perf = time.perf_counter()
-                    flip_ps = win.flip()
-                    flip_return_perf = time.perf_counter()
-                    flip_perf = flip_perf_capture.get(
-                        "actual_perf_s",
-                        flip_return_perf,
+                    frame_refresh_count = (
+                        refresh_cadence.frame_refresh_counts[
+                            expected_frame_index
+                        ]
                     )
-                    last_flip_perf = flip_perf
-                    frames_presented += 1
-                    current_source_time_s = float(
-                        prepared_frame.source_pts_s
-                    )
-                    actual_source_last_frame_s = current_source_time_s
-
-                    for edge in sync_edges:
-                        sync_records.append(
-                            {
-                                "level": int(edge.level),
-                                "frame_index": int(edge.frame_index),
-                                "interval_frames": edge.interval_frames,
-                                "timestamp_perf_s": flip_perf,
-                                "requested_timestamp_perf_s": (
-                                    flip_requested_perf
-                                ),
-                            }
+                    for repeat_index in range(frame_refresh_count):
+                        flip_perf_capture: Dict[str, float] = {}
+                        win.callOnFlip(
+                            _capture_perf_counter_on_flip,
+                            flip_perf_capture,
                         )
-
-                    if first_flip_ps is None:
-                        first_flip_ps = flip_ps
-                        first_flip_perf = flip_perf
-                        first_flip_requested_perf = (
-                            flip_requested_perf
-                        )
-                        actual_source_start_s = current_source_time_s
-                        if logger is not None:
-                            logger.log_frame_flip(
-                                trial_num=trial_num,
-                                event="video_clip_start",
-                                timestamp_perf_s=first_flip_perf,
-                                requested_timestamp_perf_s=(
-                                    first_flip_requested_perf
-                                ),
-                                requested_duration=expected_duration_s,
-                            )
-                        _log_message(
-                            msg_logger,
-                            "INFO",
-                            (
-                                f"video_start trial_num={trial_num} "
-                                f"file={video_file.name} "
-                                f"source_path={video_file} "
-                                f"requested_source_start_s="
-                                f"{clip_start_s:.6f} "
-                                f"actual_source_start_s="
-                                f"{actual_source_start_s:.6f} "
-                                f"configured_video_fps="
-                                f"{video_frame_rate:.6f} "
-                                f"scheduled_video_frames="
-                                f"{video_frame_count} "
-                                f"video_size={video_size} "
-                                f"prepared_size={prepared_size} "
-                                f"draw_size=({draw_size[0]:.1f},"
-                                f"{draw_size[1]:.1f}) "
-                                f"backend={backend_used}"
-                            ),
-                        )
-                    elif scheduled_flip_perf is not None:
-                        lateness_s = max(
-                            0.0,
-                            flip_perf - scheduled_flip_perf,
-                        )
-                        maximum_frame_lateness_s = max(
-                            maximum_frame_lateness_s,
-                            lateness_s,
-                        )
-                        if lateness_s > timing_failure_threshold_s:
-                            late_frame_count += 1
-                            _log_message(
-                                msg_logger,
-                                "ERROR",
-                                f"video_flip_missed trial_num={trial_num} "
-                                f"file={video_file.name} "
-                                f"frame_index={display_frame_index} "
-                                f"lateness_s={lateness_s:.6f}",
-                            )
-                            raise RuntimeError(
-                                f"Video frame {display_frame_index} missed its "
-                                f"scheduled display flip by {lateness_s:.6f}s"
-                            )
-
-                    if (
-                        frame_publisher is not None
-                        and flip_perf >= next_frame_publish_perf
-                    ):
-                        frame_publisher.publish_rgb(
-                            prepared_frame.rgb,
-                            source_frame_index=int(
-                                round(
-                                    (
-                                        current_source_time_s
-                                        - source_time_origin_s
-                                    )
-                                    * video_frame_rate
+                        if repeat_index == 0:
+                            for edge in sync_edges:
+                                win.callOnFlip(
+                                    _set_gpio_level_on_flip,
+                                    sync_gpio_module,
+                                    sync_gpio_chip,
+                                    int(sync_pin),
+                                    int(edge.level),
                                 )
-                            ),
-                            source_media_time_s=current_source_time_s,
-                            main_display_flip_perf_s=flip_perf,
-                            trial_num=trial_num,
+
+                        if bg_rect is not None:
+                            bg_rect.draw()
+                        video_stim.draw()
+                        flip_requested_perf = time.perf_counter()
+                        flip_ps = win.flip()
+                        flip_return_perf = time.perf_counter()
+                        flip_perf = flip_perf_capture.get(
+                            "actual_perf_s",
+                            flip_return_perf,
                         )
-                        next_frame_publish_perf = (
-                            flip_perf + frame_publish_interval_s
-                        )
+                        final_repeat_flip_perf = flip_perf
+                        display_refreshes_presented += 1
+
+                        if repeat_index == 0:
+                            last_flip_perf = flip_perf
+                            frames_presented += 1
+                            actual_source_last_frame_s = (
+                                current_source_time_s
+                            )
+                            for edge in sync_edges:
+                                sync_records.append(
+                                    {
+                                        "level": int(edge.level),
+                                        "frame_index": int(edge.frame_index),
+                                        "interval_frames": (
+                                            edge.interval_frames
+                                        ),
+                                        "timestamp_perf_s": flip_perf,
+                                        "requested_timestamp_perf_s": (
+                                            flip_requested_perf
+                                        ),
+                                    }
+                                )
+
+                            if first_flip_ps is None:
+                                first_flip_ps = flip_ps
+                                first_flip_perf = flip_perf
+                                first_flip_requested_perf = (
+                                    flip_requested_perf
+                                )
+                                actual_source_start_s = (
+                                    current_source_time_s
+                                )
+                                if logger is not None:
+                                    logger.log_frame_flip(
+                                        trial_num=trial_num,
+                                        event="video_clip_start",
+                                        timestamp_perf_s=first_flip_perf,
+                                        requested_timestamp_perf_s=(
+                                            first_flip_requested_perf
+                                        ),
+                                        requested_duration=(
+                                            expected_duration_s
+                                        ),
+                                    )
+                                _log_message(
+                                    msg_logger,
+                                    "INFO",
+                                    (
+                                        f"video_start trial_num={trial_num} "
+                                        f"file={video_file.name} "
+                                        f"source_path={video_file} "
+                                        f"requested_source_start_s="
+                                        f"{clip_start_s:.6f} "
+                                        f"actual_source_start_s="
+                                        f"{actual_source_start_s:.6f} "
+                                        f"configured_video_fps="
+                                        f"{video_frame_rate:.6f} "
+                                        f"scheduled_video_frames="
+                                        f"{video_frame_count} "
+                                        f"video_size={video_size} "
+                                        f"prepared_size={prepared_size} "
+                                        f"draw_size=({draw_size[0]:.1f},"
+                                        f"{draw_size[1]:.1f}) "
+                                        f"backend={backend_used}"
+                                    ),
+                                )
+
+                        if previous_refresh_flip_perf is not None:
+                            refresh_interval_s = (
+                                flip_perf - previous_refresh_flip_perf
+                            )
+                            maximum_refresh_interval_s = max(
+                                maximum_refresh_interval_s,
+                                refresh_interval_s,
+                            )
+                            interval_excess_s = max(
+                                0.0,
+                                refresh_interval_s
+                                - display_frame_period_s,
+                            )
+                            maximum_frame_lateness_s = max(
+                                maximum_frame_lateness_s,
+                                interval_excess_s,
+                            )
+                            if (
+                                refresh_interval_s
+                                < 0.5 * display_frame_period_s
+                                or refresh_interval_s
+                                > 1.5 * display_frame_period_s
+                            ):
+                                late_frame_count += 1
+                                _log_message(
+                                    msg_logger,
+                                    "ERROR",
+                                    f"video_refresh_missed "
+                                    f"trial_num={trial_num} "
+                                    f"file={video_file.name} "
+                                    f"frame_index={display_frame_index} "
+                                    f"repeat_index={repeat_index} "
+                                    f"interval_s="
+                                    f"{refresh_interval_s:.6f} "
+                                    f"expected_interval_s="
+                                    f"{display_frame_period_s:.6f}",
+                                )
+                                raise RuntimeError(
+                                    "Video presentation lost display-refresh "
+                                    "lock"
+                                )
+                        previous_refresh_flip_perf = flip_perf
+
+                        if (
+                            repeat_index == 0
+                            and frame_publisher is not None
+                            and flip_perf >= next_frame_publish_perf
+                        ):
+                            frame_publisher.publish_rgb(
+                                prepared_frame.rgb,
+                                source_frame_index=int(
+                                    round(
+                                        (
+                                            current_source_time_s
+                                            - source_time_origin_s
+                                        )
+                                        * video_frame_rate
+                                    )
+                                ),
+                                source_media_time_s=current_source_time_s,
+                                main_display_flip_perf_s=flip_perf,
+                                trial_num=trial_num,
+                            )
+                            next_frame_publish_perf = (
+                                flip_perf + frame_publish_interval_s
+                            )
+                    source_frame_holds_completed += 1
     finally:
         final_sync_edge = None
         clear_flip_perf_capture: Dict[str, float] = {}
@@ -735,43 +810,33 @@ def play_video_fill_screen(
 
             requested_clear_perf = None
             if (
-                first_flip_perf is not None
+                final_repeat_flip_perf is not None
                 and not aborted
-                and frames_presented == video_frame_count
+                and source_frame_holds_completed == video_frame_count
             ):
-                requested_clear_perf = first_flip_perf + (
-                    video_frame_count * video_frame_period_s
+                requested_clear_perf = (
+                    final_repeat_flip_perf + display_frame_period_s
                 )
-                if last_flip_perf is not None:
-                    requested_clear_perf = max(
-                        requested_clear_perf,
-                        last_flip_perf + video_frame_period_s,
-                    )
-                remaining_s = (
-                    requested_clear_perf
-                    - flip_request_lead_s
-                    - time.perf_counter()
-                )
-                if remaining_s > 0.0:
-                    time.sleep(remaining_s)
 
-            clear_flip_requested_perf = time.perf_counter()
+            clear_flip_submitted_perf_s = time.perf_counter()
             win.flip()
             clear_flip_return_perf = time.perf_counter()
             clear_flip_completed = True
-            end_requested_perf = (
-                requested_clear_perf
-                if requested_clear_perf is not None
-                else clear_flip_requested_perf
-            )
+            # The requested timestamp is when Python submitted the blocking
+            # flip. Keep the predicted next-VBL target separate for timing
+            # validation and the nominal scheduled endpoint.
+            end_requested_perf = clear_flip_submitted_perf_s
             end_perf = clear_flip_perf_capture.get(
                 "actual_perf_s",
                 clear_flip_return_perf,
             )
             if requested_clear_perf is not None:
+                clip_offset_timing_error_s = (
+                    end_perf - requested_clear_perf
+                )
                 clip_offset_lateness_s = max(
                     0.0,
-                    end_perf - requested_clear_perf,
+                    clip_offset_timing_error_s,
                 )
             if final_sync_edge is not None:
                 sync_records.append(
@@ -790,17 +855,47 @@ def play_video_fill_screen(
                     timestamp_perf_s=end_perf,
                     requested_timestamp_perf_s=end_requested_perf,
                 )
-            if clip_offset_lateness_s > timing_failure_threshold_s:
+            if (
+                requested_clear_perf is not None
+                and previous_refresh_flip_perf is not None
+            ):
+                clear_interval_s = end_perf - previous_refresh_flip_perf
+                maximum_refresh_interval_s = max(
+                    maximum_refresh_interval_s,
+                    clear_interval_s,
+                )
+                maximum_frame_lateness_s = max(
+                    maximum_frame_lateness_s,
+                    max(0.0, clear_interval_s - display_frame_period_s),
+                )
+                if (
+                    clear_interval_s < 0.5 * display_frame_period_s
+                    or clear_interval_s > 1.5 * display_frame_period_s
+                ):
+                    late_frame_count += 1
+                    _log_message(
+                        msg_logger,
+                        "ERROR",
+                        f"video_offset_refresh_missed trial_num={trial_num} "
+                        f"file={video_file.name} "
+                        f"interval_s={clear_interval_s:.6f} "
+                        f"expected_interval_s="
+                        f"{display_frame_period_s:.6f}",
+                    )
+                    raise RuntimeError(
+                        "Video clip offset lost display-refresh lock"
+                    )
+            if abs(clip_offset_timing_error_s) > timing_failure_threshold_s:
                 _log_message(
                     msg_logger,
                     "ERROR",
-                    f"video_offset_flip_missed trial_num={trial_num} "
+                    f"video_offset_timing_error trial_num={trial_num} "
                     f"file={video_file.name} "
-                    f"lateness_s={clip_offset_lateness_s:.6f}",
+                    f"timing_error_s={clip_offset_timing_error_s:.6f}",
                 )
                 raise RuntimeError(
-                    "Video clip offset flip missed its scheduled deadline by "
-                    f"{clip_offset_lateness_s:.6f}s"
+                    "Video clip offset did not occur on the next display "
+                    "refresh"
                 )
         finally:
             if sync_schedule is not None and not clear_flip_completed:
@@ -825,25 +920,34 @@ def play_video_fill_screen(
                     f"video_main_display_timing trial_num={trial_num} "
                     f"file={video_file.name} "
                     f"frames_presented={frames_presented} "
+                    f"source_frame_holds_completed="
+                    f"{source_frame_holds_completed} "
+                    f"display_refreshes_presented="
+                    f"{display_refreshes_presented} "
                     f"source_frames_skipped="
                     f"{scheduled_video_slots_skipped} "
-                    f"late_frames={late_frame_count} "
-                    f"maximum_lateness_s="
+                    f"missed_refreshes={late_frame_count} "
+                    f"maximum_refresh_excess_s="
                     f"{maximum_frame_lateness_s:.6f} "
+                    f"maximum_refresh_interval_s="
+                    f"{maximum_refresh_interval_s:.6f} "
                     f"offset_lateness_s={clip_offset_lateness_s:.6f} "
                     f"long_video_intervals="
                     f"{frame_timing_monitor.missed_refreshes}"
                 ),
             )
             if logger is not None:
-                pulse_duration = (
-                    video_frame_period_s
-                    * int(sync_schedule.pulse_width_frames)
-                    if sync_schedule is not None
-                    else None
-                )
                 for record in sync_records:
                     is_on = int(record["level"]) == 1
+                    pulse_duration = (
+                        refresh_cadence.refreshes_for_source_frames(
+                            int(record["frame_index"]),
+                            int(sync_schedule.pulse_width_frames),
+                        )
+                        * display_frame_period_s
+                        if is_on and sync_schedule is not None
+                        else None
+                    )
                     logger.log_signal(
                         trial_num=trial_num,
                         event=(
@@ -877,6 +981,10 @@ def play_video_fill_screen(
                             ),
                         )
 
+    dropped_frames = max(
+        int(late_frame_count),
+        int(frame_timing_monitor.missed_refreshes),
+    )
     if first_flip_perf is not None:
         _log_message(
             msg_logger,
@@ -891,6 +999,8 @@ def play_video_fill_screen(
                 f"last_frame_on_perf_s={last_flip_perf} "
                 f"clip_offset_perf_s={end_perf} "
                 f"frames_presented={frames_presented} "
+                f"display_refreshes_presented="
+                f"{display_refreshes_presented} "
                 f"dropped_frames={dropped_frames} "
                 f"late_frames={late_frame_count} "
                 f"aborted={int(aborted)} "
@@ -920,8 +1030,9 @@ def play_video_fill_screen(
         "end_time_perf_s": end_perf,
         "clip_offset_perf_s": end_perf,
         "end_requested_perf_s": end_requested_perf,
+        "clear_flip_submitted_perf_s": clear_flip_submitted_perf_s,
         "requested_end_perf_s": (
-            first_flip_perf + clip_duration_s
+            first_flip_perf + scheduled_display_duration_s
             if first_flip_perf is not None
             else None
         ),
@@ -929,9 +1040,16 @@ def play_video_fill_screen(
             end_perf if first_flip_perf is not None else None
         ),
         "last_frame_on_perf_s": last_flip_perf,
+        "final_repeat_flip_perf_s": final_repeat_flip_perf,
         "actual_source_start_s": actual_source_start_s,
         "actual_source_last_frame_s": actual_source_last_frame_s,
         "frames_presented": int(frames_presented),
+        "source_frame_holds_completed": int(
+            source_frame_holds_completed
+        ),
+        "display_refreshes_presented": int(
+            display_refreshes_presented
+        ),
         "displayed_duration_s": (
             end_perf - first_flip_perf
             if end_perf is not None and first_flip_perf is not None
@@ -946,6 +1064,7 @@ def play_video_fill_screen(
         "subject_target_size": tuple(subject_target_size),
         "stimulus_rotation_degrees": rotation_degrees,
         "scheduled_duration_s": clip_duration_s,
+        "scheduled_display_duration_s": scheduled_display_duration_s,
         "backend_used": backend_used,
         "scheduled_video_slots_skipped": int(
             scheduled_video_slots_skipped
@@ -955,10 +1074,36 @@ def play_video_fill_screen(
             maximum_frame_lateness_s
         ),
         "clip_offset_lateness_s": float(clip_offset_lateness_s),
+        "clip_offset_timing_error_s": float(
+            clip_offset_timing_error_s
+        ),
+        "maximum_refresh_interval_s": float(
+            maximum_refresh_interval_s
+        ),
         "long_video_intervals": int(
             frame_timing_monitor.missed_refreshes
         ),
         "configured_video_frame_rate": video_frame_rate,
+        "display_refresh_rate": display_refresh_rate,
+        "nominal_refreshes_per_video_frame": (
+            refresh_cadence.nominal_refreshes_per_video_frame
+        ),
+        "minimum_refreshes_per_video_frame": min(
+            refresh_cadence.frame_refresh_counts
+        ),
+        "maximum_refreshes_per_video_frame": max(
+            refresh_cadence.frame_refresh_counts
+        ),
+        "refresh_hold_histogram": dict(
+            refresh_cadence.refresh_count_histogram
+        ),
+        "cadence_final_phase_error_s": (
+            refresh_cadence.final_phase_error_s
+        ),
+        "cadence_maximum_absolute_phase_error_s": (
+            refresh_cadence.maximum_absolute_phase_error_s
+        ),
+        "effective_video_frame_rate": effective_video_frame_rate,
         "scheduled_video_frame_count": video_frame_count,
         "sync_pulses": sum(
             1

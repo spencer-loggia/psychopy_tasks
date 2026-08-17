@@ -192,7 +192,7 @@ def probe_video(ffprobe_bin: str, path: Path) -> dict:
         "-show_entries",
         (
             "stream=width,height,pix_fmt,r_frame_rate,avg_frame_rate,"
-            "start_time,codec_name"
+            "start_time,codec_name,profile"
         ),
         "-of",
         "json",
@@ -242,6 +242,54 @@ def output_path_for(video_path: Path, output_dir: Path) -> Path:
     return output_dir / f"{video_path.stem}.mp4"
 
 
+def validate_processed_video(
+    ffprobe_bin: str,
+    output_path: Path,
+    *,
+    expected_size: tuple[int, int],
+    expected_frame_rate: float,
+) -> None:
+    """Verify the complete media contract required by runtime playback."""
+    stream = probe_video(ffprobe_bin, output_path)
+    if stream.get("codec_name") != PREFERRED_VIDEO_STREAM_CODEC:
+        raise RuntimeError(
+            f"Processed video is not HEVC/H.265: {output_path} "
+            f"({stream.get('codec_name')})"
+        )
+    if str(stream.get("profile", "")).strip().lower() != "main":
+        raise RuntimeError(
+            f"Processed video is not HEVC Main profile: {output_path} "
+            f"({stream.get('profile')})"
+        )
+    if stream.get("pix_fmt") != "yuv420p":
+        raise RuntimeError(
+            f"Processed video is not yuv420p: {output_path} "
+            f"({stream.get('pix_fmt')})"
+        )
+    if (
+        int(stream.get("width", 0)) != int(expected_size[0])
+        or int(stream.get("height", 0)) != int(expected_size[1])
+    ):
+        raise RuntimeError(
+            f"Processed video has unexpected size: {output_path} "
+            f"({stream.get('width')}x{stream.get('height')} vs expected "
+            f"{expected_size[0]}x{expected_size[1]})"
+        )
+    output_rate = parse_frame_rate(stream)
+    if abs(output_rate - float(expected_frame_rate)) > 0.001:
+        raise RuntimeError(
+            f"Processed video has unexpected frame rate: {output_path} "
+            f"({output_rate:.6f} vs expected "
+            f"{float(expected_frame_rate):.6f})"
+        )
+    start_time_s = float(stream.get("start_time", 0.0) or 0.0)
+    if not math.isfinite(start_time_s) or abs(start_time_s) > 1e-6:
+        raise RuntimeError(
+            f"Processed video timestamps were not rebased to zero: "
+            f"{output_path} (start_time={start_time_s})"
+        )
+
+
 def preprocess_video(
     ffmpeg_bin: str,
     ffprobe_bin: str,
@@ -259,6 +307,18 @@ def preprocess_video(
     expected_frame_rate: float,
 ) -> str:
     if output_path.exists() and not overwrite:
+        try:
+            validate_processed_video(
+                ffprobe_bin,
+                output_path,
+                expected_size=expected_size,
+                expected_frame_rate=expected_frame_rate,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Existing output does not satisfy the current playback "
+                f"contract; rerun with --overwrite: {output_path}: {exc}"
+            ) from exc
         print(f"Skipping existing file: {output_path}")
         return "skipped"
 
@@ -325,30 +385,12 @@ def preprocess_video(
 
         try:
             _run_checked(cmd)
-            stream = probe_video(ffprobe_bin, output_path)
-            if stream.get("codec_name") != PREFERRED_VIDEO_STREAM_CODEC:
-                raise RuntimeError(
-                    f"Processed video is not HEVC/H.265: {output_path} ({stream.get('codec_name')})"
-                )
-            if stream.get("pix_fmt") != "yuv420p":
-                raise RuntimeError(f"Processed video is not yuv420p: {output_path} ({stream.get('pix_fmt')})")
-            if int(stream.get("width", 0)) != int(expected_size[0]) or int(stream.get("height", 0)) != int(expected_size[1]):
-                raise RuntimeError(
-                    f"Processed video has unexpected size: {output_path} "
-                    f"({stream.get('width')}x{stream.get('height')} vs expected {expected_size[0]}x{expected_size[1]})"
-                )
-            output_rate = parse_frame_rate(stream)
-            if abs(output_rate - float(expected_frame_rate)) > 0.001:
-                raise RuntimeError(
-                    f"Processed video has unexpected frame rate: {output_path} "
-                    f"({output_rate:.6f} vs expected {float(expected_frame_rate):.6f})"
-                )
-            start_time_s = float(stream.get("start_time", 0.0) or 0.0)
-            if not math.isfinite(start_time_s) or abs(start_time_s) > 1e-6:
-                raise RuntimeError(
-                    f"Processed video timestamps were not rebased to zero: "
-                    f"{output_path} (start_time={start_time_s})"
-                )
+            validate_processed_video(
+                ffprobe_bin,
+                output_path,
+                expected_size=expected_size,
+                expected_frame_rate=expected_frame_rate,
+            )
             return codec
         except Exception as exc:
             last_error = exc

@@ -361,30 +361,39 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
   `clip_duration_seconds`, and a positive `num_clips`. Subject-screen taps do
   not interrupt playback; the task completes after `num_clips` clips. Each
   trial randomly selects one source, uniformly selects a valid temporal start
-  aligned to the configured video-frame timebase, and presents the
-  fixed-duration clip without extracting a temporary file. A dedicated
-  `multiprocessing` `spawn` worker uses ffpyplayer directly to seek, decode,
-  center-crop, and prepare that clip. `frame_rate` defaults to `30` and must
+  aligned to that source's PTS origin and configured video-frame timebase, and
+  presents the fixed-duration clip without extracting a temporary file. A
+  dedicated `multiprocessing` `spawn` worker uses ffpyplayer directly to seek,
+  decode, center-crop, and prepare that clip. `frame_rate` defaults to `30` and must
   match the probed source rate; rate conversion belongs in offline
   preprocessing so runtime playback never synthesizes or discards a source
   frame. The requested duration is rounded only to the nearest count of video
   frames; both the original request and scheduled duration are logged.
 - Sources must be HEVC Main/yuv420p. The task probes each unique path once and
   refuses incompatible media or sources shorter than the requested clip.
-- The behavior row for each trial records the full source path, requested and
-  actual source timestamps, first-frame display time, last-frame end time,
+- The behavior row for each completed or user-aborted trial records the full
+  source path, requested and actual source timestamps, first-frame
+  flip-completion time, last-frame end flip-completion time,
   requested and scheduled duration, configured rate, scheduled/displayed frame
   counts, and displayed duration. The corresponding event-log start/end records
-  are main-display flips; the end flip removes the last frame.
-- Video flips use absolute `1 / frame_rate` deadlines. The task draws the
-  next prepared frame, waits until `flip_request_lead_seconds` (default
-  `0.015`) before its deadline, and then submits a refresh-synchronized
-  PsychoPy flip. A completed clip presents every source frame exactly once in
-  index order; a late flip does not skip an expired frame slot or substitute a
-  newer decoded frame. A missed flip or unavailable next chunk is a fatal
-  timing error, stopping before any missing frame is skipped. The task also
-  rejects a monitor rate that is not an integer-compatible multiple of
-  `frame_rate`, avoiding uneven refresh cadence.
+  are main-display flips; the end flip removes the last frame. A fatal timing
+  or decoder error writes an invalid attempted-trial behavior row and preserves
+  exact onset, clear, and diagnostic records in the event/message logs. These
+  timestamps describe flip completion near vertical blanking; use the existing
+  GPIO pulse and a photodiode when physical pixel illumination time is needed.
+- Playback draws and calls blocking PsychoPy `Window.flip()` once per physical
+  display refresh. A cumulative phase schedule maps every ideal source-frame
+  boundary to the nearest VBL using the measured monitor rate. Each prepared
+  source frame is uploaded once, then the same persistent texture is redrawn
+  for the resulting number of refreshes. Thus 59.94/30 uses mostly two-refresh
+  holds with an occasional one-refresh correction, while 60/24 uses a balanced
+  three/two cadence. The phase error remains bounded to half a refresh instead
+  of accumulating over the clip, and every source frame is still displayed at
+  least once. A combination that would assign zero refreshes to any source
+  frame is rejected. There are no scheduler sleeps; a missed refresh or
+  unavailable chunk is fatal, so playback never catches up by skipping or
+  substituting source frames. The exact hold histogram, total refresh count,
+  and maximum/final phase errors are logged.
 - The ffpyplayer worker writes prepared RGB24 frames into parent-owned shared
   memory. The prepared-frame budget is configured by
   `video_buffer_megabytes` and defaults to 512 MiB. If the complete prepared
@@ -392,10 +401,11 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
   exactly three chunks, each holding at most `max(1, round(frame_rate))` frames
   (about one second, or fewer when the budget requires); two are ready before
   playback, and the remaining slot lets the worker stay ahead by refilling
-  released slots as the main process consumes prepared chunks. Queues carry
-  only chunk ownership and timestamp metadata. The main process reads each
-  frame in place across chunk boundaries and performs one direct GL upload into
-  a persistent texture, with no intermediate main-process pixel copy.
+  released slots as the main process consumes prepared chunks. No pixel data
+  crosses a queue; queues carry only ownership, timestamp, status, and error
+  messages. The main process reads each frame in place across chunk boundaries
+  and uploads it once into a persistent GL texture; repeated display-refresh
+  draws neither copy nor re-upload its pixels.
 - `play_video` decodes each clip once. No faster than once every 0.1 seconds,
   the main process copies the currently displayed RGB24 frame into a four-slot,
   latest-frame-wins shared-memory preview ring. The experimenter process copies
@@ -411,8 +421,12 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
   accumulating lag.
 - A fresh ffpyplayer worker owns each selected clip and exits when preparation
   is complete. For efficient random access over a mounted network filesystem,
-  preprocess sources with `bin/preprocess_videos.py`; outputs use MP4
-  fast-start metadata and a default two-second maximum keyframe interval.
+  preprocess sources with `bin/preprocess_videos.py --frame_rate 30` (`30` is
+  also the default). Preprocessing center-crops/scales the video, normalizes it
+  to that constant frame rate, rebases PTS to zero, encodes HEVC Main/yuv420p,
+  enables MP4 fast-start, and uses a default two-second maximum keyframe
+  interval. Any frame duplication or removal needed for rate normalization
+  occurs offline; runtime playback performs no frame-rate conversion.
 - On Raspberry Pi, `play_video` sends one-video-presentation-frame sync pulses on BCM GPIO
   `sync_pin` (default `18`). Pulse onsets are frame locked and their successive
   intervals are sampled inclusively from `sync_interval_frames` (default
@@ -443,7 +457,6 @@ A minimal video-source portion of the configuration is:
   "num_clips": 10,
   "seek_timeout_seconds": 30.0,
   "frame_rate": 30,
-  "flip_request_lead_seconds": 0.015,
   "video_buffer_megabytes": 512,
   "pump_pin": 0,
   "pump_pulse_time_seconds": 0.25,

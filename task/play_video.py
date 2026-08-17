@@ -22,6 +22,7 @@ from bin.affinity import (
 from bin.config import load_config, validate_config
 from bin.daqc2_outputs import DAQC2DigitalOutputs, PeriodicDOUTPulseController
 from bin.buffered_video import DEFAULT_BUFFER_BYTES
+from bin.frame_timing import plan_frame_duration
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.video_playback import (
@@ -29,6 +30,7 @@ from bin.video_playback import (
     SharedVideoFrameBuffer,
     is_raspberry_pi,
     parse_frame_rate,
+    plan_video_refresh_cadence,
     select_random_video_clip,
     validate_hevc_stream,
     video_duration_seconds,
@@ -77,7 +79,6 @@ def parse_args():
     parser.add_argument("--bg", type=int, nargs=3, default=None, help="Background RGB color")
     parser.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate (Hz)")
     parser.add_argument("--frame_rate", type=float, default=None, help="Authoritative video presentation and clip-selection rate (Hz)")
-    parser.add_argument("--flip_request_lead_seconds", type=float, default=None, help="How early to submit each video flip before its absolute deadline")
     parser.add_argument("--video_buffer_megabytes", type=float, default=None, help="Maximum shared-memory budget for prepared RGB video chunks")
     parser.add_argument("--ffprobe", default=None, help="Path to ffprobe for codec probing")
     parser.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi frame-sync GPIO and pump behavior")
@@ -119,7 +120,6 @@ def run_task(
     pump_pulse_time_seconds: Optional[float] = None,
     pump_interval: Optional[float] = None,
     frame_rate: float = 30.0,
-    flip_request_lead_seconds: float = 0.015,
     video_buffer_megabytes: float = DEFAULT_BUFFER_BYTES / (1024 * 1024),
 ):
     if isinstance(num_clips, bool) or not isinstance(num_clips, int) or num_clips <= 0:
@@ -135,15 +135,6 @@ def run_task(
     frame_rate = float(frame_rate)
     if not math.isfinite(frame_rate) or frame_rate <= 0.0:
         raise ValueError("frame_rate must be a positive finite value")
-    flip_request_lead_seconds = float(flip_request_lead_seconds)
-    if (
-        not math.isfinite(flip_request_lead_seconds)
-        or flip_request_lead_seconds < 0.0
-        or flip_request_lead_seconds >= 1.0 / frame_rate
-    ):
-        raise ValueError(
-            "flip_request_lead_seconds must be non-negative and shorter than one configured video frame"
-        )
     video_buffer_megabytes = float(video_buffer_megabytes)
     if (
         not math.isfinite(video_buffer_megabytes)
@@ -303,6 +294,98 @@ def run_task(
                 f"periodic_pump_failure error={pump_controller.failure}",
             )
 
+    def _write_video_behavior_row(
+        *,
+        trial_num: int,
+        chosen_video: Path,
+        selected_clip,
+        playback_info=None,
+        failure_reason: str = "",
+    ) -> None:
+        playback = dict(playback_info or {})
+        first_frame_time = (
+            logger.seconds_since_session_start(playback["start_flip_perf_s"])
+            if playback.get("start_flip_perf_s") is not None
+            else None
+        )
+        last_frame_end_time = (
+            logger.seconds_since_session_start(
+                playback["last_frame_end_perf_s"]
+            )
+            if playback.get("last_frame_end_perf_s") is not None
+            else None
+        )
+        behavior_logger.writerow(
+            {
+                "trial_num": int(trial_num),
+                "source_video_path": str(
+                    playback.get("video_path", chosen_video)
+                ),
+                "source_video_name": str(
+                    playback.get("video_name", chosen_video.name)
+                ),
+                "source_duration_seconds": (
+                    f"{float(playback.get('source_duration_s', selected_clip.source_duration_s)):.9f}"
+                ),
+                "source_clip_start_seconds": (
+                    f"{float(playback.get('clip_start_s', selected_clip.start_s)):.9f}"
+                ),
+                "source_clip_end_seconds": (
+                    f"{float(playback.get('clip_end_s', selected_clip.end_s)):.9f}"
+                ),
+                "requested_clip_duration_seconds": (
+                    f"{float(selected_clip.requested_duration_s):.9f}"
+                ),
+                "scheduled_clip_duration_seconds": (
+                    f"{float(selected_clip.duration_s):.9f}"
+                ),
+                "configured_video_frame_rate": (
+                    f"{float(selected_clip.frame_rate):.9f}"
+                ),
+                "scheduled_video_frames": int(selected_clip.frame_count),
+                "actual_source_start_seconds": (
+                    f"{float(playback['actual_source_start_s']):.9f}"
+                    if playback.get("actual_source_start_s") is not None
+                    else ""
+                ),
+                "actual_source_last_frame_seconds": (
+                    f"{float(playback['actual_source_last_frame_s']):.9f}"
+                    if playback.get("actual_source_last_frame_s") is not None
+                    else ""
+                ),
+                "first_frame_time_since_session_start": (
+                    f"{float(first_frame_time):.9f}"
+                    if first_frame_time is not None
+                    else ""
+                ),
+                "last_frame_end_time_since_session_start": (
+                    f"{float(last_frame_end_time):.9f}"
+                    if last_frame_end_time is not None
+                    else ""
+                ),
+                "displayed_duration_seconds": (
+                    f"{float(playback['displayed_duration_s']):.9f}"
+                    if playback.get("displayed_duration_s") is not None
+                    else ""
+                ),
+                "display_frames": playback.get("frames_presented", ""),
+                "aborted": int(
+                    True if failure_reason else playback.get("aborted", False)
+                ),
+                "stop_reason": (
+                    failure_reason
+                    or playback.get("abort_reason")
+                    or "completed"
+                ),
+                "dropped_frames": playback.get("dropped_frames", ""),
+                "scheduled_video_slots_skipped": playback.get(
+                    "scheduled_video_slots_skipped",
+                    "",
+                ),
+                "sync_pulses": playback.get("sync_pulses", ""),
+            }
+        )
+
     try:
         if raspi:
             import lgpio
@@ -399,7 +482,6 @@ def run_task(
                 f"n_unique_videos={len(video_streams)} clip_duration_s={clip_duration_seconds:.6f} "
                 f"num_clips={num_clips} "
                 f"configured_video_fps={frame_rate:.6f} "
-                f"flip_request_lead_s={flip_request_lead_seconds:.6f} "
                 f"video_buffer_megabytes={video_buffer_megabytes:.3f} "
                 f"seek_timeout_s={seek_timeout_seconds:.3f}"
             ),
@@ -431,32 +513,53 @@ def run_task(
             msg_logger=msg_logger,
             context="play_video",
         )
-        cadence_ratio = fps / frame_rate
-        nearest_refreshes_per_video_frame = max(1, int(round(cadence_ratio)))
-        cadence_error_hz = fps / nearest_refreshes_per_video_frame - frame_rate
+        cadence_frame_count = plan_frame_duration(
+            clip_duration_seconds,
+            frame_rate,
+            minimum_frames=1,
+        ).frame_count
+        try:
+            refresh_cadence = plan_video_refresh_cadence(
+                cadence_frame_count,
+                frame_rate,
+                fps,
+            )
+        except ValueError as exc:
+            msg_logger.log(
+                "ERROR",
+                f"video_monitor_cadence_unusable "
+                f"configured_video_fps={frame_rate:.6f} "
+                f"monitor_fps={fps:.6f} error={exc}",
+            )
+            raise
+        effective_video_fps = (
+            cadence_frame_count
+            / refresh_cadence.scheduled_display_duration_s
+        )
+        cadence_error_hz = effective_video_fps - frame_rate
         msg_logger.log(
             "INFO",
             (
                 f"video_cadence configured_video_fps={frame_rate:.6f} "
-                f"monitor_fps={fps:.6f} refreshes_per_video_frame="
-                f"{nearest_refreshes_per_video_frame} cadence_error_hz={cadence_error_hz:.6f} "
-                "schedule=absolute_deadline source_frames=never_skip"
+                f"monitor_fps={fps:.6f} nominal_refreshes_per_video_frame="
+                f"{refresh_cadence.nominal_refreshes_per_video_frame:.9f} "
+                f"refresh_hold_histogram="
+                f"{dict(refresh_cadence.refresh_count_histogram)} "
+                f"total_refreshes={refresh_cadence.total_refreshes} "
+                f"maximum_phase_error_s="
+                f"{refresh_cadence.maximum_absolute_phase_error_s:.9f} "
+                f"final_phase_error_s="
+                f"{refresh_cadence.final_phase_error_s:.9f} "
+                f"effective_video_fps={effective_video_fps:.9f} "
+                f"cadence_error_hz={cadence_error_hz:.9f} "
+                "schedule=nearest_vbl_phase_accumulator "
+                "source_frames=never_skip"
             ),
         )
-        cadence_tolerance_hz = max(0.005, frame_rate * 0.0005)
-        if abs(cadence_error_hz) > cadence_tolerance_hz:
-            msg_logger.log(
-                "ERROR",
-                (
-                    "video_monitor_cadence_mismatch "
-                    f"configured_video_fps={frame_rate:.6f} monitor_fps={fps:.6f} "
-                    f"nearest_refresh_ratio={nearest_refreshes_per_video_frame}:1 "
-                    f"tolerance_hz={cadence_tolerance_hz:.6f}"
-                ),
-            )
-            raise ValueError(
-                f"Monitor rate {fps:.6f} Hz is not an integer-compatible "
-                f"multiple of video frame_rate {frame_rate:.6f} Hz"
+        if not refresh_sync_request_applied:
+            raise RuntimeError(
+                "The main PsychoPy window did not accept refresh-synchronized "
+                "blocking flips"
             )
 
         if experimenter_screen is not None:
@@ -575,99 +678,78 @@ def run_task(
                 else None
             )
             try:
-                playback_info = utils.play_video_fill_screen(
-                    win=win,
-                    video_path=chosen_video,
-                    logger=logger,
-                    bg_rect=bg_rect,
-                    msg_logger=msg_logger,
-                    allow_escape=True,
-                    stop_on_mouse_click=False,
-                    mouse=mouse,
-                    ffprobe_bin=ffprobe_bin,
-                    external_abort_checker=_external_abort_reason,
-                    trial_num=played_videos + 1,
-                    stream_info=chosen_stream,
-                    frame_publisher=frame_publisher,
-                    sync_schedule=sync_schedule,
-                    sync_gpio_module=sync_lgpio,
-                    sync_gpio_chip=sync_gpio_chip,
-                    sync_pin=sync_pin,
-                    frame_publish_interval_s=0.1,
-                    clip_start_s=selected_clip.start_s,
-                    clip_duration_s=selected_clip.duration_s,
-                    requested_clip_duration_s=selected_clip.requested_duration_s,
-                    video_frame_rate=selected_clip.frame_rate,
-                    video_frame_count=selected_clip.frame_count,
-                    flip_request_lead_s=flip_request_lead_seconds,
-                    video_buffer_bytes=video_buffer_bytes,
-                    seek_timeout_s=seek_timeout_seconds,
-                    decoder_ready_callback=_pin_main_for_playback,
-                    stimulus_rotation_degrees=main_rotation_deg,
-                    native_target_size=native_main_size,
+                try:
+                    playback_info = utils.play_video_fill_screen(
+                        win=win,
+                        video_path=chosen_video,
+                        logger=logger,
+                        bg_rect=bg_rect,
+                        msg_logger=msg_logger,
+                        allow_escape=True,
+                        stop_on_mouse_click=False,
+                        mouse=mouse,
+                        ffprobe_bin=ffprobe_bin,
+                        external_abort_checker=_external_abort_reason,
+                        trial_num=played_videos + 1,
+                        stream_info=chosen_stream,
+                        frame_publisher=frame_publisher,
+                        sync_schedule=sync_schedule,
+                        sync_gpio_module=sync_lgpio,
+                        sync_gpio_chip=sync_gpio_chip,
+                        sync_pin=sync_pin,
+                        frame_publish_interval_s=0.1,
+                        clip_start_s=selected_clip.start_s,
+                        clip_duration_s=selected_clip.duration_s,
+                        requested_clip_duration_s=(
+                            selected_clip.requested_duration_s
+                        ),
+                        video_frame_rate=selected_clip.frame_rate,
+                        video_frame_count=selected_clip.frame_count,
+                        display_refresh_rate=fps,
+                        refresh_cadence=refresh_cadence,
+                        video_buffer_bytes=video_buffer_bytes,
+                        seek_timeout_s=seek_timeout_seconds,
+                        decoder_ready_callback=_pin_main_for_playback,
+                        stimulus_rotation_degrees=main_rotation_deg,
+                        native_target_size=native_main_size,
+                    )
+                finally:
+                    # Keep future children off the reserved presentation core.
+                    _stage_main_for_decoder()
+            except Exception as exc:
+                failure_reason = f"playback_error:{type(exc).__name__}"
+                msg_logger.log(
+                    "ERROR",
+                    f"video_trial_failed trial_num={played_videos + 1} "
+                    f"file={chosen_video.name} reason={failure_reason} "
+                    f"error={exc}",
                 )
-            finally:
-                # Move the Python thread off reserved CPU 0 between clips so the
-                # next spawned ffpyplayer worker inherits the worker-core mask.
-                _stage_main_for_decoder()
+                _write_video_behavior_row(
+                    trial_num=played_videos + 1,
+                    chosen_video=chosen_video,
+                    selected_clip=selected_clip,
+                    failure_reason=failure_reason,
+                )
+                session_logs.flush()
+                raise
             _drain_pump_edges()
             if playback_info.get("abort_reason") == "pump_failure":
+                _write_video_behavior_row(
+                    trial_num=played_videos + 1,
+                    chosen_video=chosen_video,
+                    selected_clip=selected_clip,
+                    playback_info=playback_info,
+                )
+                session_logs.flush()
                 raise RuntimeError(
                     f"Periodic pump output failed: {pump_controller.failure if pump_controller is not None else 'unknown error'}"
                 )
             played_videos += 1
-            first_frame_time = (
-                logger.seconds_since_session_start(playback_info["start_flip_perf_s"])
-                if playback_info.get("start_flip_perf_s") is not None
-                else None
-            )
-            last_frame_end_time = (
-                logger.seconds_since_session_start(playback_info["last_frame_end_perf_s"])
-                if playback_info.get("last_frame_end_perf_s") is not None
-                else None
-            )
-            behavior_logger.writerow(
-                {
-                    "trial_num": played_videos,
-                    "source_video_path": str(playback_info["video_path"]),
-                    "source_video_name": playback_info["video_name"],
-                    "source_duration_seconds": f"{float(playback_info['source_duration_s']):.9f}",
-                    "source_clip_start_seconds": f"{float(playback_info['clip_start_s']):.9f}",
-                    "source_clip_end_seconds": f"{float(playback_info['clip_end_s']):.9f}",
-                    "requested_clip_duration_seconds": f"{float(selected_clip.requested_duration_s):.9f}",
-                    "scheduled_clip_duration_seconds": f"{float(selected_clip.duration_s):.9f}",
-                    "configured_video_frame_rate": f"{float(selected_clip.frame_rate):.9f}",
-                    "scheduled_video_frames": int(selected_clip.frame_count),
-                    "actual_source_start_seconds": (
-                        f"{float(playback_info['actual_source_start_s']):.9f}"
-                        if playback_info.get("actual_source_start_s") is not None
-                        else ""
-                    ),
-                    "actual_source_last_frame_seconds": (
-                        f"{float(playback_info['actual_source_last_frame_s']):.9f}"
-                        if playback_info.get("actual_source_last_frame_s") is not None
-                        else ""
-                    ),
-                    "first_frame_time_since_session_start": (
-                        f"{float(first_frame_time):.9f}" if first_frame_time is not None else ""
-                    ),
-                    "last_frame_end_time_since_session_start": (
-                        f"{float(last_frame_end_time):.9f}" if last_frame_end_time is not None else ""
-                    ),
-                    "displayed_duration_seconds": (
-                        f"{float(playback_info['displayed_duration_s']):.9f}"
-                        if playback_info.get("displayed_duration_s") is not None
-                        else ""
-                    ),
-                    "display_frames": playback_info["frames_presented"],
-                    "aborted": int(playback_info["aborted"]),
-                    "stop_reason": playback_info.get("abort_reason") or "completed",
-                    "dropped_frames": playback_info["dropped_frames"],
-                    "scheduled_video_slots_skipped": int(
-                        playback_info.get("scheduled_video_slots_skipped", 0)
-                    ),
-                    "sync_pulses": playback_info["sync_pulses"],
-                }
+            _write_video_behavior_row(
+                trial_num=played_videos,
+                chosen_video=chosen_video,
+                selected_clip=selected_clip,
+                playback_info=playback_info,
             )
             if experimenter_preview is not None:
                 experimenter_preview.clear_scene(
@@ -770,12 +852,6 @@ def main():
             bg=tuple(_get("bg", cfg.get("bg", (0, 0, 0)))),
             refresh_rate=_get("refresh_rate", cfg.get("refresh_rate", cfg.get("refrech_rate", None))),
             frame_rate=float(_get("frame_rate", cfg.get("frame_rate", 30.0))),
-            flip_request_lead_seconds=float(
-                _get(
-                    "flip_request_lead_seconds",
-                    cfg.get("flip_request_lead_seconds", 0.015),
-                )
-            ),
             video_buffer_megabytes=float(
                 _get(
                     "video_buffer_megabytes",

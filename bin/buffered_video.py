@@ -278,13 +278,10 @@ def _decode_worker(
                     f"ffpyplayer did not open {Path(video_path).name} within "
                     f"{float(seek_timeout_s):.1f}s"
                 )
-            decoded, status = player.get_frame()
-            if status == "eof":
-                raise RuntimeError(
-                    f"ffpyplayer reached EOF while opening {Path(video_path).name}"
-                )
-            if decoded is None:
-                time.sleep(0.002)
+            # Metadata is updated by ffpyplayer's reader thread. Do not consume
+            # a frame merely to open the file, because doing so can leave a
+            # pre-seek image queued ahead of the requested clip.
+            time.sleep(0.002)
         if stop_event.is_set():
             return
 
@@ -342,8 +339,14 @@ def _decode_worker(
                 pts = float(raw_pts)
                 if not math.isfinite(pts):
                     raise RuntimeError("ffpyplayer returned a non-finite frame PTS")
-                if absolute_frame_index == 0 and pts < expected_pts - pts_tolerance_s:
-                    continue
+                if absolute_frame_index == 0:
+                    # Accurate seek decodes forward from an earlier seek point,
+                    # and some builds can briefly expose a frame queued before
+                    # the seek completed. Ignore every non-target PTS until the
+                    # exact requested first frame arrives or the seek deadline
+                    # expires. Later frames remain strictly contiguous.
+                    if abs(pts - expected_pts) > pts_tolerance_s:
+                        continue
                 if abs(pts - expected_pts) > pts_tolerance_s:
                     raise RuntimeError(
                         f"ffpyplayer frame {absolute_frame_index} PTS {pts:.6f}s "

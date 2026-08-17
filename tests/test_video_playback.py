@@ -1,9 +1,11 @@
 from collections import deque
 import importlib.util
+from multiprocessing import shared_memory
 import queue
 import random
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -15,6 +17,7 @@ from bin.buffered_video import (
     BufferedVideoFrameStream,
     DEFAULT_BUFFER_BYTES,
     VideoBufferUnderrun,
+    _decode_worker,
     copy_ffpyplayer_rgb24,
     plan_video_chunks,
 )
@@ -24,6 +27,7 @@ from bin.video_playback import (
     SharedVideoFrameReader,
     center_crop_bounds,
     parse_frame_rate,
+    plan_video_refresh_cadence,
     select_random_video_clip,
     validate_hevc_stream,
     video_duration_seconds,
@@ -97,12 +101,38 @@ class VideoPlaybackTests(unittest.TestCase):
         )
 
         self.assertEqual(clip.duration_s, 10.0)
+        self.assertEqual(clip.source_time_origin_s, 0.0)
         self.assertGreaterEqual(clip.start_s, 0.0)
         self.assertLessEqual(clip.end_s, 120.0)
         self.assertAlmostEqual(clip.end_s - clip.start_s, 10.0)
-        self.assertAlmostEqual(clip.start_s * 30.0, clip.start_frame)
+        self.assertAlmostEqual(
+            (clip.start_s - clip.source_time_origin_s) * 30.0,
+            clip.start_frame,
+        )
         self.assertEqual(clip.frame_count, 300)
         self.assertEqual(clip.frame_rate, 30.0)
+
+    def test_random_clip_preserves_nonzero_source_time_origin(self):
+        rng = Mock()
+        rng.randint.return_value = 3
+
+        clip = select_random_video_clip(
+            {
+                "duration": "10.0",
+                "start_time": "4.25",
+                "avg_frame_rate": "2/1",
+            },
+            2.0,
+            rng=rng,
+            frame_rate=2.0,
+        )
+
+        rng.randint.assert_called_once_with(0, 16)
+        self.assertEqual(clip.source_time_origin_s, 4.25)
+        self.assertEqual(clip.start_frame, 3)
+        self.assertEqual(clip.start_s, 5.75)
+        self.assertEqual(clip.end_s, 7.75)
+        self.assertEqual(clip.duration_s, 2.0)
 
     def test_configured_frame_rate_is_authoritative_for_clip_selection(self):
         clip = select_random_video_clip(
@@ -215,6 +245,166 @@ class VideoPlaybackTests(unittest.TestCase):
                 dtype=np.uint8,
             ),
         )
+
+    def test_decode_worker_seeks_before_consuming_and_discards_stale_pts(self):
+        layout = plan_video_chunks(
+            (2, 2),
+            frame_count=3,
+            frame_rate=2.0,
+            memory_budget_bytes=3 * 2 * 2 * 3,
+        )
+
+        class FakeImage:
+            def __init__(self, value):
+                self._pixels = bytearray([value] * (2 * 2 * 3))
+
+            @staticmethod
+            def get_pixel_format():
+                return "rgb24"
+
+            @staticmethod
+            def get_size():
+                return (2, 2)
+
+            @staticmethod
+            def get_linesizes(*, keep_align):
+                return (6,)
+
+            def to_memoryview(self, *, keep_align):
+                return (
+                    types.SimpleNamespace(memview=memoryview(self._pixels)),
+                )
+
+        player_calls = []
+        decoded_frames = deque(
+            [
+                ("stale", FakeImage(99), 10.5),
+                ("target", FakeImage(10), 10.0),
+                ("next", FakeImage(20), 10.5),
+                ("last", FakeImage(30), 11.0),
+            ]
+        )
+
+        class FakeMediaPlayer:
+            def __init__(self):
+                self.metadata_calls = 0
+                self.seek_args = None
+
+            def get_metadata(self):
+                player_calls.append("metadata")
+                self.metadata_calls += 1
+                return {
+                    "src_vid_size": (
+                        (0, 0) if self.metadata_calls == 1 else (2, 2)
+                    )
+                }
+
+            def seek(self, *args, **kwargs):
+                player_calls.append("seek")
+                self.seek_args = (args, kwargs)
+
+            def get_frame(self):
+                label, image, pts = decoded_frames.popleft()
+                player_calls.append(f"frame:{label}")
+                return (image, pts), 0.0
+
+            def close_player(self):
+                player_calls.append("close")
+
+        player = FakeMediaPlayer()
+        media_player_factory = Mock(return_value=player)
+        fake_player_module = types.ModuleType("ffpyplayer.player")
+        fake_player_module.MediaPlayer = media_player_factory
+        fake_ffpyplayer = types.ModuleType("ffpyplayer")
+        fake_ffpyplayer.__path__ = []
+        fake_ffpyplayer.player = fake_player_module
+
+        owner = shared_memory.SharedMemory(
+            create=True,
+            size=layout.total_bytes,
+        )
+        free_slots = queue.Queue()
+        free_slots.put(0)
+        ready_chunks = queue.Queue()
+        try:
+            with (
+                patch.dict(
+                    sys.modules,
+                    {
+                        "ffpyplayer": fake_ffpyplayer,
+                        "ffpyplayer.player": fake_player_module,
+                    },
+                ),
+                patch("bin.buffered_video.time.sleep") as sleep,
+            ):
+                _decode_worker(
+                    video_path="unused.mp4",
+                    shared_memory_name=owner.name,
+                    layout=layout,
+                    crop_bounds=(0, 0, 2, 2),
+                    clip_start_s=10.0,
+                    seek_timeout_s=1.0,
+                    free_slots=free_slots,
+                    ready_chunks=ready_chunks,
+                    stop_event=threading.Event(),
+                )
+
+            messages = []
+            while not ready_chunks.empty():
+                messages.append(ready_chunks.get_nowait())
+
+            self.assertEqual(
+                player_calls,
+                [
+                    "metadata",
+                    "metadata",
+                    "seek",
+                    "frame:stale",
+                    "frame:target",
+                    "frame:next",
+                    "frame:last",
+                    "close",
+                ],
+            )
+            sleep.assert_called_once_with(0.002)
+            self.assertEqual(
+                player.seek_args,
+                (
+                    (10.0,),
+                    {
+                        "relative": False,
+                        "seek_by_bytes": False,
+                        "accurate": True,
+                    },
+                ),
+            )
+            self.assertEqual(
+                messages,
+                [
+                    (
+                        "info",
+                        {
+                            "video_filter": "crop=2:2:0:0",
+                            "pixel_format": "rgb24",
+                        },
+                    ),
+                    ("chunk", 0, 0, 3, (10.0, 10.5, 11.0)),
+                    ("eof", 3),
+                ],
+            )
+
+            shared_frames = np.ndarray(
+                (3, 2, 2, 3),
+                dtype=np.uint8,
+                buffer=owner.buf,
+            )
+            self.assertEqual(
+                [int(frame[0, 0, 0]) for frame in shared_frames],
+                [10, 20, 30],
+            )
+        finally:
+            owner.close()
+            owner.unlink()
 
     def test_buffered_stream_crosses_ready_chunk_boundary_without_waiting(self):
         stream = self._make_buffered_stream_state_machine()
@@ -401,6 +591,272 @@ class VideoPlaybackTests(unittest.TestCase):
             (0, 656, 1080, 1264),
         )
 
+    def test_refresh_locked_presenter_reuses_each_uploaded_frame(self):
+        video_utils = self._load_utils_without_psychopy_runtime()
+
+        class FakeClock:
+            def __init__(self):
+                self.anchor_s = 100.0
+                self.now_s = self.anchor_s
+
+            def perf_counter(self):
+                return self.now_s
+
+        class FakeWindow:
+            def __init__(self, clock):
+                self.clock = clock
+                self.size = (2, 2)
+                self.flip_count = 0
+                self.recordFrameIntervals = False
+                self.refreshThreshold = 0.1
+                self.nDroppedFrames = 0
+                self._flip_callbacks = []
+
+            def callOnFlip(self, callback, *args, **kwargs):
+                self._flip_callbacks.append((callback, args, kwargs))
+
+            def flip(self):
+                self.flip_count += 1
+                self.clock.now_s = (
+                    self.clock.anchor_s + self.flip_count / 60.0
+                )
+                callbacks, self._flip_callbacks = self._flip_callbacks, []
+                for callback, args, kwargs in callbacks:
+                    callback(*args, **kwargs)
+                return self.flip_count
+
+        clock = FakeClock()
+        win = FakeWindow(clock)
+        frames = [
+            types.SimpleNamespace(
+                frame_index=frame_index,
+                source_pts_s=frame_index / 30.0,
+                rgb=np.full((2, 2, 3), frame_index, dtype=np.uint8),
+            )
+            for frame_index in range(3)
+        ]
+        frame_stream = types.SimpleNamespace(
+            layout=types.SimpleNamespace(
+                slot_count=1,
+                frames_per_chunk=3,
+                total_bytes=sum(frame.rgb.nbytes for frame in frames),
+            ),
+            startup_wait_s=0.0,
+            wait_until_ready=Mock(),
+            next_frame=Mock(side_effect=frames),
+            close=Mock(),
+        )
+        stimulus = types.SimpleNamespace(current_frame=None)
+        drawn_frames = []
+        stimulus.draw = Mock(
+            side_effect=lambda: drawn_frames.append(stimulus.current_frame)
+        )
+        uploaded_frames = []
+
+        def record_upload(target_stimulus, rgb):
+            frame_index = int(rgb[0, 0, 0])
+            self.assertIs(target_stimulus, stimulus)
+            target_stimulus.current_frame = frame_index
+            uploaded_frames.append(frame_index)
+
+        class FakeGPIO:
+            def __init__(self):
+                self.writes = []
+
+            def gpio_write(self, chip, pin, level):
+                self.writes.append((win.flip_count, chip, pin, level))
+                return 0
+
+        gpio = FakeGPIO()
+        sync_schedule = RandomFramePulseSchedule(
+            2,
+            2,
+            pulse_width_frames=1,
+            rng=random.Random(0),
+        )
+        frame_publisher = Mock()
+        event_logger = Mock()
+
+        with (
+            patch.object(
+                video_utils,
+                "BufferedVideoFrameStream",
+                return_value=frame_stream,
+            ),
+            patch.object(
+                video_utils.visual,
+                "ImageStim",
+                return_value=stimulus,
+            ) as image_stim,
+            patch.object(
+                video_utils,
+                "upload_rgb_texture",
+                side_effect=record_upload,
+            ) as upload_texture,
+            patch.object(
+                video_utils.time,
+                "perf_counter",
+                side_effect=clock.perf_counter,
+            ),
+            patch.object(
+                video_utils.time,
+                "sleep",
+                side_effect=AssertionError(
+                    "refresh-locked presentation must not sleep"
+                ),
+            ) as sleep,
+        ):
+            result = video_utils.play_video_fill_screen(
+                win=win,
+                video_path="unused.mp4",
+                logger=event_logger,
+                allow_escape=False,
+                stream_info={
+                    "duration": "1.0",
+                    "start_time": "0.0",
+                    "width": 2,
+                    "height": 2,
+                },
+                frame_publisher=frame_publisher,
+                sync_schedule=sync_schedule,
+                sync_gpio_module=gpio,
+                sync_gpio_chip="chip",
+                sync_pin=18,
+                frame_publish_interval_s=0.0,
+                clip_start_s=0.0,
+                clip_duration_s=0.1,
+                requested_clip_duration_s=0.1,
+                video_frame_rate=30.0,
+                video_frame_count=3,
+                display_refresh_rate=60.0,
+                native_target_size=(2, 2),
+            )
+
+        self.assertEqual(frame_stream.next_frame.call_count, 3)
+        self.assertEqual(upload_texture.call_count, 3)
+        self.assertEqual(uploaded_frames, [0, 1, 2])
+        self.assertEqual(drawn_frames, [0, 0, 1, 1, 2, 2])
+        self.assertEqual(stimulus.draw.call_count, 6)
+        self.assertEqual(win.flip_count, 7)
+        image_stim.assert_called_once()
+        sleep.assert_not_called()
+        frame_stream.close.assert_called_once()
+
+        flip_time = lambda flip_index: clock.anchor_s + flip_index / 60.0
+        self.assertEqual(result["start_flip_psychopy_s"], 1)
+        self.assertAlmostEqual(result["start_flip_perf_s"], flip_time(1))
+        self.assertAlmostEqual(result["last_frame_on_perf_s"], flip_time(5))
+        self.assertAlmostEqual(
+            result["final_repeat_flip_perf_s"],
+            flip_time(6),
+        )
+        self.assertAlmostEqual(result["clip_offset_perf_s"], flip_time(7))
+        self.assertAlmostEqual(result["displayed_duration_s"], 6.0 / 60.0)
+        self.assertAlmostEqual(
+            result["clear_flip_submitted_perf_s"],
+            flip_time(6),
+        )
+        self.assertAlmostEqual(result["end_requested_perf_s"], flip_time(6))
+        self.assertAlmostEqual(result["requested_end_perf_s"], flip_time(7))
+        self.assertEqual(result["frames_presented"], 3)
+        self.assertEqual(result["source_frame_holds_completed"], 3)
+        self.assertEqual(result["display_refreshes_presented"], 6)
+        self.assertEqual(result["dropped_frames"], 0)
+
+        self.assertEqual(frame_publisher.publish_rgb.call_count, 3)
+        publish_calls = frame_publisher.publish_rgb.call_args_list
+        self.assertEqual(
+            [call.kwargs["source_frame_index"] for call in publish_calls],
+            [0, 1, 2],
+        )
+        self.assertEqual(
+            [
+                call.kwargs["main_display_flip_perf_s"]
+                for call in publish_calls
+            ],
+            [flip_time(1), flip_time(3), flip_time(5)],
+        )
+
+        # The pulse begins on source frame 2's first refresh, remains high
+        # through its repeated refresh, then is forced low by the clear flip.
+        self.assertEqual(
+            gpio.writes,
+            [(5, "chip", 18, 1), (7, "chip", 18, 0)],
+        )
+        self.assertEqual(result["sync_pulses"], 1)
+
+        end_flip_call = next(
+            call
+            for call in event_logger.log_frame_flip.call_args_list
+            if call.kwargs["event"] == "video_clip_end"
+        )
+        self.assertAlmostEqual(
+            end_flip_call.kwargs["requested_timestamp_perf_s"],
+            flip_time(6),
+        )
+        self.assertAlmostEqual(
+            end_flip_call.kwargs["timestamp_perf_s"],
+            flip_time(7),
+        )
+
+    @staticmethod
+    def _load_utils_without_psychopy_runtime():
+        fake_psychopy = types.ModuleType("psychopy")
+        fake_psychopy.visual = types.SimpleNamespace(
+            Window=object,
+            ImageStim=object,
+            Circle=object,
+            Rect=object,
+            TextStim=object,
+        )
+        fake_psychopy.event = types.SimpleNamespace(
+            Mouse=object,
+            clearEvents=Mock(),
+            getKeys=Mock(return_value=[]),
+        )
+        with patch.dict(sys.modules, {"psychopy": fake_psychopy}):
+            import bin.utils as video_utils
+
+        return video_utils
+
+    def test_refresh_cadence_is_uniform_for_exact_rate_multiple(self):
+        cadence = plan_video_refresh_cadence(4, 30.0, 60.0)
+
+        self.assertEqual(cadence.frame_refresh_counts, (2, 2, 2, 2))
+        self.assertEqual(cadence.refresh_boundaries, (0, 2, 4, 6, 8))
+        self.assertEqual(cadence.refresh_count_histogram, ((2, 4),))
+        self.assertEqual(cadence.total_refreshes, 8)
+        self.assertEqual(cadence.final_phase_error_s, 0.0)
+
+    def test_refresh_cadence_absorbs_5994_rate_without_phase_drift(self):
+        cadence = plan_video_refresh_cadence(1800, 30.0, 59.94)
+
+        self.assertEqual(cadence.refresh_count_histogram, ((1, 4), (2, 1796)))
+        self.assertEqual(cadence.total_refreshes, 3596)
+        self.assertEqual(min(cadence.frame_refresh_counts), 1)
+        self.assertEqual(max(cadence.frame_refresh_counts), 2)
+        self.assertLessEqual(
+            cadence.maximum_absolute_phase_error_s,
+            (0.5 / 59.94) + 1e-12,
+        )
+        self.assertLessEqual(
+            abs(cadence.final_phase_error_s),
+            (0.5 / 59.94) + 1e-12,
+        )
+
+    def test_refresh_cadence_uses_balanced_three_two_pulldown(self):
+        cadence = plan_video_refresh_cadence(6, 24.0, 60.0)
+
+        self.assertEqual(cadence.frame_refresh_counts, (3, 2, 3, 2, 3, 2))
+        self.assertEqual(cadence.total_refreshes, 15)
+
+    def test_refresh_cadence_rejects_any_zero_refresh_source_frame(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "would receive zero physical refreshes",
+        ):
+            plan_video_refresh_cadence(30, 30.0, 20.0)
+
 
 class PlayVideoTaskTests(unittest.TestCase):
     @staticmethod
@@ -542,33 +998,39 @@ class PlayVideoTaskTests(unittest.TestCase):
         fake_utils.setup_task_window.assert_not_called()
         fake_utils.play_video_fill_screen.assert_not_called()
 
-    def test_run_task_rejects_noninteger_monitor_cadence_before_decode(self):
+    def test_run_task_accepts_noninteger_monitor_cadence_without_drift(self):
         module, fake_utils, messages = self._make_validation_harness(
             source_rate="30/1",
             monitor_rate=59.94,
         )
+        fake_utils.play_video_fill_screen.return_value = {
+            "video_name": "clip.mp4",
+            "frames_presented": 60,
+            "aborted": False,
+            "abort_reason": "",
+            "dropped_frames": 0,
+            "sync_pulses": 0,
+        }
 
         with tempfile.TemporaryDirectory() as tmpdir:
             video_path = Path(tmpdir) / "clip.mp4"
             video_path.touch()
-            with self.assertRaisesRegex(
-                ValueError,
-                "Monitor rate 59.940000 Hz is not an integer-compatible multiple",
-            ):
-                module.run_task(
-                    video_files=[str(video_path)],
-                    clip_duration_seconds=2.0,
-                    output_dir=tmpdir,
-                    num_clips=1,
-                    frame_rate=30.0,
-                )
+            stop_reason = module.run_task(
+                video_files=[str(video_path)],
+                clip_duration_seconds=2.0,
+                output_dir=tmpdir,
+                num_clips=1,
+                frame_rate=30.0,
+            )
 
+        self.assertEqual(stop_reason, "done")
         fake_utils.setup_task_window.assert_called_once()
-        fake_utils.play_video_fill_screen.assert_not_called()
+        fake_utils.play_video_fill_screen.assert_called_once()
         self.assertTrue(
             any(
-                level == "ERROR"
-                and message.startswith("video_monitor_cadence_mismatch")
+                level == "INFO"
+                and message.startswith("video_cadence")
+                and "schedule=nearest_vbl_phase_accumulator" in message
                 for level, message in messages
             )
         )
@@ -784,7 +1246,11 @@ class PlayVideoTaskTests(unittest.TestCase):
         self.assertEqual(playback_kwargs["stimulus_rotation_degrees"], 90)
         self.assertEqual(playback_kwargs["video_frame_rate"], 30.0)
         self.assertEqual(playback_kwargs["video_frame_count"], 60)
-        self.assertEqual(playback_kwargs["flip_request_lead_s"], 0.015)
+        self.assertEqual(playback_kwargs["display_refresh_rate"], 60.0)
+        cadence = playback_kwargs["refresh_cadence"]
+        self.assertEqual(cadence.frame_refresh_counts, (2,) * 60)
+        self.assertEqual(cadence.total_refreshes, 120)
+        self.assertNotIn("flip_request_lead_s", playback_kwargs)
         self.assertEqual(
             playback_kwargs["video_buffer_bytes"],
             DEFAULT_BUFFER_BYTES,

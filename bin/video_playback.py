@@ -80,6 +80,118 @@ class VideoClipSelection:
     requested_duration_s: float = 0.0
 
 
+@dataclass(frozen=True)
+class VideoRefreshCadence:
+    """Nearest-VBL schedule for a fixed sequence of source frames."""
+
+    video_frame_count: int
+    video_frame_rate: float
+    display_refresh_rate: float
+    nominal_refreshes_per_video_frame: float
+    frame_refresh_counts: tuple[int, ...]
+    refresh_boundaries: tuple[int, ...]
+    refresh_count_histogram: tuple[tuple[int, int], ...]
+    total_refreshes: int
+    source_duration_s: float
+    scheduled_display_duration_s: float
+    final_phase_error_s: float
+    maximum_absolute_phase_error_s: float
+
+    def refreshes_for_source_frames(
+        self,
+        first_frame_index: int,
+        frame_count: int,
+    ) -> int:
+        """Return physical refreshes occupied by a source-frame interval."""
+        first = max(0, min(self.video_frame_count, int(first_frame_index)))
+        end = max(first, min(self.video_frame_count, first + int(frame_count)))
+        return self.refresh_boundaries[end] - self.refresh_boundaries[first]
+
+
+def plan_video_refresh_cadence(
+    video_frame_count: int,
+    video_frame_rate: float,
+    display_refresh_rate: float,
+) -> VideoRefreshCadence:
+    """Map source-frame boundaries to nearest display refreshes.
+
+    Each boundary is rounded independently from its absolute ideal position,
+    using round-half-up on an exact rational ratio. Consequently, phase error
+    never accumulates beyond half a display refresh. Adjacent boundary
+    differences become the per-frame hold counts.
+    """
+    raw_video_frame_count = video_frame_count
+    if isinstance(raw_video_frame_count, bool):
+        raise ValueError("video_frame_count must be a positive integer")
+    video_frame_count = int(raw_video_frame_count)
+    if (
+        video_frame_count <= 0
+        or video_frame_count != raw_video_frame_count
+    ):
+        raise ValueError("video_frame_count must be a positive integer")
+    video_frame_rate = float(video_frame_rate)
+    display_refresh_rate = float(display_refresh_rate)
+    if not math.isfinite(video_frame_rate) or video_frame_rate <= 0.0:
+        raise ValueError("video_frame_rate must be positive and finite")
+    if (
+        not math.isfinite(display_refresh_rate)
+        or display_refresh_rate <= 0.0
+    ):
+        raise ValueError("display_refresh_rate must be positive and finite")
+
+    refresh_ratio = Fraction(str(display_refresh_rate)) / Fraction(
+        str(video_frame_rate)
+    )
+    boundaries = [0]
+    holds: list[int] = []
+    histogram: dict[int, int] = {}
+    maximum_absolute_phase_error_s = 0.0
+
+    for boundary_index in range(1, video_frame_count + 1):
+        ideal_boundary = boundary_index * refresh_ratio
+        # floor(x + 1/2), evaluated with integers to avoid float drift and
+        # Python's alternating ties-to-even behavior.
+        refresh_boundary = (
+            (2 * ideal_boundary.numerator) + ideal_boundary.denominator
+        ) // (2 * ideal_boundary.denominator)
+        hold_count = int(refresh_boundary - boundaries[-1])
+        if hold_count < 1:
+            raise ValueError(
+                "The measured display rate cannot show every source frame "
+                f"at least once: source frame {boundary_index - 1} would "
+                "receive zero physical refreshes"
+            )
+        boundaries.append(int(refresh_boundary))
+        holds.append(hold_count)
+        histogram[hold_count] = histogram.get(hold_count, 0) + 1
+        actual_boundary_s = float(refresh_boundary) / display_refresh_rate
+        ideal_boundary_s = float(boundary_index) / video_frame_rate
+        maximum_absolute_phase_error_s = max(
+            maximum_absolute_phase_error_s,
+            abs(actual_boundary_s - ideal_boundary_s),
+        )
+
+    total_refreshes = boundaries[-1]
+    source_duration_s = video_frame_count / video_frame_rate
+    scheduled_display_duration_s = total_refreshes / display_refresh_rate
+    return VideoRefreshCadence(
+        video_frame_count=video_frame_count,
+        video_frame_rate=video_frame_rate,
+        display_refresh_rate=display_refresh_rate,
+        nominal_refreshes_per_video_frame=float(refresh_ratio),
+        frame_refresh_counts=tuple(holds),
+        refresh_boundaries=tuple(boundaries),
+        refresh_count_histogram=tuple(sorted(histogram.items())),
+        total_refreshes=total_refreshes,
+        source_duration_s=source_duration_s,
+        scheduled_display_duration_s=scheduled_display_duration_s,
+        final_phase_error_s=(
+            scheduled_display_duration_s - source_duration_s
+        ),
+        maximum_absolute_phase_error_s=maximum_absolute_phase_error_s,
+    )
+
+
 def select_random_video_clip(
     stream: dict[str, Any],
     clip_duration_s: float,
@@ -159,8 +271,8 @@ def validate_hevc_stream(
         problems.append(
             f"pix_fmt={pixel_format or 'unknown'} (required yuv420p 8-bit 4:2:0)"
         )
-    if profile and profile != "main":
-        problems.append(f"profile={profile} (required Main)")
+    if profile != "main":
+        problems.append(f"profile={profile or 'unknown'} (required Main)")
     if width <= 0 or height <= 0 or width % 2 or height % 2:
         problems.append(f"size={width}x{height} (required positive even dimensions)")
 

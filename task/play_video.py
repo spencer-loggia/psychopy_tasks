@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
-from psychopy import core, event, logging as pylogging
+from psychopy import event, logging as pylogging
 
 _project_root = Path(__file__).resolve().parents[1]
 if str(_project_root) not in sys.path:
@@ -35,8 +35,10 @@ from bin.screen import (
     ExperimenterPreview,
     describe_screen,
     load_screen_config,
+    oriented_size,
     resolve_scene_size,
     resolve_task_screens,
+    software_stimulus_rotation,
 )
 
 
@@ -164,9 +166,12 @@ def run_task(
                 "check Raspberry Pi OS drivers and membership in the video group."
             )
 
-    main_screen, experimenter_screen = resolve_task_screens(screen_config)
+    main_screen, experimenter_screen = resolve_task_screens(
+        screen_config,
+        allow_same_screen=True,
+    )
     win = utils.setup_window(bg_rgb_255=bg, fullscreen=fullscreen, size=win_size, screen_info=main_screen)
-    main_vsync_requested = bool(
+    refresh_sync_request_applied = bool(
         getattr(win, "_neuro_tasks_refresh_sync_requested", False)
     )
     bg_rect = utils.make_bg_rect(win, bg)
@@ -176,12 +181,14 @@ def run_task(
     sync_lgpio = None
     sync_gpio_chip = None
     reusable_movie = None
-    main_scene_size = resolve_scene_size(
+    native_main_size = resolve_scene_size(
         main_screen,
         fullscreen=bool(fullscreen),
         requested_size=win_size,
         realized_size=tuple(win.size),
     )
+    main_rotation_deg = software_stimulus_rotation(main_screen.rotation)
+    subject_main_size = oriented_size(native_main_size, main_rotation_deg)
 
     resolved_config_name = str(config_name).strip() if config_name else "play_video"
     session_logs = SessionLogBundle(
@@ -278,8 +285,8 @@ def run_task(
         msg_logger.log(
             "INFO",
             (
-                "main_display_sync wait_blanking=1 swap_interval=1 "
-                f"request_applied={int(main_vsync_requested)}"
+                "main_display_sync wait_blanking_requested=1 "
+                f"refresh_sync_request_applied={int(refresh_sync_request_applied)}"
             ),
         )
         msg_logger.log(
@@ -302,7 +309,15 @@ def run_task(
             )
         msg_logger.log(
             "INFO",
-            f"resolved_main_scene_size size={main_scene_size[0]}x{main_scene_size[1]} fullscreen={int(bool(fullscreen))} requested_win_size={win_size} realized_win_size={tuple(win.size)}",
+            (
+                "resolved_main_scene_size "
+                f"native_size={native_main_size[0]}x{native_main_size[1]} "
+                f"subject_size={subject_main_size[0]}x{subject_main_size[1]} "
+                f"output_rotation={main_screen.rotation} "
+                f"stimulus_rotation_deg={main_rotation_deg} "
+                f"fullscreen={int(bool(fullscreen))} requested_win_size={win_size} "
+                f"realized_win_size={tuple(win.size)}"
+            ),
         )
         fps, frame_dur = utils.resolve_frame_rate(
             win,
@@ -319,7 +334,11 @@ def run_task(
                 start_perf_s=time.perf_counter(),
                 update_interval_s=0.1,
             )
-            experimenter_preview.clear_scene(bg_rgb_255=bg, main_size=main_scene_size)
+            experimenter_preview.clear_scene(
+                bg_rgb_255=bg,
+                main_size=native_main_size,
+                main_rotation_deg=main_rotation_deg,
+            )
             msg_logger.log(
                 "INFO",
                 (
@@ -403,7 +422,8 @@ def run_task(
                     minimum_sequence=frame_publisher.sequence + 1,
                     video_size=(int(chosen_stream["width"]), int(chosen_stream["height"])),
                     bg_rgb_255=bg,
-                    main_size=main_scene_size,
+                    main_size=native_main_size,
+                    main_rotation_deg=main_rotation_deg,
                 )
             sync_schedule = (
                 RandomFramePulseSchedule(
@@ -442,6 +462,8 @@ def run_task(
                     keep_movie_loaded=True,
                     seek_timeout_s=seek_timeout_seconds,
                     decoder_ready_callback=_pin_main_for_playback,
+                    stimulus_rotation_degrees=main_rotation_deg,
+                    native_target_size=native_main_size,
                 )
             finally:
                 # Move the Python thread off reserved CPU 0 between clips. A
@@ -503,7 +525,11 @@ def run_task(
                 }
             )
             if experimenter_preview is not None:
-                experimenter_preview.clear_scene(bg_rgb_255=bg, main_size=main_scene_size)
+                experimenter_preview.clear_scene(
+                    bg_rgb_255=bg,
+                    main_size=native_main_size,
+                    main_rotation_deg=main_rotation_deg,
+                )
             session_logs.flush()
             if playback_info["aborted"]:
                 stop_reason = playback_info.get("abort_reason") or "aborted"

@@ -270,6 +270,7 @@ The repo also includes a shared checked-in `event_name_library.json`. It is the 
 `event_log.tsv` is the deployment-facing timing log shared across tasks. Columns:
 
 - `trial_num`
+- `requested_time_since_session_start`
 - `time_since_session_start`
 - `event`
 - `event_code`
@@ -278,13 +279,14 @@ The repo also includes a shared checked-in `event_name_library.json`. It is the 
 
 Common event-log rules:
 
-- `time_since_session_start` is measured from session start using high-resolution real time (`time.perf_counter()`), not separate PsychoPy and perf-counter columns.
+- `requested_time_since_session_start` records when a refresh-locked flip or hardware change was submitted; it is blank for events that have no separate request time.
+- `time_since_session_start` records when that flip or hardware operation actually completed, measured from session start using high-resolution real time (`time.perf_counter()`).
 - `event_type` is one of `frame_flip`, `interaction`, or `signal`.
 - Frame-flip events are logged at the real flip time for the frame that changed the main display.
 - Interaction events are logged as close as possible to the touch / click / key / eye-tracker event itself.
 - Signal events are logged as close as possible to the GPIO, DAQC2, or external signal send.
 - Events that have no visible effect or a programmatic zero-duration no-op should not be logged.
-- `requested_duration` is filled only when the code requested a fixed duration for that state or signal. Variable windows such as `choice_start` leave it blank.
+- `requested_duration` always retains the exact configured request, not the nearest frame-achievable duration. It is blank only when no duration was requested.
 
 `event_code_library.json` is generated per session as the minimal subset of `event_name_library.json` that was actually used in that run. It includes:
 
@@ -365,6 +367,11 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
   second VLC decoder or accumulating a delayed frame queue. Each ring frame
   includes its sequence, source frame/media time, main-display flip time, and
   trial number.
+- The preview is a subject-view mirror: it transposes the complete native main
+  framebuffer geometry (background, positions, stimuli, hit boxes, and video
+  crop), rather than merely undoing each stimulus orientation. Scene commands
+  use a one-slot latest-state queue, and shared video reads the newest committed
+  ring frame, so a slow preview drops stale frames instead of accumulating lag.
 - The VLC player stays loaded when successive trials select the same source.
   For efficient random access over a mounted network filesystem, preprocess
   sources with `bin/preprocess_videos.py`; outputs use MP4 fast-start metadata
@@ -397,24 +404,24 @@ Multi-screen tasks use `screens.main` for the subject display and `screens.exper
 Each value can be a detected screen index or an output name such as `HDMI-1` or `DSI-1`.
 Use output names on X11 rigs because numeric monitor order is not stable across display changes.
 Set either value to `null` to inherit the process environment defaults: `screens.main` reads `MAIN_SCREEN`, and
-`screens.experimenter` reads `SECONDARY_SCREEN`. The touch launcher exports its resolved global `screens` values
-to those environment variables for the diagnostic and launched tasks. Resolution is consistently CLI override,
-then the current process's config (`screens.main`/`screens.experimenter`, including legacy aliases), then the
-environment. Output names such as `HDMI-2` are rig configuration values, not constants in the display code.
+`screens.experimenter` reads `SECONDARY_SCREEN`. The touch launcher exports the canonical names of the physical
+outputs it resolved and marks those values authoritative for every diagnostic and child task. CLI selectors remain
+highest priority. Outside the launcher, config selectors retain priority over ordinary environment defaults.
+Output names such as `HDMI-2` are rig configuration values, not constants in the display code.
 PsychoPy presentation windows default to true fullscreen. Main X11 windows use PsychoPy's native,
 window-manager-controlled fullscreen path without post-creation moves or resizing. Before
 launching a task or diagnostic, the interface is withdrawn from the experimenter output so the window manager does
-not relocate the new fullscreen window to that active display. The configured output is matched by exact geometry
-before PsychoPy's Linux `screen=0` workaround reorders the Pyglet view. The non-vsync experimenter preview uses the
+not relocate the new fullscreen window to that active display. Pyglet preselection is best-effort during
+PsychoPy's Linux `screen=0` workaround; the realized native rectangle is the authoritative check. The non-vsync experimenter preview uses the
 same native fullscreen creation with scoped override-redirect so it remains on its configured output without
-altering the subject window's presentation path. Every realized native rectangle is verified; a normal task aborts
-on incorrect placement, while the diagnostic reports placement failure and continues timing any realized window.
+altering the subject window's presentation path. Every realized native rectangle is verified; tasks, diagnostics,
+and experimenter previews all reject incorrect placement before timing begins.
 The shared window factory disables PsychoPy's implicit constructor timing benchmark; timing begins only after the
 launcher has released and the task has reactivated the subject window.
 The launcher, main-screen curtain, and experimenter controls likewise request true fullscreen after first being
 positioned on their assigned output.
 Display positions and sizes are read from the OS when each task starts. If display enumeration is unavailable, only
-the main display is created from the `1600x2560` fallback; detected OS dimensions always take precedence.
+the main display is created from the native `2560x1600` fallback; detected OS dimensions always take precedence.
 For `active_foraging`, setting `screens.main` and `screens.experimenter` to the same display is allowed and disables
 the experimenter preview, so only the main task content is shown.
 
@@ -427,6 +434,12 @@ experimenter window has keyboard focus.
 
 The `match2cue` display uses the same preview, subject/trial indicator, manual reward control, and exit control.
 Its running counts are `Correct`, `Incorrect`, and `Rewards delivered`; it does not show reward-level outlines.
+
+Main-display sizes and `win_size` overrides always use native framebuffer order. On the current rig that is
+`2560x1600`, with the OS output set to `normal`. `active_foraging`, `match2cue`, and `play_video` compensate by
+turning subject-facing stimuli 90 degrees clockwise. If the OS output is returned to RandR `right`, the software
+compensation becomes zero to avoid a double rotation. Positions and touch coordinates remain in native framebuffer
+coordinates. The experimenter process transposes the entire scene to the subject-facing `1600x2560` view.
 
 Eye Tracker Calibration
 -----------------------
@@ -496,9 +509,7 @@ The launcher setup scripts use the same mapping by default: `task/pulse_pump.py`
 
 Active Foraging Timing
 ----------------------
-The main visual timing parameters in `active_foraging` are interpreted by the presentation mode, not as abstract global delays. Those visual timings are quantized to display frames before use. `pump_delay_time` is separate: it is a post-choice reward delay applied in wall-clock seconds before reward delivery begins.
-
-`active_foraging` now validates requested visual timings against the active frame rate before the task starts. If `duration`, `isi`, `choice_time`, or `iti` is not an exact multiple of the frame duration, the task logs an error and exits instead of silently rounding. It also enforces minimum visible durations: `choice_time` must be at least 1 frame, and when `sequential=true` or `is_memory=true`, `duration` must be at least 1 frame. If you want nominal frame-based timings such as `0.050` at `120 Hz`, set `refresh_rate` explicitly to the intended rate.
+The main visual timing parameters in `active_foraging` are interpreted by the presentation mode, not as abstract global delays. Any finite duration is accepted; it does not need to be an exact refresh interval. Each visual phase is planned for the nearest achievable refresh transition using the measured synchronized display rate, while the exact configured request is retained in the event log. `requested_time_since_session_start` and `time_since_session_start` expose flip-submission and realized-flip timing. Minimum semantic rules remain: `choice_time` must be positive, and when `sequential=true` or `is_memory=true`, `duration` must be positive. `pump_delay_time` remains a wall-clock delay before reward delivery.
 
 - `duration`: stimulus display duration. When `sequential=true`, this is the on-screen time for each individual stimulus in the sequence. When `sequential=false` and `is_memory=true`, the full array remains visible for `duration`, then the task switches to dot-only choice for `choice_time`. When `sequential=false` and `is_memory=false`, `duration` must be exactly `0`; the full array appears on the first choice frame and remains visible for `choice_time` only.
 - `isi`: pre-stimulus cue interval, not a between-trial delay. In simultaneous non-memory mode it shows dots at all candidate locations before the full array appears. In sequential memory mode it shows the dot cue for each item before that item is shown.
@@ -529,7 +540,7 @@ Common `active_foraging` configurations:
 
 Active Foraging Positioning
 ---------------------------
-`active_foraging` places every stimulus center on a stimulus circle in main-screen pixel coordinates. `center_point` is `[x, y]` with origin at the upper-left of the main screen. When `center_point` is `null`, it defaults to the exact middle of the main screen. `stim_range_radius` is the circle radius in pixels. When it is `null`, it defaults to half the distance from `center_point` to the closest screen edge.
+`active_foraging` places every stimulus center on a stimulus circle in native main-framebuffer pixel coordinates. `center_point` is `[x, y]` with origin at the upper-left of the native `2560x1600` screen. When `center_point` is `null`, it defaults to the exact middle of the main screen. `stim_range_radius` is the circle radius in pixels. When it is `null`, it defaults to half the distance from `center_point` to the closest screen edge. Authored image sizes remain `[width, height]`; their native axis-aligned bounds swap after a 90-degree turn, which placement and overlap checks account for.
 
 - `fixed_positions=true`: locations are evenly spaced around the circle. The spacing angle is `2*pi / num_afc`, and the first location is offset by half that spacing from the point directly below `center_point`.
 - `fixed_positions=false`: locations are random points on the circle, with rejected draws when stimulus bounding boxes would overlap.

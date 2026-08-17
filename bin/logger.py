@@ -4,6 +4,7 @@ import csv
 import datetime as dt
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -299,6 +300,7 @@ class EventLogger:
         self._writer.writerow(
             [
                 "trial_num",
+                "requested_time_since_session_start",
                 "time_since_session_start",
                 "event",
                 "event_code",
@@ -318,14 +320,29 @@ class EventLogger:
         event_type: str,
         requested_duration: Optional[float] = None,
         timestamp_perf_s: Optional[float] = None,
+        requested_timestamp_perf_s: Optional[float] = None,
         description: Optional[str] = None,
     ) -> None:
-        if requested_duration is not None and float(requested_duration) < 0:
-            raise ValueError("requested_duration must be non-negative when provided.")
+        if requested_duration is not None:
+            requested_duration = float(requested_duration)
+            if not math.isfinite(requested_duration) or requested_duration < 0:
+                raise ValueError(
+                    "requested_duration must be finite and non-negative when provided."
+                )
         definition = self._library.ensure(event, event_type=event_type, description=description)
         timestamp_s = self.seconds_since_session_start(timestamp_perf_s)
+        requested_timestamp_s = (
+            None
+            if requested_timestamp_perf_s is None
+            else self.seconds_since_session_start(requested_timestamp_perf_s)
+        )
         row = [
             "" if trial_num is None else str(int(trial_num)),
+            (
+                ""
+                if requested_timestamp_s is None
+                else f"{requested_timestamp_s:.9f}"
+            ),
             f"{timestamp_s:.9f}",
             str(event).strip(),
             str(definition.code),
@@ -344,6 +361,7 @@ class EventLogger:
         trial_num: Optional[int],
         event: str,
         timestamp_perf_s: Optional[float],
+        requested_timestamp_perf_s: Optional[float] = None,
         requested_duration: Optional[float] = None,
         description: Optional[str] = None,
     ) -> None:
@@ -353,6 +371,7 @@ class EventLogger:
             event_type="frame_flip",
             requested_duration=requested_duration,
             timestamp_perf_s=timestamp_perf_s,
+            requested_timestamp_perf_s=requested_timestamp_perf_s,
             description=description,
         )
 
@@ -378,6 +397,7 @@ class EventLogger:
         trial_num: Optional[int],
         event: str,
         timestamp_perf_s: Optional[float],
+        requested_timestamp_perf_s: Optional[float] = None,
         requested_duration: Optional[float] = None,
         description: Optional[str] = None,
     ) -> None:
@@ -387,6 +407,7 @@ class EventLogger:
             event_type="signal",
             requested_duration=requested_duration,
             timestamp_perf_s=timestamp_perf_s,
+            requested_timestamp_perf_s=requested_timestamp_perf_s,
             description=description,
         )
 

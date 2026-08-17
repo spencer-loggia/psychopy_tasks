@@ -3,8 +3,8 @@ Delayed CSC1 AFC task.
 
 This version follows the same logging/timing style as the working tasks:
 ``SessionLogBundle`` creates event, message, and behavior logs; visual timing is
-validated against the detected/overridden frame rate; per-trial presentation is
-frame-locked and uses the active_foraging event vocabulary, plus ``delay_start``.
+planned to the nearest display frames; per-trial presentation is frame-locked
+and uses the active_foraging event vocabulary, plus ``delay_start``.
 
 Trial sequence:
     onset cue click/touch -> optional pre-cue ISI -> feature cue -> delay_start -> AFC choices -> gray/IBI
@@ -39,6 +39,7 @@ if str(_project_root) not in sys.path:
 
 from bin import utils
 from bin.config import load_config, validate_config
+from bin.frame_timing import plan_frame_duration
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.screen import (
@@ -380,19 +381,14 @@ def _compute_positions(
 
 def _log_global_timing(msg_logger, fps: float, frame_dur: float, timings: Dict[str, float]) -> Dict[str, Tuple[int, float]]:
     quantized: Dict[str, Tuple[int, float]] = {}
-
-    def q(label: str, seconds: float, at_least_one: bool = False):
-        frames = int(round(max(0.0, float(seconds)) * float(fps)))
-        if at_least_one:
-            frames = max(1, frames)
-        quantized[label] = (frames, frames / float(fps))
-
-    q("cue_time", timings["cue_time"], at_least_one=True)
-    q("delay_time", timings["delay_time"], at_least_one=False)
-    q("isi", timings["isi"], at_least_one=False)
-    q("choice_time", timings["choice_time"], at_least_one=True)
-    q("iti", timings["iti"], at_least_one=False)
-    q("timeout_time", timings["timeout_time"], at_least_one=False)
+    minimum_frames = {"cue_time": 1, "choice_time": 1}
+    for label, seconds in timings.items():
+        plan = plan_frame_duration(
+            seconds,
+            fps,
+            minimum_frames=minimum_frames.get(label, 0),
+        )
+        quantized[label] = (plan.frame_count, plan.scheduled_s)
 
     msg_logger.log(
         "INFO",
@@ -455,6 +451,38 @@ def run_task(
     screen_config: Optional[Dict[str, Any]] = None,
 ) -> None:
     utils.set_debug(debug)
+    cue_time = float(cue_time)
+    delay_time = float(delay_time)
+    choice_time = float(choice_time)
+    iti = float(iti)
+    isi = float(isi)
+    timeout_time = float(timeout_time)
+    reward_pulse_s = (
+        float(pump_pulse_time_seconds)
+        if pump_pulse_time_seconds is not None
+        else float(reward_pulse_time)
+    )
+    pump_delay_s = float(pump_delay_time)
+
+    for label, seconds in (("cue_time", cue_time), ("choice_time", choice_time)):
+        if not math.isfinite(seconds) or seconds <= 0.0:
+            raise ValueError(f"{label} must be a positive finite value")
+    for label, seconds in (
+        ("delay_time", delay_time),
+        ("isi", isi),
+        ("iti", iti),
+        ("timeout_time", timeout_time),
+        ("reward_pulse_time", reward_pulse_s),
+        ("reward_inter_pulse_time", float(reward_inter_pulse_time)),
+        ("pump_delay_time", pump_delay_s),
+    ):
+        if not math.isfinite(seconds) or seconds < 0.0:
+            raise ValueError(f"{label} must be a finite non-negative value")
+    if inter_pump_interval is not None:
+        inter_pump_interval_s = float(inter_pump_interval)
+        if not math.isfinite(inter_pump_interval_s) or inter_pump_interval_s < 0.0:
+            raise ValueError("inter_pump_interval must be a finite non-negative value")
+
     if seed is not None:
         random.seed(int(seed))
     rng = np.random.default_rng(seed)
@@ -613,8 +641,6 @@ def run_task(
     pigpio_pi = None
     experimenter_preview = None
     task_end_notes = "done"
-    reward_pulse_s = float(pump_pulse_time_seconds) if pump_pulse_time_seconds is not None else float(reward_pulse_time)
-    pump_delay_s = max(0.0, float(pump_delay_time))
 
     main_screen, experimenter_screen = resolve_task_screens(screen_config, allow_same_screen=True)
     try:
@@ -1012,20 +1038,6 @@ def run_task(
                     pass
                 return False
 
-        utils.validate_frame_aligned_timings(
-            fps,
-            {
-                "cue_time": cue_time,
-                "delay_time": delay_time,
-                "isi": isi,
-                "choice_time": choice_time,
-                "iti": iti,
-                "timeout_time": timeout_time,
-            },
-            context="afc_csc1",
-            minimum_frames={"cue_time": 1, "choice_time": 1},
-            msg_logger=msg_logger,
-        )
         quantized = _log_global_timing(
             msg_logger,
             fps,
@@ -1039,7 +1051,7 @@ def run_task(
                 "timeout_time": timeout_time,
             },
         )
-        iti_frames, iti_s = quantized["iti"]
+        iti_frames, _ = quantized["iti"]
         timeout_frames, timeout_s = quantized["timeout_time"]
 
         onset_stim = utils.make_onset_cue_stim(
@@ -1208,19 +1220,27 @@ def run_task(
                 is_correct_current=is_correct,
             )
 
-            feedback_s = 0.0
+            feedback_requested_s = 0.0
             if is_correct and float(reward_pulse_s) > 0.0:
-                feedback_s += float(reward_pulse_s)
-            if (not is_correct) and float(timeout_s) > 0.0:
-                feedback_s += float(timeout_s)
+                feedback_requested_s += float(reward_pulse_s)
+            if (not is_correct) and timeout_time > 0.0:
+                feedback_requested_s += timeout_time
 
             gray_start_perf = trial_meta.get("gray_flip_perf_s")
             if gray_start_perf is not None:
+                gray_duration_requested = iti + feedback_requested_s
                 logger.log_frame_flip(
                     trial_num=trial_num,
                     event="gray_inter_trial_interval",
                     timestamp_perf_s=float(gray_start_perf),
-                    requested_duration=(float(iti_s) + float(feedback_s)) if (iti_s + feedback_s) > 0 else None,
+                    requested_timestamp_perf_s=trial_meta.get(
+                        "gray_flip_requested_perf_s"
+                    ),
+                    requested_duration=(
+                        gray_duration_requested
+                        if gray_duration_requested > 0.0
+                        else None
+                    ),
                 )
 
             if is_correct and float(reward_pulse_s) > 0.0:

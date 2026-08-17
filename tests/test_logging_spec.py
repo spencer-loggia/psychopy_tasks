@@ -57,6 +57,55 @@ class LoggingSpecTests(unittest.TestCase):
 
             self.assertTrue(finished.is_set())
 
+    def test_repeated_task_window_signal_keeps_the_valid_launcher_release(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ready_path = Path(tmpdir) / "task-ready"
+            release_path = Path(tmpdir) / "task-released"
+            finished = threading.Event()
+
+            def signal() -> None:
+                signal_task_window_ready()
+                finished.set()
+
+            with patch.dict(
+                os.environ,
+                {
+                    TASK_WINDOW_READY_ENV: str(ready_path),
+                    TASK_WINDOW_RELEASE_ENV: str(release_path),
+                },
+            ):
+                thread = threading.Thread(target=signal)
+                thread.start()
+                deadline = time.monotonic() + 1.0
+                while not ready_path.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.001)
+                self.assertTrue(ready_path.is_file())
+                release_path.write_text("released\n", encoding="utf-8")
+                thread.join(timeout=1.0)
+                self.assertTrue(finished.is_set())
+
+                ready_path.write_text("first-window-ready\n", encoding="utf-8")
+                with (
+                    patch(
+                        "bin.task_lifecycle.time.monotonic",
+                        side_effect=AssertionError("repeated signal must not wait"),
+                    ),
+                    patch(
+                        "bin.task_lifecycle.time.sleep",
+                        side_effect=AssertionError("repeated signal must not sleep"),
+                    ),
+                ):
+                    self.assertTrue(signal_task_window_ready())
+
+            self.assertEqual(
+                ready_path.read_text(encoding="utf-8"),
+                "first-window-ready\n",
+            )
+            self.assertEqual(
+                release_path.read_text(encoding="utf-8"),
+                "released\n",
+            )
+
     def test_task_window_signal_times_out_without_launcher_release(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             ready_path = Path(tmpdir) / "task-ready"
@@ -169,6 +218,7 @@ class LoggingSpecTests(unittest.TestCase):
                     trial_num=1,
                     event="stimulus_on",
                     timestamp_perf_s=bundle.session_clock.start_perf_s,
+                    requested_timestamp_perf_s=bundle.session_clock.start_perf_s - 0.001,
                     requested_duration=0.5,
                 )
             finally:
@@ -184,6 +234,7 @@ class LoggingSpecTests(unittest.TestCase):
                 list(rows[0]),
                 [
                     "trial_num",
+                    "requested_time_since_session_start",
                     "time_since_session_start",
                     "event",
                     "event_code",
@@ -192,6 +243,25 @@ class LoggingSpecTests(unittest.TestCase):
                 ],
             )
             self.assertEqual(rows[0]["trial_num"], "1")
+            self.assertEqual(rows[0]["requested_time_since_session_start"], "-0.001000000")
+
+    def test_event_log_rejects_nonfinite_requested_duration(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = SessionLogBundle(
+                output_root=tmpdir,
+                task_name="random_image_sequence",
+                config_name="test",
+            )
+            try:
+                with self.assertRaises(ValueError):
+                    bundle.event_logger.log_frame_flip(
+                        trial_num=1,
+                        event="stimulus_on",
+                        timestamp_perf_s=bundle.session_clock.start_perf_s,
+                        requested_duration=float("nan"),
+                    )
+            finally:
+                bundle.close()
 
     def test_trial_sequence_uses_trial_cue_event(self):
         definitions, _ = load_task_event_definitions("afc_trial_sequence")

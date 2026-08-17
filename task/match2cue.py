@@ -38,6 +38,7 @@ from bin.afc_stimuli import (
 )
 from bin.config import load_config, validate_config
 from bin.daqc2_outputs import DAQC2DigitalOutputs
+from bin.frame_timing import plan_frame_duration, validate_requested_durations
 from bin.logger import SessionLogBundle
 from bin.match2cue_logic import (
     Match2CueTrial,
@@ -48,14 +49,15 @@ from bin.screen import (
     ExperimenterPreview,
     describe_screen,
     load_screen_config,
+    oriented_size,
     resolve_scene_size,
     resolve_task_screens,
     set_window_mouse_visible,
+    software_stimulus_rotation,
 )
 from bin.task_lifecycle import USER_EXIT_CODE
 from interface.rig_mode import IS_RIG_ENV_VAR, experimenter_cursor_visible_for_touchscreen
 from task.active_foraging_timing import (
-    duration_requires_positive_frames,
     validate_duration_for_presentation_mode,
 )
 
@@ -197,16 +199,17 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     self_initiation = bool(cfg.get("self_initiation", True))
     if num_afc < 1:
         raise ValueError("num_afc must be at least 1")
-    if match_cue_duration <= 0.0:
-        raise ValueError("match_cue_duration must be positive")
-    if delay_time < 0.0:
-        raise ValueError("delay_time must be zero or greater")
-    if choice_time <= 0.0:
-        raise ValueError("choice_time must be positive")
-    if isi < 0.0:
-        raise ValueError("isi must be zero or greater")
-    if iti < 0.0:
-        raise ValueError("iti must be zero or greater")
+    validate_requested_durations(
+        {
+            "match_cue_duration": match_cue_duration,
+            "delay_time": delay_time,
+            "choice_time": choice_time,
+            "isi": isi,
+            "iti": iti,
+        },
+        positive={"match_cue_duration", "choice_time"},
+        context="match2cue",
+    )
     validate_duration_for_presentation_mode(
         duration,
         sequential=sequential,
@@ -295,32 +298,6 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
         msg_logger=msg_logger,
         context="match2cue",
     )
-    utils.validate_frame_aligned_timings(
-        fps,
-        {
-            "match_cue_duration": match_cue_duration,
-            "delay_time": delay_time,
-            "duration": duration,
-            "isi": isi,
-            "choice_time": choice_time,
-            "iti": iti,
-        },
-        context="match2cue",
-        minimum_frames={
-            "match_cue_duration": 1,
-            "choice_time": 1,
-            **(
-                {"duration": 1}
-                if duration_requires_positive_frames(
-                    sequential=sequential,
-                    is_memory=is_memory,
-                )
-                else {}
-            ),
-        },
-        msg_logger=msg_logger,
-    )
-
     if experimenter_screen is not None:
         experimenter_preview = ExperimenterPreview(
             experimenter_screen,
@@ -337,8 +314,31 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
             ),
         )
 
+    main_scene_size = resolve_scene_size(
+        main_screen,
+        fullscreen=fullscreen,
+        requested_size=win_size,
+        realized_size=tuple(win.size),
+    )
+    stimulus_rotation_degrees = software_stimulus_rotation(main_screen.rotation)
+    subject_scene_size = oriented_size(
+        main_scene_size,
+        stimulus_rotation_degrees,
+    )
+    msg_logger.log(
+        "INFO",
+        f"resolved_main_scene_size native_size={main_scene_size[0]}x{main_scene_size[1]} "
+        f"subject_size={subject_scene_size[0]}x{subject_scene_size[1]} "
+        f"output_rotation={main_screen.rotation} stimulus_rotation_deg={stimulus_rotation_degrees} "
+        f"fullscreen={int(fullscreen)} requested_win_size={win_size} "
+        f"realized_win_size={tuple(win.size)}",
+    )
     fixation_size = int(cfg.get("fixation_size", 0))
-    fix = utils.make_fixation_cross(win, size=fixation_size)
+    fix = utils.make_fixation_cross(
+        win,
+        size=fixation_size,
+        ori=stimulus_rotation_degrees,
+    )
     bg_rect = utils.make_bg_rect(win, space.bg)
     dot_size = int(cfg.get("dot_size", 40))
     dot_color = tuple(cfg.get("dot_color", [50, 50, 50]))
@@ -353,14 +353,8 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
             cells=8,
             sigma_frac=0.22,
             zero_threshold=1,
+            ori=stimulus_rotation_degrees,
         )
-
-    main_scene_size = resolve_scene_size(
-        main_screen,
-        fullscreen=fullscreen,
-        requested_size=win_size,
-        realized_size=tuple(win.size),
-    )
 
     def update_preview_counts() -> None:
         if experimenter_preview is not None:
@@ -378,6 +372,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
             fixation_color=(0, 0, 0),
             status_counts=status_counts,
             highlight_box=None,
+            main_rotation_deg=stimulus_rotation_degrees,
         )
 
     pylogging.console.setLevel(pylogging.CRITICAL)
@@ -442,14 +437,16 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
 
     def deliver_reward(trial_num: Optional[int], *, context: str) -> bool:
         nonlocal task_end_status
-        start_perf = time.perf_counter()
+        start_requested_perf = time.perf_counter()
         aborted = False
         set_pump(True)
+        start_perf = time.perf_counter()
         try:
             logger.log_signal(
                 trial_num=trial_num,
                 event="pump_on",
                 timestamp_perf_s=start_perf,
+                requested_timestamp_perf_s=start_requested_perf,
                 requested_duration=pump_pulse_time,
             )
             if context == "manual_reward":
@@ -460,12 +457,14 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                     allow_manual_reward=False,
                 )
         finally:
-            end_perf = time.perf_counter()
+            end_requested_perf = time.perf_counter()
             set_pump(False)
+            end_perf = time.perf_counter()
             logger.log_signal(
                 trial_num=trial_num,
                 event="pump_off",
                 timestamp_perf_s=end_perf,
+                requested_timestamp_perf_s=end_requested_perf,
             )
         status_counts["Rewards delivered"] += 1
         update_preview_counts()
@@ -493,7 +492,8 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
         buffer_size=max(1, int(cfg.get("buffer_len_trials", 5))),
         start_idx=1,
     )
-    iti_frames = max(0, int(round(iti * fps)))
+    iti_plan = plan_frame_duration(iti, fps)
+    iti_frames = iti_plan.frame_count
     run_indefinitely = n_trials <= 0
     fixed_positions = bool(cfg.get("fixed_positions", False))
     center_value = cfg.get("center_point")
@@ -517,18 +517,16 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 break
             trial_num = int(payload["trial_idx"])
             cue_image = preloaded[trial.cue]
-            effective_win_size = resolve_scene_size(
-                main_screen,
-                fullscreen=fullscreen,
-                requested_size=win_size,
-                realized_size=tuple(win.size),
-            )
+            effective_win_size = main_scene_size
             sampled_positions, positions = compute_afc_positions(
                 fixed_positions,
                 num_afc,
                 center_point,
                 stim_range_radius,
-                stimulus_size(preloaded, trial.options[0]),
+                oriented_size(
+                    stimulus_size(preloaded, trial.options[0]),
+                    stimulus_rotation_degrees,
+                ),
                 effective_win_size,
                 rng=position_rng,
             )
@@ -579,6 +577,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 pre_options_cue_image=cue_image,
                 pre_options_cue_duration=match_cue_duration,
                 pre_options_delay=delay_time,
+                stimulus_rotation_degrees=stimulus_rotation_degrees,
             )
             timing_monitor = trial_meta.get("_main_display_frame_timing_monitor")
             if aborted:
@@ -598,13 +597,16 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
             outcome = score_match2cue_choice(trial, chosen_index)
             gray_start_perf = trial_meta.get("gray_flip_perf_s")
             if gray_start_perf is not None:
-                gray_duration = iti_frames / fps
+                gray_duration = float(iti)
                 if outcome.reward_delivered:
                     gray_duration += pump_delay_time + pump_pulse_time
                 logger.log_frame_flip(
                     trial_num=trial_num,
                     event="gray_inter_trial_interval",
                     timestamp_perf_s=float(gray_start_perf),
+                    requested_timestamp_perf_s=trial_meta.get(
+                        "gray_flip_requested_perf_s"
+                    ),
                     requested_duration=(gray_duration if gray_duration > 0.0 else None),
                 )
             if outcome.correct is True:

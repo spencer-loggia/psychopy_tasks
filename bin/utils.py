@@ -27,16 +27,15 @@ import threading
 from psychopy import visual, event
 import time
 from .screen import (
-    activate_psychopy_window,
     build_reward_hit_boxes,
     compute_aspect_cover_size,
-    configure_window_vsync,
-    enforce_window_vsync,
+    initialize_psychopy_window,
     MainDisplayFrameTimingMonitor,
-    open_psychopy_window,
+    oriented_size,
     resolve_window_frame_rate,
     serialize_preview_image,
 )
+from .frame_timing import flip_with_timestamps, plan_frame_duration
 from .video_playback import (
     RandomFramePulseSchedule,
     SharedVideoFrameBuffer,
@@ -125,23 +124,17 @@ def setup_window(
     )
     if monitor:
         win_kwargs["monitor"] = monitor
-    win = open_psychopy_window(
+    win = initialize_psychopy_window(
         visual,
         screen_info,
         fullscreen=fullscreen,
         size=size,
+        sync_to_refresh=sync_to_refresh,
+        # The launcher removes its main-output curtain before activation and
+        # strict realized-rectangle verification.
+        on_window_ready=signal_task_window_ready,
         **win_kwargs,
     )
-    sync_request_applied = (
-        enforce_window_vsync(win)
-        if sync_to_refresh
-        else configure_window_vsync(win, False)
-    )
-    win._neuro_tasks_refresh_sync_requested = bool(
-        sync_to_refresh and sync_request_applied
-    )
-    signal_task_window_ready()
-    activate_psychopy_window(win)
     return win
 
 
@@ -259,6 +252,8 @@ def play_video_fill_screen(
     keep_movie_loaded: bool = False,
     seek_timeout_s: float = 15.0,
     decoder_ready_callback: Optional[Callable[[], None]] = None,
+    stimulus_rotation_degrees: float = 0.0,
+    native_target_size: Optional[Sequence[float]] = None,
 ) -> Dict[str, Any]:
     video_file = Path(video_path)
     if stream_info is None and not video_file.is_file():
@@ -296,6 +291,9 @@ def play_video_fill_screen(
         )
     if frame_duration_s is not None and float(frame_duration_s) <= 0.0:
         raise ValueError("frame_duration_s must be positive when provided")
+    rotation_degrees = float(stimulus_rotation_degrees)
+    if not math.isfinite(rotation_degrees):
+        raise ValueError("stimulus_rotation_degrees must be finite")
 
     from psychopy.visual.vlcmoviestim import VlcMovieStim
 
@@ -342,9 +340,12 @@ def play_video_fill_screen(
             "The installed PsychoPy VlcMovieStim does not expose its decoded "
             "frame buffer; shared single-decoder preview requires PsychoPy 2025.1.1."
         )
-    draw_size = compute_aspect_cover_size(tuple(win.size), video_size)
+    native_size = tuple(native_target_size or tuple(win.size))
+    subject_target_size = oriented_size(native_size, rotation_degrees)
+    draw_size = compute_aspect_cover_size(subject_target_size, video_size)
     movie.size = draw_size
     movie.pos = (0.0, 0.0)
+    movie.ori = rotation_degrees
     abort_reason = ""
 
     if stop_on_mouse_click and mouse is None:
@@ -364,7 +365,9 @@ def play_video_fill_screen(
                     f"video_playback file={video_file.name} "
                     f"source_path={video_file} clip_start_s={clip_start_s:.6f} "
                     f"clip_end_s={clip_start_s + clip_duration_s:.6f} "
-                    f"video_size={video_size} win_size={tuple(win.size)} draw_size={draw_size} "
+                    f"video_size={video_size} native_target_size={native_size} "
+                    f"subject_target_size={subject_target_size} rotation_deg={rotation_degrees:g} "
+                    f"win_size={tuple(win.size)} draw_size={draw_size} "
                     f"scale_mode=uniform_cover backend={backend_used} "
                     f"codec={stream.get('codec_name')} pix_fmt={stream.get('pix_fmt')}"
                 ),
@@ -374,7 +377,9 @@ def play_video_fill_screen(
 
     first_flip_ps = None
     first_flip_perf = None
+    first_flip_requested_perf = None
     end_perf = None
+    end_requested_perf = None
     prev_frame_idx = None
     dropped_frames = 0
     aborted = False
@@ -382,10 +387,17 @@ def play_video_fill_screen(
     last_published_frame_idx = None
     next_frame_publish_perf = 0.0
     frames_presented = 0
-    target_display_frames = (
-        max(1, int(math.floor((clip_duration_s / float(frame_duration_s)) + 0.5)))
+    duration_plan = (
+        plan_frame_duration(
+            clip_duration_s,
+            1.0 / float(frame_duration_s),
+            minimum_frames=1,
+        )
         if frame_duration_s is not None
         else None
+    )
+    target_display_frames = (
+        duration_plan.frame_count if duration_plan is not None else None
     )
     sync_records: List[Dict[str, Any]] = []
     backend_drop_count = None
@@ -473,8 +485,9 @@ def play_video_fill_screen(
             if bg_rect is not None:
                 bg_rect.draw()
             movie.draw()
-            flip_ps = win.flip()
-            flip_perf = time.perf_counter()
+            flip_timing = flip_with_timestamps(win)
+            flip_ps = flip_timing.psychopy_s
+            flip_perf = flip_timing.actual_perf_s
             frame_idx = movie.frameIndex
             frames_presented += 1
             try:
@@ -490,6 +503,7 @@ def play_video_fill_screen(
                         "frame_index": int(edge.frame_index),
                         "interval_frames": edge.interval_frames,
                         "timestamp_perf_s": flip_perf,
+                        "requested_timestamp_perf_s": flip_timing.requested_perf_s,
                     }
                 )
 
@@ -515,12 +529,14 @@ def play_video_fill_screen(
             if first_flip_ps is None:
                 first_flip_ps = flip_ps
                 first_flip_perf = flip_perf
+                first_flip_requested_perf = flip_timing.requested_perf_s
                 actual_source_start_s = current_source_time_s
                 if logger is not None:
                     logger.log_frame_flip(
                         trial_num=trial_num,
                         event="video_clip_start",
                         timestamp_perf_s=first_flip_perf,
+                        requested_timestamp_perf_s=first_flip_requested_perf,
                         requested_duration=expected_duration_s,
                     )
                     _log_message(
@@ -535,14 +551,20 @@ def play_video_fill_screen(
                         ),
                     )
 
-            duration_reached = (
-                frames_presented >= target_display_frames
-                if target_display_frames is not None
-                else (
+            if frame_duration_s is not None and first_flip_perf is not None:
+                # Transition on the refresh nearest the exact requested end.
+                # Re-evaluating from observed flips also recovers after a missed
+                # refresh instead of blindly presenting the original frame count.
+                predicted_clear_perf = flip_perf + float(frame_duration_s)
+                requested_clear_perf = first_flip_perf + clip_duration_s
+                duration_reached = predicted_clear_perf >= (
+                    requested_clear_perf - (float(frame_duration_s) / 2.0)
+                )
+            else:
+                duration_reached = (
                     first_flip_perf is not None
                     and flip_perf - first_flip_perf >= clip_duration_s
                 )
-            )
             if (
                 frames_presented == 1
                 and not duration_reached
@@ -594,8 +616,10 @@ def play_video_fill_screen(
                 )
         if bg_rect is not None:
             bg_rect.draw()
-        clear_flip_ps = win.flip()
-        end_perf = time.perf_counter()
+        clear_flip_timing = flip_with_timestamps(win)
+        clear_flip_ps = clear_flip_timing.psychopy_s
+        end_requested_perf = clear_flip_timing.requested_perf_s
+        end_perf = clear_flip_timing.actual_perf_s
         if final_sync_edge is not None:
             sync_records.append(
                 {
@@ -603,6 +627,7 @@ def play_video_fill_screen(
                     "frame_index": int(final_sync_edge.frame_index),
                     "interval_frames": None,
                     "timestamp_perf_s": end_perf,
+                    "requested_timestamp_perf_s": end_requested_perf,
                 }
             )
         if logger is not None and first_flip_perf is not None:
@@ -611,6 +636,7 @@ def play_video_fill_screen(
                 trial_num=trial_num,
                 event="video_clip_end",
                 timestamp_perf_s=end_perf,
+                requested_timestamp_perf_s=end_requested_perf,
             )
             _log_message(
                 msg_logger,
@@ -666,6 +692,7 @@ def play_video_fill_screen(
                         "frame_index": int(forced_edge.frame_index),
                         "interval_frames": None,
                         "timestamp_perf_s": time.perf_counter(),
+                        "requested_timestamp_perf_s": None,
                     }
                 )
         backend_drop_count = getattr(movie, "nDroppedFrames", backend_drop_count)
@@ -692,6 +719,9 @@ def play_video_fill_screen(
                     trial_num=trial_num,
                     event="video_sync_signal_on" if is_on else "video_sync_signal_off",
                     timestamp_perf_s=float(record["timestamp_perf_s"]),
+                    requested_timestamp_perf_s=record.get(
+                        "requested_timestamp_perf_s"
+                    ),
                     requested_duration=pulse_duration if is_on else None,
                 )
                 if is_on:
@@ -721,7 +751,14 @@ def play_video_fill_screen(
         "expected_duration_s": expected_duration_s,
         "start_flip_psychopy_s": first_flip_ps,
         "start_flip_perf_s": first_flip_perf,
+        "start_flip_requested_perf_s": first_flip_requested_perf,
         "end_time_perf_s": end_perf,
+        "end_requested_perf_s": end_requested_perf,
+        "requested_end_perf_s": (
+            first_flip_perf + clip_duration_s
+            if first_flip_perf is not None
+            else None
+        ),
         "last_frame_end_perf_s": end_perf if first_flip_perf is not None else None,
         "actual_source_start_s": actual_source_start_s,
         "actual_source_last_frame_s": actual_source_last_frame_s,
@@ -736,6 +773,12 @@ def play_video_fill_screen(
         "abort_reason": abort_reason,
         "video_size": tuple(video_size),
         "draw_size": tuple(draw_size),
+        "native_target_size": tuple(native_size),
+        "subject_target_size": tuple(subject_target_size),
+        "stimulus_rotation_degrees": rotation_degrees,
+        "scheduled_duration_s": (
+            duration_plan.scheduled_s if duration_plan is not None else None
+        ),
         "backend_used": backend_used,
         "backend_dropped_frames": backend_drop_count,
         "main_display_dropped_frames": main_display_dropped_frames,
@@ -769,79 +812,23 @@ def detect_frame_rate(win: visual.Window, msg_logger=None) -> Tuple[float, float
     return resolve_frame_rate(win, msg_logger=msg_logger)
 
 
-def validate_frame_aligned_timings(
-    fps: float,
-    timings_s: Dict[str, float],
-    *,
-    context: str = "task",
-    minimum_frames: Optional[Dict[str, int]] = None,
-    msg_logger=None,
-) -> None:
-    """Validate that requested visual timings are exact frame multiples.
-
-    Raises ValueError if any provided timing cannot be represented as an
-    integer number of frames at the given fps.
-    """
-    fps = float(fps)
-    if fps <= 0:
-        raise ValueError(f"fps must be > 0, got {fps}")
-    frame_dur = 1.0 / fps
-    tolerance_s = max(1e-9, frame_dur * 1e-6)
-    invalid_parts: List[str] = []
-    minimum_frames = dict(minimum_frames or {})
-
-    for label, seconds in timings_s.items():
-        value_s = float(seconds)
-        if value_s < 0.0:
-            continue
-        nearest_frames = int(round(value_s * fps))
-        nearest_s = nearest_frames / fps
-        if abs(nearest_s - value_s) <= tolerance_s:
-            min_frames = int(minimum_frames.get(label, 0))
-            if nearest_frames < min_frames:
-                invalid_parts.append(
-                    (
-                        f"{label}={value_s:.6f}s "
-                        f"({nearest_frames}fr, requires at least {min_frames}fr={min_frames / fps:.6f}s)"
-                    )
-                )
-            continue
-        lower_frames = int(math.floor(value_s * fps))
-        upper_frames = int(math.ceil(value_s * fps))
-        lower_s = lower_frames / fps
-        upper_s = upper_frames / fps
-        invalid_parts.append(
-            (
-                f"{label}={value_s:.6f}s "
-                f"(nearest lower {lower_frames}fr={lower_s:.6f}s, "
-                f"upper {upper_frames}fr={upper_s:.6f}s)"
-            )
-        )
-
-    if not invalid_parts:
-        return
-
-    msg = (
-        f"Invalid frame-aligned timing for {context}: requested visual timings must be exact "
-        f"multiples of the frame duration at fps={fps:.6f}Hz "
-        f"(frame_dur_s={frame_dur:.9f}). "
-        + "; ".join(invalid_parts)
-        + ". Set a frame-aligned value that also satisfies the minimum-frame requirement, "
-        + "or override refresh_rate to the intended nominal rate."
-    )
-    if msg_logger is not None:
-        try:
-            msg_logger.log("ERROR", msg)
-        except Exception:
-            pass
-    raise ValueError(msg)
-
-
-def make_fixation_cross(win: visual.Window, size: int = 40, color: Tuple[int, int, int] = (0, 0, 0)):
+def make_fixation_cross(
+    win: visual.Window,
+    size: int = 40,
+    color: Tuple[int, int, int] = (0, 0, 0),
+    ori: float = 0.0,
+):
     # If size is zero or negative, return None to indicate no fixation should be shown.
     if size is None or size <= 0:
         return None
-    return visual.TextStim(win, text="+", height=size, color=rgb255_to_psychopy(color), colorSpace="rgb")
+    return visual.TextStim(
+        win,
+        text="+",
+        height=size,
+        color=rgb255_to_psychopy(color),
+        colorSpace="rgb",
+        ori=float(ori),
+    )
 
 
 def make_bg_rect(win: visual.Window, bg_rgb_255: Tuple[int, int, int]):
@@ -1130,6 +1117,7 @@ def make_image_stim_from_array(
     img_obj,
     size: Optional[Tuple[int, int]] = None,
     bg_rgb_255: Optional[Tuple[int, int, int]] = None,
+    ori: float = 0.0,
 ):
     """
     Create an ImageStim from PIL/Path/ndarray.
@@ -1145,7 +1133,9 @@ def make_image_stim_from_array(
 
     if pil is None:
         # last resort: let PsychoPy try whatever it is
-        return visual.ImageStim(win, image=img_obj, size=size, units="pix")
+        return visual.ImageStim(
+            win, image=img_obj, size=size, units="pix", ori=float(ori)
+        )
 
     # If a background color was requested earlier during rasterization,
     # the image may already be fully opaque. In that case, pass the RGB
@@ -1167,14 +1157,29 @@ def make_image_stim_from_array(
     if extrema == (255, 255):
         # fully opaque: use RGB image (no mask) and no interpolation to
         # prevent border smoothing artifacts
-        return visual.ImageStim(win, image=rgb, size=size, units="pix", interpolate=False)
+        return visual.ImageStim(
+            win,
+            image=rgb,
+            size=size,
+            units="pix",
+            interpolate=False,
+            ori=float(ori),
+        )
 
     # Otherwise preserve transparency via RGB + mask. PsychoPy expects masks in
     # the range [-1, 1] where -1 is fully transparent and +1 is fully opaque.
     # Convert the 8-bit alpha channel to that range to avoid unintended 50% opacity.
     mask01 = np.asarray(a, dtype=np.float32) / 255.0  # H x W, 0..1
     mask_pm1 = (mask01 * 2.0) - 1.0                  # H x W, -1..1
-    return visual.ImageStim(win, image=rgb, mask=mask_pm1, size=size, units="pix", interpolate=False)
+    return visual.ImageStim(
+        win,
+        image=rgb,
+        mask=mask_pm1,
+        size=size,
+        units="pix",
+        interpolate=False,
+        ori=float(ori),
+    )
 
 
 def clear_events():
@@ -1188,6 +1193,7 @@ def make_onset_cue_stim(
     cells: int = 8,
     sigma_frac: float = 0.22,
     zero_threshold: int = 1,
+    ori: float = 0.0,
 ):
     """Create a checkerboard onset cue ImageStim with a centered 2D Gaussian alpha mask.
 
@@ -1227,7 +1233,9 @@ def make_onset_cue_stim(
     cb.putalpha(Image.fromarray(mask_u8, mode="L"))
 
     # Convert to ImageStim (preserve alpha; ImageStim builder will provide proper mask)
-    stim = make_image_stim_from_array(win, cb, size=(w, w), bg_rgb_255=None)
+    stim = make_image_stim_from_array(
+        win, cb, size=(w, w), bg_rgb_255=None, ori=ori
+    )
     try:
         stim.pos = (0, 0)
     except Exception:
@@ -1299,6 +1307,7 @@ def present_trial_with_persistent_dots(
     pre_options_delay: float = 0.0,
     pre_options_cue_event: str = "match_cue_on",
     pre_options_delay_event: str = "delay_start",
+    stimulus_rotation_degrees: float = 0.0,
 ):
     """Present stimuli one at a time, leave faint dots at their locations,
     show all dots for `choice_time`, then clear.
@@ -1330,17 +1339,30 @@ def present_trial_with_persistent_dots(
     if fps is None:
         fps, frame_dur = detect_frame_rate(win, msg_logger=msg_logger)
     else:
+        fps = float(fps)
         frame_dur = 1.0 / float(fps)
     frame_timing_monitor = MainDisplayFrameTimingMonitor(win, frame_dur)
     if trial_meta is not None:
         trial_meta["_main_display_frame_timing_monitor"] = frame_timing_monitor
 
-    def _q_to_frames(seconds: float, at_least_one: bool = True) -> Tuple[int, float]:
-        frames = int(round(max(0.0, float(seconds)) * float(fps)))
-        if at_least_one:
-            frames = max(1, frames)
-        actual_s = frames * frame_dur
-        return frames, actual_s
+    rotation_degrees = float(stimulus_rotation_degrees)
+    if not math.isfinite(rotation_degrees):
+        raise ValueError("stimulus_rotation_degrees must be finite")
+
+    cue_plan = plan_frame_duration(
+        pre_options_cue_duration,
+        fps,
+        minimum_frames=1 if pre_options_cue_image is not None else 0,
+    )
+    delay_plan = plan_frame_duration(pre_options_delay, fps)
+    isi_plan = plan_frame_duration(isi, fps)
+    choice_plan = plan_frame_duration(choice_time, fps, minimum_frames=1)
+    if sequential or is_memory:
+        stim_plan = plan_frame_duration(duration, fps, minimum_frames=1)
+    else:
+        # Simultaneous non-memory trials expose the options for choice_time;
+        # duration is intentionally a no-op in this presentation mode.
+        stim_plan = plan_frame_duration(0.0, fps)
 
     def _set_initiation_time(perf_s: Optional[float] = None):
         if trial_meta is None or "initiation_time_s" in trial_meta:
@@ -1406,7 +1428,7 @@ def present_trial_with_persistent_dots(
         if not raspi or pigpio_pi is None:
             return True
         try:
-            _, pulse_s = _q_to_frames(0.25, at_least_one=True)
+            pulse_s = 0.25
             duration_us = int(pulse_s * 1_000_000)
             win.callOnFlip(_send_led_pulse_on_flip, pigpio_pi, raspi_pin, duration_us)
             trial_start_signal_armed_s = pulse_s
@@ -1417,7 +1439,10 @@ def present_trial_with_persistent_dots(
             _log_message(msg_logger, "ERROR", error_msg)
             return False
 
-    def _commit_trial_start_signal(flip_perf_s: float) -> None:
+    def _commit_trial_start_signal(
+        flip_perf_s: float,
+        requested_perf_s: Optional[float] = None,
+    ) -> None:
         nonlocal trial_start_signal_armed_s, trial_start_signal_sent
         if trial_start_signal_armed_s is None:
             return
@@ -1425,12 +1450,8 @@ def present_trial_with_persistent_dots(
             trial_num=trial_num,
             event="trial_start_signal_on",
             timestamp_perf_s=flip_perf_s,
+            requested_timestamp_perf_s=requested_perf_s,
             requested_duration=trial_start_signal_armed_s,
-        )
-        logger.log_signal(
-            trial_num=trial_num,
-            event="trial_start_signal_off",
-            timestamp_perf_s=flip_perf_s + trial_start_signal_armed_s,
         )
         trial_start_signal_sent = True
         trial_start_signal_armed_s = None
@@ -1442,6 +1463,7 @@ def present_trial_with_persistent_dots(
                 "image_payload": item.get("image_payload"),
                 "pos": [float(item["pos"][0]), float(item["pos"][1])],
                 "size": [float(item["size"][0]), float(item["size"][1])],
+                "ori": float(item.get("ori", 0.0)),
             }
             images.append(image)
         return images
@@ -1476,6 +1498,7 @@ def present_trial_with_persistent_dots(
             ),
             fixation_size=fixation_size,
             fixation_color=(0, 0, 0),
+            main_rotation_deg=rotation_degrees,
         )
 
     def _make_preview_image_entry(
@@ -1487,6 +1510,7 @@ def present_trial_with_persistent_dots(
             "image_payload": serialize_preview_image(image_obj),
             "pos": tuple(float(v) for v in getattr(stim_obj, "pos", (0.0, 0.0))),
             "size": tuple(float(v) for v in getattr(stim_obj, "size", (64.0, 64.0))),
+            "ori": float(getattr(stim_obj, "ori", rotation_degrees)),
         }
         if reward_level is not None:
             entry["reward_level"] = int(reward_level)
@@ -1496,6 +1520,7 @@ def present_trial_with_persistent_dots(
         try:
             onset_cue.pos = (0, 0)
             onset_cue.opacity = 1.0
+            onset_cue.ori = rotation_degrees
         except Exception:
             pass
         bg_rect.draw()
@@ -1509,6 +1534,7 @@ def present_trial_with_persistent_dots(
                         "image_payload": serialize_preview_image(getattr(onset_cue, "image", None)),
                         "pos": tuple(float(v) for v in getattr(onset_cue, "pos", (0.0, 0.0))),
                         "size": tuple(float(v) for v in getattr(onset_cue, "size", (200.0, 200.0))),
+                        "ori": float(getattr(onset_cue, "ori", rotation_degrees)),
                     }
                 ]
             )
@@ -1519,13 +1545,15 @@ def present_trial_with_persistent_dots(
         # Arm before the vsync-blocked flip so even a press and release that
         # both arrive during the flip remain observable through click timing.
         mouse_presses.reset()
-        oc_flip = win.flip()
-        oc_perf = time.perf_counter()
-        _commit_trial_start_signal(oc_perf)
+        oc_timing = flip_with_timestamps(win)
+        oc_flip = oc_timing.psychopy_s
+        oc_perf = oc_timing.actual_perf_s
+        _commit_trial_start_signal(oc_perf, oc_timing.requested_perf_s)
         logger.log_frame_flip(
             trial_num=trial_num,
             event=_frame_event_name("onset_cue"),
             timestamp_perf_s=oc_perf,
+            requested_timestamp_perf_s=oc_timing.requested_perf_s,
         )
         while True:
             if _event.getKeys(["escape"]):
@@ -1555,18 +1583,17 @@ def present_trial_with_persistent_dots(
 
             _core.wait(0.01)
 
-    cue_frames = 0
-    cue_s = 0.0
-    delay_frames = 0
-    delay_s = 0.0
+    cue_frames = cue_plan.frame_count
+    cue_s = cue_plan.scheduled_s
+    delay_frames = delay_plan.frame_count
+    delay_s = delay_plan.scheduled_s
     if pre_options_cue_image is not None:
-        cue_frames, cue_s = _q_to_frames(pre_options_cue_duration, at_least_one=True)
-        delay_frames, delay_s = _q_to_frames(pre_options_delay, at_least_one=False)
         cue_stim = make_image_stim_from_array(
             win,
             pre_options_cue_image,
             size=None,
             bg_rgb_255=bg_rgb_255,
+            ori=rotation_degrees,
         )
         cue_stim.pos = (0.0, 0.0)
         cue_preview = [
@@ -1574,6 +1601,7 @@ def present_trial_with_persistent_dots(
                 "image_payload": serialize_preview_image(pre_options_cue_image),
                 "pos": [0.0, 0.0],
                 "size": [float(cue_stim.size[0]), float(cue_stim.size[1])],
+                "ori": rotation_degrees,
             }
         ]
         _show_preview(cue_preview)
@@ -1591,16 +1619,20 @@ def present_trial_with_persistent_dots(
                 cue_stim.draw()
                 if fix is not None:
                     fix.draw()
-                win.flip()
+                flip_timing = flip_with_timestamps(win)
                 if first_flip:
-                    cue_perf = time.perf_counter()
-                    _commit_trial_start_signal(cue_perf)
+                    cue_perf = flip_timing.actual_perf_s
+                    _commit_trial_start_signal(
+                        cue_perf,
+                        flip_timing.requested_perf_s,
+                    )
                     _set_initiation_time(cue_perf)
                     logger.log_frame_flip(
                         trial_num=trial_num,
                         event=pre_options_cue_event,
                         timestamp_perf_s=cue_perf,
-                        requested_duration=cue_s,
+                        requested_timestamp_perf_s=flip_timing.requested_perf_s,
+                        requested_duration=cue_plan.requested_s,
                     )
                     first_flip = False
 
@@ -1617,24 +1649,22 @@ def present_trial_with_persistent_dots(
                     bg_rect.draw()
                     if fix is not None:
                         fix.draw()
-                    win.flip()
+                    flip_timing = flip_with_timestamps(win)
                     if first_flip:
-                        delay_perf = time.perf_counter()
+                        delay_perf = flip_timing.actual_perf_s
                         logger.log_frame_flip(
                             trial_num=trial_num,
                             event=pre_options_delay_event,
                             timestamp_perf_s=delay_perf,
-                            requested_duration=delay_s,
+                            requested_timestamp_perf_s=flip_timing.requested_perf_s,
+                            requested_duration=delay_plan.requested_s,
                         )
                         first_flip = False
 
     # Quantize durations to frames and log rounding in message logger.
-    if sequential or is_memory:
-        stim_frames, stim_s = _q_to_frames(duration, at_least_one=True)
-    else:
-        stim_frames, stim_s = (0, 0.0)
-    isi_frames, isi_s = _q_to_frames(isi, at_least_one=False)
-    _, choice_s = _q_to_frames(choice_time, at_least_one=False)
+    stim_frames, stim_s = stim_plan.frame_count, stim_plan.scheduled_s
+    isi_frames, isi_s = isi_plan.frame_count, isi_plan.scheduled_s
+    choice_s = choice_plan.scheduled_s
     _log_message(
         msg_logger,
         "INFO",
@@ -1642,7 +1672,7 @@ def present_trial_with_persistent_dots(
             f"timing_quantization trial_num={trial_num} "
             f"stim_duration={duration:.6f}s-> {stim_frames}fr({stim_s:.6f}s) "
             f"isi={isi:.6f}s-> {isi_frames}fr({isi_s:.6f}s) "
-            f"choice_time={choice_time:.6f}s-> {int(round(max(0.0, float(choice_time)) * float(fps)))}fr({choice_s:.6f}s) "
+            f"choice_time={choice_time:.6f}s-> {choice_plan.frame_count}fr({choice_s:.6f}s) "
             f"pre_options_cue={float(pre_options_cue_duration):.6f}s-> {cue_frames}fr({cue_s:.6f}s) "
             f"pre_options_delay={float(pre_options_delay):.6f}s-> {delay_frames}fr({delay_s:.6f}s)"
         ),
@@ -1686,6 +1716,7 @@ def present_trial_with_persistent_dots(
                 fillColor=None,
                 lineColor=None,
                 opacity=0.0,
+                ori=rotation_degrees,
             )
             choice_hit_targets.append(target)
 
@@ -1761,7 +1792,11 @@ def present_trial_with_persistent_dots(
         mouse_presses.reset()
         choice_input_armed = True
 
-    def _start_choice_window(start_flip_ps, start_perf: float) -> None:
+    def _start_choice_window(
+        start_flip_ps,
+        start_perf: float,
+        requested_perf: Optional[float] = None,
+    ) -> None:
         nonlocal choice_started, choice_flip, choice_perf, choice_window_s, choice_deadline
         if choice_started:
             return
@@ -1780,6 +1815,8 @@ def present_trial_with_persistent_dots(
             trial_num=trial_num,
             event=_frame_event_name("choice_start"),
             timestamp_perf_s=choice_perf,
+            requested_timestamp_perf_s=requested_perf,
+            requested_duration=choice_plan.requested_s,
         )
 
         if start_touch.active and choice_perf is not None:
@@ -1834,10 +1871,23 @@ def present_trial_with_persistent_dots(
                 _core.wait(min(poll_interval_s, remaining))
         return False
 
-    def _record_gray_flip(perf_s: float) -> None:
+    def _choice_transition_request_deadline() -> Optional[float]:
+        if choice_deadline is None:
+            return None
+        # Submit the clearing frame before the midpoint between the two
+        # surrounding refreshes so it realizes on the refresh nearest the
+        # requested end rather than one refresh after it.
+        return max(float(choice_perf), choice_deadline - (frame_dur / 2.0))
+
+    def _record_gray_flip(
+        perf_s: float,
+        requested_perf_s: Optional[float] = None,
+    ) -> None:
         if trial_meta is None:
             return
         trial_meta["gray_flip_perf_s"] = float(perf_s)
+        if requested_perf_s is not None:
+            trial_meta["gray_flip_requested_perf_s"] = float(requested_perf_s)
 
     def _build_stimulus(p, pos):
         if isinstance(p, tuple) and len(p) == 2:
@@ -1849,7 +1899,13 @@ def present_trial_with_persistent_dots(
         else:
             name = getattr(p, "name", str(p))
             pil_img = preloaded[p]
-        stim = make_image_stim_from_array(win, pil_img, size=None, bg_rgb_255=bg_rgb_255)
+        stim = make_image_stim_from_array(
+            win,
+            pil_img,
+            size=None,
+            bg_rgb_255=bg_rgb_255,
+            ori=rotation_degrees,
+        )
         stim.pos = pos
         return name, pil_img, stim
 
@@ -1901,16 +1957,21 @@ def present_trial_with_persistent_dots(
                             d.draw()
                         if fix is not None:
                             fix.draw()
-                        dot_flip = win.flip()
+                        dot_timing = flip_with_timestamps(win)
+                        dot_flip = dot_timing.psychopy_s
                         if first_flip:
-                            dot_perf = time.perf_counter()
-                            _commit_trial_start_signal(dot_perf)
+                            dot_perf = dot_timing.actual_perf_s
+                            _commit_trial_start_signal(
+                                dot_perf,
+                                dot_timing.requested_perf_s,
+                            )
                             _set_initiation_time(dot_perf)
                             logger.log_frame_flip(
                                 trial_num=trial_num,
                                 event=_frame_event_name("dot", idx),
                                 timestamp_perf_s=dot_perf,
-                                requested_duration=isi_s,
+                                requested_timestamp_perf_s=dot_timing.requested_perf_s,
+                                requested_duration=isi_plan.requested_s,
                             )
                             first_flip = False
 
@@ -1931,16 +1992,21 @@ def present_trial_with_persistent_dots(
                     stim.draw()
                     if fix is not None:
                         fix.draw()
-                    flip_ps = win.flip()
+                    stim_timing = flip_with_timestamps(win)
+                    flip_ps = stim_timing.psychopy_s
                     if first_flip:
-                        flip_perf = time.perf_counter()
-                        _commit_trial_start_signal(flip_perf)
+                        flip_perf = stim_timing.actual_perf_s
+                        _commit_trial_start_signal(
+                            flip_perf,
+                            stim_timing.requested_perf_s,
+                        )
                         _set_initiation_time(flip_perf)
                         logger.log_frame_flip(
                             trial_num=trial_num,
                             event=_frame_event_name("stim", idx),
                             timestamp_perf_s=flip_perf,
-                            requested_duration=stim_s,
+                            requested_timestamp_perf_s=stim_timing.requested_perf_s,
+                            requested_duration=stim_plan.requested_s,
                         )
                         first_flip = False
 
@@ -1964,10 +2030,15 @@ def present_trial_with_persistent_dots(
                 if fix is not None:
                     fix.draw()
                 _arm_choice_input()
-                off_flip = win.flip()
-                off_perf = time.perf_counter()
+                off_timing = flip_with_timestamps(win)
+                off_flip = off_timing.psychopy_s
+                off_perf = off_timing.actual_perf_s
                 _build_choice_hit_targets()
-                _start_choice_window(off_flip, off_perf)
+                _start_choice_window(
+                    off_flip,
+                    off_perf,
+                    off_timing.requested_perf_s,
+                )
                 _show_preview(stims_for_choice_preview)
 
     else:
@@ -2007,16 +2078,21 @@ def present_trial_with_persistent_dots(
                         d.draw()
                     if fix is not None:
                         fix.draw()
-                    dot_flip = win.flip()
+                    dot_timing = flip_with_timestamps(win)
+                    dot_flip = dot_timing.psychopy_s
                     if first_flip:
-                        dot_perf = time.perf_counter()
-                        _commit_trial_start_signal(dot_perf)
+                        dot_perf = dot_timing.actual_perf_s
+                        _commit_trial_start_signal(
+                            dot_perf,
+                            dot_timing.requested_perf_s,
+                        )
                         _set_initiation_time(dot_perf)
                         logger.log_frame_flip(
                             trial_num=trial_num,
                             event=_frame_event_name("dot"),
                             timestamp_perf_s=dot_perf,
-                            requested_duration=isi_s,
+                            requested_timestamp_perf_s=dot_timing.requested_perf_s,
+                            requested_duration=isi_plan.requested_s,
                         )
                         first_flip = False
 
@@ -2039,16 +2115,25 @@ def present_trial_with_persistent_dots(
                     fix.draw()
                 if first_flip and not is_memory:
                     _arm_choice_input()
-                flip_ps = win.flip()
+                stim_timing = flip_with_timestamps(win)
+                flip_ps = stim_timing.psychopy_s
                 if first_flip:
-                    flip_perf = time.perf_counter()
-                    _commit_trial_start_signal(flip_perf)
+                    flip_perf = stim_timing.actual_perf_s
+                    _commit_trial_start_signal(
+                        flip_perf,
+                        stim_timing.requested_perf_s,
+                    )
                     _set_initiation_time(flip_perf)
-                    stim_request = stim_s if is_memory else choice_s
+                    stim_request = (
+                        stim_plan.requested_s
+                        if is_memory
+                        else choice_plan.requested_s
+                    )
                     logger.log_frame_flip(
                         trial_num=trial_num,
                         event=_frame_event_name("stim"),
                         timestamp_perf_s=flip_perf,
+                        requested_timestamp_perf_s=stim_timing.requested_perf_s,
                         requested_duration=stim_request,
                     )
                     first_flip = False
@@ -2056,13 +2141,21 @@ def present_trial_with_persistent_dots(
             flip_perf = time.perf_counter()
         if not is_memory:
             _build_choice_hit_targets()
-            _start_choice_window(flip_ps, flip_perf)
+            _start_choice_window(
+                flip_ps,
+                flip_perf,
+                stim_timing.requested_perf_s,
+            )
         elif choice_started and choice_deadline is not None:
             if _poll_choice_until(min(choice_deadline, flip_perf + frame_dur)):
                 return True, None
 
         if not is_memory:
-            if choice_deadline is not None and _poll_choice_until(choice_deadline):
+            transition_request_deadline = _choice_transition_request_deadline()
+            if (
+                transition_request_deadline is not None
+                and _poll_choice_until(transition_request_deadline)
+            ):
                 return True, None
         else:
             if not dots:
@@ -2094,23 +2187,31 @@ def present_trial_with_persistent_dots(
             if fix is not None:
                 fix.draw()
             _arm_choice_input()
-            choice_flip = win.flip()
-            choice_perf_now = time.perf_counter()
+            choice_timing = flip_with_timestamps(win)
+            choice_flip = choice_timing.psychopy_s
+            choice_perf_now = choice_timing.actual_perf_s
             _build_choice_hit_targets()
-            _start_choice_window(choice_flip, choice_perf_now)
+            _start_choice_window(
+                choice_flip,
+                choice_perf_now,
+                choice_timing.requested_perf_s,
+            )
             _show_preview([] if is_memory else (stims_for_choice_preview if sequential else preview_images))
 
-        if choice_deadline is not None:
-            if _poll_choice_until(choice_deadline):
+        transition_request_deadline = _choice_transition_request_deadline()
+        if transition_request_deadline is not None:
+            if _poll_choice_until(transition_request_deadline):
                 return True, None
 
     bg_rect.draw()
     if fix is not None:
         fix.draw()
-    win.flip()
+    clear_timing = flip_with_timestamps(win)
     _show_preview([])
-    clr_perf = time.perf_counter()
-    _record_gray_flip(clr_perf)
+    _record_gray_flip(
+        clear_timing.actual_perf_s,
+        clear_timing.requested_perf_s,
+    )
     return False, chosen_info
 
 
@@ -2429,16 +2530,14 @@ def present_delayed_afc_trial(
         fps = float(fps)
         frame_dur = 1.0 / fps
 
-    def _q_to_frames(seconds: float, at_least_one: bool = False) -> Tuple[int, float]:
-        frames = int(round(max(0.0, float(seconds)) * fps))
-        if at_least_one:
-            frames = max(1, frames)
-        return frames, frames * frame_dur
-
-    isi_frames, isi_s = _q_to_frames(isi, at_least_one=False)
-    cue_frames, cue_s = _q_to_frames(cue_time, at_least_one=True)
-    delay_frames, delay_s = _q_to_frames(delay_time, at_least_one=False)
-    choice_frames, choice_s = _q_to_frames(choice_time, at_least_one=True)
+    isi_plan = plan_frame_duration(isi, fps)
+    cue_plan = plan_frame_duration(cue_time, fps, minimum_frames=1)
+    delay_plan = plan_frame_duration(delay_time, fps)
+    choice_plan = plan_frame_duration(choice_time, fps, minimum_frames=1)
+    isi_frames, isi_s = isi_plan.frame_count, isi_plan.scheduled_s
+    cue_frames, cue_s = cue_plan.frame_count, cue_plan.scheduled_s
+    delay_frames, delay_s = delay_plan.frame_count, delay_plan.scheduled_s
+    choice_frames, choice_s = choice_plan.frame_count, choice_plan.scheduled_s
 
     _log_message(
         msg_logger,
@@ -2614,7 +2713,7 @@ def present_delayed_afc_trial(
         if not raspi or pigpio_pi is None:
             return True
         try:
-            _, pulse_s = _q_to_frames(0.25, at_least_one=True)
+            pulse_s = 0.25
             duration_us = int(pulse_s * 1_000_000)
             win.callOnFlip(_send_led_pulse_on_flip, pigpio_pi, raspi_pin, duration_us)
             trial_start_signal_armed_s = pulse_s
@@ -2624,7 +2723,10 @@ def present_delayed_afc_trial(
             _log_message(msg_logger, "ERROR", f"trial_start_signal_registration_failed trial_num={trial_num} error={e}")
             return False
 
-    def _commit_trial_start_signal(flip_perf_s: float) -> None:
+    def _commit_trial_start_signal(
+        flip_perf_s: float,
+        requested_perf_s: Optional[float] = None,
+    ) -> None:
         nonlocal trial_start_signal_armed_s, trial_start_signal_sent
         if trial_start_signal_armed_s is None:
             return
@@ -2632,12 +2734,8 @@ def present_delayed_afc_trial(
             trial_num=trial_num,
             event="trial_start_signal_on",
             timestamp_perf_s=flip_perf_s,
+            requested_timestamp_perf_s=requested_perf_s,
             requested_duration=trial_start_signal_armed_s,
-        )
-        logger.log_signal(
-            trial_num=trial_num,
-            event="trial_start_signal_off",
-            timestamp_perf_s=flip_perf_s + trial_start_signal_armed_s,
         )
         trial_start_signal_sent = True
         trial_start_signal_armed_s = None
@@ -2653,12 +2751,13 @@ def present_delayed_afc_trial(
     bg_rect.draw()
     onset_cue.draw()
     mouse_presses.reset()
-    win.flip()
-    oc_perf = time.perf_counter()
+    onset_timing = flip_with_timestamps(win)
+    oc_perf = onset_timing.actual_perf_s
     logger.log_frame_flip(
         trial_num=trial_num,
         event="onset_cue_on",
         timestamp_perf_s=oc_perf,
+        requested_timestamp_perf_s=onset_timing.requested_perf_s,
     )
     while True:
         if _abort_from_input("during_onset_cue"):
@@ -2702,7 +2801,7 @@ def present_delayed_afc_trial(
             if _abort_from_input("during_pre_cue_isi"):
                 return True, None
             _draw_blank()
-            win.flip()
+            flip_with_timestamps(win)
             if first_flip:
                 _log_message(msg_logger, "INFO", f"pre_cue_interval trial_num={trial_num} duration_s={isi_s:.6f}")
                 first_flip = False
@@ -2716,10 +2815,13 @@ def present_delayed_afc_trial(
         bg_rect.draw()
         cue_stim.draw()
         _draw_fixation_if_requested()
-        win.flip()
+        cue_timing = flip_with_timestamps(win)
         if first_flip:
-            cue_perf = time.perf_counter()
-            _commit_trial_start_signal(cue_perf)
+            cue_perf = cue_timing.actual_perf_s
+            _commit_trial_start_signal(
+                cue_perf,
+                cue_timing.requested_perf_s,
+            )
             _set_initiation_time(cue_perf)
             if trial_meta is not None:
                 trial_meta["cue_flip_perf_s"] = float(cue_perf)
@@ -2733,7 +2835,8 @@ def present_delayed_afc_trial(
                 trial_num=trial_num,
                 event="feature_cue_on",
                 timestamp_perf_s=cue_perf,
-                requested_duration=cue_s,
+                requested_timestamp_perf_s=cue_timing.requested_perf_s,
+                requested_duration=cue_plan.requested_s,
             )
             first_flip = False
 
@@ -2743,16 +2846,17 @@ def present_delayed_afc_trial(
             if _abort_from_input("during_delay"):
                 return True, None
             _draw_blank()
-            win.flip()
+            delay_timing = flip_with_timestamps(win)
             if first_flip:
-                delay_perf = time.perf_counter()
+                delay_perf = delay_timing.actual_perf_s
                 if trial_meta is not None:
                     trial_meta["delay_flip_perf_s"] = float(delay_perf)
                 logger.log_frame_flip(
                     trial_num=trial_num,
                     event="delay_start",
                     timestamp_perf_s=delay_perf,
-                    requested_duration=delay_s,
+                    requested_timestamp_perf_s=delay_timing.requested_perf_s,
+                    requested_duration=delay_plan.requested_s,
                 )
                 first_flip = False
 
@@ -2770,24 +2874,30 @@ def present_delayed_afc_trial(
         stim.draw()
     _draw_fixation_if_requested()
     mouse_presses.reset()
-    win.flip()
-    choice_perf = time.perf_counter()
+    choice_timing = flip_with_timestamps(win)
+    choice_perf = choice_timing.actual_perf_s
     if trial_meta is not None:
         trial_meta["choice_start_perf_s"] = float(choice_perf)
     logger.log_frame_flip(
         trial_num=trial_num,
         event="options_on",
         timestamp_perf_s=choice_perf,
-        requested_duration=choice_s,
+        requested_timestamp_perf_s=choice_timing.requested_perf_s,
+        requested_duration=choice_plan.requested_s,
     )
     logger.log_frame_flip(
         trial_num=trial_num,
         event="choice_start",
         timestamp_perf_s=choice_perf,
-        requested_duration=choice_s,
+        requested_timestamp_perf_s=choice_timing.requested_perf_s,
+        requested_duration=choice_plan.requested_s,
     )
 
     choice_deadline = choice_perf + float(choice_s)
+    choice_transition_request_deadline = max(
+        choice_perf,
+        choice_deadline - (frame_dur / 2.0),
+    )
     choice_info: Optional[Dict[str, Any]] = None
     start_touch = mouse_presses.poll()
 
@@ -2824,7 +2934,10 @@ def present_delayed_afc_trial(
             }
 
     poll_interval_s = 0.002
-    while time.perf_counter() < choice_deadline and choice_info is None:
+    while (
+        time.perf_counter() < choice_transition_request_deadline
+        and choice_info is None
+    ):
         if _abort_from_input("during_choice"):
             return True, None
         touch_sample = mouse_presses.poll()
@@ -2868,14 +2981,18 @@ def present_delayed_afc_trial(
                     "choice_feature": choice_feature,
                 }
                 break
-        remaining = choice_deadline - time.perf_counter()
+        remaining = choice_transition_request_deadline - time.perf_counter()
         if remaining > 0:
             _core.wait(min(poll_interval_s, remaining))
 
     _draw_blank()
-    win.flip()
-    gray_perf = time.perf_counter()
+    gray_timing = flip_with_timestamps(win)
+    gray_perf = gray_timing.actual_perf_s
     _record_gray_flip(gray_perf)
+    if trial_meta is not None:
+        trial_meta["gray_flip_requested_perf_s"] = float(
+            gray_timing.requested_perf_s
+        )
 
     if choice_info is None:
         _log_message(

@@ -13,7 +13,7 @@ import re
 import subprocess
 import sys
 import time
-from typing import Any, Dict, Optional, Sequence, Union
+from typing import Any, Callable, Dict, Optional, Sequence, Union
 
 import numpy as np
 from PIL import Image
@@ -28,7 +28,8 @@ ScreenSelector = Optional[Union[int, str]]
 _UNSET = object()
 MAIN_SCREEN_ENV = "MAIN_SCREEN"
 SECONDARY_SCREEN_ENV = "SECONDARY_SCREEN"
-_DEFAULT_MAIN_SIZE = (1600, 2560)
+SCREEN_ENV_OVERRIDE_ENV = "NEURO_TASK_SCREEN_ENV_OVERRIDE"
+_DEFAULT_MAIN_SIZE = (2560, 1600)
 
 
 def set_window_mouse_visible(win, visible: bool) -> bool:
@@ -86,9 +87,11 @@ def configure_window_vsync(win, enabled: bool) -> bool:
         pass
 
     targets = [getattr(win, "winHandle", None), getattr(win, "backend", None)]
+    seen_targets: set[int] = set()
     for target in targets:
-        if target is None:
+        if target is None or id(target) in seen_targets:
             continue
+        seen_targets.add(id(target))
         for method_name in ("set_vsync", "setVSync"):
             try:
                 method = getattr(target, method_name, None)
@@ -132,9 +135,11 @@ def resolve_window_frame_rate(
     context: str = "task",
     fallback_fps: float = 60.0,
 ) -> tuple[float, float]:
-    """Measure main-window flips and compare them with an optional override."""
+    """Use measured synchronized flips, with configured FPS as a fallback."""
     try:
-        measured_fps = measure_window_flip_rate(win)
+        measured_fps = float(measure_window_flip_rate(win))
+        if not np.isfinite(measured_fps) or measured_fps <= 0.0:
+            measured_fps = None
     except Exception:
         measured_fps = None
 
@@ -145,7 +150,6 @@ def resolve_window_frame_rate(
             raise ValueError("configured refresh_rate must be a positive finite value")
 
     if configured is not None:
-        used_fps = configured
         if measured_fps is None:
             _safe_log_message(
                 msg_logger,
@@ -171,8 +175,10 @@ def resolve_window_frame_rate(
                     f"tolerance_hz={tolerance_hz:.6f} status={status}"
                 ),
             )
-    elif measured_fps is not None:
+    if measured_fps is not None:
         used_fps = measured_fps
+    elif configured is not None:
+        used_fps = configured
     else:
         used_fps = float(fallback_fps)
         _safe_log_message(
@@ -262,6 +268,46 @@ class ScreenGeometry:
     rotation: str = "normal"
 
 
+def software_stimulus_rotation(rotation: str | None) -> int:
+    """Return the clockwise software turn needed for a native-orientation output."""
+    return {
+        "right": 0,
+        "inverted": 270,
+        "left": 180,
+    }.get(str(rotation or "").strip().lower(), 90)
+
+
+def _quarter_turn_degrees(rotation_degrees: Any) -> int:
+    degrees = float(rotation_degrees)
+    if not np.isfinite(degrees):
+        raise ValueError("rotation_degrees must be finite")
+    quarter_turns = round(degrees / 90.0)
+    if not np.isclose(degrees, quarter_turns * 90.0, rtol=0.0, atol=1e-9):
+        raise ValueError("rotation_degrees must be a multiple of 90")
+    return int(quarter_turns * 90) % 360
+
+
+def oriented_size(size, rotation_degrees) -> tuple[float, float]:
+    """Return canvas dimensions after a clockwise quarter turn."""
+    width, height = float(size[0]), float(size[1])
+    if _quarter_turn_degrees(rotation_degrees) in (90, 270):
+        return height, width
+    return width, height
+
+
+def rotate_centered_point(point, rotation_degrees) -> tuple[float, float]:
+    """Rotate a centered, y-up point clockwise by a quarter turn."""
+    x, y = float(point[0]), float(point[1])
+    rotation = _quarter_turn_degrees(rotation_degrees)
+    if rotation == 90:
+        return y, -x
+    if rotation == 180:
+        return -x, -y
+    if rotation == 270:
+        return -y, x
+    return x, y
+
+
 def parse_screen_selector(value: Any, name: str) -> ScreenSelector:
     if value is None or value == "":
         return None
@@ -286,6 +332,15 @@ def parse_screen_selector(value: Any, name: str) -> ScreenSelector:
     raise ValueError(f"Screen field '{name}' must be a non-negative integer or output name")
 
 
+def _screen_env_override_enabled() -> bool:
+    return str(os.environ.get(SCREEN_ENV_OVERRIDE_ENV, "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def load_screen_config(
     cfg: Dict[str, Any],
     *,
@@ -297,12 +352,17 @@ def load_screen_config(
         screens_cfg = {}
     if not isinstance(screens_cfg, dict):
         raise ValueError("Config field 'screens' must be a JSON object")
+    prefer_environment = _screen_env_override_enabled()
 
     main_value = cli_main
     main_is_null = False
     if main_value is None:
         main_is_null = "main" in screens_cfg and screens_cfg["main"] is None
-        main_value = screens_cfg.get("main", cfg.get("main_screen"))
+        configured_main = screens_cfg.get("main", cfg.get("main_screen"))
+        if prefer_environment and MAIN_SCREEN_ENV in os.environ:
+            main_value = os.environ[MAIN_SCREEN_ENV]
+        else:
+            main_value = configured_main
     if main_value is None:
         main_value = os.environ.get(MAIN_SCREEN_ENV)
         if main_is_null and (main_value is None or not str(main_value).strip()):
@@ -313,10 +373,14 @@ def load_screen_config(
     if experimenter_value is None:
         experimenter_key = "experimenter" if "experimenter" in screens_cfg else "secondary"
         experimenter_is_null = experimenter_key in screens_cfg and screens_cfg[experimenter_key] is None
-        experimenter_value = screens_cfg.get(
+        configured_experimenter = screens_cfg.get(
             experimenter_key,
             cfg.get("experimenter_screen", cfg.get("secondary_screen")),
         )
+        if prefer_environment and SECONDARY_SCREEN_ENV in os.environ:
+            experimenter_value = os.environ[SECONDARY_SCREEN_ENV]
+        else:
+            experimenter_value = configured_experimenter
     if experimenter_value is None:
         experimenter_value = os.environ.get(SECONDARY_SCREEN_ENV)
         if experimenter_is_null and (experimenter_value is None or not str(experimenter_value).strip()):
@@ -766,44 +830,74 @@ def _match_screen_geometry(
 def _bind_linux_pyglet_display(
     screen_info: ScreenGeometry,
     *,
-    strict: bool = True,
     wm_managed: bool = True,
 ):
-    """Make PsychoPy screen 0 select the target, retaining its Xinerama index."""
+    """Best-effort preselect a target as screen 0 during Window construction."""
     import pyglet
 
     original_display = pyglet.canvas.Display
+    original_get_display = getattr(pyglet.canvas, "get_display", None)
     override_key = "xlib_fullscreen_override_redirect"
     previous_override = pyglet.options.get(override_key, _UNSET)
     selection: Dict[str, Any] = {}
+    reordered_displays: list[tuple[Any, Any]] = []
+    prepared_display_ids: set[int] = set()
 
-    def target_first_display(*args: Any, **kwargs: Any) -> Any:
-        display = original_display(*args, **kwargs)
-        screens = list(display.get_screens())
-        selection["available_rects"] = [_screen_rect(screen) for screen in screens]
+    def prepare_display(display: Any) -> Any:
+        display_id = id(display)
+        if display_id in prepared_display_ids:
+            return display
+        prepared_display_ids.add(display_id)
         try:
+            screens = list(display.get_screens())
+            selection["available_rects"] = [
+                _screen_rect(screen) for screen in screens
+            ]
             monitor_index, target = _match_screen_geometry(
                 screens,
                 screen_info,
                 source="Pyglet",
             )
-        except RuntimeError:
-            if strict:
-                raise
+            original_screens = getattr(display, "_screens", _UNSET)
+            display._screens = [target] + [
+                screen for screen in screens if screen is not target
+            ]
+        except Exception as exc:
+            selection.setdefault(
+                "preselection_error",
+                f"{type(exc).__name__}: {str(exc).strip()}",
+            )
             return display
+
         selection["monitor_index"] = monitor_index
         selection["selected_rect"] = _screen_rect(target)
-        display._screens = [target] + [
-            screen for screen in screens if screen is not target
-        ]
+        reordered_displays.append((display, original_screens))
         return display
+
+    def target_first_display(*args: Any, **kwargs: Any) -> Any:
+        return prepare_display(original_display(*args, **kwargs))
+
+    def target_get_display(*args: Any, **kwargs: Any) -> Any:
+        return prepare_display(original_get_display(*args, **kwargs))
 
     pyglet.options[override_key] = not wm_managed
     pyglet.canvas.Display = target_first_display
+    if callable(original_get_display):
+        pyglet.canvas.get_display = target_get_display
     try:
         yield selection
     finally:
+        for display, original_screens in reversed(reordered_displays):
+            try:
+                if original_screens is _UNSET:
+                    delattr(display, "_screens")
+                else:
+                    display._screens = original_screens
+            except Exception:
+                pass
         pyglet.canvas.Display = original_display
+        if callable(original_get_display):
+            pyglet.canvas.get_display = original_get_display
         if previous_override is _UNSET:
             pyglet.options.pop(override_key, None)
         else:
@@ -939,6 +1033,7 @@ def open_psychopy_window(
     size: Optional[Sequence[int]] = None,
     require_correct_placement: bool = True,
     wm_managed: bool = True,
+    on_window_created: Optional[Callable[[Any], None]] = None,
     **kwargs: Any,
 ) -> Any:
     """Open and verify a PsychoPy window on one resolved physical display."""
@@ -958,24 +1053,52 @@ def open_psychopy_window(
     )
 
     native_x11_fullscreen = bool(fullscreen and sys.platform.startswith("linux"))
+    pyglet_selection: Dict[str, Any] = {}
     if fullscreen and not native_x11_fullscreen:
-        screens = list(_get_pyglet_display().get_screens())
-        window_kwargs["screen"] = _match_screen_geometry(
-            screens,
-            screen_info,
-            source="Pyglet",
-        )[0]
+        screens = []
+        try:
+            screens = list(_get_pyglet_display().get_screens())
+            pyglet_selection["available_rects"] = [
+                _screen_rect(screen) for screen in screens
+            ]
+            monitor_index, target = _match_screen_geometry(
+                screens,
+                screen_info,
+                source="Pyglet",
+            )
+            window_kwargs["screen"] = monitor_index
+            pyglet_selection["monitor_index"] = monitor_index
+            pyglet_selection["selected_rect"] = _screen_rect(target)
+        except Exception as exc:
+            pyglet_selection["preselection_error"] = (
+                f"{type(exc).__name__}: {str(exc).strip()}"
+            )
+            requested_index = max(0, int(screen_info.index))
+            window_kwargs["screen"] = (
+                requested_index
+                if requested_index < len(screens)
+                else 0
+            )
     if native_x11_fullscreen:
         with _bind_linux_pyglet_display(
             screen_info,
-            strict=require_correct_placement,
             wm_managed=wm_managed,
         ) as pyglet_selection:
             win = visual_module.Window(**window_kwargs)
         pyglet_selection = pyglet_selection or {}
     else:
-        pyglet_selection = {}
         win = visual_module.Window(**window_kwargs)
+
+    try:
+        if on_window_created is not None:
+            on_window_created(win)
+        activate_psychopy_window(win)
+    except Exception:
+        try:
+            win.close()
+        except Exception:
+            pass
+        raise
 
     if fullscreen:
         placement_error = None
@@ -1002,10 +1125,14 @@ def open_psychopy_window(
         monitor_index = pyglet_selection.get("monitor_index")
         selected_rect = pyglet_selection.get("selected_rect")
         available_rects = pyglet_selection.get("available_rects", [])
+        preselection_error = pyglet_selection.get("preselection_error")
         win._neuro_tasks_pyglet_selection = (
             f"Xinerama monitor {monitor_index} at {selected_rect} from {available_rects}"
             if monitor_index is not None and selected_rect is not None
-            else f"target selection unavailable; candidates {available_rects}"
+            else (
+                f"target selection unavailable; candidates {available_rects}; "
+                f"{preselection_error or 'no preselection detail'}"
+            )
         )
         win._neuro_tasks_fullscreen_path = (
             f"native {'managed' if wm_managed else 'unmanaged'} PsychoPy fullscreen"
@@ -1013,6 +1140,40 @@ def open_psychopy_window(
             else "window-manager fullscreen"
         )
     return win
+
+
+def initialize_psychopy_window(
+    visual_module: Any,
+    screen_info: Optional[ScreenGeometry],
+    *,
+    fullscreen: bool,
+    size: Optional[Sequence[int]] = None,
+    sync_to_refresh: bool = True,
+    on_window_ready: Optional[Callable[[], None]] = None,
+    **kwargs: Any,
+) -> Any:
+    """Create one main window through the shared sync/readiness/placement path."""
+
+    def _prepare_realized_window(win: Any) -> None:
+        request_applied = (
+            enforce_window_vsync(win)
+            if sync_to_refresh
+            else configure_window_vsync(win, False)
+        )
+        win._neuro_tasks_refresh_sync_requested = bool(
+            sync_to_refresh and request_applied
+        )
+        if on_window_ready is not None:
+            on_window_ready()
+
+    return open_psychopy_window(
+        visual_module,
+        screen_info,
+        fullscreen=fullscreen,
+        size=size,
+        on_window_created=_prepare_realized_window,
+        **kwargs,
+    )
 
 
 def set_tk_window_fullscreen(window, screen_info: ScreenGeometry) -> None:
@@ -1349,7 +1510,14 @@ def _preview_rgb255_to_psychopy(rgb_255: Sequence[int]) -> list[float]:
     return [max(-1.0, min(1.0, (float(v) / 127.5) - 1.0)) for v in rgb_255]
 
 
-def _build_preview_image_stim(win, payload: Dict[str, Any], *, pos, size):
+def _build_preview_image_stim(
+    win,
+    payload: Dict[str, Any],
+    *,
+    pos,
+    size,
+    ori: float = 0.0,
+):
     from psychopy import visual
 
     image_payload = payload.get("image_payload")
@@ -1374,6 +1542,7 @@ def _build_preview_image_stim(win, payload: Dict[str, Any], *, pos, size):
         units="pix",
         pos=pos,
         size=size,
+        ori=float(ori),
         interpolate=False,
     )
 
@@ -1440,14 +1609,15 @@ def build_reward_hit_boxes(
             continue
         pos = item.get("pos", (0.0, 0.0))
         size = item.get("size", (64.0, 64.0))
-        boxes.append(
-            {
-                "pos": [float(pos[0]), float(pos[1])],
-                "size": [float(size[0]) * scale, float(size[1]) * scale],
-                "color": list(reward_level_color(int(item["reward_level"]))),
-                "line_width": float(line_width),
-            }
-        )
+        box = {
+            "pos": [float(pos[0]), float(pos[1])],
+            "size": [float(size[0]) * scale, float(size[1]) * scale],
+            "color": list(reward_level_color(int(item["reward_level"]))),
+            "line_width": float(line_width),
+        }
+        if "ori" in item:
+            box["ori"] = float(item["ori"])
+        boxes.append(box)
     return boxes
 
 
@@ -1465,6 +1635,7 @@ def _experimenter_preview_process(
     initial_total_trials: Optional[int],
     initial_status_counts: Optional[Dict[str, int]],
     stop_event,
+    startup_sender,
 ) -> None:
     import ctypes
     from psychopy import core, event, visual
@@ -1513,46 +1684,34 @@ def _experimenter_preview_process(
         )
 
     def _release_movie() -> None:
-        nonlocal movie, movie_bg_rect, movie_outline_rect, movie_layout
+        nonlocal movie_bg_rect, movie_outline_rect, movie_layout
         nonlocal shared_movie_active, shared_movie_stim, shared_movie_sequence
         nonlocal shared_movie_minimum_sequence, shared_movie_crop_bounds
-        nonlocal shared_movie_upload_buffer
-        nonlocal last_bg_rgb, static_scene
-        if movie is not None:
-            try:
-                movie.stop(log=False)
-            except Exception:
-                pass
-            try:
-                if hasattr(movie, "unload"):
-                    movie.unload(log=False)
-            except Exception:
-                pass
-        movie = None
+        nonlocal shared_movie_upload_buffer, shared_movie_source_size
+        nonlocal shared_movie_target_size
         shared_movie_active = False
         shared_movie_stim = None
         shared_movie_sequence = 0
         shared_movie_minimum_sequence = 1
         shared_movie_crop_bounds = None
         shared_movie_upload_buffer = None
+        shared_movie_source_size = None
+        shared_movie_target_size = None
         movie_bg_rect = None
         movie_outline_rect = None
         movie_layout = None
-        static_scene = _build_static_scene(
-            {
-                "bg_rgb_255": last_bg_rgb,
-                "main_size": preview_canvas_size,
-                "subject": current_subject,
-                "current_trial_num": current_trial_num,
-                "total_trials": current_total_trials,
-                "status_counts": current_status_counts,
-            }
-        )
 
     def _build_static_scene(payload: Dict[str, Any]) -> Dict[str, Any]:
         bg_rgb_255 = tuple(payload.get("bg_rgb_255", (0, 0, 0)))
         main_size = tuple(payload.get("main_size") or preview_canvas_size)
-        layout = compute_centered_aspect_fit(preview_canvas_size, main_size)
+        scene_rotation_deg = _quarter_turn_degrees(
+            payload.get("main_rotation_deg", 0)
+        )
+        oriented_main_size = oriented_size(main_size, scene_rotation_deg)
+        layout = compute_centered_aspect_fit(
+            preview_canvas_size,
+            oriented_main_size,
+        )
         preview_size = layout["box_size"]
         box_center = layout["box_center"]
         canvas_bg_rect = _make_bg_rect(outside_bg_rgb)
@@ -1579,8 +1738,19 @@ def _experimenter_preview_process(
         )
 
         def _map_pos(pos: Sequence[float]) -> tuple[float, float]:
-            scaled = scale_scene_point(pos, main_size, preview_size)
+            oriented_pos = rotate_centered_point(pos, -scene_rotation_deg)
+            scaled = scale_scene_point(
+                oriented_pos,
+                oriented_main_size,
+                preview_size,
+            )
             return (float(box_center[0]) + scaled[0], float(box_center[1]) + scaled[1])
+
+        def _map_size(size: Sequence[float]) -> tuple[float, float]:
+            return scale_scene_size(size, oriented_main_size, preview_size)
+
+        def _map_ori(item: Dict[str, Any]) -> float:
+            return float(item.get("ori", 0.0)) - float(scene_rotation_deg)
 
         images = []
         for item in payload.get("images", []) or []:
@@ -1588,14 +1758,22 @@ def _experimenter_preview_process(
                 win,
                 item,
                 pos=_map_pos(item.get("pos", (0, 0))),
-                size=scale_scene_size(item.get("size", (64, 64)), main_size, preview_size),
+                size=_map_size(item.get("size", (64, 64))),
+                ori=_map_ori(item),
             )
             if stim is not None:
                 images.append(stim)
 
         dots = []
         for item in payload.get("dots", []) or []:
-            radius = max(1.0, scale_scene_length(float(item.get("radius", 4.0)), main_size, preview_size))
+            radius = max(
+                1.0,
+                scale_scene_length(
+                    float(item.get("radius", 4.0)),
+                    oriented_main_size,
+                    preview_size,
+                ),
+            )
             dot = visual.Circle(
                 win,
                 radius=radius,
@@ -1609,7 +1787,7 @@ def _experimenter_preview_process(
 
         hit_boxes = []
         for item in payload.get("hit_boxes", []) or []:
-            scaled_size = scale_scene_size(item.get("size", (64, 64)), main_size, preview_size)
+            scaled_size = _map_size(item.get("size", (64, 64)))
             hit_boxes.append(
                 visual.Rect(
                     win,
@@ -1622,12 +1800,13 @@ def _experimenter_preview_process(
                         2.0,
                         scale_scene_length(
                             float(item.get("line_width", 4.0)),
-                            main_size,
+                            oriented_main_size,
                             preview_size,
                         ),
                     ),
                     fillColor=None,
                     units="pix",
+                    ori=_map_ori(item),
                 )
             )
 
@@ -1638,7 +1817,14 @@ def _experimenter_preview_process(
                 win,
                 text="+",
                 units="pix",
-                height=max(1.0, scale_scene_length(float(fixation_size), main_size, preview_size)),
+                height=max(
+                    1.0,
+                    scale_scene_length(
+                        float(fixation_size),
+                        oriented_main_size,
+                        preview_size,
+                    ),
+                ),
                 color=_preview_rgb255_to_psychopy(payload.get("fixation_color", (0, 0, 0))),
                 colorSpace="rgb",
                 pos=_map_pos((0, 0)),
@@ -1648,17 +1834,28 @@ def _experimenter_preview_process(
         highlight_payload = payload.get("highlight_box")
         if isinstance(highlight_payload, dict):
             line_color = highlight_payload.get("color", (255, 255, 255))
-            line_width = max(2.0, scale_scene_length(float(highlight_payload.get("line_width", 4.0)), main_size, preview_size))
+            line_width = max(
+                2.0,
+                scale_scene_length(
+                    float(highlight_payload.get("line_width", 4.0)),
+                    oriented_main_size,
+                    preview_size,
+                ),
+            )
+            highlight_size = _map_size(
+                highlight_payload.get("size", (64, 64))
+            )
             highlight_box = visual.Rect(
                 win,
-                width=max(4.0, scale_scene_size(highlight_payload.get("size", (64, 64)), main_size, preview_size)[0]),
-                height=max(4.0, scale_scene_size(highlight_payload.get("size", (64, 64)), main_size, preview_size)[1]),
+                width=max(4.0, highlight_size[0]),
+                height=max(4.0, highlight_size[1]),
                 pos=_map_pos(highlight_payload.get("pos", (0, 0))),
                 lineColor=_preview_rgb255_to_psychopy(line_color),
                 lineColorSpace="rgb",
                 lineWidth=line_width,
                 fillColor=None,
                 units="pix",
+                ori=_map_ori(highlight_payload),
             )
 
         return {
@@ -1677,6 +1874,7 @@ def _experimenter_preview_process(
             "current_trial_num": payload.get("current_trial_num"),
             "total_trials": payload.get("total_trials"),
             "layout": layout,
+            "main_rotation_deg": scene_rotation_deg,
         }
 
     def _place_overlay_controls(layout: Optional[Dict[str, Any]]) -> None:
@@ -1795,18 +1993,42 @@ def _experimenter_preview_process(
         exit_button_rect.draw()
         exit_button_text.draw()
 
-    win = open_psychopy_window(
-        visual,
-        screen_info,
-        fullscreen=True,
-        wm_managed=False,
-        units="pix",
-        colorSpace="rgb",
-        color=_preview_rgb255_to_psychopy((0, 0, 0)),
-        allowStencil=False,
-        allowGUI=False,
-        waitBlanking=False,
-    )
+    try:
+        win = open_psychopy_window(
+            visual,
+            screen_info,
+            fullscreen=True,
+            wm_managed=False,
+            units="pix",
+            colorSpace="rgb",
+            color=_preview_rgb255_to_psychopy((0, 0, 0)),
+            allowStencil=False,
+            allowGUI=False,
+            waitBlanking=False,
+        )
+    except Exception as exc:
+        try:
+            startup_sender.send(
+                {
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {str(exc).strip()}",
+                }
+            )
+        finally:
+            startup_sender.close()
+        raise
+    else:
+        startup_sender.send(
+            {
+                "ok": True,
+                "placement": getattr(
+                    win,
+                    "_neuro_tasks_screen_placement",
+                    describe_screen(screen_info),
+                ),
+            }
+        )
+        startup_sender.close()
     configure_window_vsync(win, False)
     last_cursor_apply_s = 0.0
     if mouse_visible is not None:
@@ -1820,17 +2042,19 @@ def _experimenter_preview_process(
     current_subject = initial_subject
     current_trial_num = initial_current_trial_num
     current_total_trials = initial_total_trials
+    current_main_size = tuple(preview_canvas_size)
+    current_main_rotation_deg = 0
     static_scene = _build_static_scene(
         {
             "bg_rgb_255": last_bg_rgb,
-            "main_size": preview_canvas_size,
+            "main_size": current_main_size,
+            "main_rotation_deg": current_main_rotation_deg,
             "subject": current_subject,
             "current_trial_num": current_trial_num,
             "total_trials": current_total_trials,
             "status_counts": current_status_counts,
         }
     )
-    movie = None
     movie_bg_rect = None
     movie_outline_rect = None
     movie_layout = None
@@ -1841,6 +2065,8 @@ def _experimenter_preview_process(
     shared_movie_minimum_sequence = 1
     shared_movie_crop_bounds = None
     shared_movie_upload_buffer = None
+    shared_movie_source_size = None
+    shared_movie_target_size = None
     task_label_text = None
 
     try:
@@ -1968,6 +2194,12 @@ def _experimenter_preview_process(
                         current_trial_num = payload.get("current_trial_num")
                     if "total_trials" in payload:
                         current_total_trials = payload.get("total_trials")
+                    if "main_size" in payload:
+                        current_main_size = tuple(payload["main_size"])
+                    if "main_rotation_deg" in payload:
+                        current_main_rotation_deg = _quarter_turn_degrees(
+                            payload["main_rotation_deg"]
+                        )
                     scene_payload = dict(payload)
                     scene_payload["reward_counts"] = current_reward_counts
                     scene_payload["status_counts"] = current_status_counts
@@ -1975,50 +2207,34 @@ def _experimenter_preview_process(
                     scene_payload["subject"] = current_subject
                     scene_payload["current_trial_num"] = current_trial_num
                     scene_payload["total_trials"] = current_total_trials
+                    scene_payload.setdefault("main_size", current_main_size)
+                    scene_payload.setdefault(
+                        "main_rotation_deg",
+                        current_main_rotation_deg,
+                    )
+                    static_scene.update(
+                        {
+                            "reward_counts": current_reward_counts,
+                            "status_counts": current_status_counts,
+                            "subject": current_subject,
+                            "current_trial_num": current_trial_num,
+                            "total_trials": current_total_trials,
+                        }
+                    )
                     if command_type == "static_scene":
                         _release_movie()
                         last_bg_rgb = tuple(payload.get("bg_rgb_255", last_bg_rgb))
                         static_scene = _build_static_scene(scene_payload)
-                    elif command_type == "play_video":
-                        _release_movie()
-                        last_bg_rgb = tuple(payload.get("bg_rgb_255", last_bg_rgb))
-                        movie_layout = compute_centered_aspect_fit(
-                            preview_canvas_size,
-                            tuple(payload.get("main_size") or preview_canvas_size),
-                        )
-                        movie_bg_rect = _make_bg_rect(outside_bg_rgb)
-                        movie_outline_rect = visual.Rect(
-                            win,
-                            width=movie_layout["box_size"][0],
-                            height=movie_layout["box_size"][1],
-                            pos=movie_layout["box_center"],
-                            fillColor=None,
-                            lineColor=_preview_rgb255_to_psychopy(preview_outline_rgb),
-                            lineColorSpace="rgb",
-                            lineWidth=2,
-                            units="pix",
-                        )
-                        from psychopy.visual.vlcmoviestim import VlcMovieStim
-
-                        movie = VlcMovieStim(
-                            win,
-                            filename=str(payload["video_path"]),
-                            units="pix",
-                            size=movie_layout["box_size"],
-                            pos=movie_layout["box_center"],
-                            loop=False,
-                            autoStart=False,
-                            noAudio=True,
-                        )
-                        movie.size = movie_layout["box_size"]
-                        movie.pos = movie_layout["box_center"]
-                        movie.play(log=False)
                     elif command_type == "play_shared_video":
                         _release_movie()
                         last_bg_rgb = tuple(payload.get("bg_rgb_255", last_bg_rgb))
+                        shared_movie_target_size = oriented_size(
+                            current_main_size,
+                            current_main_rotation_deg,
+                        )
                         movie_layout = compute_centered_aspect_fit(
                             preview_canvas_size,
-                            tuple(payload.get("main_size") or preview_canvas_size),
+                            shared_movie_target_size,
                         )
                         movie_bg_rect = _make_bg_rect(outside_bg_rgb)
                         movie_outline_rect = visual.Rect(
@@ -2049,15 +2265,13 @@ def _experimenter_preview_process(
                             payload.get("minimum_sequence", 1)
                         )
                         shared_movie_sequence = shared_movie_minimum_sequence - 1
-                        shared_movie_crop_bounds = center_crop_bounds(
-                            tuple(payload["video_size"]),
-                            tuple(payload.get("main_size") or preview_canvas_size),
-                        )
+                        shared_movie_crop_bounds = None
+                        shared_movie_source_size = None
                         shared_movie_active = True
                     elif command_type == "clear_scene":
                         _release_movie()
                         last_bg_rgb = tuple(payload.get("bg_rgb_255", last_bg_rgb))
-                        static_scene = _build_static_scene(scene_payload if scene_payload else {"bg_rgb_255": last_bg_rgb, "main_size": preview_canvas_size})
+                        static_scene = _build_static_scene(scene_payload)
                 except Exception:
                     continue
 
@@ -2075,7 +2289,7 @@ def _experimenter_preview_process(
                 try:
                     _place_overlay_controls(
                         movie_layout
-                        if movie is not None or shared_movie_active
+                        if shared_movie_active
                         else static_scene.get("layout")
                     )
                     mouse_pos = mouse.getPos()
@@ -2088,19 +2302,6 @@ def _experimenter_preview_process(
             last_mouse_down = mouse_down
 
             try:
-                if movie is not None:
-                    if movie_bg_rect is not None:
-                        movie_bg_rect.draw()
-                    movie.draw()
-                    if movie_outline_rect is not None:
-                        movie_outline_rect.draw()
-                    _draw_overlay(movie_layout)
-                    win.flip()
-                    if bool(getattr(movie, "isFinished", False)):
-                        _release_movie()
-                    core.wait(0.005)
-                    continue
-
                 if shared_movie_active:
                     shared_frame_updated = False
                     if shared_movie_reader is not None:
@@ -2111,6 +2312,19 @@ def _experimenter_preview_process(
                         if shared_frame is not None:
                             shared_frame_updated = True
                             shared_movie_sequence = shared_frame.sequence
+                            actual_source_size = (
+                                int(shared_frame.rgba.shape[1]),
+                                int(shared_frame.rgba.shape[0]),
+                            )
+                            if (
+                                shared_movie_crop_bounds is None
+                                or shared_movie_source_size != actual_source_size
+                            ):
+                                shared_movie_source_size = actual_source_size
+                                shared_movie_crop_bounds = center_crop_bounds(
+                                    actual_source_size,
+                                    shared_movie_target_size,
+                                )
                             left, top, right, bottom = shared_movie_crop_bounds
                             cropped_view = shared_frame.rgba[top:bottom, left:right]
                             expected_shape = (
@@ -2126,6 +2340,7 @@ def _experimenter_preview_process(
                                     expected_shape,
                                     dtype=np.uint8,
                                 )
+                                shared_movie_stim = None
                             np.copyto(shared_movie_upload_buffer, cropped_view)
                             if shared_movie_stim is None:
                                 blank_image = Image.new(
@@ -2179,7 +2394,8 @@ def _experimenter_preview_process(
                 static_scene = _build_static_scene(
                     {
                         "bg_rgb_255": last_bg_rgb,
-                        "main_size": preview_canvas_size,
+                        "main_size": current_main_size,
+                        "main_rotation_deg": current_main_rotation_deg,
                         "reward_counts": current_reward_counts,
                         "status_counts": current_status_counts,
                         "highlight_box": current_highlight_box,
@@ -2215,6 +2431,7 @@ class ExperimenterPreview:
         start_perf_s: Optional[float] = None,
         update_interval_s: float = 0.1,
         mouse_visible: Optional[bool] = True,
+        startup_timeout_s: float = 10.0,
     ):
         self.screen_info = screen_info
         self.task_label = task_label
@@ -2226,10 +2443,14 @@ class ExperimenterPreview:
         self.update_interval_s = max(0.05, float(update_interval_s))
         self.exit_requested = False
         self._ctx = mp.get_context("spawn")
-        self._queue = self._ctx.Queue(maxsize=4)
+        # Scene commands are state snapshots, not an event stream. Keeping only
+        # the newest snapshot prevents a slow preview process from accumulating
+        # visual latency behind the main task.
+        self._queue = self._ctx.Queue(maxsize=1)
         self._reward_event = self._ctx.Event()
         self._exit_event = self._ctx.Event()
         self._stop_event = self._ctx.Event()
+        startup_receiver, startup_sender = self._ctx.Pipe(duplex=False)
         self._process = self._ctx.Process(
             target=_experimenter_preview_process,
             args=(
@@ -2246,10 +2467,41 @@ class ExperimenterPreview:
                 total_trials,
                 self.status_counts,
                 self._stop_event,
+                startup_sender,
             ),
             daemon=True,
         )
         self._process.start()
+        startup_sender.close()
+        timeout_s = max(0.1, float(startup_timeout_s))
+        deadline = time.monotonic() + timeout_s
+        startup_result = None
+        while time.monotonic() < deadline:
+            if startup_receiver.poll(min(0.1, deadline - time.monotonic())):
+                startup_result = startup_receiver.recv()
+                break
+            if not self._process.is_alive():
+                break
+        startup_receiver.close()
+        if not isinstance(startup_result, dict) or not startup_result.get("ok"):
+            error = (
+                startup_result.get("error")
+                if isinstance(startup_result, dict)
+                else (
+                    f"preview process exited with status {self._process.exitcode}"
+                    if not self._process.is_alive()
+                    else f"preview window did not become ready within {timeout_s:.1f}s"
+                )
+            )
+            self._stop_event.set()
+            if self._process.is_alive():
+                self._process.terminate()
+            self._process.join(timeout=1.0)
+            raise RuntimeError(
+                f"Experimenter preview failed to realize on "
+                f"{describe_screen(screen_info)}: {error}"
+            )
+        self.placement = str(startup_result.get("placement", ""))
 
     def poll(self) -> bool:
         if self.exit_requested:
@@ -2321,6 +2573,7 @@ class ExperimenterPreview:
         hit_boxes: Optional[list[Dict[str, Any]]] = None,
         fixation_size: Optional[float] = None,
         fixation_color: Sequence[int] = (0, 0, 0),
+        main_rotation_deg: float = 0,
         reward_counts: Any = _UNSET,
         status_counts: Any = _UNSET,
         highlight_box: Any = _UNSET,
@@ -2329,6 +2582,7 @@ class ExperimenterPreview:
             "type": "static_scene",
             "bg_rgb_255": list(bg_rgb_255),
             "main_size": [int(main_size[0]), int(main_size[1])],
+            "main_rotation_deg": _quarter_turn_degrees(main_rotation_deg),
             "images": list(images or []),
             "dots": list(dots or []),
             "hit_boxes": list(hit_boxes or []),
@@ -2348,6 +2602,7 @@ class ExperimenterPreview:
         *,
         bg_rgb_255: Sequence[int],
         main_size: Optional[Sequence[int]] = None,
+        main_rotation_deg: float = 0,
         reward_counts: Any = _UNSET,
         status_counts: Any = _UNSET,
         highlight_box: Any = _UNSET,
@@ -2355,6 +2610,7 @@ class ExperimenterPreview:
         payload: Dict[str, Any] = {
             "type": "clear_scene",
             "bg_rgb_255": list(bg_rgb_255),
+            "main_rotation_deg": _quarter_turn_degrees(main_rotation_deg),
         }
         if main_size is not None:
             payload["main_size"] = [int(main_size[0]), int(main_size[1])]
@@ -2366,22 +2622,6 @@ class ExperimenterPreview:
             payload["highlight_box"] = dict(highlight_box) if highlight_box is not None else None
         self._send(payload)
 
-    def play_video(
-        self,
-        video_path: str,
-        *,
-        bg_rgb_255: Sequence[int],
-        main_size: Optional[Sequence[int]] = None,
-    ) -> None:
-        payload: Dict[str, Any] = {
-            "type": "play_video",
-            "video_path": str(video_path),
-            "bg_rgb_255": list(bg_rgb_255),
-        }
-        if main_size is not None:
-            payload["main_size"] = [int(main_size[0]), int(main_size[1])]
-        self._send(payload)
-
     def play_shared_video(
         self,
         *,
@@ -2390,6 +2630,7 @@ class ExperimenterPreview:
         video_size: Sequence[int],
         bg_rgb_255: Sequence[int],
         main_size: Optional[Sequence[int]] = None,
+        main_rotation_deg: float = 0,
     ) -> None:
         """Mirror frames published by the main process without decoding again."""
         payload: Dict[str, Any] = {
@@ -2398,6 +2639,7 @@ class ExperimenterPreview:
             "minimum_sequence": int(minimum_sequence),
             "video_size": [int(video_size[0]), int(video_size[1])],
             "bg_rgb_255": list(bg_rgb_255),
+            "main_rotation_deg": _quarter_turn_degrees(main_rotation_deg),
         }
         if main_size is not None:
             payload["main_size"] = [int(main_size[0]), int(main_size[1])]

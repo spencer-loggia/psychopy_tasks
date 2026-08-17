@@ -52,11 +52,9 @@
     "main": null,
     "experimenter": null
   },
-  "refresh_rate": 60,
   "n": 2000,
 
   "fullscreen": true,
-  "win_size": [2560, 1600],
   "fixation_size": 0,
   "dot_size": 60,
   "dot_color": [50, 50, 50],

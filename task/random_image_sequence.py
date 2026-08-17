@@ -15,12 +15,12 @@ python task/random_image_sequence.py \
   --svg_size 256 256
 """
 import argparse
+import math
 import sys
-import time
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Any, Dict, Optional, Tuple
 
-from psychopy import core, logging as pylogging, event
+from psychopy import logging as pylogging, event
 
 # Ensure project root on sys.path for local imports
 _project_root = Path(__file__).resolve().parents[1]
@@ -28,9 +28,11 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from bin import utils
+from bin.frame_timing import flip_with_timestamps, plan_frame_duration
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.config import load_config, validate_config
+from bin.screen import describe_screen, load_screen_config, resolve_task_screens
 
 
 def parse_args():
@@ -52,6 +54,8 @@ def parse_args():
     parser.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate (Hz); skip auto-detection if provided")
     parser.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi GPIO features (no-op if unused)")
     parser.add_argument("--raspi_pin", type=int, default=None, help="GPIO pin to use for raspi features (BCM numbering)")
+    parser.add_argument("--main_screen", default=None, help="Main task screen index or output name")
+    parser.add_argument("--experimenter_screen", default=None, help="Experimenter screen index or output name")
     return parser.parse_args()
 
 
@@ -73,11 +77,18 @@ def run_task(
     raspi: bool = False,
     raspi_pin: int = 18,
     config_name: Optional[str] = None,
+    screen_config: Optional[Dict[str, Any]] = None,
 ):
     # Enable or disable debug outputs (writing debug PNGs)
     utils.set_debug(debug)
-    if duration <= 0:
-        raise ValueError("duration must be positive")
+    duration = float(duration)
+    isi = float(isi)
+    if not math.isfinite(duration) or duration <= 0.0:
+        raise ValueError("duration must be a positive finite value")
+    if not math.isfinite(isi) or isi < 0.0:
+        raise ValueError("isi must be a finite non-negative value")
+    if int(n) < 1:
+        raise ValueError("n must be at least 1")
     image_files = utils.find_image_files(images_dir, recursive=False)
     if not image_files:
         raise FileNotFoundError(f"No images found in {images_dir}")
@@ -93,8 +104,14 @@ def run_task(
     # same background color and avoid platform-specific transparency issues.
     preloaded = utils.load_image_assets(chosen_paths, raster_size=image_size, bg_rgb_255=bg)
 
-    # Create window & fixation
-    win = utils.setup_window(bg_rgb_255=bg, fullscreen=fullscreen, size=win_size)
+    # Resolve and verify the same physical main output used by other tasks.
+    main_screen, _ = resolve_task_screens(screen_config, allow_same_screen=True)
+    win = utils.setup_window(
+        bg_rgb_255=bg,
+        fullscreen=fullscreen,
+        size=win_size,
+        screen_info=main_screen,
+    )
     fix = utils.make_fixation_cross(win, size=fixation_size)
     # Create a full-window background patch so we can reliably show a solid
     # background during ISI periods (some backends may retain previous
@@ -118,6 +135,7 @@ def run_task(
         "INFO",
         f"session_start task=random_image_sequence config_name={resolved_config_name} session_dir={session_logs.session_dir}",
     )
+    msg_logger.log("INFO", f"resolved_screens main={describe_screen(main_screen)}")
 
     # Initialize lgpio if requested (harmless if not used here)
     pigpio_pi = None  # naming kept for compatibility with presenter API
@@ -144,27 +162,16 @@ def run_task(
         msg_logger=msg_logger,
         context="random_image_sequence",
     )
-    utils.validate_frame_aligned_timings(
-        fps,
-        {
-            "duration": duration,
-            "isi": isi,
-        },
-        context="random_image_sequence",
-        minimum_frames={"duration": 1},
-        msg_logger=msg_logger,
+    # Plan each requested duration to its nearest refresh-locked presentation.
+    stim_plan = plan_frame_duration(duration, fps, minimum_frames=1)
+    isi_plan = plan_frame_duration(isi, fps)
+    final_fix_plan = plan_frame_duration(1.0, fps)
+    stim_frames, stim_s = stim_plan.frame_count, stim_plan.scheduled_s
+    isi_frames, isi_s = isi_plan.frame_count, isi_plan.scheduled_s
+    final_fix_frames, final_fix_s = (
+        final_fix_plan.frame_count,
+        final_fix_plan.scheduled_s,
     )
-
-    # Global timing quantization
-    def _q(seconds: float, at_least_one: bool = False):
-        frames = int(round(max(0.0, float(seconds)) * float(fps)))
-        if at_least_one:
-            frames = max(1, frames)
-        return frames, frames / float(fps)
-
-    stim_frames, stim_s = _q(duration, at_least_one=True)
-    isi_frames, isi_s = _q(isi, at_least_one=False)
-    final_fix_frames, final_fix_s = _q(1.0, at_least_one=False)
     try:
         msg_logger.log(
             "INFO",
@@ -202,14 +209,14 @@ def run_task(
             bg_rect.draw()
             if fix is not None:
                 fix.draw()
-            isi_flip_ps = win.flip()
+            isi_timing = flip_with_timestamps(win)
             if first_flip:
-                isi_perf = time.perf_counter()
                 logger.log_frame_flip(
                     trial_num=None,
                     event="gray_pre_sequence",
-                    timestamp_perf_s=isi_perf,
-                    requested_duration=isi_s,
+                    timestamp_perf_s=isi_timing.actual_perf_s,
+                    requested_timestamp_perf_s=isi_timing.requested_perf_s,
+                    requested_duration=isi,
                 )
                 first_flip = False
 
@@ -222,14 +229,14 @@ def run_task(
             stim.draw()
             if fix is not None:
                 fix.draw()  # fixation on top
-            flip_time_ps = win.flip()
+            stim_timing = flip_with_timestamps(win)
             if first_flip:
-                flip_time_perf = time.perf_counter()
                 logger.log_frame_flip(
                     trial_num=idx,
                     event="stimulus_on",
-                    timestamp_perf_s=flip_time_perf,
-                    requested_duration=stim_s,
+                    timestamp_perf_s=stim_timing.actual_perf_s,
+                    requested_timestamp_perf_s=stim_timing.requested_perf_s,
+                    requested_duration=duration,
                 )
                 msg_logger.log("INFO", f"stimulus_presented trial_num={idx} stimulus_name={img_name}")
                 first_flip = False
@@ -240,36 +247,36 @@ def run_task(
                 break
         if aborted:
             break
-        # Clear the screen to background (fixation on top) and log image_off
-        bg_rect.draw()
-        if fix is not None:
-            fix.draw()
-        win.flip()
-        end_time_perf = time.perf_counter()
         is_last_stimulus = idx == len(image_stims)
-        if is_last_stimulus:
+        # The gray-onset flip is the first frame of a non-zero ISI/final
+        # fixation. Skip it between stimuli when the nearest-frame ISI is zero.
+        if is_last_stimulus or isi_frames > 0:
+            bg_rect.draw()
+            if fix is not None:
+                fix.draw()
+            gray_timing = flip_with_timestamps(win)
             logger.log_frame_flip(
                 trial_num=idx,
-                event="gray_final_fixation",
-                timestamp_perf_s=end_time_perf,
-                requested_duration=final_fix_s,
-            )
-        elif isi_frames > 0:
-            logger.log_frame_flip(
-                trial_num=idx,
-                event="gray_inter_stimulus",
-                timestamp_perf_s=end_time_perf,
-                requested_duration=isi_s,
+                event=(
+                    "gray_final_fixation"
+                    if is_last_stimulus
+                    else "gray_inter_stimulus"
+                ),
+                timestamp_perf_s=gray_timing.actual_perf_s,
+                requested_timestamp_perf_s=gray_timing.requested_perf_s,
+                requested_duration=1.0 if is_last_stimulus else isi,
             )
         behavior_logger.writerow(
             {
                 "trial_num": idx,
                 "stimulus_name": img_name,
-                "requested_duration": f"{stim_s:.9f}",
+                "requested_duration": f"{duration:.9f}",
             }
         )
         # ISI between images
-        for _f in range(isi_frames if not is_last_stimulus else 0):
+        for _f in range(
+            max(0, isi_frames - 1) if not is_last_stimulus else 0
+        ):
             bg_rect.draw()
             if fix is not None:
                 fix.draw()
@@ -320,6 +327,12 @@ def main():
             return val
         return cfg.get(name, default)
 
+    screen_config = load_screen_config(
+        cfg,
+        cli_main=args.main_screen,
+        cli_experimenter=args.experimenter_screen,
+    )
+
     try:
         aborted_by_user = run_task(
             images_dir=_get("images_dir", cfg.get("images_dir")),
@@ -339,6 +352,7 @@ def main():
             raspi=_get("raspi", cfg.get("raspi", False)),
             raspi_pin=_get("raspi_pin", cfg.get("raspi_pin", 18)),
             config_name=cfg.get("config_name", "random_image_sequence"),
+            screen_config=screen_config,
         )
         if aborted_by_user:
             sys.exit(USER_EXIT_CODE)

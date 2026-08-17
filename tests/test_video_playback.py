@@ -1,8 +1,12 @@
 import ctypes
+import importlib.util
 import random
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -239,6 +243,261 @@ class VideoPlaybackTests(unittest.TestCase):
                 find_pi_hevc_decoder_device(sys_root, dev_root),
                 dev_root / "video19",
             )
+
+
+class PlayVideoTaskRotationTests(unittest.TestCase):
+    @staticmethod
+    def _load_task_module(fake_utils, fake_screen, fake_psychopy):
+        import bin as bin_package
+
+        task_path = Path(__file__).resolve().parents[1] / "task" / "play_video.py"
+        spec = importlib.util.spec_from_file_location(
+            "_test_play_video_task_rotation",
+            task_path,
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Could not load task module from {task_path}")
+        module = importlib.util.module_from_spec(spec)
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "psychopy": fake_psychopy,
+                    "bin.utils": fake_utils,
+                    "bin.screen": fake_screen,
+                },
+            ),
+            patch.object(bin_package, "utils", fake_utils, create=True),
+            patch.object(bin_package, "screen", fake_screen, create=True),
+        ):
+            spec.loader.exec_module(module)
+        return module
+
+    def test_run_task_propagates_native_geometry_and_clockwise_rotation(self):
+        mouse = types.SimpleNamespace(
+            getPressed=Mock(return_value=(False, False, False)),
+            clickReset=Mock(),
+        )
+        fake_event = types.SimpleNamespace(
+            Mouse=Mock(return_value=mouse),
+            clearEvents=Mock(),
+        )
+        fake_psychopy = types.ModuleType("psychopy")
+        fake_psychopy.event = fake_event
+        fake_psychopy.logging = types.SimpleNamespace(
+            CRITICAL=50,
+            console=types.SimpleNamespace(setLevel=Mock()),
+        )
+
+        main_screen = types.SimpleNamespace(
+            index=0,
+            x=0,
+            y=0,
+            width=2560,
+            height=1600,
+            name="MAIN",
+            rotation="normal",
+        )
+        experimenter_screen = types.SimpleNamespace(
+            index=1,
+            x=2560,
+            y=0,
+            width=1920,
+            height=1080,
+            name="PREVIEW",
+            rotation="normal",
+        )
+        resolve_task_screens = Mock(
+            return_value=(main_screen, experimenter_screen)
+        )
+        resolve_scene_size = Mock(return_value=(2560, 1600))
+        software_stimulus_rotation = Mock(return_value=90)
+        oriented_size = Mock(return_value=(1600, 2560))
+
+        preview_instances = []
+
+        class FakePreview:
+            def __init__(self, *args, **kwargs):
+                self.clear_calls = []
+                self.play_calls = []
+                self.closed = False
+                preview_instances.append(self)
+
+            def clear_scene(self, **kwargs):
+                self.clear_calls.append(kwargs)
+
+            def play_shared_video(self, **kwargs):
+                self.play_calls.append(kwargs)
+
+            def poll(self):
+                return False
+
+            def close(self):
+                self.closed = True
+
+        fake_screen = types.ModuleType("bin.screen")
+        fake_screen.ExperimenterPreview = FakePreview
+        fake_screen.describe_screen = lambda screen: screen.name
+        fake_screen.load_screen_config = Mock()
+        fake_screen.oriented_size = oriented_size
+        fake_screen.resolve_scene_size = resolve_scene_size
+        fake_screen.resolve_task_screens = resolve_task_screens
+        fake_screen.software_stimulus_rotation = software_stimulus_rotation
+
+        stream = {
+            "codec_name": "hevc",
+            "profile": "Main",
+            "pix_fmt": "yuv420p",
+            "width": 1920,
+            "height": 1080,
+            "duration": "60.0",
+            "avg_frame_rate": "30/1",
+        }
+        win = types.SimpleNamespace(
+            size=(2560, 1600),
+            _neuro_tasks_refresh_sync_requested=True,
+            close=Mock(),
+        )
+        movie = types.SimpleNamespace(stop=Mock())
+        playback_result = {
+            "movie_stim": movie,
+            "start_flip_perf_s": 10.0,
+            "last_frame_end_perf_s": 12.0,
+            "video_path": Path("clip.mp4"),
+            "video_name": "clip.mp4",
+            "source_duration_s": 60.0,
+            "clip_start_s": 1.0,
+            "clip_end_s": 3.0,
+            "clip_duration_s": 2.0,
+            "actual_source_start_s": 1.0,
+            "actual_source_last_frame_s": 3.0,
+            "displayed_duration_s": 2.0,
+            "frames_presented": 120,
+            "aborted": True,
+            "abort_reason": "mouse_click",
+            "dropped_frames": 0,
+            "main_display_dropped_frames": 0,
+            "sync_pulses": 0,
+        }
+        play_video_fill_screen = Mock(return_value=playback_result)
+        fake_utils = types.ModuleType("bin.utils")
+        fake_utils.probe_video_stream = Mock(return_value=stream)
+        fake_utils.setup_window = Mock(return_value=win)
+        fake_utils.make_bg_rect = Mock(return_value=object())
+        fake_utils.resolve_frame_rate = Mock(return_value=(60.0, 1.0 / 60.0))
+        fake_utils.play_video_fill_screen = play_video_fill_screen
+
+        module = self._load_task_module(
+            fake_utils,
+            fake_screen,
+            fake_psychopy,
+        )
+
+        class FakeFramePublisher:
+            name = "raw-frame-buffer"
+            slot_count = 4
+            sequence = 0
+
+            def __init__(self, capacity_bytes):
+                self.capacity_bytes = capacity_bytes
+                self.closed = False
+
+            def descriptor(self):
+                return {
+                    "name": self.name,
+                    "capacity_bytes": self.capacity_bytes,
+                    "slot_count": self.slot_count,
+                }
+
+            def close(self):
+                self.closed = True
+
+        class FakeEventLogger:
+            @staticmethod
+            def seconds_since_session_start(timestamp):
+                return timestamp
+
+        class FakeBehaviorLogger:
+            def __init__(self):
+                self.rows = []
+
+            def writerow(self, row):
+                self.rows.append(row)
+
+        class FakeMessageLogger:
+            def __init__(self):
+                self.messages = []
+
+            def log(self, level, message):
+                self.messages.append((level, message))
+
+        class FakeSessionLogs:
+            def __init__(self):
+                self.event_logger = FakeEventLogger()
+                self.message_logger = FakeMessageLogger()
+                self.behavior_logger = FakeBehaviorLogger()
+                self.session_dir = Path("test-session")
+                self.closed = False
+
+            def flush(self):
+                pass
+
+            def close(self):
+                self.closed = True
+
+        session_logs = FakeSessionLogs()
+        module.SessionLogBundle = Mock(return_value=session_logs)
+        module.SharedVideoFrameBuffer = FakeFramePublisher
+        module.build_main_and_worker_affinity_plan = Mock(
+            return_value={
+                "supported": False,
+                "reason": "test",
+                "current_affinity": None,
+                "main_cpu_affinity": None,
+                "worker_cpu_affinity": None,
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_path = Path(tmpdir) / "clip.mp4"
+            video_path.touch()
+            stop_reason = module.run_task(
+                video_files=[str(video_path)],
+                clip_duration_seconds=2.0,
+                output_dir=tmpdir,
+                screen_config={"main": "MAIN", "experimenter": "PREVIEW"},
+            )
+
+        self.assertEqual(stop_reason, "mouse_click")
+        resolve_task_screens.assert_called_once_with(
+            {"main": "MAIN", "experimenter": "PREVIEW"},
+            allow_same_screen=True,
+        )
+        software_stimulus_rotation.assert_called_once_with("normal")
+        oriented_size.assert_called_once_with((2560, 1600), 90)
+
+        playback_kwargs = play_video_fill_screen.call_args.kwargs
+        self.assertEqual(playback_kwargs["native_target_size"], (2560, 1600))
+        self.assertEqual(playback_kwargs["stimulus_rotation_degrees"], 90)
+
+        preview = preview_instances[0]
+        self.assertEqual(len(preview.play_calls), 1)
+        self.assertEqual(preview.play_calls[0]["video_size"], (1920, 1080))
+        self.assertEqual(preview.play_calls[0]["main_size"], (2560, 1600))
+        self.assertEqual(preview.play_calls[0]["main_rotation_deg"], 90)
+        self.assertEqual(len(preview.clear_calls), 2)
+        for clear_call in preview.clear_calls:
+            self.assertEqual(clear_call["main_size"], (2560, 1600))
+            self.assertEqual(clear_call["main_rotation_deg"], 90)
+
+        messages = [message for _, message in session_logs.message_logger.messages]
+        geometry_message = next(
+            message for message in messages if message.startswith("resolved_main_scene_size")
+        )
+        self.assertIn("native_size=2560x1600", geometry_message)
+        self.assertIn("subject_size=1600x2560", geometry_message)
+        self.assertIn("stimulus_rotation_deg=90", geometry_message)
+        self.assertFalse(any("swap_interval" in message for message in messages))
 
 
 if __name__ == "__main__":

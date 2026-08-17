@@ -1,7 +1,9 @@
 """Timing validation helpers for active_foraging presentation modes."""
 
+import math
 
-def duration_requires_positive_frames(*, sequential: bool, is_memory: bool) -> bool:
+
+def duration_requires_visible_phase(*, sequential: bool, is_memory: bool) -> bool:
     """Return whether duration represents a visible stimulus phase."""
     return bool(sequential) or bool(is_memory)
 
@@ -13,9 +15,11 @@ def validate_duration_for_presentation_mode(
     is_memory: bool,
     context: str = "active_foraging",
 ) -> None:
-    """Validate duration semantics before frame-alignment validation."""
+    """Validate duration semantics independently of display refresh rate."""
     duration_s = float(duration)
-    if duration_requires_positive_frames(sequential=sequential, is_memory=is_memory):
+    if not math.isfinite(duration_s):
+        raise ValueError(f"Invalid {context} timing config: duration must be finite.")
+    if duration_requires_visible_phase(sequential=sequential, is_memory=is_memory):
         if duration_s <= 0.0:
             raise ValueError(
                 f"Invalid {context} timing config: duration must be positive when "

@@ -382,10 +382,8 @@ def run_display_diagnostic(
 
     try:
         from bin.screen import (
-            activate_psychopy_window,
-            enforce_window_vsync,
+            initialize_psychopy_window,
             load_screen_config,
-            open_psychopy_window,
             resolve_task_screens,
         )
         from bin.task_lifecycle import signal_task_window_ready
@@ -398,20 +396,17 @@ def run_display_diagnostic(
         monitor_refresh_rate_hz, monitor_rate_detail = query_main_monitor_refresh_rate(
             main_screen
         )
-        win_kwargs = {
-            "color": (0.0, 0.0, 0.0),
-            "colorSpace": "rgb",
-            "units": "pix",
-            "allowGUI": False,
-            "allowStencil": False,
-            "waitBlanking": True,
-        }
-        win = open_psychopy_window(
+        win = initialize_psychopy_window(
             visual_module,
             main_screen,
             fullscreen=True,
-            require_correct_placement=False,
-            **win_kwargs,
+            sync_to_refresh=True,
+            on_window_ready=signal_task_window_ready,
+            color=(0.0, 0.0, 0.0),
+            colorSpace="rgb",
+            units="pix",
+            allowStencil=False,
+            waitBlanking=True,
         )
         placement_detail = win._neuro_tasks_screen_placement
         placement_error = getattr(win, "_neuro_tasks_screen_placement_error", None)
@@ -441,8 +436,6 @@ def run_display_diagnostic(
         )
         if not isinstance(window_mode, str):
             window_mode = "native PsychoPy fullscreen"
-        signal_task_window_ready()
-        activate_psychopy_window(win)
         if affinity_plan is not None:
             affinity_check = pin_diagnostic_to_cpu_zero(
                 affinity_plan,
@@ -508,7 +501,9 @@ def run_display_diagnostic(
                 "pass",
                 f"{window_mode} verified on {placement_detail}; {selection_detail}",
             )
-        vsync_requested = bool(enforce_window_vsync(win)) and bool(
+        vsync_requested = bool(
+            getattr(win, "_neuro_tasks_refresh_sync_requested", False)
+        ) and bool(
             getattr(win, "waitBlanking", False)
         )
         swap_interval = None

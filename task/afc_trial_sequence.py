@@ -22,13 +22,13 @@ python task/afc_trial_sequence.py --config test_configs/csc_shape_config
 
 """
 import argparse
+import math
 import sys
-import time
 import random
 from pathlib import Path
-from typing import Tuple, Optional, List
+from typing import Any, Dict, Optional, Tuple
 
-from psychopy import core, logging as pylogging, event
+from psychopy import logging as pylogging
 
 # Ensure project root on sys.path for local imports (same pattern as other tasks)
 _project_root = Path(__file__).resolve().parents[1]
@@ -36,9 +36,16 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from bin import utils
+from bin.frame_timing import flip_with_timestamps, plan_frame_duration
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.config import load_config, validate_config
+from bin.screen import (
+    describe_screen,
+    load_screen_config,
+    resolve_scene_size,
+    resolve_task_screens,
+)
 
 
 def parse_args():
@@ -72,6 +79,8 @@ def parse_args():
     p.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate (Hz); skip auto-detection if provided")
     p.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi GPIO LED pulses for onset cues")
     p.add_argument("--raspi_pin", type=int, default=None, help="GPIO pin to use for raspi LED pulses (BCM numbering)")
+    p.add_argument("--main_screen", default=None, help="Main task screen index or output name")
+    p.add_argument("--experimenter_screen", default=None, help="Experimenter screen index or output name")
     # svg_size removed; use --image_size for both rasters and SVG rasterization
     return p.parse_args()
 
@@ -103,9 +112,23 @@ def run_task(
     raspi: bool = False,
     raspi_pin: int = 18,
     config_name: Optional[str] = None,
+    screen_config: Optional[Dict[str, Any]] = None,
 ):
     # Configure debug behavior before any rasterization
     utils.set_debug(debug)
+    duration = float(duration)
+    choice_time = float(choice_time)
+    iti = float(iti)
+    isi = float(isi)
+    if not math.isfinite(duration) or duration <= 0.0:
+        raise ValueError("duration must be a positive finite value")
+    if not math.isfinite(choice_time) or choice_time <= 0.0:
+        raise ValueError("choice_time must be a positive finite value")
+    for label, seconds in (("isi", isi), ("iti", iti)):
+        if not math.isfinite(seconds) or seconds < 0.0:
+            raise ValueError(f"{label} must be a finite non-negative value")
+    if int(n_trials) < 1:
+        raise ValueError("n must be at least 1")
     if seed is not None:
         random.seed(seed)
 
@@ -121,7 +144,13 @@ def run_task(
     preloaded = utils.load_image_assets(image_files, raster_size=image_size, bg_rgb_255=bg)
 
     # Window + background + fixation
-    win = utils.setup_window(bg_rgb_255=bg, fullscreen=fullscreen, size=win_size)
+    main_screen, _ = resolve_task_screens(screen_config, allow_same_screen=True)
+    win = utils.setup_window(
+        bg_rgb_255=bg,
+        fullscreen=fullscreen,
+        size=win_size,
+        screen_info=main_screen,
+    )
     fix = utils.make_fixation_cross(win, size=32)
     bg_rect = utils.make_bg_rect(win, bg)
 
@@ -148,6 +177,7 @@ def run_task(
         "INFO",
         f"session_start task=afc_trial_sequence config_name={resolved_config_name} session_dir={session_logs.session_dir}",
     )
+    msg_logger.log("INFO", f"resolved_screens main={describe_screen(main_screen)}")
 
     # Initialize lgpio if requested
     pigpio_pi = None  # naming kept for compatibility with presenter API
@@ -174,33 +204,15 @@ def run_task(
         msg_logger=msg_logger,
         context="afc_trial_sequence",
     )
-    utils.validate_frame_aligned_timings(
-        fps,
-        {
-            "duration": duration,
-            "isi": isi,
-            "choice_time": choice_time,
-            "iti": iti,
-        },
-        context="afc_trial_sequence",
-        minimum_frames={
-            "duration": 1,
-            "choice_time": 1,
-        },
-        msg_logger=msg_logger,
-    )
-    # Log global quantization for task timing parameters
+    duration_plan = plan_frame_duration(duration, fps, minimum_frames=1)
+    isi_plan = plan_frame_duration(isi, fps)
+    choice_plan = plan_frame_duration(choice_time, fps, minimum_frames=1)
+    iti_plan = plan_frame_duration(iti, fps)
+    dur_fr, dur_s = duration_plan.frame_count, duration_plan.scheduled_s
+    isi_fr, isi_s = isi_plan.frame_count, isi_plan.scheduled_s
+    ch_fr, ch_s = choice_plan.frame_count, choice_plan.scheduled_s
+    iti_frames, iti_s = iti_plan.frame_count, iti_plan.scheduled_s
     try:
-        def _q(seconds: float, at_least_one: bool = False):
-            frames = int(round(max(0.0, float(seconds)) * float(fps)))
-            if at_least_one:
-                frames = max(1, frames)
-            return frames, frames / float(fps)
-
-        dur_fr, dur_s = _q(duration, at_least_one=True)
-        isi_fr, isi_s = _q(isi, at_least_one=False)
-        ch_fr, ch_s = _q(choice_time, at_least_one=False)
-        iti_frames, iti_s = _q(iti, at_least_one=False)
         msg_logger.log(
             "INFO",
             (
@@ -222,17 +234,17 @@ def run_task(
     # Main trial loop
     aborted_task = False
     for trial_num in range(1, n_trials + 1):
-        if isi and isi > 0:
+        if isi_fr > 0:
             bg_rect.draw()
             if fix is not None:
                 fix.draw()
-            cue_flip = win.flip()
-            cue_perf = time.perf_counter()
+            cue_timing = flip_with_timestamps(win)
             logger.log_frame_flip(
                 trial_num=trial_num,
                 event="trial_cue",
-                timestamp_perf_s=cue_perf,
-                requested_duration=isi_s,
+                timestamp_perf_s=cue_timing.actual_perf_s,
+                requested_timestamp_perf_s=cue_timing.requested_perf_s,
+                requested_duration=isi,
             )
             for _ in range(max(0, isi_fr - 1)):
                 bg_rect.draw()
@@ -248,12 +260,12 @@ def run_task(
         pil0 = preloaded[first_p]
         stim_size = pil0.size  # (W,H) in pixels
 
-        # Determine the logical window size to use for placement. Prefer the
-        # user-provided `win_size` (the logical size passed to Window) when
-        # available; some backends report a different backing-buffer size via
-        # `win.size` (e.g., Retina displays). Using the requested `win_size`
-        # keeps coordinates in the expected logical pixel space.
-        effective_win_size = tuple(win_size) if win_size is not None else tuple(win.size)
+        effective_win_size = resolve_scene_size(
+            main_screen,
+            fullscreen=bool(fullscreen),
+            requested_size=win_size,
+            realized_size=tuple(win.size),
+        )
 
         # Compute non-overlapping positions for all options in this trial.
         sampled_positions = utils.sample_non_overlapping_positions(
@@ -307,7 +319,10 @@ def run_task(
                 trial_num=trial_num,
                 event="gray_inter_trial_interval",
                 timestamp_perf_s=float(gray_start_perf),
-                requested_duration=iti_s if iti_s > 0 else None,
+                requested_timestamp_perf_s=trial_meta.get(
+                    "gray_flip_requested_perf_s"
+                ),
+                requested_duration=iti if iti > 0.0 else None,
             )
 
         behavior_row = {"trial_num": trial_num}
@@ -326,7 +341,7 @@ def run_task(
         )
         behavior_logger.writerow(behavior_row)
 
-        if iti and iti > 0:
+        if iti_frames > 0:
             msg_logger.log("INFO", f"timing_quantization trial_num={trial_num} iti={iti:.6f}s-> {iti_frames}fr({iti_s:.6f}s)")
             for _f in range(max(0, iti_frames - 1)):
                 bg_rect.draw()
@@ -365,6 +380,12 @@ def main():
         if val is not None:
             return val
         return cfg.get(name, default)
+
+    screen_config = load_screen_config(
+        cfg,
+        cli_main=args.main_screen,
+        cli_experimenter=args.experimenter_screen,
+    )
 
     # gather parameters (use config defaults where CLI doesn't override)
     images_dir = _get("images_dir", cfg.get("images_dir"))
@@ -415,6 +436,7 @@ def main():
             raspi=_get("raspi", cfg.get("raspi", False)),
             raspi_pin=_get("raspi_pin", cfg.get("raspi_pin", 18)),
             config_name=config_name,
+            screen_config=screen_config,
         )
         if aborted_by_user:
             sys.exit(USER_EXIT_CODE)

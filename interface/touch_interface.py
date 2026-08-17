@@ -21,6 +21,7 @@ if str(_project_root) not in sys.path:
 
 from bin.screen import (
     MAIN_SCREEN_ENV,
+    SCREEN_ENV_OVERRIDE_ENV,
     SECONDARY_SCREEN_ENV,
     load_screen_config,
     resolve_interface_screen,
@@ -1044,10 +1045,16 @@ def main() -> None:
             allow_same_screen=True,
         )
         screen_info = resolve_interface_screen(root, screen_cfg)
-        if screen_cfg["main"] is not None:
-            os.environ[MAIN_SCREEN_ENV] = str(screen_cfg["main"])
-        if screen_cfg["experimenter"] is not None:
-            os.environ[SECONDARY_SCREEN_ENV] = str(screen_cfg["experimenter"])
+        # Child diagnostics and task configs must resolve the exact same
+        # physical outputs as the launcher, even when a source task config
+        # contains stale numeric selectors. Export stable resolved names.
+        os.environ[MAIN_SCREEN_ENV] = str(main_screen.name or main_screen.index)
+        os.environ[SECONDARY_SCREEN_ENV] = (
+            ""
+            if experimenter_screen is None
+            else str(experimenter_screen.name or experimenter_screen.index)
+        )
+        os.environ[SCREEN_ENV_OVERRIDE_ENV] = "1"
         idle_guard = create_experiment_idle_guard(
             root,
             cfg,

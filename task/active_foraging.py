@@ -45,6 +45,7 @@ from bin.affinity import (
 from bin.daqc2_outputs import DAQC2DigitalOutputs
 from bin.afc_geometry import compute_afc_positions, stimulus_size
 from bin.afc_stimuli import render_afc_stimulus
+from bin.frame_timing import plan_frame_duration, validate_requested_durations
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 import numpy as np
@@ -53,15 +54,17 @@ from bin.screen import (
     ExperimenterPreview,
     describe_screen,
     load_screen_config,
+    oriented_size,
     reward_level_color,
     resolve_scene_size,
     resolve_task_screens,
     serialize_preview_image,
     set_window_mouse_visible,
+    software_stimulus_rotation,
 )
 from interface.rig_mode import IS_RIG_ENV_VAR, experimenter_cursor_visible_for_touchscreen
 from task.active_foraging_timing import (
-    duration_requires_positive_frames,
+    duration_requires_visible_phase,
     validate_duration_for_presentation_mode,
 )
 
@@ -390,6 +393,11 @@ def run_task(
             sequential=bool(sequential),
             is_memory=bool(is_memory),
         )
+        validate_requested_durations(
+            {"isi": isi, "choice_time": choice_time, "iti": iti},
+            positive={"choice_time"},
+            context="active_foraging",
+        )
     except ValueError as exc:
         msg_logger.log("ERROR", str(exc))
         raise
@@ -573,28 +581,6 @@ def run_task(
         msg_logger=msg_logger,
         context="active_foraging",
     )
-    utils.validate_frame_aligned_timings(
-        fps,
-        {
-            "duration": duration,
-            "isi": isi,
-            "choice_time": choice_time,
-            "iti": iti,
-        },
-        context="active_foraging",
-        minimum_frames={
-            "choice_time": 1,
-            **(
-                {"duration": 1}
-                if duration_requires_positive_frames(
-                    sequential=bool(sequential),
-                    is_memory=bool(is_memory),
-                )
-                else {}
-            ),
-        },
-        msg_logger=msg_logger,
-    )
     if experimenter_screen is not None:
         experimenter_preview = ExperimenterPreview(
             experimenter_screen,
@@ -624,12 +610,14 @@ def run_task(
     try:
         # Log global timing quantization once based on detected fps
         def _q(seconds: float, at_least_one: bool = False):
-            frames = int(round(max(0.0, float(seconds)) * float(fps)))
-            if at_least_one:
-                frames = max(1, frames)
-            return frames, frames / float(fps)
+            plan = plan_frame_duration(
+                seconds,
+                fps,
+                minimum_frames=1 if at_least_one else 0,
+            )
+            return plan.frame_count, plan.scheduled_s
 
-        if duration_requires_positive_frames(
+        if duration_requires_visible_phase(
             sequential=bool(sequential),
             is_memory=bool(is_memory),
         ):
@@ -655,18 +643,31 @@ def run_task(
     # didn't provide one, default to 32.
     if fixation_size is None:
         fixation_size = 32
-    fix = utils.make_fixation_cross(win, size=fixation_size)
-    reward_counts = {0: 0, 1: 0, 2: 0, 3: 0}
     main_scene_size = resolve_scene_size(
         main_screen,
         fullscreen=bool(fullscreen),
         requested_size=win_size,
         realized_size=tuple(win.size),
     )
+    stimulus_rotation_degrees = software_stimulus_rotation(main_screen.rotation)
+    subject_scene_size = oriented_size(
+        main_scene_size,
+        stimulus_rotation_degrees,
+    )
+    fix = utils.make_fixation_cross(
+        win,
+        size=fixation_size,
+        ori=stimulus_rotation_degrees,
+    )
+    reward_counts = {0: 0, 1: 0, 2: 0, 3: 0}
     try:
         msg_logger.log(
             "INFO",
-            f"resolved_main_scene_size size={main_scene_size[0]}x{main_scene_size[1]} fullscreen={int(bool(fullscreen))} requested_win_size={win_size} realized_win_size={tuple(win.size)}",
+            f"resolved_main_scene_size native_size={main_scene_size[0]}x{main_scene_size[1]} "
+            f"subject_size={subject_scene_size[0]}x{subject_scene_size[1]} "
+            f"output_rotation={main_screen.rotation} stimulus_rotation_deg={stimulus_rotation_degrees} "
+            f"fullscreen={int(bool(fullscreen))} requested_win_size={win_size} "
+            f"realized_win_size={tuple(win.size)}",
         )
     except Exception:
         pass
@@ -684,6 +685,7 @@ def run_task(
             fixation_color=(0, 0, 0),
             reward_counts=reward_counts,
             highlight_box=None,
+            main_rotation_deg=stimulus_rotation_degrees,
         )
 
     def _preview_choice_feedback(
@@ -730,6 +732,7 @@ def run_task(
                         "image_payload": payload,
                         "pos": [float(pos[0]), float(pos[1])],
                         "size": [float(size_px[0]), float(size_px[1])],
+                        "ori": stimulus_rotation_degrees,
                     }
                 )
                 if idx == chosen_index_1based:
@@ -739,6 +742,7 @@ def run_task(
                         "size": [highlight_size[0], highlight_size[1]],
                         "color": list(reward_level_color(reward_level)),
                         "line_width": 6.0,
+                        "ori": stimulus_rotation_degrees,
                     }
 
         experimenter_preview.show_static_scene(
@@ -750,6 +754,7 @@ def run_task(
             fixation_color=(0, 0, 0),
             reward_counts=reward_counts,
             highlight_box=highlight_box,
+            main_rotation_deg=stimulus_rotation_degrees,
         )
 
     def _wait_or_abort(duration_s: float) -> bool:
@@ -771,7 +776,15 @@ def run_task(
     onset_stim = None
     if self_initiation:
         try:
-            onset_stim = utils.make_onset_cue_stim(win, bg_rgb_255=bg, size_frac=0.125, cells=8, sigma_frac=0.22, zero_threshold=1)
+            onset_stim = utils.make_onset_cue_stim(
+                win,
+                bg_rgb_255=bg,
+                size_frac=0.125,
+                cells=8,
+                sigma_frac=0.22,
+                zero_threshold=1,
+                ori=stimulus_rotation_degrees,
+            )
         except Exception:
             onset_stim = None
 
@@ -859,23 +872,27 @@ def run_task(
 
     def _deliver_manual_reward() -> None:
         pulse_duration = max(0.0, float(pump_pulse_time_seconds))
-        start_perf = time.perf_counter()
+        start_requested_perf = time.perf_counter()
         _set_pump_pin(1, context="manual_reward")
+        start_perf = time.perf_counter()
         try:
             logger.log_signal(
                 trial_num=None,
                 event="pump_on",
                 timestamp_perf_s=start_perf,
+                requested_timestamp_perf_s=start_requested_perf,
                 requested_duration=pulse_duration,
             )
             core.wait(pulse_duration)
         finally:
-            end_perf = time.perf_counter()
+            end_requested_perf = time.perf_counter()
             _set_pump_pin(0, context="manual_reward")
+            end_perf = time.perf_counter()
             logger.log_signal(
                 trial_num=None,
                 event="pump_off",
                 timestamp_perf_s=end_perf,
+                requested_timestamp_perf_s=end_requested_perf,
             )
 
     def _poll_experimenter_controls() -> bool:
@@ -956,8 +973,8 @@ def run_task(
         except Exception:
             pass
     task_end_notes = "done"
-    iti_frames = max(0, int(round(float(iti) * fps)))
-    iti_s = iti_frames / fps
+    iti_plan = plan_frame_duration(iti, fps)
+    iti_frames = iti_plan.frame_count
 
     def _fmt_optional(value: Any) -> str:
         if value == "" or value is None:
@@ -995,14 +1012,12 @@ def run_task(
             )
 
             first_pair = trial_options[0]
-            stim_size = stimulus_size(preloaded, first_pair)
-
-            effective_win_size = resolve_scene_size(
-                main_screen,
-                fullscreen=bool(fullscreen),
-                requested_size=win_size,
-                realized_size=tuple(win.size),
+            stim_size = oriented_size(
+                stimulus_size(preloaded, first_pair),
+                stimulus_rotation_degrees,
             )
+
+            effective_win_size = main_scene_size
             sampled_positions, positions = compute_afc_positions(
                 fixed_positions=fixed_positions,
                 num_afc=num_afc,
@@ -1048,6 +1063,7 @@ def run_task(
                 scene_main_size=effective_win_size,
                 event_profile="active_foraging",
                 reward_levels=[reward_map.get(pair, 0) for pair in trial_options],
+                stimulus_rotation_degrees=stimulus_rotation_degrees,
             )
             timing_monitor = trial_meta.get("_main_display_frame_timing_monitor")
             if aborted:
@@ -1089,7 +1105,7 @@ def run_task(
                 if reward_to_timeout_map is not None:
                     apply_timeout = reward_to_timeout_map.get(str(reward_level), 0)
 
-                gray_duration_requested = iti_s
+                gray_duration_requested = float(iti)
                 if num_pulses > 0:
                     gray_duration_requested += max(0.0, float(pump_delay_time))
                     gray_duration_requested += float(num_pulses * pump_pulse_time_seconds)
@@ -1098,7 +1114,7 @@ def run_task(
                     gray_duration_requested += float(timeout_duration_seconds)
             else:
                 abort_requested = False
-                gray_duration_requested = iti_s
+                gray_duration_requested = float(iti)
 
             gray_start_perf = trial_meta.get("gray_flip_perf_s", None)
             if gray_start_perf is not None:
@@ -1106,6 +1122,9 @@ def run_task(
                     trial_num=trial_num,
                     event="grey_inter_trial_interval",
                     timestamp_perf_s=float(gray_start_perf),
+                    requested_timestamp_perf_s=trial_meta.get(
+                        "gray_flip_requested_perf_s"
+                    ),
                     requested_duration=gray_duration_requested if gray_duration_requested > 0 else None,
                 )
 
@@ -1120,12 +1139,14 @@ def run_task(
                     break
 
                 for pulse_num in range(1, num_pulses + 1):
-                    pulse_start_perf = time.perf_counter()
+                    pulse_start_requested_perf = time.perf_counter()
                     _set_pump_pin(1, context="task_reward")
+                    pulse_start_perf = time.perf_counter()
                     logger.log_signal(
                         trial_num=trial_num,
                         event="pump_on",
                         timestamp_perf_s=pulse_start_perf,
+                        requested_timestamp_perf_s=pulse_start_requested_perf,
                         requested_duration=pump_pulse_time_seconds,
                     )
                     if _wait_or_abort(pump_pulse_time_seconds):
@@ -1133,12 +1154,14 @@ def run_task(
                         msg_logger.log("WARN", f"experimenter_exit_during_pump trial_num={trial_num} pulse={pulse_num}")
                         abort_requested = True
 
-                    pulse_end_perf = time.perf_counter()
+                    pulse_end_requested_perf = time.perf_counter()
                     _set_pump_pin(0, context="task_reward")
+                    pulse_end_perf = time.perf_counter()
                     logger.log_signal(
                         trial_num=trial_num,
                         event="pump_off",
                         timestamp_perf_s=pulse_end_perf,
+                        requested_timestamp_perf_s=pulse_end_requested_perf,
                     )
                     if abort_requested:
                         break
@@ -1154,12 +1177,14 @@ def run_task(
                     break
 
                 if apply_timeout > 0:
-                    timeout_start_perf = time.perf_counter()
+                    timeout_start_requested_perf = time.perf_counter()
                     _set_buzzer_pin(1, context="timeout")
+                    timeout_start_perf = time.perf_counter()
                     logger.log_signal(
                         trial_num=trial_num,
                         event="buzzer_on",
                         timestamp_perf_s=timeout_start_perf,
+                        requested_timestamp_perf_s=timeout_start_requested_perf,
                         requested_duration=timeout_duration_seconds,
                     )
                     if _wait_or_abort(timeout_duration_seconds):
@@ -1167,12 +1192,14 @@ def run_task(
                         msg_logger.log("WARN", f"experimenter_exit_during_timeout trial_num={trial_num}")
                         abort_requested = True
 
-                    timeout_end_perf = time.perf_counter()
+                    timeout_end_requested_perf = time.perf_counter()
                     _set_buzzer_pin(0, context="timeout")
+                    timeout_end_perf = time.perf_counter()
                     logger.log_signal(
                         trial_num=trial_num,
                         event="buzzer_off",
                         timestamp_perf_s=timeout_end_perf,
+                        requested_timestamp_perf_s=timeout_end_requested_perf,
                     )
 
                 if abort_requested or task_end_notes != "done":

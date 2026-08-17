@@ -360,44 +360,59 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
 - `play_video` takes an explicit `video_files` list, a required
   `clip_duration_seconds`, and a positive `num_clips`. Subject-screen taps do
   not interrupt playback; the task completes after `num_clips` clips. Each
-  trial randomly selects one source, uniformly
-  selects a valid temporal start aligned to the configured video-frame
-  timebase, seeks within that source, and presents the fixed-duration clip
-  without extracting a temporary file. `frame_rate` is authoritative and
-  defaults to `30`, even when container metadata reports another rate. The
-  requested duration is rounded only to the nearest count of configured video
-  frames; both the original request and scheduled duration are logged.
+  trial randomly selects one source, uniformly selects a valid temporal start
+  aligned to the configured video-frame timebase, and presents the
+  fixed-duration clip without extracting a temporary file. A dedicated
+  `multiprocessing` `spawn` worker uses ffpyplayer directly to seek, decode,
+  center-crop, normalize to the configured rate, and prepare that clip.
+  `frame_rate` is authoritative and defaults to `30`, even when container
+  metadata reports another rate. The requested duration is rounded only to the
+  nearest count of configured video frames; both the original request and
+  scheduled duration are logged.
 - Sources must be HEVC Main/yuv420p. The task probes each unique path once and
-  refuses incompatible media or sources shorter than the requested clip. On
-  Raspberry Pi, it also requires an accessible HEVC V4L2 hardware decoder.
+  refuses incompatible media or sources shorter than the requested clip.
 - The behavior row for each trial records the full source path, requested and
   actual source timestamps, first-frame display time, last-frame end time,
   requested and scheduled duration, configured rate, scheduled/displayed frame
-  counts, skipped schedule slots, and displayed duration. The corresponding event-log
-  start/end records are main-display flips; the end flip removes the last frame.
+  counts, and displayed duration. The corresponding event-log start/end records
+  are main-display flips; the end flip removes the last frame.
 - Video flips use absolute `1 / frame_rate` deadlines. The task draws the
-  latest decoded frame, waits until `flip_request_lead_seconds` (default
-  `0.015`) before the deadline, and then submits a refresh-synchronized
-  PsychoPy flip. If work overruns a deadline, expired video slots are skipped
-  instead of shifting subsequent deadlines and accumulating lag. A monitor
-  whose refresh is not a near-integer multiple of `frame_rate` produces an
-  explicit cadence warning.
-- `play_video` decodes each clip once. Every newly displayed decoded frame is
-  published to a four-slot, latest-frame-wins shared-memory ring; the
-  experimenter process displays the newest complete frame without creating a
-  second VLC decoder or accumulating a delayed frame queue. Each ring frame
-  includes its sequence, source frame/media time, main-display flip time, and
-  trial number.
+  next prepared frame, waits until `flip_request_lead_seconds` (default
+  `0.015`) before its deadline, and then submits a refresh-synchronized
+  PsychoPy flip. A completed clip presents every normalized frame exactly once
+  in index order; a late flip does not skip an expired frame slot or substitute
+  a newer decoded frame. If the next chunk is unavailable at a boundary,
+  playback stops with `video_buffer_underrun` before the missing frame instead
+  of waiting or skipping it. A monitor whose refresh is not a near-integer
+  multiple of `frame_rate` produces an explicit cadence warning.
+- The ffpyplayer worker writes prepared RGB24 frames into parent-owned shared
+  memory. The prepared-frame budget is configured by
+  `video_buffer_megabytes` and defaults to 512 MiB. If the complete prepared
+  clip fits, it is ready before playback in one chunk. Otherwise, the pool has
+  exactly three chunks, each holding at most `max(1, round(frame_rate))` frames
+  (about one second, or fewer when the budget requires); two are ready before
+  playback, and the remaining slot lets the worker stay ahead by refilling
+  released slots as the main process consumes prepared chunks. Queues carry
+  only chunk ownership and timestamp metadata. The main process reads each
+  frame in place across chunk boundaries and performs one direct GL upload into
+  a persistent texture, with no intermediate main-process pixel copy.
+- `play_video` decodes each clip once. No faster than once every 0.1 seconds,
+  the main process copies the currently displayed RGB24 frame into a four-slot,
+  latest-frame-wins shared-memory preview ring. The experimenter process copies
+  the newest committed slot into a private snapshot before its own GL upload;
+  these consistency copies do not create a second decoder or a delayed frame
+  queue. Each preview frame includes its sequence, source frame/media time,
+  main-display flip time, and trial number.
 - The preview is a subject-view mirror: it transposes the complete native main
   framebuffer geometry (background, positions, stimuli, hit boxes, and video
   crop), rather than merely undoing each stimulus orientation. Scene commands
   use a bounded, sequenced latest-snapshot mailbox, and shared video reads the
   newest committed ring frame, so a slow preview drops stale work instead of
   accumulating lag.
-- The VLC player stays loaded when successive trials select the same source.
-  For efficient random access over a mounted network filesystem, preprocess
-  sources with `bin/preprocess_videos.py`; outputs use MP4 fast-start metadata
-  and a default two-second maximum keyframe interval.
+- A fresh ffpyplayer worker owns each selected clip and exits when preparation
+  is complete. For efficient random access over a mounted network filesystem,
+  preprocess sources with `bin/preprocess_videos.py`; outputs use MP4
+  fast-start metadata and a default two-second maximum keyframe interval.
 - On Raspberry Pi, `play_video` sends one-video-presentation-frame sync pulses on BCM GPIO
   `sync_pin` (default `18`). Pulse onsets are frame locked and their successive
   intervals are sampled inclusively from `sync_interval_frames` (default
@@ -429,6 +444,7 @@ A minimal video-source portion of the configuration is:
   "seek_timeout_seconds": 30.0,
   "frame_rate": 30,
   "flip_request_lead_seconds": 0.015,
+  "video_buffer_megabytes": 512,
   "pump_pin": 0,
   "pump_pulse_time_seconds": 0.25,
   "pump_interval": 60.0
@@ -533,7 +549,7 @@ CPU Affinity for Timing-Critical Tasks
 The `active_foraging` and `play_video` tasks treat CPU core `0` as the timing-critical presentation core.
 
 - The main `active_foraging` process, including stimulus presentation and touch-event detection, pins itself to CPU `0` before entering the trial loop.
-- `play_video` measures the main display and starts both the experimenter preview and VLC decoder on worker cores. Once VLC has decoded and paused on the selected clip's first frame, only the main presentation thread moves to CPU `0` for the refresh-locked playback loop; it returns to worker cores between clips.
+- `play_video` measures the main display and starts the experimenter preview on worker cores. For each clip, its ffpyplayer `spawn` worker also starts on the worker-core pool and prepares either the whole clip or the first two bounded chunks before playback. Only the main presentation thread moves to CPU `0` for the exact, refresh-locked frame loop; it returns to worker cores between clips while the preparation worker remains off CPU `0`.
 - Non-timing-critical child processes such as the background trial-generation worker and the experimenter preview process inherit the remaining CPU cores. This keeps the `play_video` experimenter preview off CPU `0` as well.
 - This is necessary because `multiprocessing` children inherit the parent's CPU affinity by default. To prevent workers from inheriting CPU `0`, the parent process is first moved onto the non-zero worker-core pool, the child processes are spawned, and then the parent is pinned back to CPU `0`.
 - For the intended timing behavior on Linux or Raspberry Pi, CPU `0` should also be isolated from normal OS scheduling at the kernel level, for example with `isolcpus`, `nohz_full`, `rcu_nocbs`, or an equivalent cpuset-based setup.

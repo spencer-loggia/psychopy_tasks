@@ -1,17 +1,14 @@
 """Video validation, shared-frame mirroring, and frame pulse scheduling."""
 from __future__ import annotations
 
-from contextlib import nullcontext
 from dataclasses import dataclass
 from fractions import Fraction
 import math
 from multiprocessing import shared_memory
 from pathlib import Path
-import os
 import random
 import struct
-import time
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Optional, Sequence
 
 import numpy as np
 
@@ -20,9 +17,6 @@ from .frame_timing import plan_frame_duration
 
 REQUIRED_VIDEO_CODEC = "hevc"
 REQUIRED_VIDEO_PIXEL_FORMAT = "yuv420p"
-PI5_MAX_DECODE_PIXELS = 3840 * 2160
-PI5_MAX_DECODE_DIMENSION = 4096
-PI5_MAX_DECODE_FPS = 60.0
 
 _SEQUENCE = struct.Struct("<Q")
 _SLOT_METADATA = struct.Struct("<QqIIIddq")
@@ -119,105 +113,6 @@ def select_random_video_clip(
     )
 
 
-def next_video_frame_slot(
-    *,
-    first_flip_perf_s: float,
-    next_slot: int,
-    now_perf_s: float,
-    frame_rate: float,
-    request_lead_s: float,
-) -> tuple[int, int]:
-    """Return the earliest still-schedulable absolute video-frame slot.
-
-    The second result is the number of expired slots skipped. No relative
-    sleep is carried forward, so a slow decode/draw iteration cannot create
-    cumulative playback lag.
-    """
-    period_s = 1.0 / float(frame_rate)
-    earliest = int(
-        math.ceil(
-            (
-                float(now_perf_s)
-                + float(request_lead_s)
-                - float(first_flip_perf_s)
-            )
-            / period_s
-            - 1e-9
-        )
-    )
-    selected = max(int(next_slot), earliest)
-    return selected, max(0, selected - int(next_slot))
-
-
-def _wait_for_seekable_vlc_player(movie, deadline_perf_s: float) -> bool:
-    player = getattr(movie, "_player", None)
-    while player is not None and time.perf_counter() < deadline_perf_s:
-        try:
-            if bool(player.is_seekable()):
-                return True
-        except Exception:
-            return False
-        time.sleep(0.002)
-    return False
-
-
-def prepare_vlc_clip(
-    movie,
-    clip_start_s: float,
-    seek_timeout_s: float,
-    *,
-    ready_callback: Optional[Callable[[], None]] = None,
-) -> float:
-    """Seek without presenting pre-seek frames, then pause on the first frame."""
-    clip_start_s = float(clip_start_s)
-    seek_timeout_s = float(seek_timeout_s)
-    if not math.isfinite(clip_start_s) or clip_start_s < 0.0:
-        raise ValueError("clip_start_s must be a finite non-negative value")
-    if not math.isfinite(seek_timeout_s) or seek_timeout_s <= 0.0:
-        raise ValueError("seek_timeout_s must be a positive finite value")
-
-    if not bool(getattr(movie, "isPlaying", False)):
-        movie.play(log=False)
-
-    deadline_perf_s = time.perf_counter() + seek_timeout_s
-    if not _wait_for_seekable_vlc_player(movie, deadline_perf_s):
-        raise RuntimeError(
-            f"VLC source did not become seekable within {seek_timeout_s:.1f}s"
-        )
-    counter_before_seek = int(getattr(movie, "_frameCounter", 0))
-    movie.seek(clip_start_s, log=False)
-
-    try:
-        source_frame_duration_s = 1.0 / max(float(movie.getFPS()), 1.0)
-    except Exception:
-        source_frame_duration_s = 1.0 / 30.0
-    seek_tolerance_s = max(0.050, source_frame_duration_s * 1.5)
-
-    while time.perf_counter() < deadline_perf_s:
-        frame_counter = int(getattr(movie, "_frameCounter", 0))
-        try:
-            source_time_s = float(movie.getCurrentFrameTime())
-        except Exception:
-            source_time_s = 0.0
-        frame_ready = frame_counter > counter_before_seek
-        at_target = clip_start_s <= 0.0 or source_time_s >= (
-            clip_start_s - seek_tolerance_s
-        )
-        if frame_ready and at_target:
-            movie.pause(log=False)
-            if ready_callback is not None:
-                ready_callback()
-            return source_time_s
-        if bool(getattr(movie, "isFinished", False)):
-            break
-        time.sleep(0.002)
-
-    raise RuntimeError(
-        f"VLC did not decode the requested clip start {clip_start_s:.6f}s "
-        f"within {seek_timeout_s:.1f}s"
-    )
-
-
 def validate_hevc_stream(
     video_path: str | Path,
     stream: dict[str, Any],
@@ -247,26 +142,13 @@ def validate_hevc_stream(
     if width <= 0 or height <= 0 or width % 2 or height % 2:
         problems.append(f"size={width}x{height} (required positive even dimensions)")
 
-    if require_pi5_compatible and width > 0 and height > 0:
-        if width * height > PI5_MAX_DECODE_PIXELS:
-            problems.append(
-                f"size={width}x{height} exceeds the Pi 5 4K decode pixel limit"
-            )
-        if max(width, height) > PI5_MAX_DECODE_DIMENSION:
-            problems.append(
-                f"size={width}x{height} exceeds the Pi 5 maximum decode dimension"
-            )
-        if frame_rate <= 0.0:
-            problems.append("frame_rate=unknown (required for Pi 5 validation)")
-        elif frame_rate > PI5_MAX_DECODE_FPS + 1e-6:
-            problems.append(
-                f"frame_rate={frame_rate:.6f} exceeds the Pi 5 4K60 decode target"
-            )
+    if require_pi5_compatible and frame_rate <= 0.0:
+        problems.append("frame_rate=unknown (required for Pi playback validation)")
 
     if problems:
         detail = "; ".join(problems)
         raise ValueError(
-            f"Video is not compatible with required Pi 5 hardware HEVC playback: "
+            f"Video is not compatible with the required HEVC playback format: "
             f"{path.name}: {detail}. Run bin/preprocess_videos.py first."
         )
 
@@ -282,37 +164,6 @@ def raspberry_pi_model(model_path: str | Path = "/proc/device-tree/model") -> st
 
 def is_raspberry_pi(model_path: str | Path = "/proc/device-tree/model") -> bool:
     return "raspberry pi" in raspberry_pi_model(model_path).lower()
-
-
-def find_pi_hevc_decoder_device(
-    sys_video_root: str | Path = "/sys/class/video4linux",
-    dev_root: str | Path = "/dev",
-) -> Optional[Path]:
-    """Find an accessible Raspberry Pi HEVC V4L2 decoder device."""
-    sys_root = Path(sys_video_root)
-    device_root = Path(dev_root)
-    try:
-        entries = sorted(sys_root.glob("video*"))
-    except OSError:
-        entries = []
-
-    for entry in entries:
-        try:
-            device_name = (entry / "name").read_text(
-                encoding="utf-8", errors="replace"
-            ).strip().lower()
-        except OSError:
-            continue
-        if "hevc" not in device_name and "rpivid" not in device_name:
-            continue
-        candidate = device_root / entry.name
-        if candidate.exists() and os.access(candidate, os.R_OK | os.W_OK):
-            return candidate
-
-    fallback = device_root / "video19"
-    if fallback.exists() and os.access(fallback, os.R_OK | os.W_OK):
-        return fallback
-    return None
 
 
 @dataclass(frozen=True)
@@ -396,7 +247,7 @@ class RandomFramePulseSchedule:
 
 
 class SharedVideoFrameBuffer:
-    """Four-slot, latest-frame-wins shared memory for decoded RGBA frames."""
+    """Four-slot, latest-frame-wins shared memory for displayed RGB frames."""
 
     def __init__(self, maximum_frame_bytes: int):
         self.maximum_frame_bytes = int(maximum_frame_bytes)
@@ -429,44 +280,45 @@ class SharedVideoFrameBuffer:
             "slot_count": self.slot_count,
         }
 
-    def publish_rgba(
+    def publish_rgb(
         self,
-        frame_buffer,
+        rgb: np.ndarray,
         *,
-        width: int,
-        height: int,
         source_frame_index: int,
         source_media_time_s: Optional[float] = None,
         main_display_flip_perf_s: Optional[float] = None,
         trial_num: Optional[int] = None,
-        lock=None,
     ) -> int:
-        width = int(width)
-        height = int(height)
-        frame_bytes = width * height * 4
+        if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3:
+            raise ValueError("Shared video frames must be HxWx3 uint8 RGB")
+        if not rgb.flags.c_contiguous:
+            raise ValueError("Shared video RGB frames must be contiguous")
+        height, width = int(rgb.shape[0]), int(rgb.shape[1])
+        frame_bytes = width * height * 3
         if width <= 0 or height <= 0 or frame_bytes > self.maximum_frame_bytes:
             raise ValueError(
-                f"RGBA frame {width}x{height} does not fit shared capacity "
+                f"RGB24 frame {width}x{height} does not fit shared capacity "
                 f"{self.maximum_frame_bytes} bytes"
             )
 
         next_sequence = self._sequence + 1
         slot_index = next_sequence % _SHARED_VIDEO_SLOT_COUNT
         slot_offset = _HEADER_SIZE + (slot_index * self.maximum_frame_bytes)
-        lock_context = lock if lock is not None else nullcontext()
-        with lock_context:
-            source = np.ctypeslib.as_array(frame_buffer).view(np.uint8).reshape(-1)
-            if source.size < frame_bytes:
-                raise ValueError(
-                    f"Decoded frame buffer has {source.size} bytes; expected {frame_bytes}"
-                )
-            target = np.ndarray(
-                (frame_bytes,),
-                dtype=np.uint8,
-                buffer=self._shm.buf,
-                offset=slot_offset,
-            )
-            np.copyto(target, source[:frame_bytes], casting="no")
+        # Invalidate the slot before touching its pixels. A reader verifies this
+        # per-slot sequence both before and after its copy, so a writer can never
+        # make a partially overwritten frame look committed.
+        _SEQUENCE.pack_into(
+            self._shm.buf,
+            _slot_metadata_offset(slot_index),
+            0,
+        )
+        target = np.ndarray(
+            (height, width, 3),
+            dtype=np.uint8,
+            buffer=self._shm.buf,
+            offset=slot_offset,
+        )
+        np.copyto(target, rgb, casting="no")
 
         media_time = (
             float(source_media_time_s)
@@ -519,7 +371,7 @@ class SharedVideoFrame:
     trial_num: Optional[int]
     width: int
     height: int
-    rgba: np.ndarray
+    rgb: np.ndarray
 
 
 class SharedVideoFrameReader:
@@ -531,7 +383,6 @@ class SharedVideoFrameReader:
         maximum_frame_bytes: int,
         *,
         slot_count: int = _SHARED_VIDEO_SLOT_COUNT,
-        unregister_resource_tracker: bool = False,
     ):
         self.name = str(name)
         self.maximum_frame_bytes = int(maximum_frame_bytes)
@@ -544,13 +395,6 @@ class SharedVideoFrameReader:
         self._shm = shared_memory.SharedMemory(name=self.name, create=False)
         self._local = np.empty((self.maximum_frame_bytes,), dtype=np.uint8)
         self._closed = False
-        if unregister_resource_tracker:
-            try:
-                from multiprocessing import resource_tracker
-
-                resource_tracker.unregister(self._shm._name, "shared_memory")
-            except Exception:
-                pass
 
     def read_latest(
         self,
@@ -579,7 +423,7 @@ class SharedVideoFrameReader:
             slot_sequence != sequence_before
             or width <= 0
             or height <= 0
-            or frame_bytes != width * height * 4
+            or frame_bytes != width * height * 3
             or frame_bytes > self.maximum_frame_bytes
         ):
             return None
@@ -593,10 +437,17 @@ class SharedVideoFrameReader:
         )
         np.copyto(self._local[:frame_bytes], source, casting="no")
         sequence_after = _SEQUENCE.unpack_from(self._shm.buf, 0)[0]
-        if sequence_after != sequence_before:
+        slot_sequence_after = _SEQUENCE.unpack_from(
+            self._shm.buf,
+            _slot_metadata_offset(slot_index),
+        )[0]
+        if (
+            sequence_after != sequence_before
+            or slot_sequence_after != sequence_before
+        ):
             return None
 
-        rgba = self._local[:frame_bytes].reshape((height, width, 4))
+        rgb = self._local[:frame_bytes].reshape((height, width, 3))
         return SharedVideoFrame(
             sequence=int(sequence_before),
             source_frame_index=int(source_frame_index),
@@ -613,7 +464,7 @@ class SharedVideoFrameReader:
             trial_num=(int(trial_num) if int(trial_num) >= 0 else None),
             width=int(width),
             height=int(height),
-            rgba=rgba,
+            rgb=rgb,
         )
 
     def close(self) -> None:
@@ -626,12 +477,17 @@ class SharedVideoFrameReader:
 def center_crop_bounds(
     content_size: Sequence[int],
     target_size: Sequence[int],
+    *,
+    alignment: int = 1,
 ) -> tuple[int, int, int, int]:
     """Return ``left, top, right, bottom`` for an aspect-cover center crop."""
     content_w, content_h = int(content_size[0]), int(content_size[1])
     target_w, target_h = int(target_size[0]), int(target_size[1])
     if min(content_w, content_h, target_w, target_h) <= 0:
         raise ValueError("content and target sizes must be positive")
+    alignment = int(alignment)
+    if alignment <= 0:
+        raise ValueError("crop alignment must be positive")
 
     content_aspect = content_w / content_h
     target_aspect = target_w / target_h
@@ -641,6 +497,43 @@ def center_crop_bounds(
     else:
         crop_w = content_w
         crop_h = max(1, min(content_h, int(round(crop_w / target_aspect))))
+    if alignment > 1:
+        crop_w = max(alignment, crop_w - (crop_w % alignment))
+        crop_h = max(alignment, crop_h - (crop_h % alignment))
+        crop_w = min(crop_w, content_w - (content_w % alignment))
+        crop_h = min(crop_h, content_h - (content_h % alignment))
     left = (content_w - crop_w) // 2
     top = (content_h - crop_h) // 2
+    if alignment > 1:
+        left -= left % alignment
+        top -= top % alignment
     return left, top, left + crop_w, top + crop_h
+
+
+def upload_rgb_texture(stim: Any, rgb: np.ndarray) -> None:
+    """Upload one packed RGB24 array into an existing PsychoPy ImageStim."""
+    import ctypes
+
+    from pyglet import gl as GL
+
+    if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise ValueError("Video texture data must be HxWx3 uint8 RGB")
+    if not rgb.flags.c_contiguous:
+        raise ValueError("Video texture data must be contiguous")
+    height, width = int(rgb.shape[0]), int(rgb.shape[1])
+    pixel_pointer = rgb.ctypes.data_as(ctypes.POINTER(GL.GLubyte))
+    GL.glActiveTexture(GL.GL_TEXTURE0)
+    GL.glBindTexture(GL.GL_TEXTURE_2D, stim._texID)
+    GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
+    GL.glTexSubImage2D(
+        GL.GL_TEXTURE_2D,
+        0,
+        0,
+        0,
+        width,
+        height,
+        GL.GL_RGB,
+        GL.GL_UNSIGNED_BYTE,
+        pixel_pointer,
+    )
+    GL.glBindTexture(GL.GL_TEXTURE_2D, 0)

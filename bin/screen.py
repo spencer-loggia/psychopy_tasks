@@ -1538,13 +1538,8 @@ def _experimenter_preview_process(
                 pass
 
     try:
-        import ctypes
         from psychopy import core, event, visual
-        from pyglet import gl as GL
-        from .video_playback import (
-            SharedVideoFrameReader,
-            center_crop_bounds,
-        )
+        from .video_playback import SharedVideoFrameReader, upload_rgb_texture
     except Exception as exc:
         _report_startup(
             {
@@ -1556,30 +1551,6 @@ def _experimenter_preview_process(
     preview_canvas_size = resolve_screen_canvas_size(screen_info)
     outside_bg_rgb = (30, 30, 30)
     preview_outline_rgb = (150, 150, 150)
-
-    def _upload_rgba_texture(stim, rgba: np.ndarray) -> None:
-        """Update an ImageStim texture as raw RGBA bytes without color remapping."""
-        if rgba.dtype != np.uint8 or rgba.ndim != 3 or rgba.shape[2] != 4:
-            raise ValueError("Shared video frames must be contiguous uint8 RGBA")
-        if not rgba.flags.c_contiguous:
-            raise ValueError("Shared video upload buffer must be contiguous")
-        height, width = int(rgba.shape[0]), int(rgba.shape[1])
-        pixel_pointer = rgba.ctypes.data_as(ctypes.POINTER(GL.GLubyte))
-        GL.glActiveTexture(GL.GL_TEXTURE0)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, stim._texID)
-        GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
-        GL.glTexSubImage2D(
-            GL.GL_TEXTURE_2D,
-            0,
-            0,
-            0,
-            width,
-            height,
-            GL.GL_RGBA,
-            GL.GL_UNSIGNED_BYTE,
-            pixel_pointer,
-        )
-        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
 
     def _make_bg_rect(bg_rgb_255: Sequence[int]):
         return visual.Rect(
@@ -1595,17 +1566,12 @@ def _experimenter_preview_process(
     def _release_movie() -> None:
         nonlocal movie_bg_rect, movie_subject_bg_rect, movie_outline_rect, movie_layout
         nonlocal shared_movie_active, shared_movie_stim, shared_movie_sequence
-        nonlocal shared_movie_minimum_sequence, shared_movie_crop_bounds
-        nonlocal shared_movie_upload_buffer, shared_movie_source_size
-        nonlocal shared_movie_target_size
+        nonlocal shared_movie_minimum_sequence, shared_movie_source_size
         shared_movie_active = False
         shared_movie_stim = None
         shared_movie_sequence = 0
         shared_movie_minimum_sequence = 1
-        shared_movie_crop_bounds = None
-        shared_movie_upload_buffer = None
         shared_movie_source_size = None
-        shared_movie_target_size = None
         movie_bg_rect = None
         movie_subject_bg_rect = None
         movie_outline_rect = None
@@ -1959,10 +1925,7 @@ def _experimenter_preview_process(
     shared_movie_stim = None
     shared_movie_sequence = 0
     shared_movie_minimum_sequence = 1
-    shared_movie_crop_bounds = None
-    shared_movie_upload_buffer = None
     shared_movie_source_size = None
-    shared_movie_target_size = None
     task_label_text = None
 
     try:
@@ -2180,13 +2143,11 @@ def _experimenter_preview_process(
                                 str(descriptor["name"]),
                                 int(descriptor["maximum_frame_bytes"]),
                                 slot_count=int(descriptor.get("slot_count", 4)),
-                                unregister_resource_tracker=True,
                             )
                         shared_movie_minimum_sequence = int(
                             payload.get("minimum_sequence", 1)
                         )
                         shared_movie_sequence = shared_movie_minimum_sequence - 1
-                        shared_movie_crop_bounds = None
                         shared_movie_source_size = None
                         shared_movie_active = True
                     elif command_type == "clear_scene":
@@ -2234,40 +2195,17 @@ def _experimenter_preview_process(
                             shared_frame_updated = True
                             shared_movie_sequence = shared_frame.sequence
                             actual_source_size = (
-                                int(shared_frame.rgba.shape[1]),
-                                int(shared_frame.rgba.shape[0]),
+                                int(shared_frame.rgb.shape[1]),
+                                int(shared_frame.rgb.shape[0]),
                             )
-                            if (
-                                shared_movie_crop_bounds is None
-                                or shared_movie_source_size != actual_source_size
-                            ):
+                            if shared_movie_source_size != actual_source_size:
                                 shared_movie_source_size = actual_source_size
-                                shared_movie_crop_bounds = center_crop_bounds(
-                                    actual_source_size,
-                                    shared_movie_target_size,
-                                )
-                            left, top, right, bottom = shared_movie_crop_bounds
-                            cropped_view = shared_frame.rgba[top:bottom, left:right]
-                            expected_shape = (
-                                int(bottom - top),
-                                int(right - left),
-                                4,
-                            )
-                            if (
-                                shared_movie_upload_buffer is None
-                                or shared_movie_upload_buffer.shape != expected_shape
-                            ):
-                                shared_movie_upload_buffer = np.empty(
-                                    expected_shape,
-                                    dtype=np.uint8,
-                                )
                                 shared_movie_stim = None
-                            np.copyto(shared_movie_upload_buffer, cropped_view)
                             if shared_movie_stim is None:
                                 blank_image = Image.new(
-                                    "RGBA",
-                                    (expected_shape[1], expected_shape[0]),
-                                    (0, 0, 0, 255),
+                                    "RGB",
+                                    actual_source_size,
+                                    (0, 0, 0),
                                 )
                                 shared_movie_stim = visual.ImageStim(
                                     win,
@@ -2279,9 +2217,9 @@ def _experimenter_preview_process(
                                     flipVert=True,
                                     autoLog=False,
                                 )
-                            _upload_rgba_texture(
+                            upload_rgb_texture(
                                 shared_movie_stim,
-                                shared_movie_upload_buffer,
+                                shared_frame.rgb,
                             )
                     if not shared_frame_updated and not redraw_requested:
                         core.wait(0.002)

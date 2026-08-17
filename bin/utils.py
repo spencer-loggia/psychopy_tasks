@@ -34,11 +34,17 @@ from .screen import (
     serialize_preview_image,
 )
 from .frame_timing import flip_with_timestamps, plan_frame_duration
+from .buffered_video import (
+    BufferedVideoFrameStream,
+    DEFAULT_BUFFER_BYTES,
+    VideoBufferUnderrun,
+    VideoPreparationAborted,
+)
 from .video_playback import (
     RandomFramePulseSchedule,
     SharedVideoFrameBuffer,
-    next_video_frame_slot,
-    prepare_vlc_clip,
+    center_crop_bounds,
+    upload_rgb_texture,
     video_duration_seconds,
 )
 from .stimulus_files import (
@@ -267,8 +273,6 @@ def play_video_fill_screen(
     frame_publish_interval_s: float = 0.0,
     clip_start_s: float = 0.0,
     clip_duration_s: Optional[float] = None,
-    movie_stim=None,
-    keep_movie_loaded: bool = False,
     seek_timeout_s: float = 15.0,
     decoder_ready_callback: Optional[Callable[[], None]] = None,
     stimulus_rotation_degrees: float = 0.0,
@@ -277,7 +281,9 @@ def play_video_fill_screen(
     video_frame_count: Optional[int] = None,
     requested_clip_duration_s: Optional[float] = None,
     flip_request_lead_s: float = 0.015,
+    video_buffer_bytes: int = DEFAULT_BUFFER_BYTES,
 ) -> Dict[str, Any]:
+    """Present an exact frame sequence prepared by an ffpyplayer worker."""
     video_file = Path(video_path)
     if stream_info is None and not video_file.is_file():
         raise FileNotFoundError(f"Video file not found: {video_file}")
@@ -293,6 +299,7 @@ def play_video_fill_screen(
         sync_gpio_module is None or sync_gpio_chip is None
     ):
         raise RuntimeError("A sync schedule requires an initialized GPIO output")
+
     frame_publish_interval_s = float(frame_publish_interval_s)
     if frame_publish_interval_s < 0.0:
         raise ValueError("frame_publish_interval_s cannot be negative")
@@ -309,9 +316,11 @@ def play_video_fill_screen(
         clip_start_s + clip_duration_s > source_duration_s + 1e-6
     ):
         raise ValueError(
-            f"Requested clip {clip_start_s:.6f}-{clip_start_s + clip_duration_s:.6f}s "
-            f"exceeds source duration {source_duration_s:.6f}s"
+            f"Requested clip {clip_start_s:.6f}-"
+            f"{clip_start_s + clip_duration_s:.6f}s exceeds source duration "
+            f"{source_duration_s:.6f}s"
         )
+
     video_frame_rate = float(video_frame_rate)
     if not math.isfinite(video_frame_rate) or video_frame_rate <= 0.0:
         raise ValueError("video_frame_rate must be a positive finite value")
@@ -323,7 +332,8 @@ def play_video_fill_screen(
         or flip_request_lead_s >= video_frame_period_s
     ):
         raise ValueError(
-            "flip_request_lead_s must be finite, non-negative, and shorter than one video frame"
+            "flip_request_lead_s must be finite, non-negative, and shorter "
+            "than one video frame"
         )
     requested_clip_duration_s = float(
         clip_duration_s
@@ -344,62 +354,32 @@ def play_video_fill_screen(
     video_frame_count = int(video_frame_count)
     if video_frame_count <= 0:
         raise ValueError("video_frame_count must be positive")
+    video_buffer_bytes = int(video_buffer_bytes)
+    if video_buffer_bytes <= 0:
+        raise ValueError("video_buffer_bytes must be positive")
     rotation_degrees = float(stimulus_rotation_degrees)
     if not math.isfinite(rotation_degrees):
         raise ValueError("stimulus_rotation_degrees must be finite")
 
-    from psychopy.visual.vlcmoviestim import VlcMovieStim
-
-    backend_used = "vlc"
-    movie = movie_stim
-    movie_source = str(video_file)
-    needs_load = movie is None
-    if movie is not None:
-        current_source = str(
-            getattr(movie, "_neuro_tasks_source_path", None)
-            or getattr(movie, "filename", "")
-            or ""
-        )
-        needs_load = (
-            current_source != movie_source
-            or bool(getattr(movie, "isFinished", False))
-            or bool(getattr(movie, "isStopped", False))
-        )
-    if movie is None:
-        movie = VlcMovieStim(
-            win,
-            filename=movie_source,
-            units="pix",
-            size=tuple(win.size),
-            pos=(0.0, 0.0),
-            loop=False,
-            autoStart=False,
-            noAudio=True,
-        )
-    elif needs_load:
-        movie.loadMovie(movie_source, log=False)
-    movie._neuro_tasks_source_path = movie_source
-
-    video_size = tuple(movie.videoSize)
-    if frame_publisher is not None and (
-        not hasattr(movie, "_framePixelBuffer")
-        or not hasattr(movie, "_pixelLock")
-    ):
-        try:
-            movie.stop(log=False)
-        except Exception:
-            pass
-        raise RuntimeError(
-            "The installed PsychoPy VlcMovieStim does not expose its decoded "
-            "frame buffer; shared single-decoder preview requires PsychoPy 2025.1.1."
-        )
+    video_size = (
+        int(stream.get("width", 0) or 0),
+        int(stream.get("height", 0) or 0),
+    )
+    if min(video_size) <= 0:
+        raise ValueError("video stream width and height must be positive")
     native_size = tuple(native_target_size or tuple(win.size))
     subject_target_size = oriented_size(native_size, rotation_degrees)
-    draw_size = compute_aspect_cover_size(subject_target_size, video_size)
-    movie.size = draw_size
-    movie.pos = (0.0, 0.0)
-    movie.ori = rotation_degrees
-    abort_reason = ""
+    crop_bounds = center_crop_bounds(
+        video_size,
+        subject_target_size,
+        alignment=2,
+    )
+    prepared_size = (
+        crop_bounds[2] - crop_bounds[0],
+        crop_bounds[3] - crop_bounds[1],
+    )
+    draw_size = compute_aspect_cover_size(subject_target_size, prepared_size)
+    backend_used = "ffpyplayer"
 
     if stop_on_mouse_click and mouse is None:
         mouse = event.Mouse(win=win)
@@ -410,388 +390,455 @@ def play_video_fill_screen(
             pass
         event.clearEvents(eventType="mouse")
 
-    if msg_logger is not None:
-        try:
-            msg_logger.log(
-                "INFO",
-                (
-                    f"video_playback file={video_file.name} "
-                    f"source_path={video_file} clip_start_s={clip_start_s:.6f} "
-                    f"clip_end_s={clip_start_s + clip_duration_s:.6f} "
-                    f"video_size={video_size} native_target_size={native_size} "
-                    f"subject_target_size={subject_target_size} rotation_deg={rotation_degrees:g} "
-                    f"win_size={tuple(win.size)} draw_size={draw_size} "
-                    f"video_frame_rate={video_frame_rate:.6f} "
-                    f"video_frame_count={video_frame_count} "
-                    f"flip_request_lead_s={flip_request_lead_s:.6f} "
-                    f"scale_mode=uniform_cover backend={backend_used} "
-                    f"codec={stream.get('codec_name')} pix_fmt={stream.get('pix_fmt')}"
-                ),
-            )
-        except Exception:
-            pass
-
     first_flip_ps = None
     first_flip_perf = None
     first_flip_requested_perf = None
+    last_flip_perf = None
     end_perf = None
     end_requested_perf = None
-    prev_frame_idx = None
     dropped_frames = 0
     aborted = False
-    display_frame_index = 0
-    last_published_frame_idx = None
+    abort_reason = ""
     next_frame_publish_perf = 0.0
     frames_presented = 0
     sync_records: List[Dict[str, Any]] = []
-    backend_drop_count = None
     expected_duration_s = requested_clip_duration_s
     actual_source_start_s = None
     actual_source_last_frame_s = None
     scheduled_video_slots_skipped = 0
-    next_video_slot = 0
-    try:
-        prepared_source_time_s = prepare_vlc_clip(
-            movie,
-            clip_start_s=clip_start_s,
-            seek_timeout_s=seek_timeout_s,
-            ready_callback=decoder_ready_callback,
-        )
-    except Exception:
-        try:
-            movie.stop(log=False)
-        except Exception:
-            pass
-        raise
+    late_frame_count = 0
+    maximum_frame_lateness_s = 0.0
+    frame_timing_monitor = MainDisplayFrameTimingMonitor(
+        win,
+        video_frame_period_s,
+    )
+    frame_stream = None
+    clear_flip_completed = False
 
-    try:
-        while True:
-            if allow_escape and event.getKeys(["escape"]):
-                aborted = True
-                abort_reason = "escape_pressed"
-                _log_message(msg_logger, "WARN", f"video_abort trial_num={trial_num} file={video_file.name} reason=escape_pressed")
-                break
-
-            if external_abort_checker is not None:
-                try:
-                    external_abort = external_abort_checker()
-                    if external_abort:
-                        aborted = True
-                        abort_reason = (
-                            str(external_abort)
-                            if isinstance(external_abort, str)
-                            else "external_abort"
-                        )
-                        _log_message(msg_logger, "WARN", f"video_abort trial_num={trial_num} file={video_file.name} reason={abort_reason}")
-                        break
-                except Exception:
-                    pass
-
-            if stop_on_mouse_click and mouse is not None:
-                try:
-                    mouse_pressed = any(mouse.getPressed())
-                except Exception:
-                    mouse_pressed = False
-                if mouse_pressed:
-                    aborted = True
-                    abort_reason = "mouse_click"
-                    _log_message(msg_logger, "WARN", f"video_abort trial_num={trial_num} file={video_file.name} reason=mouse_click")
-                    break
-
-            if bool(getattr(movie, "isFinished", False)):
-                aborted = True
-                abort_reason = "source_ended_early"
-                _log_message(
-                    msg_logger,
-                    "WARN",
-                    f"video_abort trial_num={trial_num} file={video_file.name} reason=source_ended_early",
-                )
-                break
-
-            scheduled_flip_perf = None
-            if first_flip_perf is not None:
-                next_video_slot, skipped_now = next_video_frame_slot(
-                    first_flip_perf_s=first_flip_perf,
-                    next_slot=next_video_slot,
-                    now_perf_s=time.perf_counter(),
-                    frame_rate=video_frame_rate,
-                    request_lead_s=flip_request_lead_s,
-                )
-                scheduled_video_slots_skipped += skipped_now
-                if next_video_slot >= video_frame_count:
-                    break
-                scheduled_flip_perf = (
-                    first_flip_perf + next_video_slot * video_frame_period_s
-                )
-
-            sync_edges = ()
-            if sync_schedule is not None:
-                sync_edges = sync_schedule.edges_for_frame(display_frame_index)
-                for edge in sync_edges:
-                    win.callOnFlip(
-                        _set_gpio_level_on_flip,
-                        sync_gpio_module,
-                        sync_gpio_chip,
-                        int(sync_pin),
-                        int(edge.level),
-                    )
-
-            if bg_rect is not None:
-                bg_rect.draw()
-            movie.draw()
-            if scheduled_flip_perf is not None:
-                request_perf_s = scheduled_flip_perf - flip_request_lead_s
-                remaining_s = request_perf_s - time.perf_counter()
-                if remaining_s > 0.0:
-                    time.sleep(remaining_s)
-            flip_timing = flip_with_timestamps(win)
-            flip_ps = flip_timing.psychopy_s
-            flip_perf = flip_timing.actual_perf_s
-            frame_idx = movie.frameIndex
-            frames_presented += 1
+    def _poll_abort_reason():
+        if allow_escape and event.getKeys(["escape"]):
+            return "escape_pressed"
+        if external_abort_checker is not None:
             try:
-                current_source_time_s = float(movie.getCurrentFrameTime())
+                external_abort = external_abort_checker()
             except Exception:
-                current_source_time_s = prepared_source_time_s
-            actual_source_last_frame_s = current_source_time_s
-
-            for edge in sync_edges:
-                sync_records.append(
-                    {
-                        "level": int(edge.level),
-                        "frame_index": int(edge.frame_index),
-                        "interval_frames": edge.interval_frames,
-                        "timestamp_perf_s": flip_perf,
-                        "requested_timestamp_perf_s": flip_timing.requested_perf_s,
-                    }
+                external_abort = False
+            if external_abort:
+                return (
+                    str(external_abort)
+                    if isinstance(external_abort, str)
+                    else "external_abort"
                 )
+        if stop_on_mouse_click and mouse is not None:
+            try:
+                if any(mouse.getPressed()):
+                    return "mouse_click"
+            except Exception:
+                pass
+        return ""
 
-            if (
-                frame_publisher is not None
-                and frame_idx is not None
-                and frame_idx != last_published_frame_idx
-                and flip_perf >= next_frame_publish_perf
-            ):
-                frame_publisher.publish_rgba(
-                    movie._framePixelBuffer,
-                    width=int(video_size[0]),
-                    height=int(video_size[1]),
-                    source_frame_index=int(frame_idx),
-                    source_media_time_s=current_source_time_s,
-                    main_display_flip_perf_s=flip_perf,
-                    trial_num=trial_num,
-                    lock=movie._pixelLock,
-                )
-                last_published_frame_idx = int(frame_idx)
-                next_frame_publish_perf = flip_perf + frame_publish_interval_s
-
-            if first_flip_ps is None:
-                first_flip_ps = flip_ps
-                first_flip_perf = flip_perf
-                first_flip_requested_perf = flip_timing.requested_perf_s
-                actual_source_start_s = current_source_time_s
-                if logger is not None:
-                    logger.log_frame_flip(
-                        trial_num=trial_num,
-                        event="video_clip_start",
-                        timestamp_perf_s=first_flip_perf,
-                        requested_timestamp_perf_s=first_flip_requested_perf,
-                        requested_duration=expected_duration_s,
-                    )
-                    _log_message(
-                        msg_logger,
-                        "INFO",
-                        (
-                            f"video_start trial_num={trial_num} file={video_file.name} "
-                            f"source_path={video_file} requested_source_start_s={clip_start_s:.6f} "
-                            f"actual_source_start_s={actual_source_start_s:.6f} "
-                            f"configured_video_fps={video_frame_rate:.6f} "
-                            f"scheduled_video_frames={video_frame_count} "
-                            f"video_size={video_size} draw_size=({draw_size[0]:.1f},{draw_size[1]:.1f}) "
-                            f"backend={backend_used}"
-                        ),
-                    )
-
-            if (
-                frames_presented == 1
-                and video_frame_count > 1
-                and bool(getattr(movie, "isPaused", False))
-            ):
-                movie.play(log=False)
-
-            if prev_frame_idx is not None and frame_idx is not None and frame_idx > prev_frame_idx + 1:
-                dropped_now = int(frame_idx - prev_frame_idx - 1)
-                dropped_frames += dropped_now
-                _log_message(
-                    msg_logger,
-                    "WARN",
-                    (
-                        f"video_frames_dropped trial_num={trial_num} file={video_file.name} "
-                        f"dropped_now={dropped_now} total_dropped={dropped_frames} "
-                        f"prev_frame_idx={prev_frame_idx} frame_idx={frame_idx}"
-                    ),
-                )
-
-            if frame_idx is not None:
-                prev_frame_idx = int(frame_idx)
-
-            next_video_slot += 1
-            if next_video_slot >= video_frame_count:
-                break
-            if bool(getattr(movie, "isFinished", False)):
-                aborted = True
-                abort_reason = "source_ended_early"
-                _log_message(
-                    msg_logger,
-                    "WARN",
-                    f"video_abort trial_num={trial_num} file={video_file.name} reason=source_ended_early",
-                )
-                break
-            display_frame_index += 1
-
-        if bool(getattr(movie, "isPlaying", False)):
-            movie.pause(log=False)
-        final_sync_edge = None
-        if sync_schedule is not None:
-            final_sync_edge = sync_schedule.mark_forced_low(display_frame_index + 1)
-            if final_sync_edge is not None:
-                win.callOnFlip(
-                    _set_gpio_level_on_flip,
-                    sync_gpio_module,
-                    sync_gpio_chip,
-                    int(sync_pin),
-                    0,
-                )
-        if bg_rect is not None:
-            bg_rect.draw()
-        requested_clear_perf = (
-            first_flip_perf + (video_frame_count * video_frame_period_s)
-            if first_flip_perf is not None and not aborted
-            else None
-        )
-        if requested_clear_perf is not None:
-            remaining_s = (
-                requested_clear_perf
-                - flip_request_lead_s
-                - time.perf_counter()
+    def _mark_aborted(reason: str, *, level: str = "WARN") -> None:
+        nonlocal aborted, abort_reason
+        reason = str(reason or "external_abort")
+        if not aborted:
+            _log_message(
+                msg_logger,
+                level,
+                f"video_abort trial_num={trial_num} file={video_file.name} "
+                f"reason={reason}",
             )
-            if remaining_s > 0.0:
-                time.sleep(remaining_s)
-        clear_flip_timing = flip_with_timestamps(win)
-        end_requested_perf = (
-            requested_clear_perf
-            if requested_clear_perf is not None
-            else clear_flip_timing.requested_perf_s
+        aborted = True
+        abort_reason = reason
+
+    try:
+        frame_stream = BufferedVideoFrameStream(
+            video_path=video_file,
+            source_size=video_size,
+            crop_bounds=crop_bounds,
+            clip_start_s=clip_start_s,
+            frame_count=video_frame_count,
+            frame_rate=video_frame_rate,
+            seek_timeout_s=seek_timeout_s,
+            memory_budget_bytes=video_buffer_bytes,
         )
-        end_perf = clear_flip_timing.actual_perf_s
-        if final_sync_edge is not None:
-            sync_records.append(
-                {
-                    "level": 0,
-                    "frame_index": int(final_sync_edge.frame_index),
-                    "interval_frames": None,
-                    "timestamp_perf_s": end_perf,
-                    "requested_timestamp_perf_s": end_requested_perf,
-                }
+        try:
+            frame_stream.wait_until_ready(abort_checker=_poll_abort_reason)
+        except VideoPreparationAborted as exc:
+            _mark_aborted(exc.reason)
+
+        if not aborted:
+            if decoder_ready_callback is not None:
+                decoder_ready_callback()
+            blank_image = Image.new("RGB", prepared_size, (0, 0, 0))
+            video_stim = visual.ImageStim(
+                win,
+                image=blank_image,
+                units="pix",
+                size=draw_size,
+                pos=(0.0, 0.0),
+                ori=rotation_degrees,
+                interpolate=True,
+                flipVert=True,
+                autoLog=False,
             )
-        if logger is not None and first_flip_perf is not None:
-            backend_drop_count = getattr(movie, "nDroppedFrames", None)
-            logger.log_frame_flip(
-                trial_num=trial_num,
-                event="video_clip_end",
-                timestamp_perf_s=end_perf,
-                requested_timestamp_perf_s=end_requested_perf,
+            buffer_mode = (
+                "whole_clip"
+                if frame_stream.layout.slot_count == 1
+                else "three_chunk_ring"
             )
             _log_message(
                 msg_logger,
                 "INFO",
                 (
-                    f"video_end trial_num={trial_num} file={video_file.name} "
-                    f"source_path={video_file} requested_source_end_s={clip_start_s + clip_duration_s:.6f} "
-                    f"actual_source_last_frame_s={actual_source_last_frame_s} "
-                    f"frames_presented={frames_presented} "
-                    f"dropped_frames={dropped_frames} aborted={int(aborted)} "
-                    f"abort_reason={abort_reason or 'none'} "
-                    f"backend={backend_used} backend_dropped_frames={backend_drop_count}"
+                    f"video_playback file={video_file.name} "
+                    f"source_path={video_file} clip_start_s={clip_start_s:.6f} "
+                    f"clip_end_s={clip_start_s + clip_duration_s:.6f} "
+                    f"video_size={video_size} crop_bounds={crop_bounds} "
+                    f"prepared_size={prepared_size} "
+                    f"native_target_size={native_size} "
+                    f"subject_target_size={subject_target_size} "
+                    f"rotation_deg={rotation_degrees:g} "
+                    f"win_size={tuple(win.size)} draw_size={draw_size} "
+                    f"video_frame_rate={video_frame_rate:.6f} "
+                    f"video_frame_count={video_frame_count} "
+                    f"flip_request_lead_s={flip_request_lead_s:.6f} "
+                    f"backend={backend_used} buffer_mode={buffer_mode} "
+                    f"chunk_frames={frame_stream.layout.frames_per_chunk} "
+                    f"buffer_bytes={frame_stream.layout.total_bytes} "
+                    f"startup_wait_s={frame_stream.startup_wait_s:.6f} "
+                    f"codec={stream.get('codec_name')} "
+                    f"pix_fmt={stream.get('pix_fmt')}"
                 ),
             )
+
+            with frame_timing_monitor.continuous_sequence():
+                for expected_frame_index in range(video_frame_count):
+                    reason = _poll_abort_reason()
+                    if reason:
+                        _mark_aborted(reason)
+                        break
+                    try:
+                        prepared_frame = frame_stream.next_frame(
+                            abort_checker=_poll_abort_reason,
+                        )
+                    except VideoPreparationAborted as exc:
+                        _mark_aborted(exc.reason)
+                        break
+                    except VideoBufferUnderrun as exc:
+                        _log_message(
+                            msg_logger,
+                            "ERROR",
+                            f"video_buffer_underrun trial_num={trial_num} "
+                            f"file={video_file.name} error={exc}",
+                        )
+                        raise RuntimeError(
+                            "Prepared-video buffer underrun; playback stopped "
+                            "without skipping a source frame"
+                        ) from exc
+                    if prepared_frame is None:
+                        raise RuntimeError(
+                            f"ffpyplayer ended before frame "
+                            f"{expected_frame_index}"
+                        )
+                    if prepared_frame.frame_index != expected_frame_index:
+                        raise RuntimeError(
+                            f"prepared frame sequence jumped from "
+                            f"{expected_frame_index} to "
+                            f"{prepared_frame.frame_index}"
+                        )
+
+                    # The CPU view remains leased through the GL upload and the
+                    # optional preview copy. A chunk slot is released only by
+                    # the following next_frame() call.
+                    upload_rgb_texture(video_stim, prepared_frame.rgb)
+                    display_frame_index = int(prepared_frame.frame_index)
+                    scheduled_flip_perf = (
+                        first_flip_perf
+                        + (display_frame_index * video_frame_period_s)
+                        if first_flip_perf is not None
+                        else None
+                    )
+                    sync_edges = ()
+                    if sync_schedule is not None:
+                        sync_edges = sync_schedule.edges_for_frame(
+                            display_frame_index
+                        )
+                        for edge in sync_edges:
+                            win.callOnFlip(
+                                _set_gpio_level_on_flip,
+                                sync_gpio_module,
+                                sync_gpio_chip,
+                                int(sync_pin),
+                                int(edge.level),
+                            )
+
+                    if bg_rect is not None:
+                        bg_rect.draw()
+                    video_stim.draw()
+                    if scheduled_flip_perf is not None:
+                        remaining_s = (
+                            scheduled_flip_perf
+                            - flip_request_lead_s
+                            - time.perf_counter()
+                        )
+                        if remaining_s > 0.0:
+                            time.sleep(remaining_s)
+                    flip_timing = flip_with_timestamps(win)
+                    flip_ps = flip_timing.psychopy_s
+                    flip_perf = flip_timing.actual_perf_s
+                    last_flip_perf = flip_perf
+                    frames_presented += 1
+                    current_source_time_s = float(
+                        prepared_frame.source_pts_s
+                    )
+                    actual_source_last_frame_s = current_source_time_s
+
+                    for edge in sync_edges:
+                        sync_records.append(
+                            {
+                                "level": int(edge.level),
+                                "frame_index": int(edge.frame_index),
+                                "interval_frames": edge.interval_frames,
+                                "timestamp_perf_s": flip_perf,
+                                "requested_timestamp_perf_s": (
+                                    flip_timing.requested_perf_s
+                                ),
+                            }
+                        )
+
+                    if first_flip_ps is None:
+                        first_flip_ps = flip_ps
+                        first_flip_perf = flip_perf
+                        first_flip_requested_perf = (
+                            flip_timing.requested_perf_s
+                        )
+                        actual_source_start_s = current_source_time_s
+                        if logger is not None:
+                            logger.log_frame_flip(
+                                trial_num=trial_num,
+                                event="video_clip_start",
+                                timestamp_perf_s=first_flip_perf,
+                                requested_timestamp_perf_s=(
+                                    first_flip_requested_perf
+                                ),
+                                requested_duration=expected_duration_s,
+                            )
+                        _log_message(
+                            msg_logger,
+                            "INFO",
+                            (
+                                f"video_start trial_num={trial_num} "
+                                f"file={video_file.name} "
+                                f"source_path={video_file} "
+                                f"requested_source_start_s="
+                                f"{clip_start_s:.6f} "
+                                f"actual_source_start_s="
+                                f"{actual_source_start_s:.6f} "
+                                f"configured_video_fps="
+                                f"{video_frame_rate:.6f} "
+                                f"scheduled_video_frames="
+                                f"{video_frame_count} "
+                                f"video_size={video_size} "
+                                f"prepared_size={prepared_size} "
+                                f"draw_size=({draw_size[0]:.1f},"
+                                f"{draw_size[1]:.1f}) "
+                                f"backend={backend_used}"
+                            ),
+                        )
+                    elif scheduled_flip_perf is not None:
+                        lateness_s = max(
+                            0.0,
+                            flip_perf - scheduled_flip_perf,
+                        )
+                        maximum_frame_lateness_s = max(
+                            maximum_frame_lateness_s,
+                            lateness_s,
+                        )
+                        if lateness_s > 0.5 * video_frame_period_s:
+                            late_frame_count += 1
+
+                    if (
+                        frame_publisher is not None
+                        and flip_perf >= next_frame_publish_perf
+                    ):
+                        frame_publisher.publish_rgb(
+                            prepared_frame.rgb,
+                            source_frame_index=int(
+                                round(
+                                    current_source_time_s
+                                    * video_frame_rate
+                                )
+                            ),
+                            source_media_time_s=current_source_time_s,
+                            main_display_flip_perf_s=flip_perf,
+                            trial_num=trial_num,
+                        )
+                        next_frame_publish_perf = (
+                            flip_perf + frame_publish_interval_s
+                        )
     finally:
+        final_sync_edge = None
+        try:
+            if sync_schedule is not None:
+                final_sync_edge = sync_schedule.mark_forced_low(
+                    frames_presented
+                )
+                if final_sync_edge is not None:
+                    win.callOnFlip(
+                        _set_gpio_level_on_flip,
+                        sync_gpio_module,
+                        sync_gpio_chip,
+                        int(sync_pin),
+                        0,
+                    )
+            if bg_rect is not None:
+                bg_rect.draw()
+
+            requested_clear_perf = None
+            if (
+                first_flip_perf is not None
+                and not aborted
+                and frames_presented == video_frame_count
+            ):
+                requested_clear_perf = first_flip_perf + (
+                    video_frame_count * video_frame_period_s
+                )
+                if last_flip_perf is not None:
+                    requested_clear_perf = max(
+                        requested_clear_perf,
+                        last_flip_perf + video_frame_period_s,
+                    )
+                remaining_s = (
+                    requested_clear_perf
+                    - flip_request_lead_s
+                    - time.perf_counter()
+                )
+                if remaining_s > 0.0:
+                    time.sleep(remaining_s)
+
+            clear_flip_timing = flip_with_timestamps(win)
+            clear_flip_completed = True
+            end_requested_perf = (
+                requested_clear_perf
+                if requested_clear_perf is not None
+                else clear_flip_timing.requested_perf_s
+            )
+            end_perf = clear_flip_timing.actual_perf_s
+            if final_sync_edge is not None:
+                sync_records.append(
+                    {
+                        "level": 0,
+                        "frame_index": int(final_sync_edge.frame_index),
+                        "interval_frames": None,
+                        "timestamp_perf_s": end_perf,
+                        "requested_timestamp_perf_s": end_requested_perf,
+                    }
+                )
+            if logger is not None and first_flip_perf is not None:
+                logger.log_frame_flip(
+                    trial_num=trial_num,
+                    event="video_clip_end",
+                    timestamp_perf_s=end_perf,
+                    requested_timestamp_perf_s=end_requested_perf,
+                )
+        finally:
+            if sync_schedule is not None and not clear_flip_completed:
+                try:
+                    _set_gpio_level_on_flip(
+                        sync_gpio_module,
+                        sync_gpio_chip,
+                        int(sync_pin),
+                        0,
+                    )
+                except Exception:
+                    pass
+            if frame_stream is not None:
+                frame_stream.close()
+
+            _log_message(
+                msg_logger,
+                "INFO",
+                (
+                    f"video_main_display_timing trial_num={trial_num} "
+                    f"file={video_file.name} "
+                    f"frames_presented={frames_presented} "
+                    f"source_frames_skipped="
+                    f"{scheduled_video_slots_skipped} "
+                    f"late_frames={late_frame_count} "
+                    f"maximum_lateness_s="
+                    f"{maximum_frame_lateness_s:.6f} "
+                    f"long_video_intervals="
+                    f"{frame_timing_monitor.missed_refreshes}"
+                ),
+            )
+            if logger is not None:
+                pulse_duration = (
+                    video_frame_period_s
+                    * int(sync_schedule.pulse_width_frames)
+                    if sync_schedule is not None
+                    else None
+                )
+                for record in sync_records:
+                    is_on = int(record["level"]) == 1
+                    logger.log_signal(
+                        trial_num=trial_num,
+                        event=(
+                            "video_sync_signal_on"
+                            if is_on
+                            else "video_sync_signal_off"
+                        ),
+                        timestamp_perf_s=float(
+                            record["timestamp_perf_s"]
+                        ),
+                        requested_timestamp_perf_s=record.get(
+                            "requested_timestamp_perf_s"
+                        ),
+                        requested_duration=(
+                            pulse_duration if is_on else None
+                        ),
+                    )
+                    if is_on:
+                        _log_message(
+                            msg_logger,
+                            "INFO",
+                            (
+                                f"video_sync_pulse "
+                                f"trial_num={trial_num} "
+                                f"file={video_file.name} "
+                                f"display_frame="
+                                f"{record['frame_index']} "
+                                f"interval_frames="
+                                f"{record['interval_frames']} "
+                                f"pin={int(sync_pin)}"
+                            ),
+                        )
+
+    if first_flip_perf is not None:
         _log_message(
             msg_logger,
             "INFO",
             (
-                f"video_main_display_timing trial_num={trial_num} "
-                f"file={video_file.name} "
-                f"scheduled_video_slots_skipped={scheduled_video_slots_skipped}"
+                f"video_end trial_num={trial_num} "
+                f"file={video_file.name} source_path={video_file} "
+                f"requested_source_end_s="
+                f"{clip_start_s + clip_duration_s:.6f} "
+                f"actual_source_last_frame_s="
+                f"{actual_source_last_frame_s} "
+                f"frames_presented={frames_presented} "
+                f"dropped_frames={dropped_frames} "
+                f"late_frames={late_frame_count} "
+                f"aborted={int(aborted)} "
+                f"abort_reason={abort_reason or 'none'} "
+                f"backend={backend_used}"
             ),
         )
-        if sync_schedule is not None and sync_schedule.high:
-            try:
-                _set_gpio_level_on_flip(
-                    sync_gpio_module,
-                    sync_gpio_chip,
-                    int(sync_pin),
-                    0,
-                )
-            except Exception:
-                pass
-            forced_edge = sync_schedule.mark_forced_low(display_frame_index + 1)
-            if forced_edge is not None:
-                sync_records.append(
-                    {
-                        "level": 0,
-                        "frame_index": int(forced_edge.frame_index),
-                        "interval_frames": None,
-                        "timestamp_perf_s": time.perf_counter(),
-                        "requested_timestamp_perf_s": None,
-                    }
-                )
-        backend_drop_count = getattr(movie, "nDroppedFrames", backend_drop_count)
-        if keep_movie_loaded:
-            try:
-                if bool(getattr(movie, "isPlaying", False)):
-                    movie.pause(log=False)
-            except Exception:
-                pass
-        else:
-            try:
-                movie.stop(log=False)
-            except Exception:
-                pass
-        if logger is not None:
-            pulse_duration = (
-                video_frame_period_s * int(sync_schedule.pulse_width_frames)
-                if sync_schedule is not None
-                else None
-            )
-            for record in sync_records:
-                is_on = int(record["level"]) == 1
-                logger.log_signal(
-                    trial_num=trial_num,
-                    event="video_sync_signal_on" if is_on else "video_sync_signal_off",
-                    timestamp_perf_s=float(record["timestamp_perf_s"]),
-                    requested_timestamp_perf_s=record.get(
-                        "requested_timestamp_perf_s"
-                    ),
-                    requested_duration=pulse_duration if is_on else None,
-                )
-                if is_on:
-                    _log_message(
-                        msg_logger,
-                        "INFO",
-                        (
-                            f"video_sync_pulse trial_num={trial_num} file={video_file.name} "
-                            f"display_frame={record['frame_index']} "
-                            f"interval_frames={record['interval_frames']} pin={int(sync_pin)}"
-                        ),
-                    )
-        if not keep_movie_loaded:
-            try:
-                if hasattr(movie, "unload"):
-                    movie.unload(log=False)
-            except Exception:
-                pass
 
+    buffer_mode = (
+        "whole_clip"
+        if frame_stream is not None
+        and frame_stream.layout.slot_count == 1
+        else "three_chunk_ring"
+    )
     return {
         "video_name": video_file.name,
         "video_path": video_file,
@@ -810,7 +857,9 @@ def play_video_fill_screen(
             if first_flip_perf is not None
             else None
         ),
-        "last_frame_end_perf_s": end_perf if first_flip_perf is not None else None,
+        "last_frame_end_perf_s": (
+            end_perf if first_flip_perf is not None else None
+        ),
         "actual_source_start_s": actual_source_start_s,
         "actual_source_last_frame_s": actual_source_last_frame_s,
         "frames_presented": int(frames_presented),
@@ -829,14 +878,37 @@ def play_video_fill_screen(
         "stimulus_rotation_degrees": rotation_degrees,
         "scheduled_duration_s": clip_duration_s,
         "backend_used": backend_used,
-        "backend_dropped_frames": backend_drop_count,
-        "scheduled_video_slots_skipped": int(scheduled_video_slots_skipped),
+        "scheduled_video_slots_skipped": int(
+            scheduled_video_slots_skipped
+        ),
+        "late_frame_count": int(late_frame_count),
+        "maximum_frame_lateness_s": float(
+            maximum_frame_lateness_s
+        ),
+        "long_video_intervals": int(
+            frame_timing_monitor.missed_refreshes
+        ),
         "configured_video_frame_rate": video_frame_rate,
         "scheduled_video_frame_count": video_frame_count,
-        "sync_pulses": sum(1 for record in sync_records if int(record["level"]) == 1),
-        "movie_stim": movie if keep_movie_loaded else None,
+        "sync_pulses": sum(
+            1
+            for record in sync_records
+            if int(record["level"]) == 1
+        ),
+        "crop_bounds": tuple(crop_bounds),
+        "prepared_frame_size": tuple(prepared_size),
+        "video_buffer_bytes": (
+            int(frame_stream.layout.total_bytes)
+            if frame_stream is not None
+            else 0
+        ),
+        "video_buffer_mode": buffer_mode,
+        "video_preparation_wait_s": (
+            float(frame_stream.startup_wait_s)
+            if frame_stream is not None
+            else 0.0
+        ),
     }
-
 
 def resolve_frame_rate(
     win: visual.Window,

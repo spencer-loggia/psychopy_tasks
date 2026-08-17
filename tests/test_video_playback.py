@@ -1,5 +1,6 @@
-import ctypes
+from collections import deque
 import importlib.util
+import queue
 import random
 import sys
 import tempfile
@@ -10,15 +11,19 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
+from bin.buffered_video import (
+    BufferedVideoFrameStream,
+    DEFAULT_BUFFER_BYTES,
+    VideoBufferUnderrun,
+    copy_ffpyplayer_rgb24,
+    plan_video_chunks,
+)
 from bin.video_playback import (
     RandomFramePulseSchedule,
     SharedVideoFrameBuffer,
     SharedVideoFrameReader,
     center_crop_bounds,
-    find_pi_hevc_decoder_device,
-    next_video_frame_slot,
     parse_frame_rate,
-    prepare_vlc_clip,
     select_random_video_clip,
     validate_hevc_stream,
     video_duration_seconds,
@@ -26,6 +31,29 @@ from bin.video_playback import (
 
 
 class VideoPlaybackTests(unittest.TestCase):
+    @staticmethod
+    def _make_buffered_stream_state_machine():
+        frame_bytes = 2 * 1 * 3
+        layout = plan_video_chunks(
+            (2, 1),
+            frame_count=8,
+            frame_rate=2.0,
+            memory_budget_bytes=3 * 2 * frame_bytes,
+        )
+        stream = object.__new__(BufferedVideoFrameStream)
+        stream.layout = layout
+        stream._started = True
+        stream._closed = False
+        stream._pending_chunks = deque()
+        stream._current_chunk = None
+        stream._current_chunk_offset = 0
+        stream._next_frame_index = 0
+        stream._producer_eof = False
+        stream._ready_chunks = queue.Queue()
+        stream._free_slots = queue.Queue(maxsize=layout.slot_count)
+        stream._shm = types.SimpleNamespace(buf=bytearray(layout.total_bytes))
+        return stream
+
     def test_parse_frame_rate_accepts_ffprobe_fraction(self):
         self.assertAlmostEqual(parse_frame_rate("30000/1001"), 29.97002997)
 
@@ -89,17 +117,37 @@ class VideoPlaybackTests(unittest.TestCase):
         self.assertAlmostEqual(clip.start_s * 30.0, clip.start_frame)
         self.assertAlmostEqual(clip.requested_duration_s, 0.11)
 
-    def test_absolute_video_schedule_skips_expired_slots_without_lag(self):
-        slot, skipped = next_video_frame_slot(
-            first_flip_perf_s=100.0,
-            next_slot=3,
-            now_perf_s=100.2,
+    def test_chunk_plan_buffers_a_small_clip_in_one_slot(self):
+        layout = plan_video_chunks(
+            (4, 3),
+            frame_count=5,
             frame_rate=30.0,
-            request_lead_s=0.015,
+            memory_budget_bytes=5 * 4 * 3 * 3,
         )
 
-        self.assertEqual(slot, 7)
-        self.assertEqual(skipped, 4)
+        self.assertEqual(layout.frame_bytes, 4 * 3 * 3)
+        self.assertEqual(layout.frames_per_chunk, 5)
+        self.assertEqual(layout.slot_count, 1)
+        self.assertEqual(layout.slot_bytes, 5 * 4 * 3 * 3)
+        self.assertEqual(layout.total_bytes, layout.slot_bytes)
+        self.assertEqual(layout.total_chunks, 1)
+        self.assertEqual(layout.preload_chunks, 1)
+
+    def test_chunk_plan_uses_bounded_three_slot_ring_for_large_clip(self):
+        frame_bytes = 4 * 3 * 3
+        layout = plan_video_chunks(
+            (4, 3),
+            frame_count=100,
+            frame_rate=10.0,
+            memory_budget_bytes=3 * 4 * frame_bytes,
+        )
+
+        self.assertEqual(layout.frames_per_chunk, 4)
+        self.assertEqual(layout.slot_count, 3)
+        self.assertEqual(layout.slot_bytes, 4 * frame_bytes)
+        self.assertEqual(layout.total_bytes, 3 * 4 * frame_bytes)
+        self.assertEqual(layout.total_chunks, 25)
+        self.assertEqual(layout.preload_chunks, 2)
 
     def test_random_clip_rejects_source_shorter_than_requested_clip(self):
         with self.assertRaisesRegex(ValueError, "exceeds source duration"):
@@ -111,53 +159,148 @@ class VideoPlaybackTests(unittest.TestCase):
     def test_video_duration_rejects_nonfinite_metadata(self):
         self.assertEqual(video_duration_seconds({"duration": "nan"}), 0.0)
 
-    def test_prepare_vlc_clip_seeks_to_zero_when_reusing_source(self):
-        class FakePlayer:
-            def is_seekable(self):
-                return True
-
-        class FakeMovie:
-            def __init__(self):
-                self._player = FakePlayer()
-                self._frameCounter = 12
-                self.isPlaying = False
-                self.isPaused = True
-                self.isFinished = False
-                self.source_time = 42.0
-                self.seek_calls = []
-
-            def play(self, log=False):
-                self.isPlaying = True
-                self.isPaused = False
-
-            def seek(self, timestamp, log=False):
-                self.seek_calls.append(timestamp)
-                self.source_time = float(timestamp)
-                self._frameCounter += 1
-
-            def pause(self, log=False):
-                self.isPlaying = False
-                self.isPaused = True
-
-            def getFPS(self):
-                return 30.0
-
-            def getCurrentFrameTime(self):
-                return self.source_time
-
-        movie = FakeMovie()
-        callback_states = []
-        actual_start = prepare_vlc_clip(
-            movie,
-            0.0,
-            0.1,
-            ready_callback=lambda: callback_states.append(movie.isPaused),
+    def test_copy_ffpyplayer_rgb24_removes_row_padding(self):
+        width, height = 2, 2
+        line_size = 8
+        padded_rows = bytearray(
+            [
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                250,
+                251,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                252,
+                253,
+            ]
         )
 
-        self.assertEqual(movie.seek_calls, [0.0])
-        self.assertEqual(actual_start, 0.0)
-        self.assertTrue(movie.isPaused)
-        self.assertEqual(callback_states, [True])
+        class FakeImage:
+            @staticmethod
+            def get_pixel_format():
+                return "rgb24"
+
+            @staticmethod
+            def get_size():
+                return width, height
+
+            @staticmethod
+            def get_linesizes(*, keep_align):
+                self.assertTrue(keep_align)
+                return (line_size,)
+
+            @staticmethod
+            def to_memoryview(*, keep_align):
+                self.assertTrue(keep_align)
+                return (types.SimpleNamespace(memview=memoryview(padded_rows)),)
+
+        target = np.empty((height, width, 3), dtype=np.uint8)
+        copy_ffpyplayer_rgb24(FakeImage(), target)
+
+        np.testing.assert_array_equal(
+            target,
+            np.array(
+                [
+                    [[1, 2, 3], [4, 5, 6]],
+                    [[7, 8, 9], [10, 11, 12]],
+                ],
+                dtype=np.uint8,
+            ),
+        )
+
+    def test_buffered_stream_crosses_ready_chunk_boundary_without_waiting(self):
+        stream = self._make_buffered_stream_state_machine()
+        stream._process_message(("chunk", 0, 0, 2, (10.0, 10.5)))
+        stream._ready_chunks.put_nowait(
+            ("chunk", 1, 2, 2, (11.0, 11.5))
+        )
+        stream._receive_message = Mock(
+            side_effect=AssertionError("presentation must not wait for a chunk")
+        )
+
+        shared_slots = np.ndarray(
+            (
+                stream.layout.slot_count,
+                stream.layout.frames_per_chunk,
+                stream.layout.height,
+                stream.layout.width,
+                3,
+            ),
+            dtype=np.uint8,
+            buffer=stream._shm.buf,
+        )
+        shared_slots[0].fill(10)
+        shared_slots[1].fill(20)
+
+        first = stream.next_frame()
+        second = stream.next_frame()
+        third = stream.next_frame()
+
+        self.assertEqual(
+            [first.frame_index, second.frame_index, third.frame_index],
+            [0, 1, 2],
+        )
+        self.assertEqual(third.source_pts_s, 11.0)
+        np.testing.assert_array_equal(
+            third.rgb,
+            np.full((1, 2, 3), 20, dtype=np.uint8),
+        )
+        self.assertEqual(stream._free_slots.get_nowait(), 0)
+        stream._receive_message.assert_not_called()
+
+    def test_buffered_stream_raises_immediate_underrun_at_chunk_boundary(self):
+        stream = self._make_buffered_stream_state_machine()
+        stream._process_message(("chunk", 0, 0, 2, (10.0, 10.5)))
+        stream._receive_message = Mock(
+            side_effect=AssertionError("presentation must not wait for a chunk")
+        )
+
+        self.assertEqual(stream.next_frame().frame_index, 0)
+        self.assertEqual(stream.next_frame().frame_index, 1)
+        with self.assertRaisesRegex(
+            VideoBufferUnderrun,
+            "prepared frame 2 was unavailable",
+        ):
+            stream.next_frame()
+
+        self.assertEqual(stream._free_slots.get_nowait(), 0)
+        stream._receive_message.assert_not_called()
+
+    def test_buffered_stream_rejects_invalid_chunk_slot(self):
+        stream = self._make_buffered_stream_state_machine()
+
+        with self.assertRaisesRegex(RuntimeError, "invalid slot 3"):
+            stream._process_message(
+                ("chunk", stream.layout.slot_count, 0, 2, (10.0, 10.5))
+            )
+
+        self.assertFalse(stream._pending_chunks)
+
+    def test_buffered_stream_rejects_inconsistent_chunk_metadata(self):
+        stream = self._make_buffered_stream_state_machine()
+
+        with self.assertRaisesRegex(RuntimeError, "metadata is inconsistent"):
+            stream._process_message(("chunk", 0, 0, 2, (10.0,)))
+
+        self.assertFalse(stream._pending_chunks)
+
+    def test_buffered_stream_rejects_noncontiguous_next_chunk(self):
+        stream = self._make_buffered_stream_state_machine()
+        stream._process_message(("chunk", 0, 1, 2, (10.0, 10.5)))
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "non-contiguous prepared chunk starts at 1; expected 0",
+        ):
+            stream.next_frame()
 
     def test_random_frame_pulses_have_frame_locked_edges(self):
         schedule = RandomFramePulseSchedule(
@@ -179,18 +322,18 @@ class VideoPlaybackTests(unittest.TestCase):
             self.assertLessEqual(on_edge.interval_frames, 300)
             self.assertEqual(off_edge.frame_index, on_edge.frame_index + 1)
 
-    def test_shared_frame_buffer_publishes_latest_rgba_without_decoding(self):
+    def test_shared_frame_buffer_publishes_latest_rgb_without_decoding(self):
         width, height = 4, 3
-        source_array = np.arange(width * height * 4, dtype=np.uint8)
-        source_type = ctypes.c_ubyte * source_array.size
-        source = source_type(*source_array.tolist())
-        shared = SharedVideoFrameBuffer(source_array.size)
-        reader = SharedVideoFrameReader(shared.name, source_array.size)
+        source = np.arange(width * height * 3, dtype=np.uint8).reshape(
+            height,
+            width,
+            3,
+        )
+        shared = SharedVideoFrameBuffer(source.nbytes)
+        reader = SharedVideoFrameReader(shared.name, source.nbytes)
         try:
-            sequence = shared.publish_rgba(
+            sequence = shared.publish_rgb(
                 source,
-                width=width,
-                height=height,
                 source_frame_index=17,
                 source_media_time_s=12.5,
                 main_display_flip_perf_s=345.25,
@@ -204,8 +347,8 @@ class VideoPlaybackTests(unittest.TestCase):
             self.assertEqual(frame.source_media_time_s, 12.5)
             self.assertEqual(frame.main_display_flip_perf_s, 345.25)
             self.assertEqual(frame.trial_num, 8)
-            self.assertEqual(frame.rgba.shape, (height, width, 4))
-            np.testing.assert_array_equal(frame.rgba.reshape(-1), source_array)
+            self.assertEqual(frame.rgb.shape, (height, width, 3))
+            np.testing.assert_array_equal(frame.rgb, source)
             self.assertIsNone(reader.read_latest(sequence))
         finally:
             reader.close()
@@ -213,8 +356,7 @@ class VideoPlaybackTests(unittest.TestCase):
 
     def test_shared_frame_ring_skips_to_latest_after_slot_rollover(self):
         width, height = 2, 2
-        frame_bytes = width * height * 4
-        source_type = ctypes.c_ubyte * frame_bytes
+        frame_bytes = width * height * 3
         shared = SharedVideoFrameBuffer(frame_bytes)
         reader = SharedVideoFrameReader(
             shared.name,
@@ -223,11 +365,13 @@ class VideoPlaybackTests(unittest.TestCase):
         )
         try:
             for frame_index in range(1, 8):
-                source = source_type(*([frame_index] * frame_bytes))
-                shared.publish_rgba(
+                source = np.full(
+                    (height, width, 3),
+                    frame_index,
+                    dtype=np.uint8,
+                )
+                shared.publish_rgb(
                     source,
-                    width=width,
-                    height=height,
                     source_frame_index=frame_index,
                     source_media_time_s=frame_index / 30.0,
                     main_display_flip_perf_s=100.0 + frame_index / 60.0,
@@ -240,8 +384,8 @@ class VideoPlaybackTests(unittest.TestCase):
             self.assertEqual(frame.source_frame_index, 7)
             self.assertEqual(frame.trial_num, 3)
             np.testing.assert_array_equal(
-                frame.rgba,
-                np.full((height, width, 4), 7, dtype=np.uint8),
+                frame.rgb,
+                np.full((height, width, 3), 7, dtype=np.uint8),
             )
         finally:
             reader.close()
@@ -256,21 +400,6 @@ class VideoPlaybackTests(unittest.TestCase):
             center_crop_bounds((1080, 1920), (1920, 1080)),
             (0, 656, 1080, 1264),
         )
-
-    def test_find_pi_hevc_decoder_device_uses_named_v4l2_device(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            sys_root = root / "sys"
-            dev_root = root / "dev"
-            (sys_root / "video19").mkdir(parents=True)
-            dev_root.mkdir()
-            (sys_root / "video19" / "name").write_text("rpivid-hevc-dec\n")
-            (dev_root / "video19").touch()
-
-            self.assertEqual(
-                find_pi_hevc_decoder_device(sys_root, dev_root),
-                dev_root / "video19",
-            )
 
 
 class PlayVideoTaskRotationTests(unittest.TestCase):
@@ -382,9 +511,7 @@ class PlayVideoTaskRotationTests(unittest.TestCase):
             _neuro_tasks_refresh_sync_requested=True,
             close=Mock(),
         )
-        movie = types.SimpleNamespace(stop=Mock())
         playback_result = {
-            "movie_stim": movie,
             "start_flip_perf_s": 10.0,
             "last_frame_end_perf_s": 12.0,
             "video_path": Path("clip.mp4"),
@@ -394,9 +521,9 @@ class PlayVideoTaskRotationTests(unittest.TestCase):
             "clip_end_s": 3.0,
             "clip_duration_s": 2.0,
             "actual_source_start_s": 1.0,
-            "actual_source_last_frame_s": 3.0,
+            "actual_source_last_frame_s": 1.0 + (59.0 / 30.0),
             "displayed_duration_s": 2.0,
-            "frames_presented": 120,
+            "frames_presented": 60,
             "aborted": False,
             "abort_reason": "",
             "dropped_frames": 0,
@@ -425,14 +552,14 @@ class PlayVideoTaskRotationTests(unittest.TestCase):
             slot_count = 4
             sequence = 0
 
-            def __init__(self, capacity_bytes):
-                self.capacity_bytes = capacity_bytes
+            def __init__(self, maximum_frame_bytes):
+                self.maximum_frame_bytes = maximum_frame_bytes
                 self.closed = False
 
             def descriptor(self):
                 return {
                     "name": self.name,
-                    "capacity_bytes": self.capacity_bytes,
+                    "maximum_frame_bytes": self.maximum_frame_bytes,
                     "slot_count": self.slot_count,
                 }
 
@@ -515,6 +642,10 @@ class PlayVideoTaskRotationTests(unittest.TestCase):
         self.assertEqual(playback_kwargs["video_frame_rate"], 30.0)
         self.assertEqual(playback_kwargs["video_frame_count"], 60)
         self.assertEqual(playback_kwargs["flip_request_lead_s"], 0.015)
+        self.assertEqual(
+            playback_kwargs["video_buffer_bytes"],
+            DEFAULT_BUFFER_BYTES,
+        )
 
         preview = preview_instances[0]
         self.assertEqual(len(preview.play_calls), 2)

@@ -21,12 +21,12 @@ from bin.affinity import (
 )
 from bin.config import load_config, validate_config
 from bin.daqc2_outputs import DAQC2DigitalOutputs, PeriodicDOUTPulseController
+from bin.buffered_video import DEFAULT_BUFFER_BYTES
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.video_playback import (
     RandomFramePulseSchedule,
     SharedVideoFrameBuffer,
-    find_pi_hevc_decoder_device,
     is_raspberry_pi,
     parse_frame_rate,
     select_random_video_clip,
@@ -77,8 +77,9 @@ def parse_args():
     parser.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate (Hz)")
     parser.add_argument("--frame_rate", type=float, default=None, help="Authoritative video presentation and clip-selection rate (Hz)")
     parser.add_argument("--flip_request_lead_seconds", type=float, default=None, help="How early to submit each video flip before its absolute deadline")
+    parser.add_argument("--video_buffer_megabytes", type=float, default=None, help="Maximum shared-memory budget for prepared RGB video chunks")
     parser.add_argument("--ffprobe", default=None, help="Path to ffprobe for codec probing")
-    parser.add_argument("--raspi", action="store_true", default=None, help="Enable Pi 5 hardware validation and frame sync GPIO")
+    parser.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi frame-sync GPIO and pump behavior")
     parser.add_argument("--no_raspi", action="store_false", dest="raspi", help="Disable Raspberry Pi hardware behavior")
     parser.add_argument("--sync_pin", type=int, default=None, help="BCM GPIO pin for frame-locked video sync pulses")
     parser.add_argument("--sync_interval_frames", type=int, nargs=2, default=None, metavar=("MIN", "MAX"), help="Inclusive randomized interval between sync-pulse onsets, in video presentation frames")
@@ -118,6 +119,7 @@ def run_task(
     pump_interval: Optional[float] = None,
     frame_rate: float = 30.0,
     flip_request_lead_seconds: float = 0.015,
+    video_buffer_megabytes: float = DEFAULT_BUFFER_BYTES / (1024 * 1024),
 ):
     if isinstance(num_clips, bool) or not isinstance(num_clips, int) or num_clips <= 0:
         raise ValueError("num_clips must be a positive integer")
@@ -141,6 +143,13 @@ def run_task(
         raise ValueError(
             "flip_request_lead_seconds must be non-negative and shorter than one configured video frame"
         )
+    video_buffer_megabytes = float(video_buffer_megabytes)
+    if (
+        not math.isfinite(video_buffer_megabytes)
+        or video_buffer_megabytes <= 0.0
+    ):
+        raise ValueError("video_buffer_megabytes must be positive and finite")
+    video_buffer_bytes = int(round(video_buffer_megabytes * 1024 * 1024))
     selection_rng = random.Random(seed)
     sync_rng = random.Random(None if seed is None else int(seed) + 0x51A7)
     if len(sync_interval_frames) != 2:
@@ -190,18 +199,8 @@ def run_task(
         video_streams[video_path] = stream
         maximum_frame_bytes = max(
             maximum_frame_bytes,
-            int(stream["width"]) * int(stream["height"]) * 4,
+            int(stream["width"]) * int(stream["height"]) * 3,
         )
-
-    hevc_decoder_device = None
-    if raspi:
-        hevc_decoder_device = find_pi_hevc_decoder_device()
-        if hevc_decoder_device is None:
-            raise RuntimeError(
-                "Raspberry Pi HEVC hardware decoder is unavailable or inaccessible. "
-                "Expected an HEVC/rpivid V4L2 device (normally /dev/video19); "
-                "check Raspberry Pi OS drivers and membership in the video group."
-            )
 
     win, main_screen, experimenter_screen = utils.setup_task_window(
         screen_config,
@@ -221,7 +220,6 @@ def run_task(
     sync_gpio_chip = None
     pump_outputs = None
     pump_controller = None
-    reusable_movie = None
     native_main_size = resolve_scene_size(
         main_screen,
         fullscreen=bool(fullscreen),
@@ -334,14 +332,14 @@ def run_task(
                 msg_logger.log(
                     "WARN",
                     (
-                        f"video_source_rate_ignored file={video_path.name} "
+                        f"video_source_rate_normalized file={video_path.name} "
                         f"probed_fps={probed_rate:.6f} "
                         f"configured_fps={frame_rate:.6f}"
                     ),
                 )
 
         # Keep CPU 0 free while multiprocessing children and decoder threads
-        # are created. The preview and VLC decoder inherit this worker-only
+        # are created. The preview and ffpyplayer worker inherit this worker-only
         # mask. Only the main presentation thread is later moved to CPU 0.
         affinity_plan = build_main_and_worker_affinity_plan(main_core=0)
         main_cpu_affinity = affinity_plan.get("main_cpu_affinity")
@@ -402,6 +400,7 @@ def run_task(
                 f"num_clips={num_clips} "
                 f"configured_video_fps={frame_rate:.6f} "
                 f"flip_request_lead_s={flip_request_lead_seconds:.6f} "
+                f"video_buffer_megabytes={video_buffer_megabytes:.3f} "
                 f"seek_timeout_s={seek_timeout_seconds:.3f}"
             ),
         )
@@ -409,7 +408,7 @@ def run_task(
             msg_logger.log(
                 "INFO",
                 (
-                    f"pi5_video_hardware decoder_device={hevc_decoder_device} "
+                    "pi5_video_mode decoder=ffpyplayer "
                     f"sync_pin={sync_pin} interval_frames={sync_interval_min}-{sync_interval_max} "
                     f"pulse_width_frames={sync_pulse_frames} pump_dout={pump_pin}"
                 ),
@@ -441,7 +440,7 @@ def run_task(
                 f"video_cadence configured_video_fps={frame_rate:.6f} "
                 f"monitor_fps={fps:.6f} refreshes_per_video_frame="
                 f"{nearest_refreshes_per_video_frame} cadence_error_hz={cadence_error_hz:.6f} "
-                "schedule=absolute_deadline missed_slots=skip"
+                "schedule=absolute_deadline source_frames=never_skip"
             ),
         )
         if abs(cadence_error_hz) > 0.05:
@@ -595,19 +594,16 @@ def run_task(
                     video_frame_rate=selected_clip.frame_rate,
                     video_frame_count=selected_clip.frame_count,
                     flip_request_lead_s=flip_request_lead_seconds,
-                    movie_stim=reusable_movie,
-                    keep_movie_loaded=True,
+                    video_buffer_bytes=video_buffer_bytes,
                     seek_timeout_s=seek_timeout_seconds,
                     decoder_ready_callback=_pin_main_for_playback,
                     stimulus_rotation_degrees=main_rotation_deg,
                     native_target_size=native_main_size,
                 )
             finally:
-                # Move the Python thread off reserved CPU 0 between clips. A
-                # subsequent load/play can then create decoder threads on the
-                # worker-core mask before presentation is pinned again.
+                # Move the Python thread off reserved CPU 0 between clips so the
+                # next spawned ffpyplayer worker inherits the worker-core mask.
                 _stage_main_for_decoder()
-            reusable_movie = playback_info["movie_stim"]
             _drain_pump_edges()
             if playback_info.get("abort_reason") == "pump_failure":
                 raise RuntimeError(
@@ -703,11 +699,6 @@ def run_task(
                 sync_lgpio.gpiochip_close(sync_gpio_chip)
             except Exception:
                 pass
-        if reusable_movie is not None:
-            try:
-                reusable_movie.stop(log=False)
-            except Exception:
-                pass
         if experimenter_preview is not None:
             try:
                 experimenter_preview.close()
@@ -777,6 +768,15 @@ def main():
                 _get(
                     "flip_request_lead_seconds",
                     cfg.get("flip_request_lead_seconds", 0.015),
+                )
+            ),
+            video_buffer_megabytes=float(
+                _get(
+                    "video_buffer_megabytes",
+                    cfg.get(
+                        "video_buffer_megabytes",
+                        DEFAULT_BUFFER_BYTES / (1024 * 1024),
+                    ),
                 )
             ),
             config_name=_get("config_name", cfg.get("config_name", "play_video")),

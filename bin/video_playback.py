@@ -393,7 +393,14 @@ class SharedVideoFrameBuffer:
         self._shm = shared_memory.SharedMemory(create=True, size=total_bytes)
         self._sequence = 0
         self._closed = False
-        self._shm.buf[:_HEADER_SIZE] = b"\x00" * _HEADER_SIZE
+        # Fault in the complete preview ring before timing-critical playback.
+        # Otherwise the first post-onset preview copy can incur shared-memory
+        # page allocation while the main process is racing the next VBL.
+        np.ndarray(
+            (total_bytes,),
+            dtype=np.uint8,
+            buffer=self._shm.buf,
+        ).fill(0)
 
     @property
     def name(self) -> str:

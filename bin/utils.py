@@ -463,6 +463,9 @@ def play_video_fill_screen(
     frame_stream = None
     prepared_frame = None
     clear_flip_completed = False
+    display_warmup_flips = 0
+    startup_preload_frames = 0
+    startup_average_preparation_fps = 0.0
 
     def _poll_abort_reason():
         if allow_escape and event.getKeys(["escape"]):
@@ -510,10 +513,30 @@ def play_video_fill_screen(
             seek_timeout_s=seek_timeout_s,
             memory_budget_bytes=video_buffer_bytes,
         )
+        startup_preload_frames = min(
+            video_frame_count,
+            frame_stream.layout.preload_chunks
+            * frame_stream.layout.frames_per_chunk,
+        )
+        _log_message(
+            msg_logger,
+            "INFO",
+            (
+                f"video_preparation_start trial_num={trial_num} "
+                f"file={video_file.name} "
+                f"startup_preload_frames={startup_preload_frames} "
+                f"chunk_frames={frame_stream.layout.frames_per_chunk} "
+                f"preload_chunks={frame_stream.layout.preload_chunks}"
+            ),
+        )
         try:
             frame_stream.wait_until_ready(abort_checker=_poll_abort_reason)
         except VideoPreparationAborted as exc:
             _mark_aborted(exc.reason)
+        if frame_stream.startup_wait_s > 0.0:
+            startup_average_preparation_fps = (
+                startup_preload_frames / frame_stream.startup_wait_s
+            )
 
         if not aborted:
             if decoder_ready_callback is not None:
@@ -530,6 +553,23 @@ def play_video_fill_screen(
                 flipVert=True,
                 autoLog=False,
             )
+            # Exercise the exact texture-upload/draw/swap path while the
+            # stimulus is still black. This moves lazy GL allocation and the
+            # first post-idle swaps out of the measured clip, so frame zero is
+            # not also the display pipeline's warm-up frame.
+            upload_rgb_texture(
+                video_stim,
+                np.zeros(
+                    (prepared_size[1], prepared_size[0], 3),
+                    dtype=np.uint8,
+                ),
+            )
+            display_warmup_flips = 2
+            for _ in range(display_warmup_flips):
+                if bg_rect is not None:
+                    bg_rect.draw()
+                video_stim.draw()
+                win.flip()
             buffer_mode = (
                 "whole_clip"
                 if frame_stream.layout.slot_count == 1
@@ -560,10 +600,14 @@ def play_video_fill_screen(
                     f"{refresh_cadence.maximum_absolute_phase_error_s:.9f} "
                     f"scheduled_display_duration_s="
                     f"{scheduled_display_duration_s:.6f} "
+                    f"display_warmup_flips={display_warmup_flips} "
                     f"backend={backend_used} buffer_mode={buffer_mode} "
                     f"chunk_frames={frame_stream.layout.frames_per_chunk} "
                     f"buffer_bytes={frame_stream.layout.total_bytes} "
                     f"startup_wait_s={frame_stream.startup_wait_s:.6f} "
+                    f"startup_preload_frames={startup_preload_frames} "
+                    f"startup_average_preparation_fps="
+                    f"{startup_average_preparation_fps:.3f} "
                     f"codec={stream.get('codec_name')} "
                     f"pix_fmt={stream.get('pix_fmt')}"
                 ),
@@ -683,40 +727,6 @@ def play_video_fill_screen(
                                 actual_source_start_s = (
                                     current_source_time_s
                                 )
-                                if logger is not None:
-                                    logger.log_frame_flip(
-                                        trial_num=trial_num,
-                                        event="video_clip_start",
-                                        timestamp_perf_s=first_flip_perf,
-                                        requested_timestamp_perf_s=(
-                                            first_flip_requested_perf
-                                        ),
-                                        requested_duration=(
-                                            expected_duration_s
-                                        ),
-                                    )
-                                _log_message(
-                                    msg_logger,
-                                    "INFO",
-                                    (
-                                        f"video_start trial_num={trial_num} "
-                                        f"file={video_file.name} "
-                                        f"source_path={video_file} "
-                                        f"requested_source_start_s="
-                                        f"{clip_start_s:.6f} "
-                                        f"actual_source_start_s="
-                                        f"{actual_source_start_s:.6f} "
-                                        f"configured_video_fps="
-                                        f"{video_frame_rate:.6f} "
-                                        f"scheduled_video_frames="
-                                        f"{video_frame_count} "
-                                        f"video_size={video_size} "
-                                        f"prepared_size={prepared_size} "
-                                        f"draw_size=({draw_size[0]:.1f},"
-                                        f"{draw_size[1]:.1f}) "
-                                        f"backend={backend_used}"
-                                    ),
-                                )
 
                         if previous_refresh_flip_perf is not None:
                             refresh_interval_s = (
@@ -761,29 +771,37 @@ def play_video_fill_screen(
                                 )
                         previous_refresh_flip_perf = flip_perf
 
-                        if (
-                            repeat_index == 0
-                            and frame_publisher is not None
-                            and flip_perf >= next_frame_publish_perf
-                        ):
-                            frame_publisher.publish_rgb(
-                                prepared_frame.rgb,
-                                source_frame_index=int(
-                                    round(
-                                        (
-                                            current_source_time_s
-                                            - source_time_origin_s
+                        if repeat_index == 0 and frame_publisher is not None:
+                            # Do not page-fault or wake the experimenter GL
+                            # process between frame zero's first two VBLs. The
+                            # preview is explicitly best-effort and begins at
+                            # its configured sampling interval.
+                            if (
+                                frames_presented == 1
+                                and frame_publish_interval_s > 0.0
+                            ):
+                                next_frame_publish_perf = (
+                                    flip_perf + frame_publish_interval_s
+                                )
+                            elif flip_perf >= next_frame_publish_perf:
+                                frame_publisher.publish_rgb(
+                                    prepared_frame.rgb,
+                                    source_frame_index=int(
+                                        round(
+                                            (
+                                                current_source_time_s
+                                                - source_time_origin_s
+                                            )
+                                            * video_frame_rate
                                         )
-                                        * video_frame_rate
-                                    )
-                                ),
-                                source_media_time_s=current_source_time_s,
-                                main_display_flip_perf_s=flip_perf,
-                                trial_num=trial_num,
-                            )
-                            next_frame_publish_perf = (
-                                flip_perf + frame_publish_interval_s
-                            )
+                                    ),
+                                    source_media_time_s=current_source_time_s,
+                                    main_display_flip_perf_s=flip_perf,
+                                    trial_num=trial_num,
+                                )
+                                next_frame_publish_perf = (
+                                    flip_perf + frame_publish_interval_s
+                                )
                     source_frame_holds_completed += 1
     finally:
         final_sync_edge = None
@@ -848,13 +866,6 @@ def play_video_fill_screen(
                         "requested_timestamp_perf_s": end_requested_perf,
                     }
                 )
-            if logger is not None and first_flip_perf is not None:
-                logger.log_frame_flip(
-                    trial_num=trial_num,
-                    event="video_clip_end",
-                    timestamp_perf_s=end_perf,
-                    requested_timestamp_perf_s=end_requested_perf,
-                )
             if (
                 requested_clear_perf is not None
                 and previous_refresh_flip_perf is not None
@@ -912,6 +923,44 @@ def play_video_fill_screen(
                 # Drop the final NumPy export before closing its SharedMemory.
                 prepared_frame = None
                 frame_stream.close()
+
+            # Persist flip records only after the refresh-critical sequence.
+            # Their captured timestamps remain the actual callOnFlip times;
+            # deferring file I/O prevents the first event row from delaying
+            # frame zero's next repeated VBL.
+            if logger is not None and first_flip_perf is not None:
+                logger.log_frame_flip(
+                    trial_num=trial_num,
+                    event="video_clip_start",
+                    timestamp_perf_s=first_flip_perf,
+                    requested_timestamp_perf_s=first_flip_requested_perf,
+                    requested_duration=expected_duration_s,
+                )
+                if end_perf is not None:
+                    logger.log_frame_flip(
+                        trial_num=trial_num,
+                        event="video_clip_end",
+                        timestamp_perf_s=end_perf,
+                        requested_timestamp_perf_s=end_requested_perf,
+                    )
+            if first_flip_perf is not None:
+                _log_message(
+                    msg_logger,
+                    "INFO",
+                    (
+                        f"video_start trial_num={trial_num} "
+                        f"file={video_file.name} source_path={video_file} "
+                        f"onset_perf_s={first_flip_perf:.9f} "
+                        f"requested_source_start_s={clip_start_s:.6f} "
+                        f"actual_source_start_s={actual_source_start_s:.6f} "
+                        f"configured_video_fps={video_frame_rate:.6f} "
+                        f"scheduled_video_frames={video_frame_count} "
+                        f"video_size={video_size} "
+                        f"prepared_size={prepared_size} "
+                        f"draw_size=({draw_size[0]:.1f},"
+                        f"{draw_size[1]:.1f}) backend={backend_used}"
+                    ),
+                )
 
             _log_message(
                 msg_logger,
@@ -1122,6 +1171,11 @@ def play_video_fill_screen(
             float(frame_stream.startup_wait_s)
             if frame_stream is not None
             else 0.0
+        ),
+        "display_warmup_flips": int(display_warmup_flips),
+        "startup_preload_frames": int(startup_preload_frames),
+        "startup_average_preparation_fps": float(
+            startup_average_preparation_fps
         ),
     }
 

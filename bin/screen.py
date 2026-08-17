@@ -116,7 +116,7 @@ def measure_window_flip_rate(
     warmup_frames: int = 10,
     sample_frames: int = 60,
 ) -> Optional[float]:
-    """Measure a low-overhead median rate from consecutive blank flips."""
+    """Measure a robust low-overhead rate from consecutive blank flips."""
     for _ in range(max(0, int(warmup_frames))):
         win.flip()
     timestamps = []
@@ -125,7 +125,20 @@ def measure_window_flip_rate(
         timestamps.append(time.perf_counter())
     intervals = np.diff(timestamps)
     intervals = intervals[np.isfinite(intervals) & (intervals > 0.0)]
-    return float(1.0 / np.median(intervals)) if intervals.size else None
+    if not intervals.size:
+        return None
+    median_period = float(np.median(intervals))
+    # A median of individual intervals is robust but unnecessarily noisy as a
+    # frequency estimate (the Pi log can report values such as 60.34 Hz for a
+    # nominal 60 Hz mode). Reject obvious missed swaps using the median, then
+    # average the remaining periods so endpoint jitter does not distort the
+    # cadence phase plan.
+    tolerance_s = max(0.001, median_period * 0.25)
+    inliers = intervals[
+        np.abs(intervals - median_period) <= tolerance_s
+    ]
+    period_s = float(np.mean(inliers if inliers.size else intervals))
+    return float(1.0 / period_s) if period_s > 0.0 else None
 
 
 def resolve_window_frame_rate(
@@ -2161,7 +2174,32 @@ def _experimenter_preview_process(
                             payload.get("minimum_sequence", 1)
                         )
                         shared_movie_sequence = shared_movie_minimum_sequence - 1
-                        shared_movie_source_size = None
+                        initial_source_size = tuple(
+                            int(value)
+                            for value in payload.get("video_size", (0, 0))
+                        )
+                        if (
+                            len(initial_source_size) == 2
+                            and min(initial_source_size) > 0
+                        ):
+                            blank_image = Image.new(
+                                "RGB",
+                                initial_source_size,
+                                (0, 0, 0),
+                            )
+                            shared_movie_stim = visual.ImageStim(
+                                win,
+                                image=blank_image,
+                                units="pix",
+                                size=movie_layout["box_size"],
+                                pos=movie_layout["box_center"],
+                                interpolate=True,
+                                flipVert=True,
+                                autoLog=False,
+                            )
+                            shared_movie_source_size = initial_source_size
+                        else:
+                            shared_movie_source_size = None
                         shared_movie_active = True
                     elif command_type == "clear_scene":
                         _release_movie()

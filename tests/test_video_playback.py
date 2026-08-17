@@ -644,6 +644,7 @@ class VideoPlaybackTests(unittest.TestCase):
             layout=types.SimpleNamespace(
                 slot_count=1,
                 frames_per_chunk=3,
+                preload_chunks=1,
                 total_bytes=sum(frame.rgb.nbytes for frame in frames),
             ),
             startup_wait_s=0.0,
@@ -738,34 +739,35 @@ class VideoPlaybackTests(unittest.TestCase):
             )
 
         self.assertEqual(frame_stream.next_frame.call_count, 3)
-        self.assertEqual(upload_texture.call_count, 3)
-        self.assertEqual(uploaded_frames, [0, 1, 2])
-        self.assertEqual(drawn_frames, [0, 0, 1, 1, 2, 2])
-        self.assertEqual(stimulus.draw.call_count, 6)
-        self.assertEqual(win.flip_count, 7)
+        self.assertEqual(upload_texture.call_count, 4)
+        self.assertEqual(uploaded_frames, [0, 0, 1, 2])
+        self.assertEqual(drawn_frames, [0, 0, 0, 0, 1, 1, 2, 2])
+        self.assertEqual(stimulus.draw.call_count, 8)
+        self.assertEqual(win.flip_count, 9)
         image_stim.assert_called_once()
         sleep.assert_not_called()
         frame_stream.close.assert_called_once()
 
         flip_time = lambda flip_index: clock.anchor_s + flip_index / 60.0
-        self.assertEqual(result["start_flip_psychopy_s"], 1)
-        self.assertAlmostEqual(result["start_flip_perf_s"], flip_time(1))
-        self.assertAlmostEqual(result["last_frame_on_perf_s"], flip_time(5))
+        self.assertEqual(result["start_flip_psychopy_s"], 3)
+        self.assertAlmostEqual(result["start_flip_perf_s"], flip_time(3))
+        self.assertAlmostEqual(result["last_frame_on_perf_s"], flip_time(7))
         self.assertAlmostEqual(
             result["final_repeat_flip_perf_s"],
-            flip_time(6),
+            flip_time(8),
         )
-        self.assertAlmostEqual(result["clip_offset_perf_s"], flip_time(7))
+        self.assertAlmostEqual(result["clip_offset_perf_s"], flip_time(9))
         self.assertAlmostEqual(result["displayed_duration_s"], 6.0 / 60.0)
         self.assertAlmostEqual(
             result["clear_flip_submitted_perf_s"],
-            flip_time(6),
+            flip_time(8),
         )
-        self.assertAlmostEqual(result["end_requested_perf_s"], flip_time(6))
-        self.assertAlmostEqual(result["requested_end_perf_s"], flip_time(7))
+        self.assertAlmostEqual(result["end_requested_perf_s"], flip_time(8))
+        self.assertAlmostEqual(result["requested_end_perf_s"], flip_time(9))
         self.assertEqual(result["frames_presented"], 3)
         self.assertEqual(result["source_frame_holds_completed"], 3)
         self.assertEqual(result["display_refreshes_presented"], 6)
+        self.assertEqual(result["display_warmup_flips"], 2)
         self.assertEqual(result["dropped_frames"], 0)
 
         self.assertEqual(frame_publisher.publish_rgb.call_count, 3)
@@ -779,14 +781,14 @@ class VideoPlaybackTests(unittest.TestCase):
                 call.kwargs["main_display_flip_perf_s"]
                 for call in publish_calls
             ],
-            [flip_time(1), flip_time(3), flip_time(5)],
+            [flip_time(3), flip_time(5), flip_time(7)],
         )
 
         # The pulse begins on source frame 2's first refresh, remains high
         # through its repeated refresh, then is forced low by the clear flip.
         self.assertEqual(
             gpio.writes,
-            [(5, "chip", 18, 1), (7, "chip", 18, 0)],
+            [(7, "chip", 18, 1), (9, "chip", 18, 0)],
         )
         self.assertEqual(result["sync_pulses"], 1)
 
@@ -797,11 +799,11 @@ class VideoPlaybackTests(unittest.TestCase):
         )
         self.assertAlmostEqual(
             end_flip_call.kwargs["requested_timestamp_perf_s"],
-            flip_time(6),
+            flip_time(8),
         )
         self.assertAlmostEqual(
             end_flip_call.kwargs["timestamp_perf_s"],
-            flip_time(7),
+            flip_time(9),
         )
 
     @staticmethod
@@ -1263,7 +1265,7 @@ class PlayVideoTaskTests(unittest.TestCase):
 
         preview = preview_instances[0]
         self.assertEqual(len(preview.play_calls), 2)
-        self.assertEqual(preview.play_calls[0]["video_size"], (1920, 1080))
+        self.assertEqual(preview.play_calls[0]["video_size"], (674, 1080))
         self.assertEqual(preview.play_calls[0]["main_size"], (2560, 1600))
         self.assertEqual(preview.play_calls[0]["main_rotation_deg"], 90)
         self.assertEqual(len(preview.clear_calls), 3)

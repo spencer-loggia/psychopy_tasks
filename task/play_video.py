@@ -28,6 +28,7 @@ from bin.task_lifecycle import USER_EXIT_CODE
 from bin.video_playback import (
     RandomFramePulseSchedule,
     SharedVideoFrameBuffer,
+    center_crop_bounds,
     is_raspberry_pi,
     parse_frame_rate,
     plan_video_refresh_cadence,
@@ -659,10 +660,22 @@ def run_task(
                 frame_rate=frame_rate,
             )
             if experimenter_preview is not None and frame_publisher is not None:
+                preview_crop_bounds = center_crop_bounds(
+                    (
+                        int(chosen_stream["width"]),
+                        int(chosen_stream["height"]),
+                    ),
+                    subject_main_size,
+                    alignment=2,
+                )
+                preview_frame_size = (
+                    preview_crop_bounds[2] - preview_crop_bounds[0],
+                    preview_crop_bounds[3] - preview_crop_bounds[1],
+                )
                 experimenter_preview.play_shared_video(
                     shared_frame_buffer=frame_publisher.descriptor(),
                     minimum_sequence=frame_publisher.sequence + 1,
-                    video_size=(int(chosen_stream["width"]), int(chosen_stream["height"])),
+                    video_size=preview_frame_size,
                     bg_rgb_255=bg,
                     main_size=native_main_size,
                     main_rotation_deg=main_rotation_deg,

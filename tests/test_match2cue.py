@@ -12,11 +12,12 @@ from bin.afc_stimuli import load_afc_stimulus_space, render_afc_stimulus
 from bin.logger import EventCodeLibrary, load_task_event_definitions
 from bin.match2cue_logic import (
     Match2CueTrial,
+    execute_reward_train,
     generate_match2cue_trial,
     resolve_match2cue_reward_settings,
     reward_train_duration,
     score_match2cue_choice,
-    should_deliver_cue_tap_reward,
+    should_deliver_match_cue_tap_reward,
 )
 
 
@@ -46,6 +47,21 @@ class Match2CueLogicTests(unittest.TestCase):
     def test_trial_requires_at_least_one_option(self):
         with self.assertRaisesRegex(ValueError, "at least 1"):
             generate_match2cue_trial([(7, None)], 0)
+
+    def test_match_cue_reward_draw_does_not_shift_legacy_seeded_trial_values(self):
+        trial = generate_match2cue_trial(
+            [(1, None), (2, None), (3, None)],
+            4,
+            rng=random.Random(17),
+        )
+
+        self.assertEqual(trial.cue, (3, None))
+        self.assertEqual(
+            trial.options,
+            ((2, None), (2, None), (3, None), (2, None)),
+        )
+        self.assertAlmostEqual(trial.reward_draw, 0.11016204891721182)
+        self.assertAlmostEqual(trial.match_cue_reward_draw, 0.026936778790526805)
 
     def test_matching_choice_uses_inverse_duplicate_reward_probability(self):
         rewarded_trial = Match2CueTrial(
@@ -132,16 +148,27 @@ class Match2CueLogicTests(unittest.TestCase):
         self.assertIsNone(outcome.correct)
         self.assertFalse(outcome.reward_delivered)
 
-    def test_cue_tap_and_choice_rewards_use_independent_draws(self):
+    def test_match_cue_tap_and_choice_rewards_use_independent_draws(self):
         trial = Match2CueTrial(
             cue=(1, None),
             options=((1, None),),
             reward_draw=0.1,
-            cue_reward_draw=0.9,
+            match_cue_reward_draw=0.9,
         )
 
         self.assertTrue(score_match2cue_choice(trial, 1).reward_delivered)
-        self.assertFalse(should_deliver_cue_tap_reward(trial, 0.7))
+        self.assertFalse(should_deliver_match_cue_tap_reward(trial, 0.7))
+
+    def test_match_cue_tap_reward_probability_boundaries(self):
+        trial = Match2CueTrial(
+            cue=(1, None),
+            options=((1, None),),
+            reward_draw=0.5,
+            match_cue_reward_draw=0.5,
+        )
+
+        self.assertFalse(should_deliver_match_cue_tap_reward(trial, 0.0))
+        self.assertTrue(should_deliver_match_cue_tap_reward(trial, 1.0))
 
 
 class Match2CueRewardSettingsTests(unittest.TestCase):
@@ -170,7 +197,7 @@ class Match2CueRewardSettingsTests(unittest.TestCase):
         self.assertEqual(settings.tie_mode, "all")
 
     def test_invalid_cue_reward_probabilities_are_rejected(self):
-        for value in (-0.1, 1.1, float("nan"), float("inf")):
+        for value in (-0.1, 1.1, float("nan"), float("inf"), True):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(ValueError, "reward_match_cue_prob"):
                     resolve_match2cue_reward_settings(
@@ -196,6 +223,38 @@ class Match2CueRewardSettingsTests(unittest.TestCase):
     def test_reward_train_duration_includes_only_between_pulse_gaps(self):
         self.assertAlmostEqual(reward_train_duration(2, 0.6, 0.2), 1.4)
         self.assertAlmostEqual(reward_train_duration(1, 0.6, 0.2), 0.6)
+
+    def test_reward_train_executes_two_pulses_with_one_between_pulse_wait(self):
+        events = []
+
+        aborted = execute_reward_train(
+            2,
+            deliver_pulse=lambda pulse_num: bool(
+                events.append(("pulse", pulse_num))
+            ),
+            wait_between_pulses=lambda pulse_num: bool(
+                events.append(("wait", pulse_num))
+            ),
+        )
+
+        self.assertFalse(aborted)
+        self.assertEqual(events, [("pulse", 1), ("wait", 1), ("pulse", 2)])
+
+    def test_reward_train_stops_when_between_pulse_wait_aborts(self):
+        events = []
+
+        aborted = execute_reward_train(
+            3,
+            deliver_pulse=lambda pulse_num: bool(
+                events.append(("pulse", pulse_num))
+            ),
+            wait_between_pulses=lambda pulse_num: (
+                events.append(("wait", pulse_num)) or True
+            ),
+        )
+
+        self.assertTrue(aborted)
+        self.assertEqual(events, [("pulse", 1), ("wait", 1)])
 
 
 class Match2CueStimulusTests(unittest.TestCase):
@@ -277,6 +336,7 @@ class Match2CueEventTests(unittest.TestCase):
         library = EventCodeLibrary(definitions, event_patterns=patterns)
 
         self.assertEqual(definitions["match_cue_on"].code, 116)
+        self.assertEqual(definitions["match_cue_touch"].code, 202)
         self.assertEqual(definitions["delay_start"].code, 114)
         self.assertEqual(library.ensure("option_3_dot", "frame_flip").code, 1003)
         self.assertEqual(library.ensure("option_3_on", "frame_flip").code, 1103)

@@ -67,6 +67,7 @@ def parse_args():
     parser.add_argument("--config", help="Path to JSON config file. CLI overrides config keys.")
     parser.add_argument("--video_files", nargs="+", default=None, help="Explicit paths to source video files")
     parser.add_argument("--clip_duration_seconds", type=float, default=None, help="Duration of each randomly selected clip/trial")
+    parser.add_argument("--num_clips", type=int, default=None, help="Number of clips/trials to play")
     parser.add_argument("--seek_timeout_seconds", type=float, default=None, help="Maximum wait for a network source seek and first decoded frame")
     parser.add_argument("--output_dir", default=None, help="Directory to save logs")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
@@ -96,6 +97,7 @@ def run_task(
     video_files: Sequence[str],
     clip_duration_seconds: Optional[float],
     output_dir: str,
+    num_clips: int,
     seed: Optional[int] = None,
     fullscreen: bool = True,
     win_size: Optional[Tuple[int, int]] = None,
@@ -117,6 +119,8 @@ def run_task(
     frame_rate: float = 30.0,
     flip_request_lead_seconds: float = 0.015,
 ):
+    if isinstance(num_clips, bool) or not isinstance(num_clips, int) or num_clips <= 0:
+        raise ValueError("num_clips must be a positive integer")
     if clip_duration_seconds is None:
         raise ValueError("clip_duration_seconds is required")
     clip_duration_seconds = float(clip_duration_seconds)
@@ -395,6 +399,7 @@ def run_task(
                 f"video_requirements codec=hevc profile=Main pix_fmt=yuv420p "
                 f"probed_once=1 n_video_paths={len(resolved_video_files)} "
                 f"n_unique_videos={len(video_streams)} clip_duration_s={clip_duration_seconds:.6f} "
+                f"num_clips={num_clips} "
                 f"configured_video_fps={frame_rate:.6f} "
                 f"flip_request_lead_s={flip_request_lead_seconds:.6f} "
                 f"seek_timeout_s={seek_timeout_seconds:.3f}"
@@ -508,7 +513,7 @@ def run_task(
 
         msg_logger.log(
             "INFO",
-            f"task_ready monitor_fps={fps:.6f} video_fps={frame_rate:.6f} n_video_paths={len(resolved_video_files)} clip_duration_s={clip_duration_seconds:.6f}",
+            f"task_ready monitor_fps={fps:.6f} video_fps={frame_rate:.6f} n_video_paths={len(resolved_video_files)} clip_duration_s={clip_duration_seconds:.6f} num_clips={num_clips}",
         )
 
         try:
@@ -518,7 +523,7 @@ def run_task(
             pass
         playback_info = None
         played_videos = 0
-        stop_reason = "mouse_click"
+        stop_reason = "done"
 
         def _external_abort_reason():
             if pump_controller is not None and pump_controller.failed:
@@ -527,7 +532,7 @@ def run_task(
                 return "experimenter_exit"
             return False
 
-        while True:
+        while played_videos < num_clips:
             _drain_pump_edges()
             if pump_controller is not None and pump_controller.failed:
                 raise RuntimeError(
@@ -537,14 +542,6 @@ def run_task(
                 stop_reason = "experimenter_exit"
                 msg_logger.log("WARN", "experimenter_exit_before_video")
                 break
-            try:
-                is_pressed = any(mouse.getPressed())
-            except Exception:
-                is_pressed = False
-            if is_pressed:
-                stop_reason = "mouse_click"
-                break
-
             chosen_video = selection_rng.choice(resolved_video_files)
             chosen_stream = video_streams[chosen_video]
             selected_clip = select_random_video_clip(
@@ -580,7 +577,7 @@ def run_task(
                     bg_rect=bg_rect,
                     msg_logger=msg_logger,
                     allow_escape=True,
-                    stop_on_mouse_click=True,
+                    stop_on_mouse_click=False,
                     mouse=mouse,
                     ffprobe_bin=ffprobe_bin,
                     external_abort_checker=_external_abort_reason,
@@ -743,6 +740,7 @@ def main():
                 "output_dir",
                 "video_files",
                 "clip_duration_seconds",
+                "num_clips",
             ],
         )
 
@@ -768,6 +766,7 @@ def main():
             video_files=_get("video_files", []),
             clip_duration_seconds=_get("clip_duration_seconds", None),
             output_dir=_get("output_dir", "./logs"),
+            num_clips=_get("num_clips", None),
             seed=_get("seed", None),
             fullscreen=bool(_get("fullscreen", cfg.get("fullscreen", True))),
             win_size=tuple(_get("win_size", cfg.get("win_size", None))) if _get("win_size", None) else None,

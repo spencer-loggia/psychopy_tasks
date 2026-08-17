@@ -2,8 +2,8 @@
 """Match-to-cue task using the shared AFC presentation engine.
 
 Trial sequence:
-    onset cue -> optional cue reward -> match cue -> delay -> options -> choice
-    -> optional choice reward -> inter-trial interval
+    onset cue -> match cue/tap -> optional match-cue reward -> delay -> options
+    -> choice -> optional choice reward -> inter-trial interval
 
 One option always equals the match cue. Other options are sampled independently
 from the full configured stimulus space, so duplicate matches are possible.
@@ -43,11 +43,12 @@ from bin.frame_timing import plan_frame_duration, validate_requested_durations
 from bin.logger import SessionLogBundle
 from bin.match2cue_logic import (
     Match2CueTrial,
+    execute_reward_train,
     generate_match2cue_trial,
     resolve_match2cue_reward_settings,
     reward_train_duration,
     score_match2cue_choice,
-    should_deliver_cue_tap_reward,
+    should_deliver_match_cue_tap_reward,
 )
 from bin.screen import (
     ExperimenterPreview,
@@ -97,7 +98,7 @@ def _generate_trial_payload(trial_idx: int, config: dict) -> dict:
         "cue": stimulus_to_json(trial.cue),
         "options": [stimulus_to_json(value) for value in trial.options],
         "reward_draw": float(trial.reward_draw),
-        "cue_reward_draw": float(trial.cue_reward_draw),
+        "match_cue_reward_draw": float(trial.match_cue_reward_draw),
         "rendered": {
             stimulus_storage_key(key): value for key, value in rendered.items()
         },
@@ -117,7 +118,7 @@ def _decode_trial_payload(
         cue=cue,
         options=options,
         reward_draw=float(payload["reward_draw"]),
-        cue_reward_draw=float(payload.get("cue_reward_draw", 1.0)),
+        match_cue_reward_draw=float(payload.get("match_cue_reward_draw", 0.0)),
     )
     rendered = {
         stimulus_from_storage_key(key): value
@@ -161,8 +162,9 @@ def _build_behavior_fieldnames(num_afc: int) -> List[str]:
             "choice_made_color",
             "choice_made_lum",
             "choice_correct",
-            "cue_reward_probability",
-            "cue_reward_delivered",
+            "match_cue_tapped",
+            "match_cue_reward_probability",
+            "match_cue_reward_delivered",
             "reward_probability",
             "reward_delivered",
             "choice_reward_pulse_count",
@@ -432,20 +434,34 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     task_end_status = "done"
 
     def poll_controls(*, allow_manual_reward: bool = True) -> bool:
-        manual_reward = False
+        nonlocal task_end_status
+        pressed_keys = set()
+        try:
+            pressed_keys = set(event.getKeys(keyList=["escape", "r"]))
+        except Exception:
+            pass
+        if "escape" in pressed_keys:
+            task_end_status = "aborted"
+            msg_logger.log("WARN", "escape_pressed task_control_poll=1")
+            return True
+
+        preview_manual_reward = bool(
+            experimenter_preview is not None
+            and experimenter_preview.consume_manual_reward_request()
+        )
+        manual_reward = bool(
+            allow_manual_reward
+            and ("r" in pressed_keys or preview_manual_reward)
+        )
         if allow_manual_reward:
-            try:
-                manual_reward = bool(event.getKeys(keyList=["r"]))
-            except Exception:
-                pass
-            if experimenter_preview is not None:
-                manual_reward = (
-                    experimenter_preview.consume_manual_reward_request()
-                    or manual_reward
-                )
             if manual_reward:
                 deliver_reward(None, context="manual_reward")
-        return bool(experimenter_preview is not None and experimenter_preview.poll())
+        experimenter_exit = bool(
+            experimenter_preview is not None and experimenter_preview.poll()
+        )
+        if experimenter_exit:
+            task_end_status = "experimenter_exit"
+        return experimenter_exit
 
     def wait_or_abort(duration_s: float, *, allow_manual_reward: bool = True) -> bool:
         deadline = time.perf_counter() + max(0.0, float(duration_s))
@@ -461,9 +477,9 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
         nonlocal task_end_status
         start_requested_perf = time.perf_counter()
         aborted = False
-        set_pump(True)
-        start_perf = time.perf_counter()
         try:
+            set_pump(True)
+            start_perf = time.perf_counter()
             logger.log_signal(
                 trial_num=trial_num,
                 event="pump_on",
@@ -480,21 +496,23 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 )
         finally:
             end_requested_perf = time.perf_counter()
-            set_pump(False)
-            end_perf = time.perf_counter()
-            logger.log_signal(
-                trial_num=trial_num,
-                event="pump_off",
-                timestamp_perf_s=end_perf,
-                requested_timestamp_perf_s=end_requested_perf,
-            )
+            try:
+                set_pump(False)
+            finally:
+                end_perf = time.perf_counter()
+                logger.log_signal(
+                    trial_num=trial_num,
+                    event="pump_off",
+                    timestamp_perf_s=end_perf,
+                    requested_timestamp_perf_s=end_requested_perf,
+                )
         status_counts["Rewards delivered"] += 1
         update_preview_counts()
         msg_logger.log(
             "INFO",
             f"reward_pulse trial_num={trial_num} context={context}",
         )
-        if aborted:
+        if aborted and task_end_status == "done":
             task_end_status = "experimenter_exit"
         return aborted
 
@@ -506,25 +524,34 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     ) -> bool:
         """Deliver an abort-aware pulse train with gaps only between pulses."""
         nonlocal task_end_status
-        for pulse_num in range(1, int(num_pulses) + 1):
-            if deliver_reward(trial_num, context=context):
-                return True
-            if pulse_num >= int(num_pulses):
-                continue
+
+        def deliver_pulse(_pulse_num: int) -> bool:
+            return deliver_reward(trial_num, context=context)
+
+        def wait_between_pulses(pulse_num: int) -> bool:
+            nonlocal task_end_status
             if wait_or_abort(
                 reward_settings.inter_pump_interval,
                 allow_manual_reward=False,
             ):
-                task_end_status = "experimenter_exit"
+                if task_end_status == "done":
+                    task_end_status = "experimenter_exit"
                 msg_logger.log(
                     "WARN",
                     (
-                        "experimenter_exit_during_inter_pump_interval "
-                        f"trial_num={trial_num} pulse={pulse_num}"
+                        "reward_train_aborted_during_inter_pump_interval "
+                        f"trial_num={trial_num} pulse={pulse_num} "
+                        f"status={task_end_status}"
                     ),
                 )
                 return True
-        return False
+            return False
+
+        return execute_reward_train(
+            num_pulses,
+            deliver_pulse=deliver_pulse,
+            wait_between_pulses=wait_between_pulses,
+        )
 
     worker_config = {
         "n_trials": n_trials,
@@ -562,7 +589,8 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
             if experimenter_preview is not None:
                 experimenter_preview.set_trial_progress(trial_num, n_trials)
             if poll_controls():
-                task_end_status = "experimenter_exit"
+                if task_end_status == "done":
+                    task_end_status = "experimenter_exit"
                 break
 
             payload = buffer_manager.get_next_trial()
@@ -597,18 +625,15 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                     f"position_assigned trial_num={trial_num} option_num={option_num} screen_px={screen_pos} psychopy_pos={psycho_pos}",
                 )
 
-            cue_reward_state = {"delivered": False}
-            cue_reward_won = bool(
-                self_initiation
-                and should_deliver_cue_tap_reward(
-                    trial,
-                    reward_settings.reward_match_cue_prob,
-                )
+            match_cue_reward_state = {"delivered": False}
+            match_cue_reward_won = should_deliver_match_cue_tap_reward(
+                trial,
+                reward_settings.reward_match_cue_prob,
             )
 
-            def deliver_won_cue_reward() -> bool:
-                cue_reward_state["delivered"] = True
-                return deliver_reward(trial_num, context="cue_tap_reward")
+            def deliver_won_match_cue_reward() -> bool:
+                match_cue_reward_state["delivered"] = True
+                return deliver_reward(trial_num, context="match_cue_tap_reward")
 
             trial_meta: Dict[str, Any] = {}
             aborted, choice_info = utils.present_trial_with_persistent_dots(
@@ -628,8 +653,13 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 init_dot_color=init_dot_color,
                 bg_rgb_255=space.bg,
                 onset_cue=onset_stim,
-                on_onset_cue_touch=(
-                    deliver_won_cue_reward if cue_reward_won else None
+                detect_pre_options_cue_touch=(
+                    reward_settings.reward_match_cue_prob > 0.0
+                ),
+                on_pre_options_cue_touch=(
+                    deliver_won_match_cue_reward
+                    if match_cue_reward_won
+                    else None
                 ),
                 msg_logger=msg_logger,
                 fps=fps,
@@ -660,10 +690,8 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                             "scope=continuous_frame_sequences"
                         ),
                     )
-                if task_end_status != "experimenter_exit":
-                    task_end_status = (
-                        "experimenter_exit" if poll_controls() else "aborted"
-                    )
+                if task_end_status == "done":
+                    task_end_status = "aborted"
                 break
 
             chosen_index = choice_info.get("chosen_index") if choice_info is not None else None
@@ -698,8 +726,12 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
             update_preview_counts()
 
             if outcome.reward_delivered:
-                if pump_delay_time > 0 and wait_or_abort(pump_delay_time):
-                    task_end_status = "experimenter_exit"
+                if pump_delay_time > 0 and wait_or_abort(
+                    pump_delay_time,
+                    allow_manual_reward=False,
+                ):
+                    if task_end_status == "done":
+                        task_end_status = "experimenter_exit"
                     break
                 if deliver_reward_train(
                     trial_num,
@@ -731,8 +763,11 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 "choice_made_color": chosen_color,
                 "choice_made_lum": chosen_lum,
                 "choice_correct": (int(outcome.correct) if outcome.correct is not None else ""),
-                "cue_reward_probability": f"{reward_settings.reward_match_cue_prob:.9f}",
-                "cue_reward_delivered": int(cue_reward_state["delivered"]),
+                "match_cue_tapped": int(trial_meta.get("match_cue_touched", False)),
+                "match_cue_reward_probability": f"{reward_settings.reward_match_cue_prob:.9f}",
+                "match_cue_reward_delivered": int(
+                    match_cue_reward_state["delivered"]
+                ),
                 "reward_probability": f"{outcome.reward_probability:.9f}",
                 "reward_delivered": int(outcome.reward_delivered),
                 "choice_reward_pulse_count": (
@@ -766,7 +801,8 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
             with timing_context:
                 for _ in range(hold_frames):
                     if poll_controls():
-                        task_end_status = "experimenter_exit"
+                        if task_end_status == "done":
+                            task_end_status = "experimenter_exit"
                         break
                     bg_rect.draw()
                     if fix is not None:

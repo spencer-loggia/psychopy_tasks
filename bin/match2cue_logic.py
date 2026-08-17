@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 from bin.afc_stimuli import StimulusKey
 
@@ -17,10 +17,10 @@ class Match2CueTrial:
     cue: StimulusKey
     options: tuple[StimulusKey, ...]
     reward_draw: float
-    # Kept separate from reward_draw so cue-tap and choice rewards are
+    # Kept separate from reward_draw so match-cue-tap and choice rewards are
     # independent. The default preserves compatibility with callers that
     # construct trials directly and only score the option choice.
-    cue_reward_draw: float = 1.0
+    match_cue_reward_draw: float = 0.0
 
     @property
     def matching_count(self) -> int:
@@ -62,6 +62,8 @@ def resolve_match2cue_reward_settings(
     tie_mode: Any = "random",
 ) -> Match2CueRewardSettings:
     """Validate reward options and apply backward-compatible defaults."""
+    if isinstance(reward_match_cue_prob, bool):
+        raise ValueError("reward_match_cue_prob must be a number from 0 to 1")
     try:
         cue_probability = float(reward_match_cue_prob)
     except (TypeError, ValueError) as exc:
@@ -125,12 +127,28 @@ def reward_train_duration(
     )
 
 
-def should_deliver_cue_tap_reward(
+def execute_reward_train(
+    num_pulses: int,
+    *,
+    deliver_pulse: Callable[[int], bool],
+    wait_between_pulses: Callable[[int], bool],
+) -> bool:
+    """Execute N pulses and N-1 gaps; callbacks return true to abort."""
+    count = int(num_pulses)
+    for pulse_num in range(1, count + 1):
+        if deliver_pulse(pulse_num):
+            return True
+        if pulse_num < count and wait_between_pulses(pulse_num):
+            return True
+    return False
+
+
+def should_deliver_match_cue_tap_reward(
     trial: Match2CueTrial,
     reward_probability: float,
 ) -> bool:
-    """Apply the trial's independent random draw to the cue-tap lottery."""
-    return bool(trial.cue_reward_draw < float(reward_probability))
+    """Apply the trial's independent draw to the match-cue-tap lottery."""
+    return bool(trial.match_cue_reward_draw < float(reward_probability))
 
 
 def generate_match2cue_trial(
@@ -163,7 +181,7 @@ def generate_match2cue_trial(
         reward_draw=chooser.random(),
         # Draw this after the legacy choice-reward draw so seeded cue/options
         # and choice rewards retain their prior random sequence.
-        cue_reward_draw=chooser.random(),
+        match_cue_reward_draw=chooser.random(),
     )
 
 

@@ -348,17 +348,19 @@ For `active_foraging`:
 - `reaction_time` is the time from `choice_start` until `option_touch`.
 - `choice_reaction_time` is currently the same quantity as `reaction_time`, retained because it is part of the requested task-specific schema.
 
-For `match2cue`, the behavior log additionally records the match cue, the number of matching options, the tie mode,
-whether the choice was correct, the resulting choice-reward probability and pulse count, and whether cue-tap and
-choice rewards were delivered. A no-response trial is left blank for correctness and does not increment either
-experimenter-screen correctness counter.
+For `match2cue`, the behavior log additionally records the match cue, whether that displayed match cue was tapped,
+the number of matching options, the tie mode, whether the choice was correct, the resulting choice-reward
+probability and pulse count, and whether match-cue and choice rewards were delivered. A no-response trial is left
+blank for correctness and does not increment either experimenter-screen correctness counter.
 
 Other tasks use the same session packaging and shared schemas but simpler task-specific behavior rows:
 
 - `random_image_sequence` treats each image presentation as a trial and logs one behavior row per image.
 - `afc_trial_sequence` logs one behavior row per trial, including the option list and any choice touch.
-- `play_video` takes an explicit `video_files` list and a required
-  `clip_duration_seconds`. Each trial randomly selects one source, uniformly
+- `play_video` takes an explicit `video_files` list, a required
+  `clip_duration_seconds`, and a positive `num_clips`. Subject-screen taps do
+  not interrupt playback; the task completes after `num_clips` clips. Each
+  trial randomly selects one source, uniformly
   selects a valid temporal start aligned to the configured video-frame
   timebase, seeks within that source, and presents the fixed-duration clip
   without extracting a temporary file. `frame_rate` is authoritative and
@@ -423,6 +425,7 @@ A minimal video-source portion of the configuration is:
     "/mnt/experiment-videos/source_02.mp4"
   ],
   "clip_duration_seconds": 5.0,
+  "num_clips": 10,
   "seek_timeout_seconds": 30.0,
   "frame_rate": 30,
   "flip_request_lead_seconds": 0.015,
@@ -647,7 +650,7 @@ python task/match2cue.py \
 Replace the screen selectors with the local display indices or RandR output names. The interface supplies them
 automatically when launching the task as an experiment block.
 
-Each trial runs `onset cue -> optional cue-tap reward -> match cue -> delay -> options -> choice -> optional
+Each trial runs `onset cue -> match cue/tap -> optional match-cue reward -> delay -> options -> choice -> optional
 choice reward -> inter-trial interval`. The `match_cue_duration` and `delay_time` fields control the two added
 visual phases. Option presentation uses the same `sequential`, `is_memory`, `fixed_positions`, `duration`, `isi`,
 `choice_time`, `center_point`, `stim_range_radius`, and `num_afc` semantics as active foraging.
@@ -662,10 +665,11 @@ never rewarded.
 `correct_num_pulse` is the positive number of pump pulses delivered for a rewarded choice and defaults to `1`.
 `pump_delay_time` is applied once before that pulse train. `inter_pump_interval` is the delay between consecutive
 pulses; when omitted, it defaults to `pump_pulse_time_seconds`. The pulse interval is not added after the final
-pulse. `reward_match_cue_prob` is an independent probability from `0` to `1`, defaulting to `0`, that a successful
-tap on the checkerboard self-initiation cue earns one immediate pump pulse. It has no effect when
-`self_initiation=false`, because no cue tap occurs. Cue-tap and manual rewards always use one pulse and are not
-multiplied by `correct_num_pulse`.
+pulse. `reward_match_cue_prob` is an independent probability from `0` to `1`, defaulting to `0`, that a fresh tap
+on the displayed matching stimulus earns one pump pulse. The tap is accepted only while the matching stimulus is
+visible; a held checkerboard-initiation press does not count. Reward delivery occurs after match-cue offset so the
+configured `match_cue_duration` remains frame-accurate. Match-cue and manual rewards always use one pulse and are
+not multiplied by `correct_num_pulse`.
 
 The config has no frequency-space, reward-space, reward-level, timeout, or buzzer settings. Its `subject` field is
 still required and is displayed and logged, but it does not alter task behavior.
@@ -676,13 +680,14 @@ must contain exactly one data row—the background gray—and `n_lum_levels` sho
 `n_colors * n_lum_levels` non-background rows. `n_shapes` must match the number of rows in `shapes_tsv` in either
 mode.
 
-The match-to-cue event log adds `match_cue_on` and `delay_start`. The behavior log records cue and option feature
-indices, `matching_option_count`, `tie_mode`, `choice_correct`, `cue_reward_probability`,
-`cue_reward_delivered`, `reward_probability`, `reward_delivered`, and `choice_reward_pulse_count`, in addition to
-the shared choice/touch timing fields. The existing `reward_probability` and `reward_delivered` fields continue to
-describe the option-choice reward. The experimenter preview shows the configured subject, current/total trial,
-and cumulative counts for correct choices, incorrect choices, and individual reward pulses delivered. Correct
-and reward-pulse counts can differ because of cue rewards, multi-pulse choice rewards, and random tie handling.
+The match-to-cue event log adds `match_cue_on`, `match_cue_touch`, and `delay_start`. The behavior log records cue
+and option feature indices, `matching_option_count`, `tie_mode`, `choice_correct`, `match_cue_tapped`,
+`match_cue_reward_probability`, `match_cue_reward_delivered`, `reward_probability`, `reward_delivered`, and
+`choice_reward_pulse_count`, in addition to the shared choice/touch timing fields. The existing
+`reward_probability` and `reward_delivered` fields continue to describe the option-choice reward. The
+experimenter preview shows the configured subject, current/total trial, and cumulative counts for correct choices,
+incorrect choices, and individual reward pulses delivered. Correct and reward-pulse counts can differ because of
+match-cue rewards, multi-pulse choice rewards, and random tie handling.
 
 Configuration via JSON (required for tasks)
 -----------------------------------------

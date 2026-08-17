@@ -303,7 +303,7 @@ class PlayVideoTaskRotationTests(unittest.TestCase):
 
     def test_run_task_propagates_native_geometry_and_clockwise_rotation(self):
         mouse = types.SimpleNamespace(
-            getPressed=Mock(return_value=(False, False, False)),
+            getPressed=Mock(return_value=(True, False, False)),
             clickReset=Mock(),
         )
         fake_event = types.SimpleNamespace(
@@ -397,8 +397,8 @@ class PlayVideoTaskRotationTests(unittest.TestCase):
             "actual_source_last_frame_s": 3.0,
             "displayed_duration_s": 2.0,
             "frames_presented": 120,
-            "aborted": True,
-            "abort_reason": "mouse_click",
+            "aborted": False,
+            "abort_reason": "",
             "dropped_frames": 0,
             "sync_pulses": 0,
         }
@@ -417,6 +417,8 @@ class PlayVideoTaskRotationTests(unittest.TestCase):
             fake_screen,
             fake_psychopy,
         )
+        with self.assertRaisesRegex(ValueError, "num_clips must be a positive integer"):
+            module.run_task([], 2.0, "unused", num_clips=0)
 
         class FakeFramePublisher:
             name = "raw-frame-buffer"
@@ -490,10 +492,11 @@ class PlayVideoTaskRotationTests(unittest.TestCase):
                 video_files=[str(video_path)],
                 clip_duration_seconds=2.0,
                 output_dir=tmpdir,
+                num_clips=2,
                 screen_config={"main": "MAIN", "experimenter": "PREVIEW"},
             )
 
-        self.assertEqual(stop_reason, "mouse_click")
+        self.assertEqual(stop_reason, "done")
         fake_utils.setup_task_window.assert_called_once_with(
             {"main": "MAIN", "experimenter": "PREVIEW"},
             bg_rgb_255=(0, 0, 0),
@@ -504,7 +507,9 @@ class PlayVideoTaskRotationTests(unittest.TestCase):
         software_stimulus_rotation.assert_called_once_with("normal")
         oriented_size.assert_called_once_with((2560, 1600), 90)
 
+        self.assertEqual(play_video_fill_screen.call_count, 2)
         playback_kwargs = play_video_fill_screen.call_args.kwargs
+        self.assertFalse(playback_kwargs["stop_on_mouse_click"])
         self.assertEqual(playback_kwargs["native_target_size"], (2560, 1600))
         self.assertEqual(playback_kwargs["stimulus_rotation_degrees"], 90)
         self.assertEqual(playback_kwargs["video_frame_rate"], 30.0)
@@ -512,11 +517,11 @@ class PlayVideoTaskRotationTests(unittest.TestCase):
         self.assertEqual(playback_kwargs["flip_request_lead_s"], 0.015)
 
         preview = preview_instances[0]
-        self.assertEqual(len(preview.play_calls), 1)
+        self.assertEqual(len(preview.play_calls), 2)
         self.assertEqual(preview.play_calls[0]["video_size"], (1920, 1080))
         self.assertEqual(preview.play_calls[0]["main_size"], (2560, 1600))
         self.assertEqual(preview.play_calls[0]["main_rotation_deg"], 90)
-        self.assertEqual(len(preview.clear_calls), 2)
+        self.assertEqual(len(preview.clear_calls), 3)
         for clear_call in preview.clear_calls:
             self.assertEqual(clear_call["main_size"], (2560, 1600))
             self.assertEqual(clear_call["main_rotation_deg"], 90)
@@ -529,7 +534,6 @@ class PlayVideoTaskRotationTests(unittest.TestCase):
         self.assertIn("subject_size=1600x2560", geometry_message)
         self.assertIn("stimulus_rotation_deg=90", geometry_message)
         self.assertFalse(any("swap_interval" in message for message in messages))
-
 
 if __name__ == "__main__":
     unittest.main()

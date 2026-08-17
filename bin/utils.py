@@ -1339,7 +1339,6 @@ def present_trial_with_persistent_dots(
     init_dot_color: Optional[Tuple[int, int, int]] = None,
     bg_rgb_255: Optional[Tuple[int, int, int]] = None,
     onset_cue: Optional[visual.ImageStim] = None,
-    on_onset_cue_touch: Optional[Callable[[], bool]] = None,
     msg_logger=None,
     fps: Optional[float] = None,
     raspi: bool = False,
@@ -1360,6 +1359,9 @@ def present_trial_with_persistent_dots(
     pre_options_cue_event: str = "match_cue_on",
     pre_options_delay_event: str = "delay_start",
     stimulus_rotation_degrees: float = 0.0,
+    detect_pre_options_cue_touch: bool = False,
+    on_pre_options_cue_touch: Optional[Callable[[], bool]] = None,
+    pre_options_cue_touch_event: str = "match_cue_touch",
 ):
     """Present stimuli one at a time, leave faint dots at their locations,
     show all dots for `choice_time`, then clear.
@@ -1373,9 +1375,10 @@ def present_trial_with_persistent_dots(
         - reaction_time_s: time from choice_start to option_touch
         - touch_x / touch_y: screen coordinates of the option touch
 
-    When provided, ``on_onset_cue_touch`` runs after a successful onset-cue
-    touch and after the onset cue has been cleared from the main display. A
-    truthy return value aborts the trial.
+    When ``detect_pre_options_cue_touch`` is enabled, a fresh press on the
+    pre-options cue is logged once. ``on_pre_options_cue_touch`` runs after the
+    cue's configured frame duration and after it has been cleared from the main
+    display. A truthy callback return value aborts the trial.
     """
     from psychopy import core as _core
 
@@ -1634,16 +1637,6 @@ def present_trial_with_persistent_dots(
                         timestamp_perf_s=click_perf,
                     )
                     _show_preview([])
-                    if on_onset_cue_touch is not None:
-                        # Clear the checkerboard before a potentially blocking
-                        # callback (for example, reward delivery) so its visible
-                        # duration is not extended by that work.
-                        bg_rect.draw()
-                        if fix is not None:
-                            fix.draw()
-                        flip_with_timestamps(win)
-                        if on_onset_cue_touch():
-                            return True, None
                     break
 
             _core.wait(0.01)
@@ -1672,6 +1665,43 @@ def present_trial_with_persistent_dots(
         _show_preview(cue_preview)
         if not _arm_trial_start_signal():
             return True, None
+        pre_options_cue_touched = False
+        clear_timing = None
+        if detect_pre_options_cue_touch:
+            # A held checkerboard-initiation press must not count as a tap on
+            # the matching cue. Only a new edge after this reset is eligible.
+            mouse_presses.reset()
+
+        def _poll_pre_options_cue_touch() -> None:
+            nonlocal pre_options_cue_touched
+            if not detect_pre_options_cue_touch or pre_options_cue_touched:
+                return
+            touch_sample = mouse_presses.poll()
+            if not touch_sample.press_started:
+                return
+            click_pos = touch_sample.position
+            try:
+                cue_contains_touch = bool(cue_stim.contains(click_pos))
+            except Exception:
+                cue_w, cue_h = cue_stim.size
+                cue_x, cue_y = cue_stim.pos
+                cue_contains_touch = bool(
+                    abs(click_pos[0] - cue_x) <= cue_w / 2.0
+                    and abs(click_pos[1] - cue_y) <= cue_h / 2.0
+                )
+            if not cue_contains_touch:
+                return
+            touch_perf = time.perf_counter()
+            pre_options_cue_touched = True
+            logger.log_interaction(
+                trial_num=trial_num,
+                event=pre_options_cue_touch_event,
+                timestamp_perf_s=touch_perf,
+            )
+            if trial_meta is not None:
+                trial_meta["match_cue_touched"] = True
+                trial_meta["match_cue_touch_perf_s"] = touch_perf
+
         first_flip = True
         with frame_timing_monitor.continuous_sequence():
             for _ in range(cue_frames):
@@ -1701,11 +1731,67 @@ def present_trial_with_persistent_dots(
                     )
                     first_flip = False
 
-        if delay_frames > 0:
+                _poll_pre_options_cue_touch()
+
+        if detect_pre_options_cue_touch:
+            # Close the match-cue touch window on its offset flip, then poll
+            # once more so a short tap during the final displayed frame is not
+            # lost. Reward delivery stays outside the frame-counted cue loop.
             _show_preview([])
-            first_flip = True
+            bg_rect.draw()
+            if fix is not None:
+                fix.draw()
+            clear_timing = flip_with_timestamps(win)
+            if trial_meta is not None:
+                trial_meta["match_cue_clear_flip_perf_s"] = (
+                    clear_timing.actual_perf_s
+                )
+                trial_meta["match_cue_clear_flip_requested_perf_s"] = (
+                    clear_timing.requested_perf_s
+                )
+            _log_message(
+                msg_logger,
+                "INFO",
+                (
+                    f"match_cue_cleared trial_num={trial_num} "
+                    f"timestamp_perf_s={clear_timing.actual_perf_s:.9f} "
+                    "reason=match_cue_touch_window_end"
+                ),
+            )
+            _poll_pre_options_cue_touch()
+
+        match_cue_reward_callback_ran = bool(
+            pre_options_cue_touched and on_pre_options_cue_touch is not None
+        )
+        if match_cue_reward_callback_ran:
+            if on_pre_options_cue_touch():
+                return True, None
+
+        delay_frames_remaining = delay_frames
+        delay_already_started = False
+        if (
+            clear_timing is not None
+            and not match_cue_reward_callback_ran
+            and delay_frames_remaining > 0
+        ):
+            # When no match-cue reward runs, the touch-window closing flip is
+            # also the first configured delay frame. Do not add an extra frame
+            # merely because touch detection was enabled.
+            logger.log_frame_flip(
+                trial_num=trial_num,
+                event=pre_options_delay_event,
+                timestamp_perf_s=clear_timing.actual_perf_s,
+                requested_timestamp_perf_s=clear_timing.requested_perf_s,
+                requested_duration=delay_plan.requested_s,
+            )
+            delay_frames_remaining -= 1
+            delay_already_started = True
+
+        if delay_frames_remaining > 0:
+            _show_preview([])
+            first_flip = not delay_already_started
             with frame_timing_monitor.continuous_sequence():
-                for _ in range(delay_frames):
+                for _ in range(delay_frames_remaining):
                     if _event.getKeys(["escape"]):
                         _log_message(msg_logger, "WARN", f"escape_pressed trial_num={trial_num} during_match_delay=1")
                         return True, None

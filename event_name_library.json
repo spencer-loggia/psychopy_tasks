@@ -101,6 +101,11 @@
       "event_type": "interaction",
       "description": "A touch or click was registered on a selectable option."
     },
+    "match_cue_touch": {
+      "code": 202,
+      "event_type": "interaction",
+      "description": "A fresh touch or click was registered on the displayed match-to-cue target stimulus."
+    },
     "trial_start_signal_on": {
       "code": 300,
       "event_type": "signal",
@@ -193,6 +198,7 @@
       "choice_start",
       "gray_inter_trial_interval",
       "cue_touch",
+      "match_cue_touch",
       "option_touch",
       "trial_start_signal_on",
       "trial_start_signal_off",

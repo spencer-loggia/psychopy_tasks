@@ -1,5 +1,7 @@
 import os
 import queue
+import threading
+import time
 import types
 import unittest
 from contextlib import nullcontext
@@ -13,8 +15,10 @@ from bin.screen import (
     SECONDARY_SCREEN_ENV,
     ScreenGeometry,
     _bind_linux_pyglet_display,
+    _get_latest_preview_command,
     _parse_xrandr_listactivemonitors,
     _parse_xrandr_query,
+    _wait_for_preview_startup,
     build_reward_hit_boxes,
     compute_aspect_cover_size,
     compute_centered_aspect_fit,
@@ -374,7 +378,62 @@ class ScreenConfigTests(unittest.TestCase):
 
         preview._send({"type": "latest"})
 
-        self.assertEqual(preview._queue.items, [{"type": "latest"}])
+        self.assertEqual(len(preview._queue.items), 1)
+        self.assertEqual(preview._queue.items[0]["type"], "latest")
+        self.assertEqual(preview._queue.items[0]["_preview_sequence"], 1)
+
+    def test_preview_child_drains_to_newest_snapshot_before_applying(self):
+        commands = queue.Queue()
+        commands.put_nowait({"type": "old", "_preview_sequence": 1})
+        commands.put_nowait({"type": "middle", "_preview_sequence": 2})
+        commands.put_nowait({"type": "latest", "_preview_sequence": 3})
+
+        latest = _get_latest_preview_command(commands)
+
+        self.assertEqual(latest["type"], "latest")
+        self.assertEqual(latest["_preview_sequence"], 3)
+        self.assertTrue(commands.empty())
+
+    def test_preview_sender_keeps_newest_snapshot_while_process_queue_is_full(self):
+        preview = object.__new__(ExperimenterPreview)
+        preview._queue = queue.Queue(maxsize=1)
+        preview._queue.put_nowait({"type": "already_in_flight"})
+        preview._outbox = queue.Queue(maxsize=1)
+        preview._sender_stop = threading.Event()
+        preview._closed = False
+        preview.exit_requested = False
+        preview.poll = lambda: False
+        preview._process = Mock()
+        preview._process.is_alive.return_value = True
+        sender = threading.Thread(target=preview._command_sender_loop)
+        sender.start()
+        try:
+            preview._send({"type": "middle"})
+            time.sleep(0.02)
+            preview._send({"type": "latest"})
+            newest = _get_latest_preview_command(
+                preview._queue,
+                coalesce_s=0.1,
+            )
+            self.assertEqual(newest["type"], "latest")
+        finally:
+            preview._sender_stop.set()
+            sender.join(timeout=0.2)
+
+    def test_preview_startup_pipe_eof_becomes_structured_error(self):
+        receiver = Mock()
+        receiver.poll.return_value = True
+        receiver.recv.side_effect = EOFError
+        process = Mock()
+        process.is_alive.return_value = True
+
+        result, error = _wait_for_preview_startup(receiver, process, 0.1)
+
+        self.assertIsNone(result)
+        self.assertEqual(
+            error,
+            "startup channel closed before readiness: EOFError",
+        )
 
     def test_preview_queue_includes_subject_and_trial_progress(self):
         preview = object.__new__(ExperimenterPreview)
@@ -388,15 +447,56 @@ class ScreenConfigTests(unittest.TestCase):
 
         preview._send({"type": "static_scene"})
 
-        self.assertEqual(
-            preview._queue.get_nowait(),
+        payload = preview._queue.get_nowait()
+        self.assertEqual(payload["type"], "static_scene")
+        self.assertEqual(payload["subject"], "Yuri")
+        self.assertEqual(payload["current_trial_num"], 17)
+        self.assertEqual(payload["total_trials"], 2000)
+        self.assertIsNone(payload["status_counts"])
+        self.assertIsNone(payload["reward_counts"])
+        self.assertIsNone(payload["highlight_box"])
+
+    def test_preview_snapshots_preserve_explicit_state_clears(self):
+        preview = object.__new__(ExperimenterPreview)
+        preview.subject = "Yuri"
+        preview.current_trial_num = 5
+        preview.total_trials = 10
+        preview.status_counts = {"Correct": 2}
+
+        populated = preview._complete_preview_snapshot(
             {
                 "type": "static_scene",
-                "subject": "Yuri",
-                "current_trial_num": 17,
-                "total_trials": 2000,
-            },
+                "reward_counts": {1: 4},
+                "highlight_box": {"pos": [1, 2]},
+            }
         )
+        cleared = preview._complete_preview_snapshot(
+            {
+                "type": "clear_scene",
+                "status_counts": None,
+                "reward_counts": None,
+                "highlight_box": None,
+            }
+        )
+
+        self.assertEqual(populated["reward_counts"], {1: 4})
+        self.assertIsNone(cleared["status_counts"])
+        self.assertIsNone(cleared["reward_counts"])
+        self.assertIsNone(cleared["highlight_box"])
+        self.assertGreater(
+            cleared["_preview_sequence"], populated["_preview_sequence"]
+        )
+
+    def test_preview_poll_surfaces_unexpected_process_exit(self):
+        preview = object.__new__(ExperimenterPreview)
+        preview.exit_requested = False
+        preview._closed = False
+        preview._process = Mock()
+        preview._process.is_alive.return_value = False
+        preview._process.exitcode = 7
+
+        with self.assertRaisesRegex(RuntimeError, "status 7"):
+            preview.poll()
 
     def test_preview_queue_includes_generic_status_counts(self):
         preview = object.__new__(ExperimenterPreview)

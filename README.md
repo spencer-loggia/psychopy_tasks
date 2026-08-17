@@ -370,8 +370,9 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
 - The preview is a subject-view mirror: it transposes the complete native main
   framebuffer geometry (background, positions, stimuli, hit boxes, and video
   crop), rather than merely undoing each stimulus orientation. Scene commands
-  use a one-slot latest-state queue, and shared video reads the newest committed
-  ring frame, so a slow preview drops stale frames instead of accumulating lag.
+  use a bounded, sequenced latest-snapshot mailbox, and shared video reads the
+  newest committed ring frame, so a slow preview drops stale work instead of
+  accumulating lag.
 - The VLC player stays loaded when successive trials select the same source.
   For efficient random access over a mounted network filesystem, preprocess
   sources with `bin/preprocess_videos.py`; outputs use MP4 fast-start metadata
@@ -415,7 +416,8 @@ not relocate the new fullscreen window to that active display. Pyglet preselecti
 PsychoPy's Linux `screen=0` workaround; the realized native rectangle is the authoritative check. The non-vsync experimenter preview uses the
 same native fullscreen creation with scoped override-redirect so it remains on its configured output without
 altering the subject window's presentation path. Every realized native rectangle is verified; tasks, diagnostics,
-and experimenter previews all reject incorrect placement before timing begins.
+and experimenter previews all reject incorrect placement before timing begins. A preview reports ready only after
+its controls and initial subject-view scene complete their first successful flip.
 The shared window factory disables PsychoPy's implicit constructor timing benchmark; timing begins only after the
 launcher has released and the task has reactivated the subject window.
 The launcher, main-screen curtain, and experimenter controls likewise request true fullscreen after first being

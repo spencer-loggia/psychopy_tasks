@@ -12,6 +12,7 @@ import queue
 import re
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Callable, Dict, Optional, Sequence, Union
 
@@ -768,27 +769,6 @@ def resolve_interface_screen(
     return screen_info
 
 
-def place_tk_window_on_screen(
-    root,
-    screen_info: ScreenGeometry,
-    *,
-    min_width: int = 800,
-    min_height: int = 600,
-    margin_x: int = 20,
-    margin_y: int = 20,
-) -> tuple[int, int]:
-    screen_width = max(int(screen_info.width), 1)
-    screen_height = max(int(screen_info.height), 1)
-    usable_width = max(1, screen_width - (2 * int(margin_x)))
-    usable_height = max(1, screen_height - (2 * int(margin_y)) - 40)
-    window_width = min(screen_width, max(int(min_width), usable_width))
-    window_height = min(screen_height, max(int(min_height), usable_height))
-    window_x = int(screen_info.x) + max(0, (screen_width - window_width) // 2)
-    window_y = int(screen_info.y) + max(0, (screen_height - window_height) // 2)
-    root.geometry(_format_geometry(window_width, window_height, window_x, window_y))
-    return window_width, window_height
-
-
 def _get_pyglet_display() -> Any:
     from pyglet import canvas
 
@@ -1370,142 +1350,6 @@ def _format_geometry(width: int, height: int, x: int, y: int) -> str:
     return f"{width}x{height}{x_part}{y_part}"
 
 
-def _experimenter_panel_process(
-    screen_info: ScreenGeometry,
-    task_label: str,
-    start_perf_s: float,
-    update_interval_ms: int,
-    exit_event,
-    stop_event,
-) -> None:
-    import tkinter as tk
-
-    root = tk.Tk()
-    root.title("Experimenter")
-    root.configure(bg="#e9ecef")
-    set_tk_window_fullscreen(root, screen_info)
-    try:
-        root.attributes("-topmost", True)
-    except Exception:
-        pass
-
-    time_var = tk.StringVar(value="00:00:00")
-    task_var = tk.StringVar(value=task_label or "")
-
-    container = tk.Frame(root, bg="#e9ecef")
-    container.pack(fill="both", expand=True)
-
-    task_label_widget = tk.Label(
-        container,
-        textvariable=task_var,
-        font=("Helvetica", 20),
-        bg="#e9ecef",
-        fg="#4a4a4a",
-    )
-    task_label_widget.pack(pady=(70, 20))
-
-    timer_label = tk.Label(
-        container,
-        textvariable=time_var,
-        font=("Helvetica", 56, "bold"),
-        bg="#e9ecef",
-        fg="#111111",
-    )
-    timer_label.pack(pady=(20, 60))
-
-    exit_button = tk.Button(
-        container,
-        text="exit",
-        command=exit_event.set,
-        font=("Helvetica", 28, "bold"),
-        width=10,
-        height=2,
-        bg="#c94b4b",
-        activebackground="#a63a3a",
-        fg="#ffffff",
-    )
-    exit_button.pack()
-
-    def _tick() -> None:
-        if stop_event.is_set():
-            root.destroy()
-            return
-        elapsed = time.perf_counter() - float(start_perf_s)
-        time_var.set(format_elapsed_hms(elapsed))
-        root.after(update_interval_ms, _tick)
-
-    root.protocol("WM_DELETE_WINDOW", exit_event.set)
-    root.after(0, _tick)
-    root.mainloop()
-
-
-class ExperimenterControlPanel:
-    def __init__(
-        self,
-        screen_info: ScreenGeometry,
-        *,
-        task_label: str = "",
-        start_perf_s: Optional[float] = None,
-        update_interval_s: float = 0.2,
-    ):
-        self.screen_info = screen_info
-        self.task_label = task_label
-        self.start_perf_s = time.perf_counter() if start_perf_s is None else float(start_perf_s)
-        self.update_interval_s = max(0.1, float(update_interval_s))
-        self.exit_requested = False
-        self._ctx = mp.get_context("spawn")
-        self._exit_event = self._ctx.Event()
-        self._stop_event = self._ctx.Event()
-        self._process = self._ctx.Process(
-            target=_experimenter_panel_process,
-            args=(
-                screen_info,
-                task_label,
-                self.start_perf_s,
-                int(round(self.update_interval_s * 1000.0)),
-                self._exit_event,
-                self._stop_event,
-            ),
-            daemon=True,
-        )
-        self._process.start()
-
-    def elapsed_seconds(self) -> float:
-        return max(0.0, time.perf_counter() - self.start_perf_s)
-
-    def poll(self) -> bool:
-        if self.exit_requested:
-            return True
-        self.exit_requested = bool(self._exit_event.is_set())
-        return self.exit_requested
-
-    def wait(self, duration_s: float, *, step_s: float = 0.05) -> bool:
-        deadline = time.perf_counter() + max(0.0, float(duration_s))
-        while time.perf_counter() < deadline:
-            if self.poll():
-                return True
-            remaining = deadline - time.perf_counter()
-            if remaining > 0:
-                time.sleep(min(max(0.01, step_s), remaining))
-        return self.poll()
-
-    def close(self) -> None:
-        try:
-            self._stop_event.set()
-        except Exception:
-            pass
-        try:
-            if self._process.is_alive():
-                self._process.join(timeout=1.0)
-        except Exception:
-            pass
-        try:
-            if self._process.is_alive():
-                self._process.terminate()
-        except Exception:
-            pass
-
-
 def _preview_rgb255_to_psychopy(rgb_255: Sequence[int]) -> list[float]:
     return [max(-1.0, min(1.0, (float(v) / 127.5) - 1.0)) for v in rgb_255]
 
@@ -1621,6 +1465,61 @@ def build_reward_hit_boxes(
     return boxes
 
 
+def _get_latest_preview_command(
+    command_queue,
+    *,
+    coalesce_s: float = 0.005,
+) -> Optional[Dict[str, Any]]:
+    """Drain pending preview snapshots and return only the newest one."""
+    latest = None
+    coalesce_deadline = None
+    while True:
+        try:
+            candidate = command_queue.get_nowait()
+            if latest is None or int(candidate.get("_preview_sequence", 0)) >= int(
+                latest.get("_preview_sequence", 0)
+            ):
+                latest = candidate
+            if coalesce_deadline is None:
+                coalesce_deadline = time.monotonic() + max(0.0, float(coalesce_s))
+        except queue.Empty:
+            if latest is None or coalesce_deadline is None:
+                return latest
+            remaining = coalesce_deadline - time.monotonic()
+            if remaining <= 0.0:
+                return latest
+            try:
+                candidate = command_queue.get(timeout=remaining)
+            except queue.Empty:
+                return latest
+            except (OSError, ValueError):
+                return latest
+            if int(candidate.get("_preview_sequence", 0)) >= int(
+                latest.get("_preview_sequence", 0)
+            ):
+                latest = candidate
+        except (OSError, ValueError):
+            return latest
+
+
+def _wait_for_preview_startup(startup_receiver, process, timeout_s: float):
+    """Wait for a preview readiness result without leaking raw Pipe errors."""
+    deadline = time.monotonic() + max(0.1, float(timeout_s))
+    while time.monotonic() < deadline:
+        remaining = max(0.0, deadline - time.monotonic())
+        if startup_receiver.poll(min(0.1, remaining)):
+            try:
+                return startup_receiver.recv(), None
+            except (EOFError, OSError) as exc:
+                return None, (
+                    "startup channel closed before readiness: "
+                    f"{type(exc).__name__}"
+                )
+        if not process.is_alive():
+            break
+    return None, None
+
+
 def _experimenter_preview_process(
     screen_info: ScreenGeometry,
     task_label: str,
@@ -1637,13 +1536,39 @@ def _experimenter_preview_process(
     stop_event,
     startup_sender,
 ) -> None:
-    import ctypes
-    from psychopy import core, event, visual
-    from pyglet import gl as GL
-    from .video_playback import (
-        SharedVideoFrameReader,
-        center_crop_bounds,
-    )
+    startup_reported = False
+
+    def _report_startup(result: Dict[str, Any]) -> None:
+        nonlocal startup_reported
+        if startup_reported:
+            return
+        startup_reported = True
+        try:
+            startup_sender.send(result)
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+        finally:
+            try:
+                startup_sender.close()
+            except OSError:
+                pass
+
+    try:
+        import ctypes
+        from psychopy import core, event, visual
+        from pyglet import gl as GL
+        from .video_playback import (
+            SharedVideoFrameReader,
+            center_crop_bounds,
+        )
+    except Exception as exc:
+        _report_startup(
+            {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {str(exc).strip()}",
+            }
+        )
+        raise
     preview_canvas_size = resolve_screen_canvas_size(screen_info)
     outside_bg_rgb = (30, 30, 30)
     preview_outline_rgb = (150, 150, 150)
@@ -1684,7 +1609,7 @@ def _experimenter_preview_process(
         )
 
     def _release_movie() -> None:
-        nonlocal movie_bg_rect, movie_outline_rect, movie_layout
+        nonlocal movie_bg_rect, movie_subject_bg_rect, movie_outline_rect, movie_layout
         nonlocal shared_movie_active, shared_movie_stim, shared_movie_sequence
         nonlocal shared_movie_minimum_sequence, shared_movie_crop_bounds
         nonlocal shared_movie_upload_buffer, shared_movie_source_size
@@ -1698,6 +1623,7 @@ def _experimenter_preview_process(
         shared_movie_source_size = None
         shared_movie_target_size = None
         movie_bg_rect = None
+        movie_subject_bg_rect = None
         movie_outline_rect = None
         movie_layout = None
 
@@ -2007,28 +1933,13 @@ def _experimenter_preview_process(
             waitBlanking=False,
         )
     except Exception as exc:
-        try:
-            startup_sender.send(
-                {
-                    "ok": False,
-                    "error": f"{type(exc).__name__}: {str(exc).strip()}",
-                }
-            )
-        finally:
-            startup_sender.close()
-        raise
-    else:
-        startup_sender.send(
+        _report_startup(
             {
-                "ok": True,
-                "placement": getattr(
-                    win,
-                    "_neuro_tasks_screen_placement",
-                    describe_screen(screen_info),
-                ),
+                "ok": False,
+                "error": f"{type(exc).__name__}: {str(exc).strip()}",
             }
         )
-        startup_sender.close()
+        raise
     configure_window_vsync(win, False)
     last_cursor_apply_s = 0.0
     if mouse_visible is not None:
@@ -2056,6 +1967,7 @@ def _experimenter_preview_process(
         }
     )
     movie_bg_rect = None
+    movie_subject_bg_rect = None
     movie_outline_rect = None
     movie_layout = None
     shared_movie_reader = None
@@ -2167,18 +2079,33 @@ def _experimenter_preview_process(
             colorSpace="rgb",
         )
 
+        # The parent may begin timing immediately after construction returns.
+        # Report readiness only after every preview primitive exists and the
+        # verified window has completed one successful draw/flip.
+        static_scene["canvas_bg_rect"].draw()
+        static_scene["preview_bg_rect"].draw()
+        static_scene["preview_outline_rect"].draw()
+        _draw_overlay()
+        win.flip()
+        _report_startup(
+            {
+                "ok": True,
+                "placement": getattr(
+                    win,
+                    "_neuro_tasks_screen_placement",
+                    describe_screen(screen_info),
+                ),
+            }
+        )
+
         while not stop_event.is_set():
             redraw_requested = False
             if mouse_visible is not None and time.perf_counter() - last_cursor_apply_s >= 0.5:
                 set_window_mouse_visible(win, bool(mouse_visible))
                 last_cursor_apply_s = time.perf_counter()
 
-            while True:
-                try:
-                    payload = command_queue.get_nowait()
-                except queue.Empty:
-                    break
-
+            latest_payload = _get_latest_preview_command(command_queue)
+            for payload in (() if latest_payload is None else (latest_payload,)):
                 try:
                     command_type = str(payload.get("type", "")).strip().lower()
                     redraw_requested = True
@@ -2237,6 +2164,16 @@ def _experimenter_preview_process(
                             shared_movie_target_size,
                         )
                         movie_bg_rect = _make_bg_rect(outside_bg_rgb)
+                        movie_subject_bg_rect = visual.Rect(
+                            win,
+                            width=movie_layout["box_size"][0],
+                            height=movie_layout["box_size"][1],
+                            pos=movie_layout["box_center"],
+                            fillColor=_preview_rgb255_to_psychopy(last_bg_rgb),
+                            fillColorSpace="rgb",
+                            lineColor=None,
+                            units="pix",
+                        )
                         movie_outline_rect = visual.Rect(
                             win,
                             width=movie_layout["box_size"][0],
@@ -2367,6 +2304,8 @@ def _experimenter_preview_process(
                         continue
                     if movie_bg_rect is not None:
                         movie_bg_rect.draw()
+                    if movie_subject_bg_rect is not None:
+                        movie_subject_bg_rect.draw()
                     if shared_movie_stim is not None:
                         shared_movie_stim.draw()
                     if movie_outline_rect is not None:
@@ -2405,6 +2344,14 @@ def _experimenter_preview_process(
                     }
                 )
             core.wait(max(0.02, float(update_interval_ms) / 1000.0))
+    except Exception as exc:
+        _report_startup(
+            {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {str(exc).strip()}",
+            }
+        )
+        raise
     finally:
         _release_movie()
         if shared_movie_reader is not None:
@@ -2442,11 +2389,22 @@ class ExperimenterPreview:
         self.start_perf_s = time.perf_counter() if start_perf_s is None else float(start_perf_s)
         self.update_interval_s = max(0.05, float(update_interval_s))
         self.exit_requested = False
+        self._closed = False
+        self._preview_reward_counts = None
+        self._preview_highlight_box = None
+        self._preview_bg_rgb_255 = None
+        self._preview_main_size = None
+        self._preview_main_rotation_deg = 0
+        self._preview_command_sequence = 0
         self._ctx = mp.get_context("spawn")
-        # Scene commands are state snapshots, not an event stream. Keeping only
-        # the newest snapshot prevents a slow preview process from accumulating
-        # visual latency behind the main task.
+        # The process queue and local outbox are both single-slot. A sender
+        # thread absorbs multiprocessing's feeder-thread handoff without ever
+        # blocking the timing-critical task thread; newer snapshots replace a
+        # pending one while the preview is behind.
         self._queue = self._ctx.Queue(maxsize=1)
+        self._outbox: queue.Queue = queue.Queue(maxsize=1)
+        self._sender_stop = threading.Event()
+        self._sender_thread = None
         self._reward_event = self._ctx.Event()
         self._exit_event = self._ctx.Event()
         self._stop_event = self._ctx.Event()
@@ -2471,23 +2429,30 @@ class ExperimenterPreview:
             ),
             daemon=True,
         )
-        self._process.start()
+        try:
+            self._process.start()
+        except Exception as exc:
+            startup_sender.close()
+            startup_receiver.close()
+            self._queue.close()
+            self._closed = True
+            raise RuntimeError(
+                f"Experimenter preview process could not start: "
+                f"{type(exc).__name__}: {str(exc).strip()}"
+            ) from exc
         startup_sender.close()
         timeout_s = max(0.1, float(startup_timeout_s))
-        deadline = time.monotonic() + timeout_s
-        startup_result = None
-        while time.monotonic() < deadline:
-            if startup_receiver.poll(min(0.1, deadline - time.monotonic())):
-                startup_result = startup_receiver.recv()
-                break
-            if not self._process.is_alive():
-                break
+        startup_result, startup_transport_error = _wait_for_preview_startup(
+            startup_receiver,
+            self._process,
+            timeout_s,
+        )
         startup_receiver.close()
         if not isinstance(startup_result, dict) or not startup_result.get("ok"):
             error = (
                 startup_result.get("error")
                 if isinstance(startup_result, dict)
-                else (
+                else startup_transport_error or (
                     f"preview process exited with status {self._process.exitcode}"
                     if not self._process.is_alive()
                     else f"preview window did not become ready within {timeout_s:.1f}s"
@@ -2497,15 +2462,35 @@ class ExperimenterPreview:
             if self._process.is_alive():
                 self._process.terminate()
             self._process.join(timeout=1.0)
+            self._queue.close()
+            self._closed = True
             raise RuntimeError(
                 f"Experimenter preview failed to realize on "
                 f"{describe_screen(screen_info)}: {error}"
             )
         self.placement = str(startup_result.get("placement", ""))
+        self._sender_thread = threading.Thread(
+            target=self._command_sender_loop,
+            name="experimenter-preview-mailbox",
+            daemon=True,
+        )
+        try:
+            self._sender_thread.start()
+        except Exception as exc:
+            self.close()
+            raise RuntimeError(
+                "Experimenter preview mailbox could not start: "
+                f"{type(exc).__name__}: {str(exc).strip()}"
+            ) from exc
 
     def poll(self) -> bool:
         if self.exit_requested:
             return True
+        if not getattr(self, "_closed", False) and not self._process.is_alive():
+            raise RuntimeError(
+                "Experimenter preview process exited unexpectedly with status "
+                f"{self._process.exitcode}"
+            )
         self.exit_requested = bool(self._exit_event.is_set())
         return self.exit_requested
 
@@ -2532,36 +2517,125 @@ class ExperimenterPreview:
     def set_status_counts(self, status_counts: Optional[Dict[str, int]]) -> None:
         self.status_counts = dict(status_counts) if status_counts is not None else None
 
-    def _send(self, payload: Dict[str, Any]) -> None:
+    def _command_sender_loop(self) -> None:
+        pending = None
+        while not self._sender_stop.is_set():
+            if pending is None:
+                try:
+                    pending = self._outbox.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+
+            # If the process queue is still occupied, continually replace the
+            # pending value with the newest local snapshot. The main task never
+            # waits for this transport thread.
+            while True:
+                try:
+                    pending = self._outbox.get_nowait()
+                except queue.Empty:
+                    break
+
+            try:
+                self._queue.put(pending, timeout=0.01)
+            except queue.Full:
+                continue
+            except (OSError, ValueError):
+                return
+            pending = None
+
+    def _complete_preview_snapshot(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         payload = dict(payload)
+        self._preview_reward_counts = getattr(
+            self, "_preview_reward_counts", None
+        )
+        self._preview_highlight_box = getattr(
+            self, "_preview_highlight_box", None
+        )
+        self._preview_bg_rgb_255 = getattr(self, "_preview_bg_rgb_255", None)
+        self._preview_main_size = getattr(self, "_preview_main_size", None)
+        self._preview_main_rotation_deg = getattr(
+            self, "_preview_main_rotation_deg", 0
+        )
+        if "subject" in payload:
+            self.subject = payload["subject"]
+        if "current_trial_num" in payload:
+            self.current_trial_num = payload["current_trial_num"]
+        if "total_trials" in payload:
+            self.total_trials = payload["total_trials"]
+        if "status_counts" in payload:
+            value = payload["status_counts"]
+            self.status_counts = dict(value) if value is not None else None
+        if "reward_counts" in payload:
+            value = payload["reward_counts"]
+            self._preview_reward_counts = dict(value) if value is not None else None
+        if "highlight_box" in payload:
+            value = payload["highlight_box"]
+            self._preview_highlight_box = dict(value) if value is not None else None
+        if "bg_rgb_255" in payload:
+            self._preview_bg_rgb_255 = list(payload["bg_rgb_255"])
+        if "main_size" in payload:
+            self._preview_main_size = [
+                int(payload["main_size"][0]),
+                int(payload["main_size"][1]),
+            ]
+        if "main_rotation_deg" in payload:
+            self._preview_main_rotation_deg = _quarter_turn_degrees(
+                payload["main_rotation_deg"]
+            )
+
         subject = getattr(self, "subject", None)
         current_trial_num = getattr(self, "current_trial_num", None)
         total_trials = getattr(self, "total_trials", None)
         status_counts = getattr(self, "status_counts", None)
-        if subject is not None:
-            payload.setdefault("subject", str(subject))
-        if current_trial_num is not None:
-            payload.setdefault("current_trial_num", int(current_trial_num))
-        if total_trials is not None:
-            payload.setdefault("total_trials", int(total_trials))
-        if status_counts is not None:
-            payload.setdefault("status_counts", dict(status_counts))
-        if self.poll() or not self._process.is_alive():
+        payload["subject"] = None if subject is None else str(subject)
+        payload["current_trial_num"] = (
+            None if current_trial_num is None else int(current_trial_num)
+        )
+        payload["total_trials"] = (
+            None if total_trials is None else int(total_trials)
+        )
+        payload["status_counts"] = (
+            None if status_counts is None else dict(status_counts)
+        )
+        payload["reward_counts"] = (
+            None
+            if self._preview_reward_counts is None
+            else dict(self._preview_reward_counts)
+        )
+        payload["highlight_box"] = (
+            None
+            if self._preview_highlight_box is None
+            else dict(self._preview_highlight_box)
+        )
+        if self._preview_bg_rgb_255 is not None:
+            payload["bg_rgb_255"] = list(self._preview_bg_rgb_255)
+        if self._preview_main_size is not None:
+            payload["main_size"] = list(self._preview_main_size)
+        payload["main_rotation_deg"] = int(self._preview_main_rotation_deg)
+        self._preview_command_sequence = (
+            int(getattr(self, "_preview_command_sequence", 0)) + 1
+        )
+        payload["_preview_sequence"] = self._preview_command_sequence
+        return payload
+
+    def _send(self, payload: Dict[str, Any]) -> None:
+        if getattr(self, "_closed", False) or self.poll():
             return
-        try:
-            self._queue.put_nowait(payload)
-            return
-        except queue.Full:
+        payload = self._complete_preview_snapshot(payload)
+        sender_stop = getattr(self, "_sender_stop", None)
+        if sender_stop is None:
+            sender_stop = threading.Event()
+            self._sender_stop = sender_stop
+        outbox = getattr(self, "_outbox", self._queue)
+        while not sender_stop.is_set():
             try:
-                self._queue.get_nowait()
-            except (queue.Empty, OSError, ValueError):
+                outbox.put_nowait(payload)
                 return
-        except (OSError, ValueError):
-            return
-        try:
-            self._queue.put_nowait(payload)
-        except (queue.Full, OSError, ValueError):
-            pass
+            except queue.Full:
+                try:
+                    outbox.get_nowait()
+                except queue.Empty:
+                    continue
 
     def show_static_scene(
         self,
@@ -2646,8 +2720,21 @@ class ExperimenterPreview:
         self._send(payload)
 
     def close(self) -> None:
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        try:
+            self._sender_stop.set()
+        except Exception:
+            pass
         try:
             self._stop_event.set()
+        except Exception:
+            pass
+        try:
+            sender_thread = getattr(self, "_sender_thread", None)
+            if sender_thread is not None:
+                sender_thread.join(timeout=0.2)
         except Exception:
             pass
         try:
@@ -2658,5 +2745,14 @@ class ExperimenterPreview:
         try:
             if self._process.is_alive():
                 self._process.terminate()
+        except Exception:
+            pass
+        try:
+            self._process.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            self._queue.cancel_join_thread()
+            self._queue.close()
         except Exception:
             pass

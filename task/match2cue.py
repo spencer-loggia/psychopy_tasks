@@ -2,7 +2,8 @@
 """Match-to-cue task using the shared AFC presentation engine.
 
 Trial sequence:
-    onset cue -> match cue -> delay -> options -> choice -> inter-trial interval
+    onset cue -> optional cue reward -> match cue -> delay -> options -> choice
+    -> optional choice reward -> inter-trial interval
 
 One option always equals the match cue. Other options are sampled independently
 from the full configured stimulus space, so duplicate matches are possible.
@@ -280,6 +281,16 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     msg_logger.log(
         "INFO",
         f"session_start task=match2cue config_name={config_name} subject={subject} session_dir={session_logs.session_dir}",
+    )
+    msg_logger.log(
+        "INFO",
+        (
+            "reward_settings "
+            f"reward_match_cue_prob={reward_settings.reward_match_cue_prob:.9f} "
+            f"correct_num_pulse={reward_settings.correct_num_pulse} "
+            f"inter_pump_interval={reward_settings.inter_pump_interval:.9f} "
+            f"tie_mode={reward_settings.tie_mode}"
+        ),
     )
 
     fullscreen = bool(cfg.get("fullscreen", True))

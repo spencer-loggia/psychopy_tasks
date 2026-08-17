@@ -348,9 +348,10 @@ For `active_foraging`:
 - `reaction_time` is the time from `choice_start` until `option_touch`.
 - `choice_reaction_time` is currently the same quantity as `reaction_time`, retained because it is part of the requested task-specific schema.
 
-For `match2cue`, the behavior log additionally records the match cue, the number of matching options, whether the
-choice was correct, the resulting reward probability, and whether a reward was delivered. A no-response trial is
-left blank for correctness and does not increment either experimenter-screen correctness counter.
+For `match2cue`, the behavior log additionally records the match cue, the number of matching options, the tie mode,
+whether the choice was correct, the resulting choice-reward probability and pulse count, and whether cue-tap and
+choice rewards were delivered. A no-response trial is left blank for correctness and does not increment either
+experimenter-screen correctness counter.
 
 Other tasks use the same session packaging and shared schemas but simpler task-specific behavior rows:
 
@@ -646,17 +647,28 @@ python task/match2cue.py \
 Replace the screen selectors with the local display indices or RandR output names. The interface supplies them
 automatically when launching the task as an experiment block.
 
-Each trial runs `onset cue -> match cue -> delay -> options -> choice -> inter-trial interval`. The
-`match_cue_duration` and `delay_time` fields control the two added phases. Option presentation uses the same
-`sequential`, `is_memory`, `fixed_positions`, `duration`, `isi`, `choice_time`, `center_point`,
-`stim_range_radius`, and `num_afc` semantics as active foraging.
+Each trial runs `onset cue -> optional cue-tap reward -> match cue -> delay -> options -> choice -> optional
+choice reward -> inter-trial interval`. The `match_cue_duration` and `delay_time` fields control the two added
+visual phases. Option presentation uses the same `sequential`, `is_memory`, `fixed_positions`, `duration`, `isi`,
+`choice_time`, `center_point`, `stim_range_radius`, and `num_afc` semantics as active foraging.
 
 The cue is sampled uniformly from the complete configured shape/color/luminance stimulus space. One exact copy
 is guaranteed among the options; every other option is an independent random draw with replacement from that
-same space. Therefore the cue may occur more than once. Selecting any exact match is correct, and a correct choice
-delivers one `pump_pulse_time_seconds` pulse with probability `1 / matching_option_count`. An incorrect choice is
-never rewarded. The config has no frequency-space, reward-space, reward-level, timeout, or buzzer settings. Its
-`subject` field is still required and is displayed and logged, but it does not alter task behavior.
+same space. Therefore the cue may occur more than once. Selecting an exact match is correct. With the default
+`tie_mode="random"`, a selected match is rewarded with probability `1 / matching_option_count`, preserving the
+legacy behavior. With `tie_mode="all"`, every matching option is rewarded if selected. An incorrect choice is
+never rewarded.
+
+`correct_num_pulse` is the positive number of pump pulses delivered for a rewarded choice and defaults to `1`.
+`pump_delay_time` is applied once before that pulse train. `inter_pump_interval` is the delay between consecutive
+pulses; when omitted, it defaults to `pump_pulse_time_seconds`. The pulse interval is not added after the final
+pulse. `reward_match_cue_prob` is an independent probability from `0` to `1`, defaulting to `0`, that a successful
+tap on the checkerboard self-initiation cue earns one immediate pump pulse. It has no effect when
+`self_initiation=false`, because no cue tap occurs. Cue-tap and manual rewards always use one pulse and are not
+multiplied by `correct_num_pulse`.
+
+The config has no frequency-space, reward-space, reward-level, timeout, or buzzer settings. Its `subject` field is
+still required and is displayed and logged, but it does not alter task behavior.
 
 Set `n_colors` to `0` to use SVG artwork exactly as authored rather than recoloring it. In this mode the color TSV
 must contain exactly one data row—the background gray—and `n_lum_levels` should be `0`. With positive
@@ -665,10 +677,12 @@ must contain exactly one data row—the background gray—and `n_lum_levels` sho
 mode.
 
 The match-to-cue event log adds `match_cue_on` and `delay_start`. The behavior log records cue and option feature
-indices, `matching_option_count`, `choice_correct`, `reward_probability`, and `reward_delivered`, in addition to
-the shared choice/touch timing fields. The experimenter preview shows the configured subject, current/total trial,
-and separate cumulative counts for correct choices, incorrect choices, and rewards delivered. These reward and
-correct counts can differ on duplicate-match trials.
+indices, `matching_option_count`, `tie_mode`, `choice_correct`, `cue_reward_probability`,
+`cue_reward_delivered`, `reward_probability`, `reward_delivered`, and `choice_reward_pulse_count`, in addition to
+the shared choice/touch timing fields. The existing `reward_probability` and `reward_delivered` fields continue to
+describe the option-choice reward. The experimenter preview shows the configured subject, current/total trial,
+and cumulative counts for correct choices, incorrect choices, and individual reward pulses delivered. Correct
+and reward-pulse counts can differ because of cue rewards, multi-pulse choice rewards, and random tie handling.
 
 Configuration via JSON (required for tasks)
 -----------------------------------------

@@ -378,6 +378,11 @@ class VideoPlaybackTests(unittest.TestCase):
                     },
                 ),
             )
+            player_options = media_player_factory.call_args.kwargs["ff_opts"]
+            self.assertEqual(
+                player_options["vf"],
+                ["crop=2:2:0:0"],
+            )
             self.assertEqual(
                 messages,
                 [

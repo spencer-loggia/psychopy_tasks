@@ -259,7 +259,12 @@ def _decode_worker(
             "paused": False,
             "out_fmt": "rgb24",
             "autorotate": False,
-            "vf": video_filter,
+            # ffpyplayer accepts either a string or a list here, but some
+            # aarch64/Cython builds encode a bare string to ``bytes`` and then
+            # iterate it as integers while constructing the C filter list
+            # ("expected bytes, int found"). A one-item list is the documented
+            # equivalent and keeps each encoded filter as one bytes object.
+            "vf": [video_filter],
         }
         player = MediaPlayer(
             video_path,

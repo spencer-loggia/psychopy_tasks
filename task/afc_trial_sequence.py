@@ -44,7 +44,6 @@ from bin.screen import (
     describe_screen,
     load_screen_config,
     resolve_scene_size,
-    resolve_task_screens,
 )
 
 
@@ -144,12 +143,12 @@ def run_task(
     preloaded = utils.load_image_assets(image_files, raster_size=image_size, bg_rgb_255=bg)
 
     # Window + background + fixation
-    main_screen, _ = resolve_task_screens(screen_config, allow_same_screen=True)
-    win = utils.setup_window(
+    win, main_screen, _ = utils.setup_task_window(
+        screen_config,
         bg_rgb_255=bg,
         fullscreen=fullscreen,
         size=win_size,
-        screen_info=main_screen,
+        allow_same_screen=True,
     )
     fix = utils.make_fixation_cross(win, size=32)
     bg_rect = utils.make_bg_rect(win, bg)
@@ -408,8 +407,6 @@ def main():
     image_size = tuple(_get("image_size", cfg.get("image_size", None))) if _get("image_size", None) else None
     svg_size = None
     refresh_rate = _get("refresh_rate", cfg.get("refresh_rate", cfg.get("refrech_rate", None)))
-    raspi = _get("raspi", cfg.get("raspi", False))
-    raspi_pin = int(_get("raspi_pin", cfg.get("raspi_pin", 18)))
     config_name = cfg.get("config_name", "afc_trial_sequence")
 
     try:

@@ -20,6 +20,11 @@ from bin.logger import (
     EXACT_SESSION_DIR_ENV,
     sanitize_filename_component,
 )
+from bin.screen import (
+    MAIN_SCREEN_ENV,
+    SCREEN_ENV_OVERRIDE_ENV,
+    SECONDARY_SCREEN_ENV,
+)
 
 
 BLOCKS_FILENAME = "blocks.tsv"
@@ -259,6 +264,21 @@ class ExperimentManager:
         block_config["subject"] = self.subject_name
         block_config.update(injected)
         block_config["fullscreen"] = True
+        runtime_screen_override = str(
+            os.environ.get(SCREEN_ENV_OVERRIDE_ENV, "")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if runtime_screen_override and MAIN_SCREEN_ENV in os.environ:
+            # Persist the launcher's canonical physical-output names into every
+            # generated task config. This makes diagnostic/task parity explicit
+            # and avoids depending on task-local legacy numeric selectors or on
+            # environment precedence surviving another launch wrapper.
+            block_config.pop("main_screen", None)
+            block_config.pop("experimenter_screen", None)
+            block_config.pop("secondary_screen", None)
+            block_config["screens"] = {
+                "main": os.environ[MAIN_SCREEN_ENV],
+                "experimenter": os.environ.get(SECONDARY_SCREEN_ENV, ""),
+            }
 
         config_path = output_dir / BLOCK_CONFIG_FILENAME
         _write_json_atomic(config_path, block_config)

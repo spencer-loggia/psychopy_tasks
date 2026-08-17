@@ -37,7 +37,6 @@ from bin.screen import (
     load_screen_config,
     oriented_size,
     resolve_scene_size,
-    resolve_task_screens,
     software_stimulus_rotation,
 )
 
@@ -166,11 +165,13 @@ def run_task(
                 "check Raspberry Pi OS drivers and membership in the video group."
             )
 
-    main_screen, experimenter_screen = resolve_task_screens(
+    win, main_screen, experimenter_screen = utils.setup_task_window(
         screen_config,
+        bg_rgb_255=bg,
+        fullscreen=fullscreen,
+        size=win_size,
         allow_same_screen=True,
     )
-    win = utils.setup_window(bg_rgb_255=bg, fullscreen=fullscreen, size=win_size, screen_info=main_screen)
     refresh_sync_request_applied = bool(
         getattr(win, "_neuro_tasks_refresh_sync_requested", False)
     )

@@ -307,9 +307,6 @@ class PlayVideoTaskRotationTests(unittest.TestCase):
             name="PREVIEW",
             rotation="normal",
         )
-        resolve_task_screens = Mock(
-            return_value=(main_screen, experimenter_screen)
-        )
         resolve_scene_size = Mock(return_value=(2560, 1600))
         software_stimulus_rotation = Mock(return_value=90)
         oriented_size = Mock(return_value=(1600, 2560))
@@ -341,7 +338,6 @@ class PlayVideoTaskRotationTests(unittest.TestCase):
         fake_screen.load_screen_config = Mock()
         fake_screen.oriented_size = oriented_size
         fake_screen.resolve_scene_size = resolve_scene_size
-        fake_screen.resolve_task_screens = resolve_task_screens
         fake_screen.software_stimulus_rotation = software_stimulus_rotation
 
         stream = {
@@ -382,7 +378,9 @@ class PlayVideoTaskRotationTests(unittest.TestCase):
         play_video_fill_screen = Mock(return_value=playback_result)
         fake_utils = types.ModuleType("bin.utils")
         fake_utils.probe_video_stream = Mock(return_value=stream)
-        fake_utils.setup_window = Mock(return_value=win)
+        fake_utils.setup_task_window = Mock(
+            return_value=(win, main_screen, experimenter_screen)
+        )
         fake_utils.make_bg_rect = Mock(return_value=object())
         fake_utils.resolve_frame_rate = Mock(return_value=(60.0, 1.0 / 60.0))
         fake_utils.play_video_fill_screen = play_video_fill_screen
@@ -469,8 +467,11 @@ class PlayVideoTaskRotationTests(unittest.TestCase):
             )
 
         self.assertEqual(stop_reason, "mouse_click")
-        resolve_task_screens.assert_called_once_with(
+        fake_utils.setup_task_window.assert_called_once_with(
             {"main": "MAIN", "experimenter": "PREVIEW"},
+            bg_rgb_255=(0, 0, 0),
+            fullscreen=True,
+            size=None,
             allow_same_screen=True,
         )
         software_stimulus_rotation.assert_called_once_with("normal")

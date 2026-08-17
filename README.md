@@ -143,8 +143,9 @@ Experiment-managed task/subprocess policies:
   and each value is an object containing at least the subfields declared by that state history.
 - When main-input masking is enabled, a task must signal readiness after its subject window exists but before
   timing-sensitive work. The call waits for the launcher to remove the curtain; the task then activates the
-  window. `bin.utils.setup_window()` handles this sequence. A custom window must call
-  `bin.task_lifecycle.signal_task_window_ready()` and activate its native handle afterward.
+  window. `bin.utils.setup_task_window()` resolves the canonical outputs and handles this sequence for every main
+  task window. `bin.utils.setup_window()` remains only for an already-resolved auxiliary window. A custom window
+  must call `bin.task_lifecycle.signal_task_window_ready()` and activate its native handle afterward.
 
 X11 Main-Screen Idle Masking
 ----------------------------
@@ -406,8 +407,9 @@ Each value can be a detected screen index or an output name such as `HDMI-1` or 
 Use output names on X11 rigs because numeric monitor order is not stable across display changes.
 Set either value to `null` to inherit the process environment defaults: `screens.main` reads `MAIN_SCREEN`, and
 `screens.experimenter` reads `SECONDARY_SCREEN`. The touch launcher exports the canonical names of the physical
-outputs it resolved and marks those values authoritative for every diagnostic and child task. CLI selectors remain
-highest priority. Outside the launcher, config selectors retain priority over ordinary environment defaults.
+outputs it resolved, marks those values authoritative for every diagnostic and child task, and persists them into
+each manager-generated block config. CLI selectors remain highest priority. Outside the launcher, config selectors
+retain priority over ordinary environment defaults.
 Output names such as `HDMI-2` are rig configuration values, not constants in the display code.
 PsychoPy presentation windows default to true fullscreen. Main X11 windows use PsychoPy's native,
 window-manager-controlled fullscreen path without post-creation moves or resizing. Before

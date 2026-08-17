@@ -168,6 +168,53 @@ class ExperimentManagerTests(unittest.TestCase):
             self.assertEqual(second_config["x_scale"], 0.1)
             self.assertEqual(second_config["y_scale"], -0.2)
 
+    def test_generated_block_persists_launcher_screen_selection(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            launch_config, launch_path = self._project(root)
+            (root / "configs" / "demo.json").write_text(
+                json.dumps(
+                    {
+                        "config_name": "screen_parity",
+                        "screens": {"main": 0, "experimenter": 1},
+                        "main_screen": 0,
+                        "secondary_screen": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "NEURO_TASK_SCREEN_ENV_OVERRIDE": "1",
+                    "MAIN_SCREEN": "HDMI-1",
+                    "SECONDARY_SCREEN": "DSI-1",
+                },
+                clear=False,
+            ):
+                manager = ExperimentManager(
+                    working_dir=root,
+                    launch_config_path=launch_path,
+                    launch_config=launch_config,
+                    subject_name="Subject One",
+                    subject_code="S1",
+                    now=dt.datetime(2026, 8, 13, 9, 30),
+                )
+                block = manager.prepare_block(
+                    task_name="demo",
+                    launch_value="task/demo.py",
+                    config_value="configs/demo.json",
+                )
+
+            generated = json.loads(block.config_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                generated["screens"],
+                {"main": "HDMI-1", "experimenter": "DSI-1"},
+            )
+            self.assertNotIn("main_screen", generated)
+            self.assertNotIn("secondary_screen", generated)
+
     def test_experiment_ids_increment_for_same_subject_and_date(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

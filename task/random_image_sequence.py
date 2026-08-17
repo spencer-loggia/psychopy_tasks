@@ -32,7 +32,7 @@ from bin.frame_timing import flip_with_timestamps, plan_frame_duration
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.config import load_config, validate_config
-from bin.screen import describe_screen, load_screen_config, resolve_task_screens
+from bin.screen import describe_screen, load_screen_config
 
 
 def parse_args():
@@ -52,8 +52,6 @@ def parse_args():
     parser.add_argument("--debug", action="store_true", default=None, help="Enable debug outputs (write debug images to logs/)")
     parser.add_argument("--isi", type=float, default=None, help="Inter-stimulus interval in seconds (fixation visible). If omitted, value from --config is used.")
     parser.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate (Hz); skip auto-detection if provided")
-    parser.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi GPIO features (no-op if unused)")
-    parser.add_argument("--raspi_pin", type=int, default=None, help="GPIO pin to use for raspi features (BCM numbering)")
     parser.add_argument("--main_screen", default=None, help="Main task screen index or output name")
     parser.add_argument("--experimenter_screen", default=None, help="Experimenter screen index or output name")
     return parser.parse_args()
@@ -74,8 +72,6 @@ def run_task(
     isi: float = 0.0,
     debug: bool = False,
     refresh_rate: Optional[float] = None,
-    raspi: bool = False,
-    raspi_pin: int = 18,
     config_name: Optional[str] = None,
     screen_config: Optional[Dict[str, Any]] = None,
 ):
@@ -105,12 +101,12 @@ def run_task(
     preloaded = utils.load_image_assets(chosen_paths, raster_size=image_size, bg_rgb_255=bg)
 
     # Resolve and verify the same physical main output used by other tasks.
-    main_screen, _ = resolve_task_screens(screen_config, allow_same_screen=True)
-    win = utils.setup_window(
+    win, main_screen, _ = utils.setup_task_window(
+        screen_config,
         bg_rgb_255=bg,
         fullscreen=fullscreen,
         size=win_size,
-        screen_info=main_screen,
+        allow_same_screen=True,
     )
     fix = utils.make_fixation_cross(win, size=fixation_size)
     # Create a full-window background patch so we can reliably show a solid
@@ -136,24 +132,6 @@ def run_task(
         f"session_start task=random_image_sequence config_name={resolved_config_name} session_dir={session_logs.session_dir}",
     )
     msg_logger.log("INFO", f"resolved_screens main={describe_screen(main_screen)}")
-
-    # Initialize lgpio if requested (harmless if not used here)
-    pigpio_pi = None  # naming kept for compatibility with presenter API
-    if raspi:
-        try:
-            import lgpio
-
-            chip = lgpio.gpiochip_open(0)  # 0 is the default chip for RPi5
-            # Claim the pin as output
-            lgpio.gpio_claim_output(chip, raspi_pin)
-            pigpio_pi = chip  # store chip handle
-            msg_logger.log("INFO", f"lgpio initialized on chip 0, pin {raspi_pin} claimed as output")
-        except Exception as e:
-            pigpio_pi = None
-            try:
-                msg_logger.log("WARN", f"lgpio not available or failed to initialize: {e}; raspi disabled")
-            except Exception:
-                pass
 
     # Detect or override frame rate once per task
     fps, frame_dur = utils.resolve_frame_rate(
@@ -349,8 +327,6 @@ def main():
             isi=float(_get("isi", cfg.get("isi", 0.0))),
             debug=bool(_get("debug", cfg.get("debug", False))),
             refresh_rate=_get("refresh_rate", cfg.get("refresh_rate", cfg.get("refrech_rate", None))),
-            raspi=_get("raspi", cfg.get("raspi", False)),
-            raspi_pin=_get("raspi_pin", cfg.get("raspi_pin", 18)),
             config_name=cfg.get("config_name", "random_image_sequence"),
             screen_config=screen_config,
         )

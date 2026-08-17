@@ -864,6 +864,17 @@ def _bind_linux_pyglet_display(
     pyglet.canvas.Display = target_first_display
     if callable(original_get_display):
         pyglet.canvas.get_display = target_get_display
+        # PsychoPy and pyglet backends may retain a direct reference to the
+        # original getter during import. Prepare that cached/global Display
+        # now as well as intercepting later module-level calls, so import order
+        # cannot change which physical output is exposed as screen 0.
+        try:
+            prepare_display(original_get_display())
+        except Exception as exc:
+            selection.setdefault(
+                "preselection_error",
+                f"{type(exc).__name__}: {str(exc).strip()}",
+            )
     try:
         yield selection
     finally:
@@ -904,24 +915,6 @@ def _x11_window_rect(win: Any) -> tuple[int, int, int, int]:
         raise RuntimeError("X11 could not read PsychoPy's native window geometry")
     x, y = map(int, get_location())
     return x, y, int(attributes.width), int(attributes.height)
-
-
-def identify_psychopy_window_screen(
-    win: Any,
-) -> tuple[Optional[ScreenGeometry], tuple[int, int, int, int]]:
-    """Return the OS output exactly covered by a realized PsychoPy window."""
-    handle = getattr(win, "winHandle", None)
-    if sys.platform.startswith("linux"):
-        actual = _x11_window_rect(win)
-    else:
-        actual = (
-            *map(int, handle.get_location()),
-            *map(int, handle.get_size()),
-        )
-    matches = [
-        screen for screen in get_monitor_screens() if _screen_rect(screen) == actual
-    ]
-    return (matches[0] if len(matches) == 1 else None), actual
 
 
 def verify_psychopy_window_screen(win: Any, screen_info: ScreenGeometry) -> str:
@@ -1011,7 +1004,6 @@ def open_psychopy_window(
     *,
     fullscreen: bool,
     size: Optional[Sequence[int]] = None,
-    require_correct_placement: bool = True,
     wm_managed: bool = True,
     on_window_created: Optional[Callable[[Any], None]] = None,
     **kwargs: Any,
@@ -1081,27 +1073,19 @@ def open_psychopy_window(
         raise
 
     if fullscreen:
-        placement_error = None
         try:
             placement = (
                 _wait_for_psychopy_window_screen(win, screen_info)
                 if native_x11_fullscreen
                 else verify_psychopy_window_screen(win, screen_info)
             )
-        except Exception as exc:
-            placement_error = f"{type(exc).__name__}: {str(exc).strip()}"
-            if require_correct_placement:
+        except Exception:
+            try:
                 win.close()
-                raise
-            realized_screen, actual = identify_psychopy_window_screen(win)
-            realized_name = realized_screen.name if realized_screen is not None else "unmatched output"
-            placement = f"{realized_name} at {actual}"
-        else:
-            realized_screen, actual = screen_info, _screen_rect(screen_info)
+            except Exception:
+                pass
+            raise
         win._neuro_tasks_screen_placement = placement
-        win._neuro_tasks_screen_placement_error = placement_error
-        win._neuro_tasks_realized_screen = realized_screen
-        win._neuro_tasks_realized_rect = actual
         monitor_index = pyglet_selection.get("monitor_index")
         selected_rect = pyglet_selection.get("selected_rect")
         available_rects = pyglet_selection.get("available_rects", [])

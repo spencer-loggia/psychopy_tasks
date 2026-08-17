@@ -409,26 +409,11 @@ def run_display_diagnostic(
             waitBlanking=True,
         )
         placement_detail = win._neuro_tasks_screen_placement
-        placement_error = getattr(win, "_neuro_tasks_screen_placement_error", None)
-        if not isinstance(placement_error, str):
-            placement_error = None
         selection_detail = getattr(win, "_neuro_tasks_pyglet_selection", "")
         if not isinstance(selection_detail, str) or not selection_detail:
             selection_detail = "selection details unavailable"
-        realized_screen = getattr(win, "_neuro_tasks_realized_screen", None)
-        if placement_error and realized_screen is not None:
-            timing_refresh_rate_hz, timing_rate_detail = query_main_monitor_refresh_rate(
-                realized_screen
-            )
-        elif placement_error:
-            timing_refresh_rate_hz = monitor_refresh_rate_hz
-            timing_rate_detail = (
-                "fallback main-output reference because the realized output could "
-                f"not be identified; {monitor_rate_detail}"
-            )
-        else:
-            timing_refresh_rate_hz = monitor_refresh_rate_hz
-            timing_rate_detail = monitor_rate_detail
+        timing_refresh_rate_hz = monitor_refresh_rate_hz
+        timing_rate_detail = monitor_rate_detail
         window_mode = getattr(
             win,
             "_neuro_tasks_fullscreen_path",
@@ -485,22 +470,11 @@ def run_display_diagnostic(
         return _with_affinity(checks), monitor_refresh_rate_hz, None
 
     try:
-        if placement_error:
-            placement_check = _check(
-                "Main display placement",
-                "fail",
-                (
-                    f"{window_mode} realized on {placement_detail}; timing checks "
-                    f"continue on that realized output; {selection_detail}"
-                ),
-                error=placement_error,
-            )
-        else:
-            placement_check = _check(
-                "Main display placement",
-                "pass",
-                f"{window_mode} verified on {placement_detail}; {selection_detail}",
-            )
+        placement_check = _check(
+            "Main display placement",
+            "pass",
+            f"{window_mode} verified on {placement_detail}; {selection_detail}",
+        )
         vsync_requested = bool(
             getattr(win, "_neuro_tasks_refresh_sync_requested", False)
         ) and bool(
@@ -606,9 +580,9 @@ def run_display_diagnostic(
         metrics["monitor_refresh_rate_hz"] = refresh_rate_hz
         metrics["timing_output_refresh_rate_hz"] = timing_refresh_rate_hz
         metrics["timing_output_name"] = str(
-            getattr(realized_screen, "name", "unmatched output") or "unmatched output"
+            getattr(main_screen, "name", "main output") or "main output"
         )
-        metrics["main_display_placement_verified"] = not bool(placement_error)
+        metrics["main_display_placement_verified"] = True
         metrics["observed_median_rate_hz"] = interval_rate
         metrics["glx_swap_interval"] = swap_interval
         metrics["glx_sync_progress"] = sync_progress
@@ -618,12 +592,7 @@ def run_display_diagnostic(
         interval_rate_text = (
             f"{interval_rate:.3f} Hz" if interval_rate is not None else "unavailable"
         )
-        if not placement_error:
-            timing_label = f"main output {getattr(main_screen, 'name', '')}"
-        elif realized_screen is not None:
-            timing_label = f"WRONG-OUTPUT TIMING ONLY ({placement_detail})"
-        else:
-            timing_label = f"UNMATCHED-OUTPUT TIMING ONLY ({placement_detail})"
+        timing_label = f"main output {getattr(main_screen, 'name', '')}"
         detail = (
             f"{timing_label}; {window_mode} window; "
             f"target {timing_refresh_rate_hz:.3f} Hz "

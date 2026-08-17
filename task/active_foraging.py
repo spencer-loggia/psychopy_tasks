@@ -57,7 +57,6 @@ from bin.screen import (
     oriented_size,
     reward_level_color,
     resolve_scene_size,
-    resolve_task_screens,
     serialize_preview_image,
     set_window_mouse_visible,
     software_stimulus_rotation,
@@ -555,7 +554,13 @@ def run_task(
     # the full color x shape x luminance combinatoric space.
     preloaded: dict = {}
 
-    main_screen, experimenter_screen = resolve_task_screens(screen_config, allow_same_screen=True)
+    win, main_screen, experimenter_screen = utils.setup_task_window(
+        screen_config,
+        bg_rgb_255=bg,
+        fullscreen=fullscreen,
+        size=win_size,
+        allow_same_screen=True,
+    )
     try:
         msg_logger.log(
             "INFO",
@@ -564,8 +569,8 @@ def run_task(
     except Exception:
         pass
 
-    # Window + background + fixation
-    win = utils.setup_window(bg_rgb_255=bg, fullscreen=fullscreen, size=win_size, screen_info=main_screen)
+    # Window placement has already been resolved and strictly verified by the
+    # shared task-window path above.
     is_rig_raw = os.environ.get(IS_RIG_ENV_VAR)
     experimenter_mouse_visible = experimenter_cursor_visible_for_touchscreen(
         touchscreen=bool(touchscreen),
@@ -1371,7 +1376,6 @@ def main():
     # Accept both 'refresh_rate' and the common misspelling 'refrech_rate' from config
     refresh_rate = _get("refresh_rate", cfg.get("refresh_rate", cfg.get("refrech_rate", None)))
     touchscreen = bool(_get("touchscreen", cfg.get("touchscreen", False)))
-    raspi = _get("raspi", cfg.get("raspi", False))
     trial_start_pin = int(_get("trial_start_pin", cfg.get("trial_start_pin", 18)))
     daq_cfg = cfg.get("daq", {}) if isinstance(cfg.get("daq", {}), dict) else {}
     daq_address = int(_get("daq_address", daq_cfg.get("address", cfg.get("daq_address", 0))))

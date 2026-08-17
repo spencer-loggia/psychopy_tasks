@@ -16,7 +16,6 @@ from bin.screen import (
     ScreenGeometry,
     _bind_linux_pyglet_display,
     _get_latest_preview_command,
-    _parse_xrandr_listactivemonitors,
     _parse_xrandr_query,
     _wait_for_preview_startup,
     build_reward_hit_boxes,
@@ -133,14 +132,69 @@ class ScreenConfigTests(unittest.TestCase):
             get_display=get_display,
         )
         pyglet.options = {}
+        captured_get_display = pyglet.canvas.get_display
 
         with patch.dict("sys.modules", {"pyglet": pyglet}):
             with _bind_linux_pyglet_display(target_info):
                 self.assertIs(pyglet.canvas.get_display().get_screens()[0], target)
+                self.assertIs(captured_get_display().get_screens()[0], target)
 
         self.assertIsNone(cached_display._screens)
         self.assertIs(pyglet.canvas.get_display, get_display)
         self.assertNotIn("xlib_fullscreen_override_redirect", pyglet.options)
+
+    def test_window_path_handles_getter_captured_before_screen_binding(self):
+        target_info = ScreenGeometry(
+            index=1, x=0, y=0, width=2560, height=1600, name="HDMI-2"
+        )
+        other = types.SimpleNamespace(x=2560, y=0, width=1920, height=1080)
+        target = types.SimpleNamespace(x=0, y=0, width=2560, height=1600)
+
+        class FakeDisplay:
+            def __init__(self, *args, **kwargs):
+                self._screens = None
+
+            def get_screens(self):
+                return self._screens or [other, target]
+
+        cached_display = FakeDisplay()
+
+        def get_display():
+            return cached_display
+
+        captured_get_display = get_display
+        selected_screens = []
+        win = types.SimpleNamespace(
+            winHandle=types.SimpleNamespace(activate=lambda: None),
+            close=Mock(),
+        )
+
+        def make_window(**kwargs):
+            selected_screens.append(
+                captured_get_display().get_screens()[int(kwargs["screen"])]
+            )
+            return win
+
+        pyglet = types.ModuleType("pyglet")
+        pyglet.canvas = types.SimpleNamespace(
+            Display=FakeDisplay,
+            get_display=get_display,
+        )
+        pyglet.options = {}
+        visual = types.SimpleNamespace(Window=make_window)
+
+        with (
+            patch.dict("sys.modules", {"pyglet": pyglet}),
+            patch("bin.screen.sys.platform", "linux"),
+            patch(
+                "bin.screen._wait_for_psychopy_window_screen",
+                return_value="HDMI-2 at (0, 0, 2560, 1600)",
+            ),
+        ):
+            open_psychopy_window(visual, target_info, fullscreen=True)
+
+        self.assertEqual(selected_screens, [target])
+        self.assertIsNone(cached_display._screens)
 
     def test_configure_window_vsync_can_disable_experimenter_blocking(self):
         class WindowHandle:
@@ -852,7 +906,6 @@ class ScreenConfigTests(unittest.TestCase):
             "native managed PsychoPy fullscreen",
         )
         self.assertIn("Xinerama monitor 1", opened._neuro_tasks_pyglet_selection)
-        self.assertIsNone(win._neuro_tasks_screen_placement_error)
         bind_display.assert_called_once_with(
             screen,
             wm_managed=True,

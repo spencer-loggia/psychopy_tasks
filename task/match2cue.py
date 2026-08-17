@@ -51,7 +51,6 @@ from bin.screen import (
     load_screen_config,
     oriented_size,
     resolve_scene_size,
-    resolve_task_screens,
     set_window_mouse_visible,
     software_stimulus_rotation,
 )
@@ -267,24 +266,20 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
         f"session_start task=match2cue config_name={config_name} subject={subject} session_dir={session_logs.session_dir}",
     )
 
-    main_screen, experimenter_screen = resolve_task_screens(
+    fullscreen = bool(cfg.get("fullscreen", True))
+    win_size_value = cfg.get("win_size")
+    win_size = tuple(win_size_value) if win_size_value is not None else None
+    win, main_screen, experimenter_screen = utils.setup_task_window(
         screen_config,
+        bg_rgb_255=space.bg,
+        fullscreen=fullscreen,
+        size=win_size,
         allow_same_screen=True,
     )
     msg_logger.log(
         "INFO",
         f"resolved_screens main={describe_screen(main_screen)} experimenter={describe_screen(experimenter_screen)}",
     )
-    fullscreen = bool(cfg.get("fullscreen", True))
-    win_size_value = cfg.get("win_size")
-    win_size = tuple(win_size_value) if win_size_value is not None else None
-    win = utils.setup_window(
-        bg_rgb_255=space.bg,
-        fullscreen=fullscreen,
-        size=win_size,
-        screen_info=main_screen,
-    )
-
     touchscreen = bool(cfg.get("touchscreen", False))
     experimenter_preview = None
     status_counts = {"Correct": 0, "Incorrect": 0, "Rewards delivered": 0}

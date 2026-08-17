@@ -47,7 +47,6 @@ from bin.screen import (
     describe_screen,
     load_screen_config,
     resolve_scene_size,
-    resolve_task_screens,
     serialize_preview_image,
     set_window_mouse_visible,
 )
@@ -642,31 +641,6 @@ def run_task(
     experimenter_preview = None
     task_end_notes = "done"
 
-    main_screen, experimenter_screen = resolve_task_screens(screen_config, allow_same_screen=True)
-    try:
-        same_screen = (
-            experimenter_screen is not None
-            and describe_screen(experimenter_screen) == describe_screen(main_screen)
-        )
-    except Exception:
-        same_screen = False
-    if same_screen and not bool(touchscreen):
-        experimenter_screen = None
-        try:
-            msg_logger.log(
-                "INFO",
-                "experimenter_preview_disabled same_screen=True touchscreen=False",
-            )
-        except Exception:
-            pass
-    try:
-        msg_logger.log(
-            "INFO",
-            f"resolved_screens main={describe_screen(main_screen)} experimenter={describe_screen(experimenter_screen)}",
-        )
-    except Exception:
-        pass
-
     afc_counts: Dict[str, int] = {
         "total": 0,
         "correct": 0,
@@ -679,11 +653,16 @@ def run_task(
     last_trial_summary: Dict[str, Any] = {}
 
     try:
-        win = utils.setup_window(
+        win, main_screen, experimenter_screen = utils.setup_task_window(
+            screen_config,
             bg_rgb_255=bg_rgb,
             fullscreen=fullscreen,
             size=win_size,
-            screen_info=main_screen,
+            allow_same_screen=True,
+        )
+        msg_logger.log(
+            "INFO",
+            f"resolved_screens main={describe_screen(main_screen)} experimenter={describe_screen(experimenter_screen)}",
         )
         fps, frame_dur = utils.resolve_frame_rate(
             win,

@@ -8,7 +8,6 @@ Modularity helpers included:
 - make_onset_cue_stim: build a checkerboard ImageStim with a centered 2D Gaussian alpha mask.
 """
 from pathlib import Path
-import datetime as dt
 import math
 import random
 import shutil
@@ -16,14 +15,12 @@ import subprocess
 import json
 from typing import List, Tuple, Optional, Dict, Union, Callable, Any, Sequence
 import io
-import sys
 import multiprocessing as mp
 import queue
 import traceback
 
 import numpy as np
 from PIL import Image
-import threading
 from psychopy import visual, event
 import time
 from .screen import (
@@ -32,6 +29,7 @@ from .screen import (
     initialize_psychopy_window,
     MainDisplayFrameTimingMonitor,
     oriented_size,
+    resolve_task_screens,
     resolve_window_frame_rate,
     serialize_preview_image,
 )
@@ -108,7 +106,6 @@ def setup_window(
     bg_rgb_255: Tuple[int, int, int] = (128, 128, 128),
     fullscreen: bool = True,
     size: Optional[Tuple[int, int]] = None,
-    monitor: Optional[str] = None,
     screen_info=None,
     sync_to_refresh: bool = True,
 ):
@@ -122,8 +119,6 @@ def setup_window(
         allowStencil=False,
         waitBlanking=bool(sync_to_refresh),
     )
-    if monitor:
-        win_kwargs["monitor"] = monitor
     win = initialize_psychopy_window(
         visual,
         screen_info,
@@ -136,6 +131,30 @@ def setup_window(
         **win_kwargs,
     )
     return win
+
+
+def setup_task_window(
+    screen_config=None,
+    *,
+    bg_rgb_255: Tuple[int, int, int] = (128, 128, 128),
+    fullscreen: bool = True,
+    size: Optional[Tuple[int, int]] = None,
+    sync_to_refresh: bool = True,
+    allow_same_screen: bool = True,
+):
+    """Resolve the task outputs and open the verified main PsychoPy window."""
+    main_screen, experimenter_screen = resolve_task_screens(
+        screen_config,
+        allow_same_screen=allow_same_screen,
+    )
+    win = setup_window(
+        bg_rgb_255=bg_rgb_255,
+        fullscreen=fullscreen,
+        size=size,
+        screen_info=main_screen,
+        sync_to_refresh=sync_to_refresh,
+    )
+    return win, main_screen, experimenter_screen
 
 
 def _log_message(msg_logger, level: str, message: str) -> None:
@@ -396,9 +415,6 @@ def play_video_fill_screen(
         if frame_duration_s is not None
         else None
     )
-    target_display_frames = (
-        duration_plan.frame_count if duration_plan is not None else None
-    )
     sync_records: List[Dict[str, Any]] = []
     backend_drop_count = None
     expected_duration_s = clip_duration_s
@@ -617,7 +633,6 @@ def play_video_fill_screen(
         if bg_rect is not None:
             bg_rect.draw()
         clear_flip_timing = flip_with_timestamps(win)
-        clear_flip_ps = clear_flip_timing.psychopy_s
         end_requested_perf = clear_flip_timing.requested_perf_s
         end_perf = clear_flip_timing.actual_perf_s
         if final_sync_edge is not None:
@@ -1546,7 +1561,6 @@ def present_trial_with_persistent_dots(
         # both arrive during the flip remain observable through click timing.
         mouse_presses.reset()
         oc_timing = flip_with_timestamps(win)
-        oc_flip = oc_timing.psychopy_s
         oc_perf = oc_timing.actual_perf_s
         _commit_trial_start_signal(oc_perf, oc_timing.requested_perf_s)
         logger.log_frame_flip(
@@ -1958,7 +1972,6 @@ def present_trial_with_persistent_dots(
                         if fix is not None:
                             fix.draw()
                         dot_timing = flip_with_timestamps(win)
-                        dot_flip = dot_timing.psychopy_s
                         if first_flip:
                             dot_perf = dot_timing.actual_perf_s
                             _commit_trial_start_signal(
@@ -2079,7 +2092,6 @@ def present_trial_with_persistent_dots(
                     if fix is not None:
                         fix.draw()
                     dot_timing = flip_with_timestamps(win)
-                    dot_flip = dot_timing.psychopy_s
                     if first_flip:
                         dot_perf = dot_timing.actual_perf_s
                         _commit_trial_start_signal(

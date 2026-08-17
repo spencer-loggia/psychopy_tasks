@@ -1,6 +1,10 @@
 import unittest
 
-from bin.touch_input import MousePressTracker
+from bin.touch_input import (
+    MousePressSample,
+    MousePressTracker,
+    advance_release_armed_touch_gate,
+)
 
 
 class FakeMouse:
@@ -99,6 +103,41 @@ class MousePressTrackerTests(unittest.TestCase):
         self.assertFalse(tracker.poll().press_started)
         self.assertFalse(tracker.poll().press_started)
         self.assertTrue(tracker.poll().press_started)
+
+
+class ReleaseArmedTouchGateTests(unittest.TestCase):
+    def test_held_initiation_press_stays_blocked_until_release(self):
+        held = MousePressSample((0.0, 0.0), (True, False, False), False, False)
+        released = MousePressSample((0.0, 0.0), (False, False, False), False, False)
+        new_press = MousePressSample((5.0, 6.0), (True, False, False), True, False)
+
+        armed, eligible = advance_release_armed_touch_gate(False, held)
+        self.assertFalse(armed)
+        self.assertFalse(eligible)
+
+        armed, eligible = advance_release_armed_touch_gate(armed, released)
+        self.assertTrue(armed)
+        self.assertFalse(eligible)
+
+        armed, eligible = advance_release_armed_touch_gate(armed, new_press)
+        self.assertTrue(armed)
+        self.assertTrue(eligible)
+
+    def test_buffered_repress_during_flip_arms_and_activates_gate(self):
+        buffered_repress = MousePressSample(
+            (5.0, 6.0),
+            (False, False, False),
+            True,
+            True,
+        )
+
+        armed, eligible = advance_release_armed_touch_gate(
+            False,
+            buffered_repress,
+        )
+
+        self.assertTrue(armed)
+        self.assertTrue(eligible)
 
 
 if __name__ == "__main__":

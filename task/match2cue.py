@@ -630,6 +630,15 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 trial,
                 reward_settings.reward_match_cue_prob,
             )
+            msg_logger.log(
+                "INFO",
+                (
+                    f"match_cue_reward_lottery trial_num={trial_num} "
+                    f"draw={trial.match_cue_reward_draw:.9f} "
+                    f"probability={reward_settings.reward_match_cue_prob:.9f} "
+                    f"won={int(match_cue_reward_won)}"
+                ),
+            )
 
             def deliver_won_match_cue_reward() -> bool:
                 match_cue_reward_state["delivered"] = True

@@ -46,7 +46,7 @@ from .stimulus_files import (
     load_shape_definitions as _load_shape_definitions,
     split_background_from_palette as _split_background_from_palette,
 )
-from .touch_input import MousePressTracker
+from .touch_input import MousePressTracker, advance_release_armed_touch_gate
 
 # Global debug flag: when True, utilities may write debug files (PNG) to logs/
 # Default is False; tasks can enable it via CLI (--debug) or config.
@@ -1666,28 +1666,59 @@ def present_trial_with_persistent_dots(
         if not _arm_trial_start_signal():
             return True, None
         pre_options_cue_touched = False
+        pre_options_cue_touch_armed = True
+        cue_touch_target = None
         clear_timing = None
         if detect_pre_options_cue_touch:
-            # A held checkerboard-initiation press must not count as a tap on
-            # the matching cue. Only a new edge after this reset is eligible.
-            mouse_presses.reset()
+            # A held checkerboard-initiation press must be released before the
+            # matching cue can accept a touch.
+            pre_options_cue_touch_armed = not mouse_presses.reset()
+            cue_touch_target = visual.Rect(
+                win,
+                width=max(1.0, float(cue_stim.size[0]) * float(choice_hitbox_scale)),
+                height=max(1.0, float(cue_stim.size[1]) * float(choice_hitbox_scale)),
+                pos=cue_stim.pos,
+                units="pix",
+                fillColor=None,
+                lineColor=None,
+                opacity=0.0,
+                ori=rotation_degrees,
+            )
 
         def _poll_pre_options_cue_touch() -> None:
-            nonlocal pre_options_cue_touched
+            nonlocal pre_options_cue_touched, pre_options_cue_touch_armed
             if not detect_pre_options_cue_touch or pre_options_cue_touched:
                 return
             touch_sample = mouse_presses.poll()
-            if not touch_sample.press_started:
+            pre_options_cue_touch_armed, touch_is_eligible = (
+                advance_release_armed_touch_gate(
+                    pre_options_cue_touch_armed,
+                    touch_sample,
+                )
+            )
+            if not touch_is_eligible:
                 return
             click_pos = touch_sample.position
             try:
-                cue_contains_touch = bool(cue_stim.contains(click_pos))
+                cue_contains_touch = bool(cue_touch_target.contains(click_pos))
             except Exception:
                 cue_w, cue_h = cue_stim.size
                 cue_x, cue_y = cue_stim.pos
                 cue_contains_touch = bool(
-                    abs(click_pos[0] - cue_x) <= cue_w / 2.0
-                    and abs(click_pos[1] - cue_y) <= cue_h / 2.0
+                    abs(click_pos[0] - cue_x)
+                    <= (cue_w * float(choice_hitbox_scale)) / 2.0
+                    and abs(click_pos[1] - cue_y)
+                    <= (cue_h * float(choice_hitbox_scale)) / 2.0
+                )
+            if touch_sample.press_started:
+                _log_message(
+                    msg_logger,
+                    "INFO",
+                    (
+                        f"match_cue_touch_attempt trial_num={trial_num} "
+                        f"click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f}) "
+                        f"matched={int(cue_contains_touch)}"
+                    ),
                 )
             if not cue_contains_touch:
                 return

@@ -31,6 +31,25 @@ class MousePressSample:
         return self.down or self.press_started
 
 
+def advance_release_armed_touch_gate(
+    armed: bool,
+    sample: MousePressSample,
+) -> tuple[bool, bool]:
+    """Advance a touch gate that ignores a press held before it opened.
+
+    Returns ``(armed, eligible_now)``. A buffered press arms and activates the
+    gate because it proves that a release/re-press occurred during a blocking
+    display flip.
+    """
+    if armed:
+        return True, sample.active
+    if sample.buffered_press:
+        return True, True
+    if not sample.down:
+        return True, False
+    return False, False
+
+
 def _as_bool_tuple(value: Any) -> tuple[bool, ...]:
     try:
         return tuple(bool(item) for item in value)

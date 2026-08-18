@@ -275,6 +275,7 @@ def run_task(
             "aborted",
             "stop_reason",
             "dropped_frames",
+            "timing_misses",
             "scheduled_video_slots_skipped",
             "sync_pulses",
         ],
@@ -394,6 +395,7 @@ def run_task(
                     or "completed"
                 ),
                 "dropped_frames": playback.get("dropped_frames", ""),
+                "timing_misses": playback.get("late_frame_count", ""),
                 "scheduled_video_slots_skipped": playback.get(
                     "scheduled_video_slots_skipped",
                     "",
@@ -752,6 +754,11 @@ def run_task(
                         video_buffer_bytes=video_buffer_bytes,
                         seek_timeout_s=seek_timeout_seconds,
                         decoder_ready_callback=_pin_main_for_playback,
+                        video_onset_callback=(
+                            experimenter_preview.mark_video_started
+                            if experimenter_preview is not None
+                            else None
+                        ),
                         stimulus_rotation_degrees=main_rotation_deg,
                         native_target_size=native_main_size,
                     )

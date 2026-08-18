@@ -582,6 +582,7 @@ class ScreenConfigTests(unittest.TestCase):
         preview._process = Mock()
         preview._process.is_alive.return_value = True
         preview._queue = queue.Queue()
+        preview._video_start_perf_shared = types.SimpleNamespace(value=42.0)
 
         preview.show_static_scene(
             bg_rgb_255=(0, 0, 0),
@@ -601,6 +602,15 @@ class ScreenConfigTests(unittest.TestCase):
         shared_payload = preview._queue.get_nowait()
         self.assertEqual(shared_payload["main_rotation_deg"], 90)
         self.assertEqual(shared_payload["main_size"], [2560, 1600])
+        self.assertNotEqual(
+            preview._video_start_perf_shared.value,
+            preview._video_start_perf_shared.value,
+        )
+
+        preview.mark_video_started(123.456)
+        self.assertEqual(preview._video_start_perf_shared.value, 123.456)
+        with self.assertRaisesRegex(ValueError, "must be finite"):
+            preview.mark_video_started(float("nan"))
 
     def test_experimenter_label_shows_subject_and_trial_total(self):
         self.assertEqual(

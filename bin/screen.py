@@ -1543,6 +1543,7 @@ def _experimenter_preview_process(
     initial_current_trial_num: Optional[int],
     initial_total_trials: Optional[int],
     initial_status_counts: Optional[Dict[str, int]],
+    video_start_perf_shared,
     stop_event,
     startup_sender,
 ) -> None:
@@ -1850,12 +1851,27 @@ def _experimenter_preview_process(
             counts_pos = (canvas_left + margin, timer_pos[1] - max(56.0, reward_counts_text_height * 3.2))
             label_pos = (float(box_center[0]), box_bottom + margin + (task_label_height * 0.5))
 
+        video_timer_pos = (
+            timer_pos[0],
+            timer_pos[1]
+            - max(timer_text_height, video_timer_text_height) * 1.05,
+        )
+        counts_pos = (
+            counts_pos[0],
+            min(
+                counts_pos[1],
+                video_timer_pos[1]
+                - max(42.0, reward_counts_text_height * 2.4),
+            ),
+        )
+
         reward_button_rect.pos = reward_pos
         reward_button_text.pos = reward_pos
         exit_button_rect.pos = exit_pos
         exit_button_text.pos = exit_pos
         system_time_text.pos = clock_pos
         timer_text.pos = timer_pos
+        video_timer_text.pos = video_timer_pos
         reward_counts_text.pos = counts_pos
         if task_label_text is not None:
             task_label_text.pos = label_pos
@@ -1867,6 +1883,13 @@ def _experimenter_preview_process(
         system_time_text.draw()
         timer_text.text = format_elapsed_hms(elapsed)
         timer_text.draw()
+        video_start_perf_s = float(video_start_perf_shared.value)
+        if shared_movie_active and np.isfinite(video_start_perf_s):
+            video_timer_text.text = (
+                f"Video: "
+                f"{format_elapsed_hms(time.perf_counter() - video_start_perf_s)}"
+            )
+            video_timer_text.draw()
         status_counts = static_scene.get("status_counts")
         reward_counts = static_scene.get("reward_counts")
         if status_counts is not None:
@@ -1968,6 +1991,7 @@ def _experimenter_preview_process(
 
         task_label_height = max(18.0, min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.032)
         timer_text_height = max(22.0, min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.04)
+        video_timer_text_height = max(18.0, timer_text_height * 0.78)
         system_time_text_height = max(
             18.0,
             min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.028,
@@ -1993,6 +2017,17 @@ def _experimenter_preview_process(
             alignText="left",
             anchorHoriz="left",
             color=_preview_rgb255_to_psychopy((255, 255, 255)),
+            colorSpace="rgb",
+        )
+        video_timer_text = visual.TextStim(
+            win,
+            text="Video: 00:00:00",
+            units="pix",
+            height=video_timer_text_height,
+            pos=(-float(preview_canvas_size[0]) * 0.35, float(preview_canvas_size[1]) * 0.40),
+            alignText="left",
+            anchorHoriz="left",
+            color=_preview_rgb255_to_psychopy((255, 224, 128)),
             colorSpace="rgb",
         )
         reward_counts_text = visual.TextStim(
@@ -2386,6 +2421,11 @@ class ExperimenterPreview:
         self._reward_event = self._ctx.Event()
         self._exit_event = self._ctx.Event()
         self._stop_event = self._ctx.Event()
+        self._video_start_perf_shared = self._ctx.Value(
+            "d",
+            float("nan"),
+            lock=False,
+        )
         startup_receiver, startup_sender = self._ctx.Pipe(duplex=False)
         self._process = self._ctx.Process(
             target=_experimenter_preview_process,
@@ -2402,6 +2442,7 @@ class ExperimenterPreview:
                 current_trial_num,
                 total_trials,
                 self.status_counts,
+                self._video_start_perf_shared,
                 self._stop_event,
                 startup_sender,
             ),
@@ -2685,6 +2726,13 @@ class ExperimenterPreview:
         main_rotation_deg: float = 0,
     ) -> None:
         """Mirror frames published by the main process without decoding again."""
+        video_start_shared = getattr(
+            self,
+            "_video_start_perf_shared",
+            None,
+        )
+        if video_start_shared is not None:
+            video_start_shared.value = float("nan")
         payload: Dict[str, Any] = {
             "type": "play_shared_video",
             "shared_frame_buffer": dict(shared_frame_buffer),
@@ -2696,6 +2744,19 @@ class ExperimenterPreview:
         if main_size is not None:
             payload["main_size"] = [int(main_size[0]), int(main_size[1])]
         self._send(payload)
+
+    def mark_video_started(self, onset_perf_s: float) -> None:
+        """Anchor the movie overlay timer to the actual main-display onset."""
+        onset_perf_s = float(onset_perf_s)
+        if not np.isfinite(onset_perf_s):
+            raise ValueError("video onset timestamp must be finite")
+        video_start_shared = getattr(
+            self,
+            "_video_start_perf_shared",
+            None,
+        )
+        if video_start_shared is not None:
+            video_start_shared.value = onset_perf_s
 
     def close(self) -> None:
         if getattr(self, "_closed", False):

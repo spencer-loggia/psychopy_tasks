@@ -396,9 +396,11 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
   frame is rejected. One coarse sleep positions each submission after the
   preceding VBL; the blocking flip then synchronizes to its absolute target
   VBL. Every realized boundary is checked against the onset-anchored schedule.
-  A missed boundary or unavailable chunk is fatal, so playback never catches
-  up by skipping or substituting source frames. The exact hold histogram,
-  total refresh count, and maximum/final phase errors are logged.
+  A boundary that quantizes to an adjacent VBL is recorded as a timing miss,
+  after which playback continues toward the next absolute boundary without
+  skipping or substituting a source frame. An unavailable prepared chunk
+  remains fatal. The exact hold histogram, total refresh count, realized
+  boundary errors, and maximum/final phase errors are logged.
 - The ffpyplayer worker writes prepared RGB24 frames into parent-owned shared
   memory. The prepared-frame budget is configured by
   `video_buffer_megabytes` and defaults to 512 MiB. If the complete prepared
@@ -432,6 +434,9 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
   use a bounded, sequenced latest-snapshot mailbox, and shared video reads the
   newest committed ring frame, so a slow preview drops stale work instead of
   accumulating lag.
+- During movie playback the experimenter overlay shows a separate `Video:`
+  elapsed timer. Its zero is the actual main-display first-frame flip callback,
+  independent of decoder preparation time and preview transport latency.
 - A fresh ffpyplayer worker owns each selected clip and exits when preparation
   is complete. For efficient random access over a mounted network filesystem,
   preprocess sources with `bin/preprocess_videos.py --frame_rate 30` (`30` is

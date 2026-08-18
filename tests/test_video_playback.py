@@ -628,7 +628,7 @@ class VideoPlaybackTests(unittest.TestCase):
             (0, 656, 1080, 1264),
         )
 
-    def test_source_boundary_presenter_uses_three_two_pulldown(self):
+    def test_source_boundary_presenter_recovers_one_adjacent_vbl_miss(self):
         video_utils = self._load_utils_without_psychopy_runtime()
 
         class FakeClock:
@@ -666,6 +666,10 @@ class VideoPlaybackTests(unittest.TestCase):
                     self.refresh_index + 1,
                     earliest_refresh,
                 )
+                # Delay source frame 1 by one VBL. The absolute schedule must
+                # recover on frame 2 without skipping either source frame.
+                if self.flip_count == 4:
+                    self.refresh_index += 1
                 self.clock.now_s = (
                     self.clock.anchor_s + self.refresh_index / 60.0
                 )
@@ -726,6 +730,8 @@ class VideoPlaybackTests(unittest.TestCase):
         )
         frame_publisher = Mock()
         event_logger = Mock()
+        message_logger = Mock()
+        onset_callback = Mock()
         background = Mock()
         # Deliberately reproduce a noisy measured rate while the fake panel's
         # actual VBLs remain 60 Hz. Absolute source-time targets must not drift
@@ -763,6 +769,7 @@ class VideoPlaybackTests(unittest.TestCase):
                 win=win,
                 video_path="unused.mp4",
                 logger=event_logger,
+                msg_logger=message_logger,
                 bg_rect=background,
                 allow_escape=False,
                 stream_info={
@@ -784,6 +791,7 @@ class VideoPlaybackTests(unittest.TestCase):
                 video_frame_count=3,
                 display_refresh_rate=measured_refresh_rate,
                 native_target_size=(2, 2),
+                video_onset_callback=onset_callback,
             )
 
         self.assertEqual(frame_stream.next_frame.call_count, 3)
@@ -827,6 +835,20 @@ class VideoPlaybackTests(unittest.TestCase):
         self.assertEqual(result["display_refreshes_presented"], 8)
         self.assertEqual(result["display_warmup_flips"], 2)
         self.assertEqual(result["dropped_frames"], 0)
+        self.assertEqual(result["late_frame_count"], 1)
+        onset_callback.assert_called_once_with(flip_time(3))
+        warning_messages = [
+            call.args[1]
+            for call in message_logger.log.call_args_list
+            if call.args[0] == "WARN"
+        ]
+        self.assertTrue(
+            any(
+                "video_frame_boundary_missed" in message
+                and "action=continue_absolute_schedule" in message
+                for message in warning_messages
+            )
+        )
 
         self.assertEqual(frame_publisher.publish_rgb.call_count, 3)
         publish_calls = frame_publisher.publish_rgb.call_args_list
@@ -839,7 +861,7 @@ class VideoPlaybackTests(unittest.TestCase):
                 call.kwargs["main_display_flip_perf_s"]
                 for call in publish_calls
             ],
-            [flip_time(3), flip_time(6), flip_time(8)],
+            [flip_time(3), flip_time(7), flip_time(8)],
         )
 
         # The pulse begins on source frame 2's boundary. The unchanged front
@@ -1146,6 +1168,7 @@ class PlayVideoTaskTests(unittest.TestCase):
             def __init__(self, *args, **kwargs):
                 self.clear_calls = []
                 self.play_calls = []
+                self.video_start_calls = []
                 self.closed = False
                 preview_instances.append(self)
 
@@ -1154,6 +1177,9 @@ class PlayVideoTaskTests(unittest.TestCase):
 
             def play_shared_video(self, **kwargs):
                 self.play_calls.append(kwargs)
+
+            def mark_video_started(self, onset_perf_s):
+                self.video_start_calls.append(float(onset_perf_s))
 
             def poll(self):
                 return False
@@ -1324,6 +1350,10 @@ class PlayVideoTaskTests(unittest.TestCase):
         )
 
         preview = preview_instances[0]
+        onset_callback = playback_kwargs["video_onset_callback"]
+        self.assertTrue(callable(onset_callback))
+        onset_callback(123.456)
+        self.assertEqual(preview.video_start_calls, [123.456])
         self.assertEqual(len(preview.play_calls), 2)
         self.assertEqual(preview.play_calls[0]["video_size"], (674, 1080))
         self.assertEqual(

@@ -279,6 +279,7 @@ def play_video_fill_screen(
     clip_duration_s: Optional[float] = None,
     seek_timeout_s: float = 15.0,
     decoder_ready_callback: Optional[Callable[[], None]] = None,
+    video_onset_callback: Optional[Callable[[float], None]] = None,
     stimulus_rotation_degrees: float = 0.0,
     native_target_size: Optional[Sequence[float]] = None,
     video_frame_rate: float = 30.0,
@@ -769,7 +770,7 @@ def play_video_fill_screen(
                         late_frame_count += 1
                         _log_message(
                             msg_logger,
-                            "ERROR",
+                            "WARN",
                             f"video_frame_boundary_missed "
                             f"trial_num={trial_num} "
                             f"file={video_file.name} "
@@ -777,11 +778,8 @@ def play_video_fill_screen(
                             f"timing_error_s="
                             f"{boundary_timing_error_s:.6f} "
                             f"target_perf_s={target_flip_perf:.9f} "
-                            f"actual_perf_s={flip_perf:.9f}",
-                        )
-                        raise RuntimeError(
-                            "Video frame missed its planned display "
-                            "boundary"
+                            f"actual_perf_s={flip_perf:.9f} "
+                            "action=continue_absolute_schedule",
                         )
 
                 if previous_source_flip_perf is not None:
@@ -817,6 +815,17 @@ def play_video_fill_screen(
                     first_flip_perf = flip_perf
                     first_flip_requested_perf = flip_requested_perf
                     actual_source_start_s = current_source_time_s
+                    if video_onset_callback is not None:
+                        try:
+                            video_onset_callback(first_flip_perf)
+                        except Exception as exc:
+                            _log_message(
+                                msg_logger,
+                                "WARN",
+                                f"video_onset_callback_failed "
+                                f"trial_num={trial_num} "
+                                f"error={type(exc).__name__}: {exc}",
+                            )
 
                 if frame_publisher is not None:
                     # The preview is best-effort and begins at its
@@ -935,13 +944,11 @@ def play_video_fill_screen(
                 late_frame_count += 1
                 _log_message(
                     msg_logger,
-                    "ERROR",
+                    "WARN",
                     f"video_offset_timing_error trial_num={trial_num} "
                     f"file={video_file.name} "
-                    f"timing_error_s={clip_offset_timing_error_s:.6f}",
-                )
-                raise RuntimeError(
-                    "Video clip offset missed its planned display boundary"
+                    f"timing_error_s={clip_offset_timing_error_s:.6f} "
+                    "action=record_actual_offset",
                 )
         finally:
             if sync_schedule is not None and not clear_flip_completed:
@@ -1092,7 +1099,9 @@ def play_video_fill_screen(
                             ),
                         )
 
-    dropped_frames = int(late_frame_count)
+    # A boundary timing miss changes a hold by a VBL but does not omit the
+    # source frame. Keep source-frame drops distinct from cadence quality.
+    dropped_frames = int(scheduled_video_slots_skipped)
     if first_flip_perf is not None:
         _log_message(
             msg_logger,

@@ -82,8 +82,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gop_seconds",
         type=float,
-        default=2.0,
-        help="Maximum keyframe interval in seconds; shorter GOPs improve random network seeks",
+        default=0.5,
+        help="Maximum keyframe interval in seconds; the low-latency default is 0.5",
     )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs")
     parser.add_argument("--ffmpeg", default="ffmpeg", help="Path to ffmpeg executable")
@@ -342,6 +342,11 @@ def preprocess_video(
             "main",
             "-g",
             str(int(gop_frames)),
+            # Random clip starts should not wait for a deep decode/reorder
+            # queue. This trades some compression efficiency for faster exact
+            # seeks and earlier first-frame availability.
+            "-bf",
+            "0",
         ]
         if codec == "libx265":
             encoder_args.extend([

@@ -97,6 +97,38 @@ class VideoPreprocessingTests(unittest.TestCase):
             )
         )
 
+    def test_encoder_disables_b_frames_for_low_latency_random_seek(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "clip.mp4"
+            with (
+                patch.object(preprocess_videos, "_run_checked") as encode,
+                patch.object(
+                    preprocess_videos,
+                    "validate_processed_video",
+                ),
+            ):
+                result = preprocess_videos.preprocess_video(
+                    ffmpeg_bin="ffmpeg",
+                    ffprobe_bin="ffprobe",
+                    input_path=Path("input.mp4"),
+                    input_codec_name="hevc",
+                    output_path=output_path,
+                    filter_chain="crop=1280:720:0:0",
+                    codecs=["libx265"],
+                    preset="veryfast",
+                    crf=20,
+                    tune="fastdecode",
+                    gop_frames=15,
+                    overwrite=True,
+                    expected_size=(1280, 720),
+                    expected_frame_rate=30.0,
+                )
+
+        self.assertEqual(result, "libx265")
+        command = encode.call_args.args[0]
+        self.assertEqual(command[command.index("-g") + 1], "15")
+        self.assertEqual(command[command.index("-bf") + 1], "0")
+
 
 if __name__ == "__main__":
     unittest.main()

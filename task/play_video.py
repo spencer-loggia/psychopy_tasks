@@ -171,7 +171,6 @@ def run_task(
     resolved_video_files = _resolve_video_files(video_files)
 
     video_streams = {}
-    maximum_frame_bytes = 0
     for video_path in dict.fromkeys(resolved_video_files):
         stream = utils.probe_video_stream(video_path, ffprobe_bin=ffprobe_bin)
         if not stream:
@@ -203,10 +202,6 @@ def run_task(
                 "source offline or use its exact configured rate."
             )
         video_streams[video_path] = stream
-        maximum_frame_bytes = max(
-            maximum_frame_bytes,
-            int(stream["width"]) * int(stream["height"]) * 3,
-        )
 
     win, main_screen, experimenter_screen = utils.setup_task_window(
         screen_config,
@@ -234,6 +229,26 @@ def run_task(
     )
     main_rotation_deg = software_stimulus_rotation(main_screen.rotation)
     subject_main_size = oriented_size(native_main_size, main_rotation_deg)
+    maximum_frame_bytes = 0
+    minimum_runtime_crop_fraction = 1.0
+    for stream in video_streams.values():
+        source_size = (int(stream["width"]), int(stream["height"]))
+        crop_bounds = center_crop_bounds(
+            source_size,
+            subject_main_size,
+            alignment=2,
+        )
+        cropped_width = crop_bounds[2] - crop_bounds[0]
+        cropped_height = crop_bounds[3] - crop_bounds[1]
+        maximum_frame_bytes = max(
+            maximum_frame_bytes,
+            cropped_width * cropped_height * 3,
+        )
+        minimum_runtime_crop_fraction = min(
+            minimum_runtime_crop_fraction,
+            (cropped_width * cropped_height)
+            / float(source_size[0] * source_size[1]),
+        )
 
     resolved_config_name = str(config_name).strip() if config_name else "play_video"
     session_logs = SessionLogBundle(
@@ -484,9 +499,23 @@ def run_task(
                 f"num_clips={num_clips} "
                 f"configured_video_fps={frame_rate:.6f} "
                 f"video_buffer_megabytes={video_buffer_megabytes:.3f} "
+                f"minimum_runtime_crop_fraction="
+                f"{minimum_runtime_crop_fraction:.6f} "
                 f"seek_timeout_s={seek_timeout_seconds:.3f}"
             ),
         )
+        if minimum_runtime_crop_fraction < 0.8:
+            msg_logger.log(
+                "WARN",
+                (
+                    "video_decode_efficiency runtime_crop_discards_pixels "
+                    f"minimum_retained_fraction="
+                    f"{minimum_runtime_crop_fraction:.6f} "
+                    "recommendation=preprocess_to_subject_screen_aspect "
+                    f"subject_size={int(subject_main_size[0])}x"
+                    f"{int(subject_main_size[1])}"
+                ),
+            )
         if raspi:
             msg_logger.log(
                 "INFO",
@@ -553,7 +582,7 @@ def run_task(
                 f"{refresh_cadence.final_phase_error_s:.9f} "
                 f"effective_video_fps={effective_video_fps:.9f} "
                 f"cadence_error_hz={cadence_error_hz:.9f} "
-                "schedule=nearest_vbl_phase_accumulator "
+                "schedule=absolute_source_time_nearest_vbl "
                 "source_frames=never_skip"
             ),
         )

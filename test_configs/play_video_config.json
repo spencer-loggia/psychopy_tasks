@@ -1,7 +1,7 @@
 {
   "config_name": "play_video",
   "video_files": [
-    "/mnt/isilon/DATA/monkey_test_box_data/videos/monkey_kingdom.mp4"
+    "/mnt/isilon/DATA/monkey_test_box_data/videos/preproc/monkey_kingdom.mp4"
   ],
   "clip_duration_seconds": 60.0,
   "seek_timeout_seconds": 30.0,
@@ -20,5 +20,5 @@
 
   "pump_pin": 0,
   "pump_pulse_time_seconds": 0.25,
-  "pump_interval": 2.0  
+  "pump_interval": 5.0  
 }

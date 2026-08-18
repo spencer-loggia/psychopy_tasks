@@ -24,7 +24,7 @@ import numpy as np
 RGB_CHANNELS = 3
 DEFAULT_BUFFER_BYTES = 512 * 1024 * 1024
 DEFAULT_CHUNK_SLOTS = 3
-MAX_CHUNK_SECONDS = 1.0
+TARGET_CHUNK_SECONDS = 0.25
 
 
 @dataclass(frozen=True)
@@ -70,8 +70,18 @@ def plan_video_chunks(
             f"RGB24 frame requiring {frame_bytes} bytes"
         )
 
+    target_frames_per_chunk = max(
+        1,
+        int(math.ceil(frame_rate * TARGET_CHUNK_SECONDS)),
+    )
     whole_clip_bytes = frame_count * frame_bytes
-    if whole_clip_bytes <= memory_budget_bytes:
+    # Only fully preload clips no longer than one low-latency chunk. Waiting
+    # for a longer clip merely because it fits in RAM delays onset and prevents
+    # decode/display overlap.
+    if (
+        frame_count <= target_frames_per_chunk
+        and whole_clip_bytes <= memory_budget_bytes
+    ):
         frames_per_chunk = frame_count
         slot_count = 1
     else:
@@ -85,7 +95,7 @@ def plan_video_chunks(
                 f"{slot_count} RGB24 staging frames of {frame_bytes} bytes each"
             )
         frames_per_chunk = min(
-            max(1, int(round(frame_rate * MAX_CHUNK_SECONDS))),
+            target_frames_per_chunk,
             int(maximum_frames_per_slot),
         )
 
@@ -518,6 +528,10 @@ class BufferedVideoFrameStream:
             raise
 
         self._shm = shm
+        self._slot_views = tuple(
+            _shared_slot_view(shm, self.layout, slot_index)
+            for slot_index in range(self.layout.slot_count)
+        )
         self._free_slots = free_slots
         self._ready_chunks = ready_chunks
         self._stop_event = stop_event
@@ -721,7 +735,7 @@ class BufferedVideoFrameStream:
             raise RuntimeError("prepared video chunk acquisition failed")
         frame_index = self._next_frame_index
         chunk_offset = self._current_chunk_offset
-        slot = _shared_slot_view(self._shm, self.layout, chunk.slot_index)
+        slot = self._slot_views[chunk.slot_index]
         result = PreparedVideoFrame(
             frame_index=frame_index,
             source_pts_s=chunk.source_pts[chunk_offset],
@@ -750,6 +764,8 @@ class BufferedVideoFrameStream:
                 managed_queue.close()
             except Exception:
                 pass
+        # Release cached NumPy exports before closing the SharedMemory mmap.
+        self._slot_views = ()
         try:
             self._shm.close()
         finally:

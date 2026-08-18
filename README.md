@@ -381,31 +381,38 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
   exact onset, clear, and diagnostic records in the event/message logs. These
   timestamps describe flip completion near vertical blanking; use the existing
   GPIO pulse and a photodiode when physical pixel illumination time is needed.
-- Playback draws and calls blocking PsychoPy `Window.flip()` once per physical
-  display refresh. A cumulative phase schedule maps every ideal source-frame
-  boundary to the nearest VBL using the measured monitor rate. Each prepared
-  source frame is uploaded once, then the same persistent texture is redrawn
-  for the resulting number of refreshes. Thus 59.94/30 uses mostly two-refresh
+- Playback uploads, draws, and calls blocking PsychoPy `Window.flip()` only at
+  source-frame boundaries. Between boundaries the front buffer is left
+  untouched, so the display naturally repeats that image at each hardware
+  refresh without more Python or GL work. Every boundary is scheduled from
+  the frame-zero onset plus its absolute source time; the blocking swap maps
+  it to the nearest VBL. The measured monitor rate supplies the submission
+  margin and cadence diagnostics, but its small measurement error is never
+  multiplied across the clip. Thus 59.94/30 uses mostly two-refresh
   holds with an occasional one-refresh correction, while 60/24 uses a balanced
   three/two cadence. The phase error remains bounded to half a refresh instead
   of accumulating over the clip, and every source frame is still displayed at
   least once. A combination that would assign zero refreshes to any source
-  frame is rejected. There are no scheduler sleeps; a missed refresh or
-  unavailable chunk is fatal, so playback never catches up by skipping or
-  substituting source frames. The exact hold histogram, total refresh count,
-  and maximum/final phase errors are logged.
+  frame is rejected. One coarse sleep positions each submission after the
+  preceding VBL; the blocking flip then synchronizes to its absolute target
+  VBL. Every realized boundary is checked against the onset-anchored schedule.
+  A missed boundary or unavailable chunk is fatal, so playback never catches
+  up by skipping or substituting source frames. The exact hold histogram,
+  total refresh count, and maximum/final phase errors are logged.
 - The ffpyplayer worker writes prepared RGB24 frames into parent-owned shared
   memory. The prepared-frame budget is configured by
   `video_buffer_megabytes` and defaults to 512 MiB. If the complete prepared
-  clip fits, it is ready before playback in one chunk. Otherwise, the pool has
-  exactly three chunks, each holding at most `max(1, round(frame_rate))` frames
-  (about one second, or fewer when the budget requires); two are ready before
-  playback, and the remaining slot lets the worker stay ahead by refilling
-  released slots as the main process consumes prepared chunks. No pixel data
+  clip is no longer than one 0.25-second chunk, it is ready before playback in
+  one slot. Otherwise, the pool has exactly three approximately 0.25-second
+  chunks; two (about 0.5 seconds of media) are ready before playback, and the
+  remaining slot lets the worker stay ahead by refilling released slots as the
+  main process consumes prepared chunks. This overlaps preparation with display
+  even when a longer clip would fit entirely in RAM, substantially reducing
+  onset latency and memory footprint. No pixel data
   crosses a queue; queues carry only ownership, timestamp, status, and error
   messages. The main process reads each frame in place across chunk boundaries
-  and uploads it once into a persistent GL texture; repeated display-refresh
-  draws neither copy nor re-upload its pixels.
+  and uploads it once into a persistent GL texture; hardware refreshes between
+  source boundaries require no redraw, copy, or pixel re-upload.
 - `play_video` decodes each clip once. No faster than once every 0.1 seconds,
   the main process copies the currently displayed RGB24 frame into a four-slot,
   latest-frame-wins shared-memory preview ring. The experimenter process copies
@@ -413,6 +420,12 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
   these consistency copies do not create a second decoder or a delayed frame
   queue. Each preview frame includes its sequence, source frame/media time,
   main-display flip time, and trial number.
+- Each completed attempt emits a `video_pipeline_performance` message with
+  mean/maximum shared-buffer fetch, RGB texture upload, draw submission, and
+  preview-copy costs plus the minimum source-boundary submission headroom.
+  `video_playback` separately reports seek/preload time and its effective
+  preparation rate. These measurements distinguish decoder starvation from a
+  slow GL upload or an overloaded experimenter mirror on the deployed Pi.
 - The preview is a subject-view mirror: it transposes the complete native main
   framebuffer geometry (background, positions, stimuli, hit boxes, and video
   crop), rather than merely undoing each stimulus orientation. Scene commands
@@ -424,9 +437,13 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
   preprocess sources with `bin/preprocess_videos.py --frame_rate 30` (`30` is
   also the default). Preprocessing center-crops/scales the video, normalizes it
   to that constant frame rate, rebases PTS to zero, encodes HEVC Main/yuv420p,
-  enables MP4 fast-start, and uses a default two-second maximum keyframe
-  interval. Any frame duplication or removal needed for rate normalization
-  occurs offline; runtime playback performs no frame-rate conversion.
+  enables MP4 fast-start, disables B-frames, and uses a default 0.5-second
+  maximum keyframe interval. Those settings trade some compression efficiency
+  for faster random seeks and a shorter decode/reorder queue. Any frame
+  duplication or removal needed for rate normalization occurs offline; runtime
+  playback performs no frame-rate conversion. Pass the subject-view dimensions
+  (after output rotation) to `--screen_size`; runtime cropping cannot avoid
+  decoding pixels that should have been removed offline.
 - On Raspberry Pi, `play_video` sends one-video-presentation-frame sync pulses on BCM GPIO
   `sync_pin` (default `18`). Pulse onsets are frame locked and their successive
   intervals are sampled inclusively from `sync_interval_frames` (default

@@ -2273,7 +2273,12 @@ def _experimenter_preview_process(
                                 shared_frame.rgb,
                             )
                     if not shared_frame_updated and not redraw_requested:
-                        core.wait(0.002)
+                        # Published video arrives at most every 100 ms. A
+                        # 2-ms mailbox poll woke this worker about 500 times/s
+                        # and competed with ffpyplayer on the Pi cores for no
+                        # visible benefit. Ten milliseconds keeps preview lag
+                        # low without a busy-ish background loop.
+                        core.wait(0.010)
                         continue
                     if movie_bg_rect is not None:
                         movie_bg_rect.draw()

@@ -1328,7 +1328,7 @@ def run_task(
             pass
         try:
             if win is not None:
-                win.close()
+                utils.close_task_window(win)
         except Exception:
             pass
         # Do not call core.quit() here; it raises SystemExit and can mask real exceptions.

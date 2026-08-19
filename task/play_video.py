@@ -32,6 +32,7 @@ from bin.video_playback import (
     is_raspberry_pi,
     parse_frame_rate,
     plan_video_refresh_cadence,
+    probe_video_stream,
     select_random_video_clip,
     validate_hevc_stream,
     video_duration_seconds,
@@ -172,7 +173,7 @@ def run_task(
 
     video_streams = {}
     for video_path in dict.fromkeys(resolved_video_files):
-        stream = utils.probe_video_stream(video_path, ffprobe_bin=ffprobe_bin)
+        stream = probe_video_stream(video_path, ffprobe_bin=ffprobe_bin)
         if not stream:
             raise RuntimeError(f"Could not probe video stream: {video_path}")
         validate_hevc_stream(
@@ -201,6 +202,18 @@ def run_task(
                 f"frame_rate {frame_rate:.6f}: {video_path}. Normalize the "
                 "source offline or use its exact configured rate."
             )
+        average_rate = parse_frame_rate(stream.get("avg_frame_rate"))
+        nominal_rate = parse_frame_rate(stream.get("r_frame_rate"))
+        if (
+            average_rate > 0.0
+            and nominal_rate > 0.0
+            and abs(average_rate - nominal_rate) > 0.001
+        ):
+            raise ValueError(
+                f"Video reports inconsistent average/nominal frame rates "
+                f"({average_rate:.6f}/{nominal_rate:.6f}): {video_path}. "
+                "Normalize it to exact CFR during preprocessing."
+            )
         video_streams[video_path] = stream
 
     win, main_screen, experimenter_screen = utils.setup_task_window(
@@ -209,9 +222,6 @@ def run_task(
         fullscreen=fullscreen,
         size=win_size,
         allow_same_screen=True,
-    )
-    refresh_sync_request_applied = bool(
-        getattr(win, "_neuro_tasks_refresh_sync_requested", False)
     )
     bg_rect = utils.make_bg_rect(win, bg)
     mouse = event.Mouse(win=win)
@@ -276,14 +286,49 @@ def run_task(
             "stop_reason",
             "dropped_frames",
             "timing_misses",
+            "timing_validation_status",
+            "timing_error_p95_milliseconds",
+            "timing_error_maximum_milliseconds",
+            "cadence_mismatches",
+            "source_pts_contiguous",
+            "realized_refresh_hold_histogram",
+            "main_vblank_validation_status",
+            "glx_swap_interval",
+            "main_vblank_delta_msc",
+            "main_vblank_expected_delta_msc",
+            "main_vblank_delta_sbc",
+            "main_vblank_expected_delta_sbc",
             "scheduled_video_slots_skipped",
             "sync_pulses",
         ],
+        additional_table_fieldnames={
+            "video_frame_timing": [
+                "trial_num",
+                "source_frame_index",
+                "source_media_time_seconds",
+                "expected_source_time_seconds",
+                "source_pts_error_seconds",
+                "expected_time_since_video_start_seconds",
+                "requested_time_since_session_start",
+                "expected_time_since_session_start",
+                "actual_time_since_session_start",
+                "timing_error_seconds",
+                "planned_hold_refreshes",
+                "realized_hold_refreshes",
+                "realized_hold_seconds",
+                "boundary_status",
+            ]
+        },
         auto_flush=False,
     )
     logger = session_logs.event_logger
     msg_logger = session_logs.message_logger
     behavior_logger = session_logs.behavior_logger
+    frame_timing_logger = getattr(
+        session_logs,
+        "table_loggers",
+        {},
+    ).get("video_frame_timing")
     if behavior_logger is None:
         raise RuntimeError("play_video requires a behavior logger")
     pylogging.console.setLevel(pylogging.CRITICAL)
@@ -396,6 +441,63 @@ def run_task(
                 ),
                 "dropped_frames": playback.get("dropped_frames", ""),
                 "timing_misses": playback.get("late_frame_count", ""),
+                "timing_validation_status": playback.get(
+                    "timing_validation_status",
+                    "",
+                ),
+                "timing_error_p95_milliseconds": (
+                    f"{1000.0 * float(playback['timing_error_p95_s']):.6f}"
+                    if playback.get("timing_error_p95_s") is not None
+                    else ""
+                ),
+                "timing_error_maximum_milliseconds": (
+                    f"{1000.0 * float(playback['timing_error_maximum_s']):.6f}"
+                    if playback.get("timing_error_maximum_s") is not None
+                    else ""
+                ),
+                "cadence_mismatches": playback.get(
+                    "cadence_mismatch_count",
+                    "",
+                ),
+                "source_pts_contiguous": (
+                    int(bool(playback["source_pts_contiguous"]))
+                    if "source_pts_contiguous" in playback
+                    else ""
+                ),
+                "realized_refresh_hold_histogram": str(
+                    playback.get("realized_refresh_hold_histogram", "")
+                ),
+                "main_vblank_validation_status": playback.get(
+                    "main_vblank_validation_status",
+                    "",
+                ),
+                "glx_swap_interval": (
+                    playback.get("glx_swap_interval")
+                    if playback.get("glx_swap_interval") is not None
+                    else ""
+                ),
+                "main_vblank_delta_msc": (
+                    playback.get("main_vblank_delta_msc")
+                    if playback.get("main_vblank_delta_msc") is not None
+                    else ""
+                ),
+                "main_vblank_expected_delta_msc": (
+                    playback.get("main_vblank_expected_delta_msc")
+                    if playback.get("main_vblank_expected_delta_msc")
+                    is not None
+                    else ""
+                ),
+                "main_vblank_delta_sbc": (
+                    playback.get("main_vblank_delta_sbc")
+                    if playback.get("main_vblank_delta_sbc") is not None
+                    else ""
+                ),
+                "main_vblank_expected_delta_sbc": (
+                    playback.get("main_vblank_expected_delta_sbc")
+                    if playback.get("main_vblank_expected_delta_sbc")
+                    is not None
+                    else ""
+                ),
                 "scheduled_video_slots_skipped": playback.get(
                     "scheduled_video_slots_skipped",
                     "",
@@ -403,6 +505,70 @@ def run_task(
                 "sync_pulses": playback.get("sync_pulses", ""),
             }
         )
+
+    def _write_video_frame_timing_rows(
+        *,
+        trial_num: int,
+        playback_info,
+    ) -> None:
+        if frame_timing_logger is None:
+            return
+        playback = dict(playback_info or {})
+        video_fps = float(
+            playback.get("configured_video_frame_rate", 0.0) or 0.0
+        )
+        for record in playback.get("frame_timing_records", ()):
+            source_frame_index = int(record["source_frame_index"])
+            frame_timing_logger.writerow(
+                {
+                    "trial_num": int(trial_num),
+                    "source_frame_index": source_frame_index,
+                    "source_media_time_seconds": (
+                        f"{float(record['source_media_time_s']):.9f}"
+                    ),
+                    "expected_source_time_seconds": (
+                        f"{float(record['expected_source_pts_s']):.9f}"
+                    ),
+                    "source_pts_error_seconds": (
+                        f"{float(record['source_pts_error_s']):.9f}"
+                    ),
+                    "expected_time_since_video_start_seconds": (
+                        f"{source_frame_index / video_fps:.9f}"
+                        if video_fps > 0.0
+                        else ""
+                    ),
+                    "requested_time_since_session_start": (
+                        f"{logger.seconds_since_session_start(float(record['flip_requested_perf_s'])):.9f}"
+                    ),
+                    "expected_time_since_session_start": (
+                        f"{logger.seconds_since_session_start(float(record['expected_flip_perf_s'])):.9f}"
+                    ),
+                    "actual_time_since_session_start": (
+                        f"{logger.seconds_since_session_start(float(record['actual_flip_perf_s'])):.9f}"
+                    ),
+                    "timing_error_seconds": (
+                        f"{float(record['timing_error_s']):.9f}"
+                    ),
+                    "planned_hold_refreshes": record.get(
+                        "planned_hold_refreshes",
+                        "",
+                    ),
+                    "realized_hold_refreshes": (
+                        record.get("realized_hold_refreshes")
+                        if record.get("realized_hold_refreshes") is not None
+                        else ""
+                    ),
+                    "realized_hold_seconds": (
+                        f"{float(record['realized_hold_s']):.9f}"
+                        if record.get("realized_hold_s") is not None
+                        else ""
+                    ),
+                    "boundary_status": record.get(
+                        "boundary_status",
+                        "",
+                    ),
+                }
+            )
 
     try:
         if raspi:
@@ -485,13 +651,23 @@ def run_task(
             "INFO",
             f"resolved_screens main={describe_screen(main_screen)} experimenter={describe_screen(experimenter_screen)}",
         )
-        msg_logger.log(
-            "INFO",
-            (
-                "main_display_sync wait_blanking_requested=1 "
-                f"refresh_sync_request_applied={int(refresh_sync_request_applied)}"
-            ),
-        )
+        for video_path, stream in video_streams.items():
+            msg_logger.log(
+                "INFO",
+                (
+                    f"video_source_validation file={video_path.name} "
+                    f"codec={stream.get('codec_name')} "
+                    f"profile={stream.get('profile')} "
+                    f"pix_fmt={stream.get('pix_fmt')} "
+                    f"size={stream.get('width')}x{stream.get('height')} "
+                    f"avg_frame_rate={stream.get('avg_frame_rate')} "
+                    f"r_frame_rate={stream.get('r_frame_rate')} "
+                    f"field_order={stream.get('field_order', 'unknown')} "
+                    f"has_b_frames={stream.get('has_b_frames', 'unknown')} "
+                    f"start_time={stream.get('start_time')} "
+                    f"status=accepted"
+                ),
+            )
         msg_logger.log(
             "INFO",
             (
@@ -588,12 +764,6 @@ def run_task(
                 "source_frames=never_skip"
             ),
         )
-        if not refresh_sync_request_applied:
-            raise RuntimeError(
-                "The main PsychoPy window did not accept refresh-synchronized "
-                "blocking flips"
-            )
-
         if experimenter_screen is not None:
             frame_publisher = SharedVideoFrameBuffer(maximum_frame_bytes)
             experimenter_preview = ExperimenterPreview(
@@ -613,9 +783,34 @@ def run_task(
                     f"experimenter_video_mirror mode=single_decode_latest_frame_wins "
                     f"shared_memory={frame_publisher.name} capacity_bytes={maximum_frame_bytes}"
                     f" slots={frame_publisher.slot_count} publish_interval_s=0.1 "
-                    "vsync=disabled frame_pacing=new_source_frame"
+                    "vsync=secondary_output_independent "
+                    "main_swap_reference_unchanged=1 "
+                    "frame_pacing=new_source_frame"
                 ),
             )
+
+        main_vblank = utils.verify_task_window_vblank(win)
+        primary_lease = main_vblank.primary_lease
+        main_vblank_status = (
+            "confirmed"
+            if main_vblank.swap_interval == 1
+            else "platform_not_applicable"
+        )
+        msg_logger.log(
+            "INFO",
+            (
+                "main_vblank_reference phase=post_preview "
+                f"output={main_screen.name} "
+                f"refresh_sync_requested="
+                f"{int(main_vblank.refresh_sync_requested)} "
+                f"xrandr_primary_changed={int(primary_lease.changed)} "
+                f"xrandr_detail={main_vblank.primary_verification_detail} "
+                f"swap_interval={main_vblank.swap_interval!r} "
+                f"swap_interval_detail={main_vblank.swap_interval_detail} "
+                "secondary_drawable_independent=1 "
+                f"status={main_vblank_status}"
+            ),
+        )
 
         def _pin_main_for_playback() -> None:
             if not main_cpu_affinity:
@@ -781,6 +976,10 @@ def run_task(
                 )
                 session_logs.flush()
                 raise
+            _write_video_frame_timing_rows(
+                trial_num=played_videos + 1,
+                playback_info=playback_info,
+            )
             _drain_pump_edges()
             if playback_info.get("abort_reason") == "pump_failure":
                 _write_video_behavior_row(
@@ -847,11 +1046,19 @@ def run_task(
             except Exception:
                 pass
         try:
-            session_logs.close()
-        except Exception:
-            pass
+            restore_detail = utils.close_task_window(win)
+            msg_logger.log(
+                "INFO",
+                f"main_vblank_reference_restored detail={restore_detail}",
+            )
+        except Exception as exc:
+            msg_logger.log(
+                "WARN",
+                "main_vblank_reference_restore_failed "
+                f"error={type(exc).__name__}: {exc}",
+            )
         try:
-            win.close()
+            session_logs.close()
         except Exception:
             pass
 

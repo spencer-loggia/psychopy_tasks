@@ -3,11 +3,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from fractions import Fraction
+import json
 import math
 from multiprocessing import shared_memory
 from pathlib import Path
 import random
+import shutil
 import struct
+import subprocess
 from typing import Any, Optional, Sequence
 
 import numpy as np
@@ -65,6 +68,50 @@ def video_time_origin_seconds(stream: dict[str, Any]) -> float:
             "rebase the source timestamps during preprocessing"
         )
     return origin
+
+
+def probe_video_stream(
+    video_path: str | Path,
+    ffprobe_bin: str = "ffprobe",
+) -> dict[str, Any]:
+    """Return first-video-stream ffprobe metadata, or an empty mapping."""
+    ffprobe_path = shutil.which(ffprobe_bin) or ffprobe_bin
+    try:
+        result = subprocess.run(
+            [
+                ffprobe_path,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                (
+                    "stream=codec_name,profile,level,width,height,pix_fmt,"
+                    "r_frame_rate,avg_frame_rate,start_time,duration,field_order,"
+                    "has_b_frames,nb_frames,color_range,color_space:format=duration"
+                ),
+                "-of",
+                "json",
+                str(video_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        payload = json.loads(result.stdout)
+    except Exception:
+        return {}
+    streams = payload.get("streams", [])
+    if not streams:
+        return {}
+    stream = dict(streams[0])
+    if video_duration_seconds(stream) <= 0.0:
+        format_info = payload.get("format", {})
+        if isinstance(format_info, dict):
+            format_duration = format_info.get("duration")
+            if format_duration not in (None, "", "N/A"):
+                stream["duration"] = format_duration
+    return stream
 
 
 @dataclass(frozen=True)
@@ -260,6 +307,7 @@ def validate_hevc_stream(
     profile = str(stream.get("profile", "")).strip().lower()
     width = int(stream.get("width", 0) or 0)
     height = int(stream.get("height", 0) or 0)
+    field_order = str(stream.get("field_order", "")).strip().lower()
     frame_rate = parse_frame_rate(
         stream.get("avg_frame_rate") or stream.get("r_frame_rate")
     )
@@ -275,6 +323,11 @@ def validate_hevc_stream(
         problems.append(f"profile={profile or 'unknown'} (required Main)")
     if width <= 0 or height <= 0 or width % 2 or height % 2:
         problems.append(f"size={width}x{height} (required positive even dimensions)")
+    if field_order not in {"", "unknown", "progressive"}:
+        problems.append(
+            f"field_order={field_order} (interlaced motion must be "
+            "deinterlaced during preprocessing)"
+        )
 
     if require_pi5_compatible and frame_rate <= 0.0:
         problems.append("frame_rate=unknown (required for Pi playback validation)")
@@ -652,7 +705,13 @@ def center_crop_bounds(
 
 
 def upload_rgb_texture(stim: Any, rgb: np.ndarray) -> None:
-    """Upload one packed RGB24 array into an existing PsychoPy ImageStim."""
+    """Upload packed RGB24 with explicit client-memory unpack state.
+
+    OpenGL pixel-unpack settings and PBO bindings are context-global state. A
+    stale PsychoPy/pyglet binding would reinterpret the NumPy pointer as a PBO
+    byte offset or apply a previous row stride, producing partial/shifted frames
+    while leaving timing apparently correct.
+    """
     import ctypes
 
     from pyglet import gl as GL
@@ -663,9 +722,28 @@ def upload_rgb_texture(stim: Any, rgb: np.ndarray) -> None:
         raise ValueError("Video texture data must be contiguous")
     height, width = int(rgb.shape[0]), int(rgb.shape[1])
     pixel_pointer = rgb.ctypes.data_as(ctypes.POINTER(GL.GLubyte))
+    # Discard pre-existing errors so the check below is attributable to this
+    # upload. Bound the loop in case a broken context repeats one error.
+    for _ in range(16):
+        if int(GL.glGetError()) == int(GL.GL_NO_ERROR):
+            break
+    if hasattr(GL, "GL_PIXEL_UNPACK_BUFFER") and hasattr(GL, "glBindBuffer"):
+        GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, 0)
+    unpack_defaults = (
+        ("GL_UNPACK_ALIGNMENT", 1),
+        ("GL_UNPACK_ROW_LENGTH", 0),
+        ("GL_UNPACK_SKIP_ROWS", 0),
+        ("GL_UNPACK_SKIP_PIXELS", 0),
+        ("GL_UNPACK_IMAGE_HEIGHT", 0),
+        ("GL_UNPACK_SKIP_IMAGES", 0),
+        ("GL_UNPACK_SWAP_BYTES", 0),
+        ("GL_UNPACK_LSB_FIRST", 0),
+    )
+    for constant_name, value in unpack_defaults:
+        if hasattr(GL, constant_name):
+            GL.glPixelStorei(getattr(GL, constant_name), value)
     GL.glActiveTexture(GL.GL_TEXTURE0)
     GL.glBindTexture(GL.GL_TEXTURE_2D, stim._texID)
-    GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
     GL.glTexSubImage2D(
         GL.GL_TEXTURE_2D,
         0,
@@ -677,4 +755,9 @@ def upload_rgb_texture(stim: Any, rgb: np.ndarray) -> None:
         GL.GL_UNSIGNED_BYTE,
         pixel_pointer,
     )
+    upload_error = int(GL.glGetError())
     GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+    if upload_error != int(GL.GL_NO_ERROR):
+        raise RuntimeError(
+            f"OpenGL RGB texture upload failed with error 0x{upload_error:04x}"
+        )

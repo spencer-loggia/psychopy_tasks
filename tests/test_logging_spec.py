@@ -138,6 +138,36 @@ class LoggingSpecTests(unittest.TestCase):
             finally:
                 bundle.close()
 
+    def test_session_bundle_writes_additional_buffered_table(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = SessionLogBundle(
+                output_root=tmpdir,
+                task_name="play_video",
+                config_name="test",
+                additional_table_fieldnames={
+                    "video_frame_timing": ["frame", "error_s"],
+                },
+                auto_flush=False,
+            )
+            table_path = bundle.session_dir / "video_frame_timing.tsv"
+            try:
+                bundle.table_loggers["video_frame_timing"].writerow(
+                    {"frame": 2, "error_s": "0.001"}
+                )
+                bundle.flush()
+            finally:
+                bundle.close()
+
+            with table_path.open(encoding="utf-8") as table_file:
+                rows = list(csv.DictReader(
+                    table_file,
+                    delimiter="\t",
+                ))
+            self.assertEqual(
+                rows,
+                [{"frame": "2", "error_s": "0.001"}],
+            )
+
     def test_message_logger_rejects_unknown_levels(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             logger = MessageLogger(tmpdir, session_clock=SessionClock())

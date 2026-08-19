@@ -351,7 +351,7 @@ def run_task(
     # finished
     msg_logger.log("INFO", f"session_end status={'aborted' if aborted_task else 'done'}")
     session_logs.close()
-    win.close()
+    utils.close_task_window(win)
     return aborted_task
 
 

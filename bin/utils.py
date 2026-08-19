@@ -10,9 +10,6 @@ Modularity helpers included:
 from pathlib import Path
 import math
 import random
-import shutil
-import subprocess
-import json
 from typing import List, Tuple, Optional, Dict, Union, Callable, Any, Sequence
 import io
 import multiprocessing as mp
@@ -26,7 +23,9 @@ import time
 from .screen import (
     build_reward_hit_boxes,
     compute_aspect_cover_size,
+    enforce_window_vsync,
     initialize_psychopy_window,
+    MainDisplayVBlankSession,
     MainDisplayFrameTimingMonitor,
     oriented_size,
     resolve_task_screens,
@@ -34,6 +33,7 @@ from .screen import (
     serialize_preview_image,
 )
 from .frame_timing import flip_with_timestamps, plan_frame_duration
+from .glx_timing import query_glx_swap_interval, query_glx_sync_values
 from .buffered_video import (
     BufferedVideoFrameStream,
     DEFAULT_BUFFER_BYTES,
@@ -46,6 +46,7 @@ from .video_playback import (
     VideoRefreshCadence,
     center_crop_bounds,
     plan_video_refresh_cadence,
+    probe_video_stream,
     upload_rgb_texture,
     video_duration_seconds,
     video_time_origin_seconds,
@@ -60,7 +61,6 @@ from .touch_input import MousePressTracker, advance_release_armed_touch_gate
 # Global debug flag: when True, utilities may write debug files (PNG) to logs/
 # Default is False; tasks can enable it via CLI (--debug) or config.
 DEBUG = False
-PREFERRED_VIDEO_STREAM_CODEC = "hevc"
 
 
 def set_debug(value: bool):
@@ -149,22 +149,51 @@ def setup_task_window(
     bg_rgb_255: Tuple[int, int, int] = (128, 128, 128),
     fullscreen: bool = True,
     size: Optional[Tuple[int, int]] = None,
-    sync_to_refresh: bool = True,
     allow_same_screen: bool = True,
 ):
-    """Resolve the task outputs and open the verified main PsychoPy window."""
+    """Open the one verified, VBlank-synchronized subject task window."""
     main_screen, experimenter_screen = resolve_task_screens(
         screen_config,
         allow_same_screen=allow_same_screen,
     )
-    win = setup_window(
-        bg_rgb_255=bg_rgb_255,
-        fullscreen=fullscreen,
-        size=size,
-        screen_info=main_screen,
-        sync_to_refresh=sync_to_refresh,
-    )
+    vblank_session = MainDisplayVBlankSession.acquire(main_screen)
+    win = None
+    try:
+        win = setup_window(
+            bg_rgb_255=bg_rgb_255,
+            fullscreen=fullscreen,
+            size=size,
+            screen_info=main_screen,
+            sync_to_refresh=True,
+        )
+        win._neuro_tasks_main_vblank_session = vblank_session
+        vblank_session.validate(win, reassert=False)
+    except BaseException:
+        try:
+            if win is not None:
+                vblank_session.close(win)
+            else:
+                vblank_session.release_primary()
+        except Exception:
+            pass
+        raise
     return win, main_screen, experimenter_screen
+
+
+def verify_task_window_vblank(win) -> MainDisplayVBlankSession:
+    """Revalidate the shared main-output contract after other windows start."""
+    session = getattr(win, "_neuro_tasks_main_vblank_session", None)
+    if not isinstance(session, MainDisplayVBlankSession):
+        raise RuntimeError("window was not created by setup_task_window")
+    return session.validate(win)
+
+
+def close_task_window(win) -> str:
+    """Close a shared task window and restore its previous primary output."""
+    session = getattr(win, "_neuro_tasks_main_vblank_session", None)
+    if not isinstance(session, MainDisplayVBlankSession):
+        raise RuntimeError("window was not created by setup_task_window")
+    return session.close(win)
 
 
 def _log_message(msg_logger, level: str, message: str) -> None:
@@ -176,68 +205,199 @@ def _log_message(msg_logger, level: str, message: str) -> None:
         pass
 
 
-def _run_subprocess_quiet(cmd: List[str]) -> Optional[subprocess.CompletedProcess]:
+def _flush_message_logger(msg_logger) -> None:
+    """Make pre/post-playback diagnostics visible without I/O between frames."""
+    if msg_logger is None:
+        return
     try:
-        return subprocess.run(cmd, check=True, capture_output=True, text=True)
+        msg_logger.flush()
     except Exception:
-        return None
+        pass
 
 
-def probe_video_stream(video_path: Path, ffprobe_bin: str = "ffprobe") -> Dict[str, Any]:
-    ffprobe_path = shutil.which(ffprobe_bin) or ffprobe_bin
-    result = _run_subprocess_quiet([
-        ffprobe_path,
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        (
-            "stream=codec_name,profile,level,width,height,pix_fmt,"
-            "r_frame_rate,avg_frame_rate,start_time,duration:format=duration"
-        ),
-        "-of",
-        "json",
-        str(video_path),
-    ])
-    if result is None:
-        return {}
-    try:
-        payload = json.loads(result.stdout)
-    except Exception:
-        return {}
-    streams = payload.get("streams", [])
-    if not streams:
-        return {}
-    stream = dict(streams[0])
-    if video_duration_seconds(stream) <= 0.0:
-        format_info = payload.get("format", {})
-        format_duration = format_info.get("duration") if isinstance(format_info, dict) else None
-        if format_duration not in (None, "", "N/A"):
-            stream["duration"] = format_duration
-    return stream
-
-
-def _is_hevc_codec_name(codec_name: Optional[str]) -> bool:
-    return str(codec_name or "").strip().lower() == PREFERRED_VIDEO_STREAM_CODEC
-
-
-def log_video_codec_expectation(
-    video_path: Union[str, Path],
-    ffprobe_bin: str = "ffprobe",
-    msg_logger=None,
+def _summarize_video_frame_timing(
+    frame_records: Sequence[Dict[str, Any]],
+    *,
+    clip_offset_perf_s: Optional[float],
+    expected_frame_count: int,
+    video_frame_rate: float,
+    display_refresh_rate: float,
+    planned_refresh_counts: Sequence[int],
+    timing_failure_threshold_s: float,
+    aborted: bool,
+    source_frames_skipped: int,
 ) -> Dict[str, Any]:
-    stream = probe_video_stream(Path(video_path), ffprobe_bin=ffprobe_bin)
-    codec_name = str(stream.get("codec_name", "")).strip()
-    if codec_name and not _is_hevc_codec_name(codec_name):
-        _log_message(
-            msg_logger,
-            "WARN",
-            f"video_codec_mismatch file={Path(video_path).name} codec={codec_name} expected={PREFERRED_VIDEO_STREAM_CODEC}",
+    """Validate realized source-frame boundaries after the critical sequence.
+
+    The returned rows retain every source PTS and flip timestamp for an
+    auditable sidecar log.  All analysis happens after the final clear flip, so
+    this validation cannot perturb presentation timing.
+    """
+    rows = [dict(record) for record in frame_records]
+    actual_frame_count = len(rows)
+    complete = (
+        not aborted
+        and actual_frame_count == int(expected_frame_count)
+        and clip_offset_perf_s is not None
+    )
+    first_flip_perf_s = (
+        float(rows[0]["actual_flip_perf_s"]) if rows else None
+    )
+    boundary_errors_s: list[float] = []
+    source_pts_errors_s: list[float] = []
+    realized_histogram: dict[int, int] = {}
+    cadence_mismatch_count = 0
+    monotonic = True
+
+    for frame_index, row in enumerate(rows):
+        actual_flip_perf_s = float(row["actual_flip_perf_s"])
+        expected_flip_perf_s = (
+            actual_flip_perf_s
+            if first_flip_perf_s is None
+            else first_flip_perf_s + frame_index / video_frame_rate
         )
-    elif not codec_name:
-        _log_message(msg_logger, "WARN", f"video_codec_probe_failed file={Path(video_path).name}")
-    return stream
+        timing_error_s = actual_flip_perf_s - expected_flip_perf_s
+        expected_source_pts_s = float(row["expected_source_pts_s"])
+        source_pts_error_s = (
+            float(row["source_media_time_s"]) - expected_source_pts_s
+        )
+        boundary_errors_s.append(timing_error_s)
+        source_pts_errors_s.append(source_pts_error_s)
+        row["expected_flip_perf_s"] = expected_flip_perf_s
+        row["timing_error_s"] = timing_error_s
+        row["source_pts_error_s"] = source_pts_error_s
+        row["boundary_status"] = (
+            "MISS"
+            if abs(timing_error_s) > timing_failure_threshold_s
+            else "OK"
+        )
+
+        next_boundary_perf_s: Optional[float]
+        if frame_index + 1 < actual_frame_count:
+            next_boundary_perf_s = float(
+                rows[frame_index + 1]["actual_flip_perf_s"]
+            )
+        elif complete:
+            next_boundary_perf_s = float(clip_offset_perf_s)
+        else:
+            next_boundary_perf_s = None
+        planned_hold = (
+            int(planned_refresh_counts[frame_index])
+            if frame_index < len(planned_refresh_counts)
+            else None
+        )
+        row["planned_hold_refreshes"] = planned_hold
+        row["realized_hold_refreshes"] = None
+        row["realized_hold_s"] = None
+        if next_boundary_perf_s is not None:
+            interval_s = next_boundary_perf_s - actual_flip_perf_s
+            monotonic = monotonic and interval_s > 0.0
+            realized_hold = max(
+                0,
+                int(math.floor(interval_s * display_refresh_rate + 0.5)),
+            )
+            row["realized_hold_s"] = interval_s
+            row["realized_hold_refreshes"] = realized_hold
+            realized_histogram[realized_hold] = (
+                realized_histogram.get(realized_hold, 0) + 1
+            )
+            if planned_hold is not None and realized_hold != planned_hold:
+                cadence_mismatch_count += 1
+
+    offset_timing_error_s = None
+    if complete and first_flip_perf_s is not None:
+        expected_offset_perf_s = (
+            first_flip_perf_s + expected_frame_count / video_frame_rate
+        )
+        offset_timing_error_s = (
+            float(clip_offset_perf_s) - expected_offset_perf_s
+        )
+        boundary_errors_s.append(offset_timing_error_s)
+
+    absolute_errors_s = sorted(abs(value) for value in boundary_errors_s)
+
+    def _percentile(fraction: float) -> float:
+        if not absolute_errors_s:
+            return math.nan
+        if len(absolute_errors_s) == 1:
+            return absolute_errors_s[0]
+        position = fraction * (len(absolute_errors_s) - 1)
+        lower = int(math.floor(position))
+        upper = int(math.ceil(position))
+        if lower == upper:
+            return absolute_errors_s[lower]
+        weight = position - lower
+        return (
+            absolute_errors_s[lower] * (1.0 - weight)
+            + absolute_errors_s[upper] * weight
+        )
+
+    timing_miss_count = sum(
+        abs(value) > timing_failure_threshold_s
+        for value in boundary_errors_s
+    )
+    source_pts_contiguous = bool(
+        actual_frame_count > 0
+        and len(source_pts_errors_s) == actual_frame_count
+        and all(
+            abs(value) <= max(1e-4, 0.05 / video_frame_rate)
+            for value in source_pts_errors_s
+        )
+    )
+    if (
+        not complete
+        or source_frames_skipped
+        or not monotonic
+        or not source_pts_contiguous
+    ):
+        status = "FAIL"
+    elif timing_miss_count or cadence_mismatch_count:
+        status = "WARN"
+    else:
+        status = "PASS"
+
+    displayed_duration_s = (
+        float(clip_offset_perf_s) - first_flip_perf_s
+        if complete and first_flip_perf_s is not None
+        else None
+    )
+    effective_frame_rate = (
+        expected_frame_count / displayed_duration_s
+        if displayed_duration_s is not None and displayed_duration_s > 0.0
+        else math.nan
+    )
+    planned_histogram: dict[int, int] = {}
+    for hold in planned_refresh_counts:
+        hold = int(hold)
+        planned_histogram[hold] = planned_histogram.get(hold, 0) + 1
+
+    return {
+        "status": status,
+        "complete": bool(complete),
+        "frame_count": actual_frame_count,
+        "source_pts_contiguous": source_pts_contiguous,
+        "maximum_source_pts_error_s": max(
+            (abs(value) for value in source_pts_errors_s),
+            default=0.0,
+        ),
+        "timing_miss_count": int(timing_miss_count),
+        "cadence_mismatch_count": int(cadence_mismatch_count),
+        "maximum_absolute_timing_error_s": max(
+            absolute_errors_s,
+            default=math.nan,
+        ),
+        "median_absolute_timing_error_s": _percentile(0.5),
+        "p95_absolute_timing_error_s": _percentile(0.95),
+        "offset_timing_error_s": offset_timing_error_s,
+        "monotonic": bool(monotonic),
+        "planned_hold_histogram": planned_histogram,
+        "realized_hold_histogram": realized_histogram,
+        "nonuniform_cadence": len(planned_histogram) > 1,
+        "displayed_duration_s": displayed_duration_s,
+        "effective_frame_rate": effective_frame_rate,
+        "timing_failure_threshold_s": timing_failure_threshold_s,
+        "rows": rows,
+    }
 
 
 def _set_gpio_level_on_flip(lgpio_module, chip, pin: int, level: int) -> None:
@@ -296,11 +456,7 @@ def play_video_fill_screen(
 
     stream = dict(stream_info or {})
     if not stream:
-        stream = log_video_codec_expectation(
-            video_path=video_file,
-            ffprobe_bin=ffprobe_bin,
-            msg_logger=msg_logger,
-        )
+        stream = probe_video_stream(video_file, ffprobe_bin=ffprobe_bin)
     if sync_schedule is not None and (
         sync_gpio_module is None or sync_gpio_chip is None
     ):
@@ -481,6 +637,20 @@ def play_video_fill_screen(
     preview_copy_max_s = 0.0
     preview_copy_count = 0
     minimum_flip_submission_headroom_s = math.inf
+    frame_timing_records: List[Dict[str, Any]] = []
+    timing_validation: Dict[str, Any] = {
+        "status": "FAIL",
+        "rows": [],
+    }
+    glx_swap_interval = None
+    glx_swap_interval_detail = "not queried"
+    glx_sync_start = None
+    glx_sync_start_detail = "not queried"
+    glx_sync_end = None
+    glx_sync_end_detail = "not queried"
+    glx_sync_validation: Dict[str, Any] = {
+        "status": "UNAVAILABLE",
+    }
 
     def _poll_abort_reason():
         if allow_escape and event.getKeys(["escape"]):
@@ -589,10 +759,18 @@ def play_video_fill_screen(
                     dtype=np.uint8,
                 ),
             )
+            if not enforce_window_vsync(win):
+                raise RuntimeError(
+                    "Could not reassert refresh-synchronized swaps on the "
+                    "main PsychoPy window"
+                )
             display_warmup_flips = 2
             for _ in range(display_warmup_flips):
                 video_stim.draw()
                 win.flip()
+            glx_swap_interval, glx_swap_interval_detail = (
+                query_glx_swap_interval()
+            )
             buffer_mode = (
                 "whole_clip"
                 if frame_stream.layout.slot_count == 1
@@ -635,6 +813,10 @@ def play_video_fill_screen(
                     f"pix_fmt={stream.get('pix_fmt')}"
                 ),
             )
+            # Log setup/preload diagnostics before the critical sequence. The
+            # logger remains buffered between frame boundaries, then the full
+            # timing report is flushed by the task after the clip.
+            _flush_message_logger(msg_logger)
 
             for expected_frame_index in range(video_frame_count):
                 reason = _poll_abort_reason()
@@ -815,6 +997,9 @@ def play_video_fill_screen(
                     first_flip_perf = flip_perf
                     first_flip_requested_perf = flip_requested_perf
                     actual_source_start_s = current_source_time_s
+                    glx_sync_start, glx_sync_start_detail = (
+                        query_glx_sync_values()
+                    )
                     if video_onset_callback is not None:
                         try:
                             video_onset_callback(first_flip_perf)
@@ -826,6 +1011,19 @@ def play_video_fill_screen(
                                 f"trial_num={trial_num} "
                                 f"error={type(exc).__name__}: {exc}",
                             )
+
+                frame_timing_records.append(
+                    {
+                        "source_frame_index": display_frame_index,
+                        "source_media_time_s": current_source_time_s,
+                        "expected_source_pts_s": (
+                            clip_start_s
+                            + display_frame_index / video_frame_rate
+                        ),
+                        "flip_requested_perf_s": flip_requested_perf,
+                        "actual_flip_perf_s": flip_perf,
+                    }
+                )
 
                 if frame_publisher is not None:
                     # The preview is best-effort and begins at its
@@ -914,6 +1112,7 @@ def play_video_fill_screen(
                 "actual_perf_s",
                 clear_flip_return_perf,
             )
+            glx_sync_end, glx_sync_end_detail = query_glx_sync_values()
             if requested_clear_perf is not None:
                 clip_offset_timing_error_s = (
                     end_perf - requested_clear_perf
@@ -966,6 +1165,67 @@ def play_video_fill_screen(
                 prepared_frame = None
                 frame_stream.close()
 
+            timing_validation = _summarize_video_frame_timing(
+                frame_timing_records,
+                clip_offset_perf_s=end_perf,
+                expected_frame_count=video_frame_count,
+                video_frame_rate=video_frame_rate,
+                display_refresh_rate=display_refresh_rate,
+                planned_refresh_counts=(
+                    refresh_cadence.frame_refresh_counts
+                ),
+                timing_failure_threshold_s=timing_failure_threshold_s,
+                aborted=aborted,
+                source_frames_skipped=scheduled_video_slots_skipped,
+            )
+            if glx_sync_start is not None and glx_sync_end is not None:
+                delta_msc = int(glx_sync_end["msc"]) - int(
+                    glx_sync_start["msc"]
+                )
+                delta_sbc = int(glx_sync_end["sbc"]) - int(
+                    glx_sync_start["sbc"]
+                )
+                delta_ust = int(glx_sync_end["ust"]) - int(
+                    glx_sync_start["ust"]
+                )
+                expected_delta_msc = (
+                    refresh_cadence.total_refreshes
+                    if timing_validation["complete"]
+                    else None
+                )
+                expected_delta_sbc = (
+                    video_frame_count
+                    if timing_validation["complete"]
+                    else None
+                )
+                counter_rate_hz = (
+                    delta_msc * 1_000_000.0 / delta_ust
+                    if delta_ust > 0
+                    else math.nan
+                )
+                counters_match = bool(
+                    expected_delta_msc is not None
+                    and delta_msc == expected_delta_msc
+                    and delta_sbc == expected_delta_sbc
+                )
+                glx_sync_validation = {
+                    "status": "PASS" if counters_match else "WARN",
+                    "delta_msc": delta_msc,
+                    "delta_sbc": delta_sbc,
+                    "delta_ust": delta_ust,
+                    "expected_delta_msc": expected_delta_msc,
+                    "expected_delta_sbc": expected_delta_sbc,
+                    "counter_rate_hz": counter_rate_hz,
+                }
+            else:
+                glx_sync_validation = {
+                    "status": "UNAVAILABLE",
+                    "detail": (
+                        f"start={glx_sync_start_detail}; "
+                        f"end={glx_sync_end_detail}"
+                    ),
+                }
+
             # Persist flip records only after the refresh-critical sequence.
             # Their captured timestamps remain the actual callOnFlip times;
             # deferring file I/O prevents the first event row from delaying
@@ -1001,6 +1261,95 @@ def play_video_fill_screen(
                         f"prepared_size={prepared_size} "
                         f"draw_size=({draw_size[0]:.1f},"
                         f"{draw_size[1]:.1f}) backend={backend_used}"
+                    ),
+                )
+
+            validation_level = (
+                "INFO"
+                if timing_validation["status"] == "PASS"
+                else "WARN"
+            )
+            _log_message(
+                msg_logger,
+                validation_level,
+                (
+                    f"video_frame_validation trial_num={trial_num} "
+                    f"file={video_file.name} "
+                    f"status={timing_validation['status']} "
+                    f"expected_frames={video_frame_count} "
+                    f"presented_frames={timing_validation['frame_count']} "
+                    f"source_pts_contiguous="
+                    f"{int(timing_validation['source_pts_contiguous'])} "
+                    f"maximum_source_pts_error_ms="
+                    f"{1000.0 * timing_validation['maximum_source_pts_error_s']:.3f} "
+                    f"timing_misses="
+                    f"{timing_validation['timing_miss_count']} "
+                    f"cadence_mismatches="
+                    f"{timing_validation['cadence_mismatch_count']} "
+                    f"median_absolute_error_ms="
+                    f"{1000.0 * timing_validation['median_absolute_timing_error_s']:.3f} "
+                    f"p95_absolute_error_ms="
+                    f"{1000.0 * timing_validation['p95_absolute_timing_error_s']:.3f} "
+                    f"maximum_absolute_error_ms="
+                    f"{1000.0 * timing_validation['maximum_absolute_timing_error_s']:.3f} "
+                    f"allowed_absolute_error_ms="
+                    f"{1000.0 * timing_failure_threshold_s:.3f} "
+                    f"planned_hold_histogram="
+                    f"{timing_validation['planned_hold_histogram']} "
+                    f"realized_hold_histogram="
+                    f"{timing_validation['realized_hold_histogram']} "
+                    f"effective_video_fps="
+                    f"{timing_validation['effective_frame_rate']:.6f}"
+                ),
+            )
+            _log_message(
+                msg_logger,
+                (
+                    "INFO"
+                    if glx_sync_validation["status"] == "PASS"
+                    else "WARN"
+                ),
+                (
+                    f"video_main_vblank_validation trial_num={trial_num} "
+                    f"file={video_file.name} "
+                    f"status={glx_sync_validation['status']} "
+                    f"swap_interval={glx_swap_interval!r} "
+                    f"swap_interval_detail={glx_swap_interval_detail} "
+                    f"delta_msc={glx_sync_validation.get('delta_msc', 'unavailable')} "
+                    f"expected_delta_msc="
+                    f"{glx_sync_validation.get('expected_delta_msc', 'unavailable')} "
+                    f"delta_sbc={glx_sync_validation.get('delta_sbc', 'unavailable')} "
+                    f"expected_delta_sbc="
+                    f"{glx_sync_validation.get('expected_delta_sbc', 'unavailable')} "
+                    f"counter_rate_hz="
+                    f"{glx_sync_validation.get('counter_rate_hz', 'unavailable')} "
+                    f"detail={glx_sync_validation.get('detail', 'GLX_OML_sync_control')}"
+                ),
+            )
+            if timing_validation["nonuniform_cadence"]:
+                integer_refresh_candidates = [
+                    multiplier * video_frame_rate
+                    for multiplier in range(1, 9)
+                    if 40.0
+                    <= multiplier * video_frame_rate
+                    <= 144.0
+                ]
+                _log_message(
+                    msg_logger,
+                    "WARN",
+                    (
+                        f"video_motion_cadence trial_num={trial_num} "
+                        f"file={video_file.name} uniform_holds=0 "
+                        f"display_fps={display_refresh_rate:.6f} "
+                        f"video_fps={video_frame_rate:.6f} "
+                        f"planned_hold_histogram="
+                        f"{timing_validation['planned_hold_histogram']} "
+                        "interpretation=expected_pulldown_judder_in_fast_motion "
+                        "preferred_integer_multiple_display_rates_hz="
+                        + ",".join(
+                            f"{value:.6f}"
+                            for value in integer_refresh_candidates
+                        )
                     ),
                 )
 
@@ -1125,6 +1474,7 @@ def play_video_fill_screen(
                 f"backend={backend_used}"
             ),
         )
+    _flush_message_logger(msg_logger)
 
     buffer_mode = (
         "whole_clip"
@@ -1200,6 +1550,48 @@ def play_video_fill_screen(
             maximum_boundary_timing_error_s
         ),
         "long_video_intervals": int(late_frame_count),
+        "timing_validation_status": timing_validation["status"],
+        "timing_validation_miss_count": int(
+            timing_validation.get("timing_miss_count", 0)
+        ),
+        "cadence_mismatch_count": int(
+            timing_validation.get("cadence_mismatch_count", 0)
+        ),
+        "timing_error_p95_s": float(
+            timing_validation.get(
+                "p95_absolute_timing_error_s",
+                math.nan,
+            )
+        ),
+        "timing_error_maximum_s": float(
+            timing_validation.get(
+                "maximum_absolute_timing_error_s",
+                math.nan,
+            )
+        ),
+        "timing_failure_threshold_s": float(
+            timing_failure_threshold_s
+        ),
+        "realized_refresh_hold_histogram": dict(
+            timing_validation.get("realized_hold_histogram", {})
+        ),
+        "source_pts_contiguous": bool(
+            timing_validation.get("source_pts_contiguous", False)
+        ),
+        "frame_timing_records": list(
+            timing_validation.get("rows", [])
+        ),
+        "glx_swap_interval": glx_swap_interval,
+        "glx_swap_interval_detail": glx_swap_interval_detail,
+        "main_vblank_validation_status": glx_sync_validation["status"],
+        "main_vblank_delta_msc": glx_sync_validation.get("delta_msc"),
+        "main_vblank_expected_delta_msc": glx_sync_validation.get(
+            "expected_delta_msc"
+        ),
+        "main_vblank_delta_sbc": glx_sync_validation.get("delta_sbc"),
+        "main_vblank_expected_delta_sbc": glx_sync_validation.get(
+            "expected_delta_sbc"
+        ),
         "configured_video_frame_rate": video_frame_rate,
         "display_refresh_rate": display_refresh_rate,
         "nominal_refreshes_per_video_frame": (

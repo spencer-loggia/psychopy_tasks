@@ -3,6 +3,7 @@ Shared helpers for resolving monitor selectors and managing experimenter display
 """
 from __future__ import annotations
 
+import atexit
 from contextlib import contextmanager
 from dataclasses import dataclass
 import io
@@ -66,15 +67,24 @@ def set_window_mouse_visible(win, visible: bool) -> bool:
 
 
 def activate_psychopy_window(win) -> bool:
-    """Best-effort activation of a PsychoPy window's native handle."""
+    """Make a PsychoPy window's native context current and activate it."""
+    applied = False
+    handle = getattr(win, "winHandle", None)
     try:
-        activate = getattr(getattr(win, "winHandle", None), "activate", None)
-        if callable(activate):
-            activate()
-            return True
+        switch_to = getattr(handle, "switch_to", None)
+        if callable(switch_to):
+            switch_to()
+            applied = True
     except Exception:
         pass
-    return False
+    try:
+        activate = getattr(handle, "activate", None)
+        if callable(activate):
+            activate()
+            applied = True
+    except Exception:
+        pass
+    return applied
 
 
 def configure_window_vsync(win, enabled: bool) -> bool:
@@ -295,6 +305,16 @@ class ScreenGeometry:
     rotation: str = "normal"
 
 
+@dataclass(frozen=True)
+class XRandrPrimaryLease:
+    """Temporary XRandR primary-output selection for one task window."""
+
+    target_output: str
+    previous_output: Optional[str]
+    changed: bool
+    detail: str
+
+
 def software_stimulus_rotation(rotation: str | None) -> int:
     """Return the clockwise software turn needed for a native-orientation output."""
     return {
@@ -465,6 +485,271 @@ def _run_monitor_query(cmd: Sequence[str]) -> str:
     except Exception:
         return ""
     return str(result.stdout or "").strip()
+
+
+def _parse_xrandr_primary_output(output: str) -> Optional[str]:
+    for line in str(output or "").splitlines():
+        match = re.match(r"^(\S+)\s+connected\s+primary(?:\s|$)", line.strip())
+        if match:
+            return str(match.group(1))
+    return None
+
+
+def _query_xrandr_primary_output() -> Optional[str]:
+    result = subprocess.run(
+        ["xrandr", "--query"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return _parse_xrandr_primary_output(result.stdout)
+
+
+def _same_output(first: Optional[str], second: Optional[str]) -> bool:
+    return bool(
+        first
+        and second
+        and (_screen_name_aliases(first) & _screen_name_aliases(second))
+    )
+
+
+def ensure_xrandr_primary_output(
+    screen_info: ScreenGeometry,
+    *,
+    required: bool = False,
+) -> XRandrPrimaryLease:
+    """Make the resolved Linux subject output XRandR-primary for VBlank.
+
+    Some X11 drivers/compositors select a swap reference CRTC from the primary
+    output. Window geometry is still verified independently; this lease closes
+    the remaining ambiguity when a fullscreen subject window is not on the
+    desktop's previous primary output.
+    """
+    target_output = str(screen_info.name or "").strip()
+    if not sys.platform.startswith("linux"):
+        return XRandrPrimaryLease(
+            target_output=target_output,
+            previous_output=None,
+            changed=False,
+            detail="XRandR primary selection is not applicable on this platform",
+        )
+    if not target_output:
+        message = "resolved main output has no XRandR output name"
+        if required:
+            raise RuntimeError(message)
+        return XRandrPrimaryLease("", None, False, message)
+
+    try:
+        previous_output = _query_xrandr_primary_output()
+        if _same_output(previous_output, target_output):
+            return XRandrPrimaryLease(
+                target_output=target_output,
+                previous_output=previous_output,
+                changed=False,
+                detail=f"resolved main output {target_output} was already XRandR primary",
+            )
+
+        subprocess.run(
+            ["xrandr", "--output", target_output, "--primary"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        confirmed_output = _query_xrandr_primary_output()
+        if not _same_output(confirmed_output, target_output):
+            raise RuntimeError(
+                f"xrandr did not confirm {target_output} as primary "
+                f"(reported {confirmed_output or 'none'})"
+            )
+        return XRandrPrimaryLease(
+            target_output=target_output,
+            previous_output=previous_output,
+            changed=True,
+            detail=(
+                f"set resolved main output {target_output} XRandR primary; "
+                f"previous={previous_output or 'none'}"
+            ),
+        )
+    except Exception as exc:
+        message = (
+            f"could not make resolved main output {target_output} XRandR "
+            f"primary: {type(exc).__name__}: {str(exc).strip()}"
+        )
+        if required:
+            raise RuntimeError(message) from exc
+        return XRandrPrimaryLease(target_output, None, False, message)
+
+
+def restore_xrandr_primary_output(lease: Optional[XRandrPrimaryLease]) -> str:
+    """Restore the primary output changed by `ensure_xrandr_primary_output`."""
+    if lease is None or not lease.changed or not sys.platform.startswith("linux"):
+        return "XRandR primary output did not require restoration"
+    try:
+        if lease.previous_output:
+            command = [
+                "xrandr",
+                "--output",
+                lease.previous_output,
+                "--primary",
+            ]
+        else:
+            command = [
+                "xrandr",
+                "--output",
+                lease.target_output,
+                "--noprimary",
+            ]
+        subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return (
+            f"restored XRandR primary output to "
+            f"{lease.previous_output or 'none'}"
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"could not restore XRandR primary output: "
+            f"{type(exc).__name__}: {str(exc).strip()}"
+        ) from exc
+
+
+def verify_xrandr_primary_output(
+    screen_info: ScreenGeometry,
+    *,
+    required: bool = False,
+) -> str:
+    """Confirm that the resolved subject output remains XRandR-primary."""
+    target_output = str(screen_info.name or "").strip()
+    if not sys.platform.startswith("linux"):
+        return "XRandR primary verification is not applicable on this platform"
+    try:
+        primary_output = _query_xrandr_primary_output()
+        if not _same_output(primary_output, target_output):
+            raise RuntimeError(
+                f"resolved main output {target_output or 'unnamed'} is not "
+                f"XRandR primary (reported {primary_output or 'none'})"
+            )
+        return f"confirmed resolved main output {target_output} XRandR primary"
+    except Exception as exc:
+        message = (
+            f"could not verify resolved main output {target_output or 'unnamed'} "
+            f"as XRandR primary: {type(exc).__name__}: {str(exc).strip()}"
+        )
+        if required:
+            raise RuntimeError(message) from exc
+        return message
+
+
+@dataclass
+class MainDisplayVBlankSession:
+    """Own the main output and its synchronized PsychoPy window lifecycle."""
+
+    screen: ScreenGeometry
+    primary_lease: XRandrPrimaryLease
+    primary_verification_detail: str = "not verified"
+    refresh_sync_requested: bool = False
+    swap_interval: Optional[int] = None
+    swap_interval_detail: str = "not queried"
+    window_closed: bool = False
+    primary_released: bool = False
+
+    @classmethod
+    def acquire(
+        cls,
+        screen: ScreenGeometry,
+    ) -> "MainDisplayVBlankSession":
+        session = cls(
+            screen=screen,
+            primary_lease=ensure_xrandr_primary_output(
+                screen,
+                required=True,
+            ),
+        )
+        atexit.register(session._release_primary_at_exit)
+        return session
+
+    def validate(
+        self,
+        win: Any,
+        *,
+        reassert: bool = True,
+    ) -> "MainDisplayVBlankSession":
+        """Reassert and verify synchronization on the owned main drawable."""
+        if self.window_closed:
+            raise RuntimeError("cannot validate a closed main task window")
+        if reassert:
+            activate_psychopy_window(win)
+            self.refresh_sync_requested = bool(enforce_window_vsync(win))
+            win._neuro_tasks_refresh_sync_requested = (
+                self.refresh_sync_requested
+            )
+        else:
+            self.refresh_sync_requested = bool(
+                getattr(win, "_neuro_tasks_refresh_sync_requested", False)
+            )
+        if not self.refresh_sync_requested:
+            raise RuntimeError(
+                "The main PsychoPy window did not accept refresh-synchronized "
+                "blocking flips"
+            )
+
+        self.primary_verification_detail = verify_xrandr_primary_output(
+            self.screen,
+            required=True,
+        )
+        from .glx_timing import query_glx_swap_interval
+
+        self.swap_interval, self.swap_interval_detail = (
+            query_glx_swap_interval()
+        )
+        if (
+            sys.platform.startswith("linux")
+            and self.swap_interval != 1
+        ):
+            raise RuntimeError(
+                "Main-display GLX swap interval 1 was not confirmed: "
+                f"value={self.swap_interval!r}; "
+                f"detail={self.swap_interval_detail}"
+            )
+        return self
+
+    def release_primary(self) -> str:
+        """Restore the desktop's previous primary output exactly once."""
+        if self.primary_released:
+            return "XRandR primary output was already restored"
+        detail = restore_xrandr_primary_output(self.primary_lease)
+        self.primary_released = True
+        return detail
+
+    def _release_primary_at_exit(self) -> None:
+        try:
+            self.release_primary()
+        except Exception:
+            pass
+
+    def close(self, win: Any) -> str:
+        """Close the task window, then restore desktop output ownership."""
+        errors: list[str] = []
+        if not self.window_closed:
+            try:
+                win.close()
+            except Exception as exc:
+                errors.append(f"window close failed: {type(exc).__name__}: {exc}")
+            finally:
+                self.window_closed = True
+        restore_detail = "XRandR primary output was already restored"
+        try:
+            restore_detail = self.release_primary()
+        except Exception as exc:
+            errors.append(
+                f"primary restore failed: {type(exc).__name__}: {exc}"
+            )
+        if errors:
+            raise RuntimeError("; ".join(errors))
+        return restore_detail
 
 
 def _parse_xrandr_listactivemonitors(output: str) -> list[ScreenGeometry]:
@@ -1929,7 +2214,7 @@ def _experimenter_preview_process(
             color=_preview_rgb255_to_psychopy((0, 0, 0)),
             allowStencil=False,
             allowGUI=False,
-            waitBlanking=False,
+            waitBlanking=True,
         )
     except Exception as exc:
         _report_startup(
@@ -1939,7 +2224,10 @@ def _experimenter_preview_process(
             }
         )
         raise
-    configure_window_vsync(win, False)
+    # This is a separate process/drawable. Synchronizing it to its own output
+    # prevents mirror tearing without changing or backpressuring the subject
+    # window's main-output swap interval.
+    configure_window_vsync(win, True)
     last_cursor_apply_s = 0.0
     if mouse_visible is not None:
         set_window_mouse_visible(win, bool(mouse_visible))

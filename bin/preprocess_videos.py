@@ -71,13 +71,23 @@ def parse_args() -> argparse.Namespace:
         default=30.0,
         help="Constant output frame rate required by runtime playback",
     )
-    parser.add_argument("--codec", default="auto", help="HEVC video codec to use, or 'auto' to prefer hardware")
-    parser.add_argument("--preset", default="veryfast", help="Encoder preset used by software HEVC encoders")
-    parser.add_argument("--crf", type=int, default=20, help="Quality level for libx265-style encoders (lower is higher quality)")
+    parser.add_argument(
+        "--codec",
+        default="auto",
+        help=(
+            "HEVC encoder to use; auto prefers libx265 for reproducible "
+            "quality and falls back to available hardware encoders"
+        ),
+    )
+    parser.add_argument("--preset", default="medium", help="Encoder preset used by software HEVC encoders")
+    parser.add_argument("--crf", type=int, default=18, help="Quality level for libx265-style encoders (lower is higher quality)")
     parser.add_argument(
         "--tune",
-        default="fastdecode",
-        help="Optional encoder tune for easier playback; use '' to disable",
+        default="",
+        help=(
+            "Optional encoder tune. The default preserves HEVC loop filters; "
+            "fastdecode can expose blocking/ringing in fast motion."
+        ),
     )
     parser.add_argument(
         "--gop_seconds",
@@ -86,6 +96,14 @@ def parse_args() -> argparse.Namespace:
         help="Maximum keyframe interval in seconds; the low-latency default is 0.5",
     )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs")
+    parser.add_argument(
+        "--allow_frame_rate_conversion",
+        action="store_true",
+        help=(
+            "Allow the fps filter to duplicate/drop source frames when the "
+            "requested output rate differs from the input rate"
+        ),
+    )
     parser.add_argument("--ffmpeg", default="ffmpeg", help="Path to ffmpeg executable")
     parser.add_argument("--ffprobe", default="ffprobe", help="Path to ffprobe executable")
     return parser.parse_args()
@@ -149,18 +167,18 @@ def _is_hevc_encoder_name(codec_name: str) -> bool:
 def _preferred_hevc_encoder_order() -> list[str]:
     machine = platform.machine().lower()
     if sys.platform == "darwin":
-        return ["hevc_videotoolbox", "libx265"]
+        return ["libx265", "hevc_videotoolbox"]
     if sys.platform == "linux" and machine in {"aarch64", "arm64", "armv7l", "armv6l"}:
         # Raspberry Pi 5/Bookworm has a hardware HEVC decoder, not a practical
         # FFmpeg HEVC encoder path. Prefer software HEVC encoding directly.
         return ["libx265"]
     return [
+        "libx265",
         "hevc_nvenc",
         "hevc_qsv",
         "hevc_vaapi",
         "hevc_amf",
         "hevc_mf",
-        "libx265",
     ]
 
 
@@ -192,7 +210,8 @@ def probe_video(ffprobe_bin: str, path: Path) -> dict:
         "-show_entries",
         (
             "stream=width,height,pix_fmt,r_frame_rate,avg_frame_rate,"
-            "start_time,codec_name,profile"
+            "start_time,codec_name,profile,field_order,has_b_frames,"
+            "nb_frames,duration"
         ),
         "-of",
         "json",
@@ -221,14 +240,18 @@ def build_filter(
     out_height: int,
     *,
     frame_rate: float | None = None,
+    deinterlace: bool = False,
 ) -> str:
     aspect = float(screen_width) / float(screen_height)
     crop_w = f"if(gte(iw/ih\\,{aspect:.12f})\\,ih*{aspect:.12f}\\,iw)"
     crop_h = f"if(gte(iw/ih\\,{aspect:.12f})\\,ih\\,iw/{aspect:.12f})"
-    filters = [
+    filters = []
+    if deinterlace:
+        filters.append("bwdif=mode=send_frame:parity=auto:deint=all")
+    filters.extend([
         f"crop={crop_w}:{crop_h}:(iw-ow)/2:(ih-oh)/2",
-        f"scale={out_width}:{out_height}:flags=fast_bilinear"
-    ]
+        f"scale={out_width}:{out_height}:flags=lanczos"
+    ])
     if frame_rate is not None:
         resolved_rate = float(frame_rate)
         if not math.isfinite(resolved_rate) or resolved_rate <= 0.0:
@@ -281,6 +304,31 @@ def validate_processed_video(
             f"Processed video has unexpected frame rate: {output_path} "
             f"({output_rate:.6f} vs expected "
             f"{float(expected_frame_rate):.6f})"
+        )
+    for rate_field in ("avg_frame_rate", "r_frame_rate"):
+        field_rate = parse_frame_rate({rate_field: stream.get(rate_field)})
+        if field_rate <= 0.0 or abs(
+            field_rate - float(expected_frame_rate)
+        ) > 0.001:
+            raise RuntimeError(
+                f"Processed video is not exact CFR: {output_path} "
+                f"({rate_field}={stream.get(rate_field)!r}, expected "
+                f"{float(expected_frame_rate):.6f})"
+            )
+    field_order = str(stream.get("field_order", "")).strip().lower()
+    if field_order != "progressive":
+        raise RuntimeError(
+            f"Processed video is not explicitly progressive: {output_path} "
+            f"(field_order={field_order or 'unknown'})"
+        )
+    try:
+        has_b_frames = int(stream.get("has_b_frames", -1))
+    except (TypeError, ValueError):
+        has_b_frames = -1
+    if has_b_frames != 0:
+        raise RuntimeError(
+            f"Processed video retains reordered B-frames: {output_path} "
+            f"(has_b_frames={stream.get('has_b_frames')!r})"
         )
     start_time_s = float(stream.get("start_time", 0.0) or 0.0)
     if not math.isfinite(start_time_s) or abs(start_time_s) > 1e-6:
@@ -428,14 +476,6 @@ def main() -> None:
     if not math.isfinite(output_frame_rate) or output_frame_rate <= 0.0:
         raise ValueError("frame_rate must be a positive finite value")
     out_width, out_height = compute_target_size(screen_width, screen_height, int(args.short_dim))
-    filter_chain = build_filter(
-        screen_width,
-        screen_height,
-        out_width,
-        out_height,
-        frame_rate=output_frame_rate,
-    )
-
     videos = find_video_files(input_dir)
     if not videos:
         raise FileNotFoundError(f"No video files found in {input_dir}")
@@ -461,6 +501,43 @@ def main() -> None:
         input_fps = parse_frame_rate(input_stream)
         if input_fps <= 0.0:
             raise ValueError(f"Could not determine source frame rate: {video_path}")
+        frame_rate_difference = abs(input_fps - output_frame_rate)
+        if frame_rate_difference > 0.001:
+            if not bool(args.allow_frame_rate_conversion):
+                raise ValueError(
+                    f"Refusing motion-altering frame-rate conversion for "
+                    f"{video_path.name}: source={input_fps:.6f} fps, "
+                    f"requested={output_frame_rate:.6f} fps. Use --frame_rate "
+                    f"{input_fps:.9f} and the same play_video frame_rate, or "
+                    "pass --allow_frame_rate_conversion to explicitly accept "
+                    "duplicated/dropped frames."
+                )
+            warn(
+                f"frame_rate_conversion_changes_motion file={video_path.name} "
+                f"source_fps={input_fps:.6f} output_fps={output_frame_rate:.6f} "
+                "action=duplicate_or_drop_frames"
+            )
+        field_order = str(
+            input_stream.get("field_order", "")
+        ).strip().lower()
+        deinterlace = field_order not in {
+            "",
+            "unknown",
+            "progressive",
+        }
+        if deinterlace:
+            warn(
+                f"interlaced_source_deinterlaced file={video_path.name} "
+                f"field_order={field_order} filter=bwdif"
+            )
+        filter_chain = build_filter(
+            screen_width,
+            screen_height,
+            out_width,
+            out_height,
+            frame_rate=output_frame_rate,
+            deinterlace=deinterlace,
+        )
         gop_frames = max(
             1,
             int(round(output_frame_rate * float(args.gop_seconds))),

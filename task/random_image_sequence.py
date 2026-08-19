@@ -275,7 +275,7 @@ def run_task(
 
     msg_logger.log("INFO", f"session_end status={'aborted' if aborted else 'done'}")
     session_logs.close()
-    win.close()
+    utils.close_task_window(win)
     print(f"Finished; logs written to {session_logs.session_dir.resolve()}")
     return aborted
 

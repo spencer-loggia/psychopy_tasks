@@ -1307,18 +1307,23 @@ def run_task(
             buffer_mgr.close()
         except Exception:
             pass
-
-    msg_logger.log("INFO", f"session_end status={task_end_notes}")
-    try:
-        session_logs.close()
-    except Exception:
-        pass
-    try:
-        if experimenter_preview is not None:
-            experimenter_preview.close()
-    except Exception:
-        pass
-    win.close()
+        try:
+            msg_logger.log("INFO", f"session_end status={task_end_notes}")
+        except Exception:
+            pass
+        try:
+            if experimenter_preview is not None:
+                experimenter_preview.close()
+        except Exception:
+            pass
+        try:
+            utils.close_task_window(win)
+        except Exception:
+            pass
+        try:
+            session_logs.close()
+        except Exception:
+            pass
     return task_end_notes
 
 

@@ -505,6 +505,9 @@ class SessionLogBundle:
         task_name: str,
         config_name: str,
         behavior_fieldnames: Optional[list[str]] = None,
+        additional_table_fieldnames: Optional[
+            Mapping[str, list[str]]
+        ] = None,
         when: Optional[dt.datetime] = None,
         auto_flush: bool = True,
         event_name_library_path: Optional[str | Path] = None,
@@ -549,12 +552,25 @@ class SessionLogBundle:
             if behavior_fieldnames
             else None
         )
+        self.table_loggers: dict[str, BehaviorLogger] = {}
+        for table_name, fieldnames in dict(
+            additional_table_fieldnames or {}
+        ).items():
+            safe_name = sanitize_filename_component(table_name)
+            self.table_loggers[str(table_name)] = BehaviorLogger(
+                self.session_dir,
+                fieldnames=list(fieldnames),
+                filename=f"{safe_name}.tsv",
+                auto_flush=auto_flush,
+            )
 
     def flush(self) -> None:
         self.event_logger.flush()
         self.message_logger.flush()
         if self.behavior_logger is not None:
             self.behavior_logger.flush()
+        for table_logger in self.table_loggers.values():
+            table_logger.flush()
 
     def close(self) -> None:
         self.flush()
@@ -563,3 +579,5 @@ class SessionLogBundle:
         self.message_logger.close()
         if self.behavior_logger is not None:
             self.behavior_logger.close()
+        for table_logger in self.table_loggers.values():
+            table_logger.close()

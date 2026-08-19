@@ -147,7 +147,10 @@ Experiment-managed task/subprocess policies:
   task window. Task code must never construct `visual.Window`, resolve its own main output, or call
   `setup_window()`, `initialize_psychopy_window()`, or `open_psychopy_window()` for the subject window. This one
   path owns canonical selector resolution, launcher readiness, Pyglet output binding, refresh synchronization,
-  native activation, and final realized-rectangle verification. `bin.utils.setup_window()` is reserved for an
+  native activation, and final realized-rectangle verification. On Linux it also makes the resolved subject
+  output XRandR-primary, confirms swap interval 1 on that drawable, and restores the previous primary output when
+  `bin.utils.close_task_window()` closes it. Every subject task must use this matching setup/close pair.
+  `bin.utils.setup_window()` is reserved for an
   already-resolved auxiliary calibration window; the diagnostic and preview process are the only other low-level
   window-factory users. `tests/test_screen_path_policy.py` enforces this invariant for every current task and
   rejects future direct window-factory bypasses.
@@ -381,6 +384,25 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
   exact onset, clear, and diagnostic records in the event/message logs. These
   timestamps describe flip completion near vertical blanking; use the existing
   GPIO pulse and a photodiode when physical pixel illumination time is needed.
+- After the clear flip, `video_frame_timing.tsv` records every source-frame
+  index and media PTS, requested/ideal/actual flip-completion times, signed
+  timing error, and planned/realized refresh hold. No timing-row file I/O occurs
+  during playback. `video_frame_validation` adds a one-line `PASS`, `WARN`, or
+  `FAIL` summary to `message_log.tsv`, including PTS continuity, frame counts,
+  median/p95/maximum boundary error, planned and realized hold histograms, and
+  cadence mismatches. The same summary status and key error values are present
+  in `behavior_log.tsv`.
+- The shared subject-window lifecycle owns Linux/Pi XRandR-primary selection,
+  main-drawable swap-interval validation, and restoration for every task.
+  `play_video` revalidates that common contract after decoder/preview startup.
+  Each completed clip additionally logs
+  `video_main_vblank_validation`, comparing the drawable's actual GLX OML media
+  stream counter (MSC) and swap buffer counter (SBC) deltas with the exact
+  planned subject refreshes and source-frame swaps. These values are also saved
+  in `behavior_log.tsv`. The experimenter preview runs in another process and
+  synchronizes only its own drawable to its own output; it cannot become the
+  subject window's swap reference. If post-preview main-output validation fails,
+  playback never becomes ready.
 - Playback uploads, draws, and calls blocking PsychoPy `Window.flip()` only at
   source-frame boundaries. Between boundaries the front buffer is left
   untouched, so the display naturally repeats that image at each hardware
@@ -401,6 +423,13 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
   skipping or substituting a source frame. An unavailable prepared chunk
   remains fatal. The exact hold histogram, total refresh count, realized
   boundary errors, and maximum/final phase errors are logged.
+- A noninteger display/video ratio is valid but is not perceptually uniform:
+  for example, 23.976/24 fps on a 60 Hz output alternates two- and
+  three-refresh holds (3:2 pulldown). This produces visible judder in fast pans
+  even when `video_frame_validation` passes. The task emits a separate
+  `video_motion_cadence` warning with exact integer-multiple refresh-rate
+  candidates; use a supported mode such as 119.88 Hz for 23.976 fps when
+  uniform motion is required.
 - The ffpyplayer worker writes prepared RGB24 frames into parent-owned shared
   memory. The prepared-frame budget is configured by
   `video_buffer_megabytes` and defaults to 512 MiB. If the complete prepared
@@ -439,16 +468,29 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
   independent of decoder preparation time and preview transport latency.
 - A fresh ffpyplayer worker owns each selected clip and exits when preparation
   is complete. For efficient random access over a mounted network filesystem,
-  preprocess sources with `bin/preprocess_videos.py --frame_rate 30` (`30` is
-  also the default). Preprocessing center-crops/scales the video, normalizes it
-  to that constant frame rate, rebases PTS to zero, encodes HEVC Main/yuv420p,
-  enables MP4 fast-start, disables B-frames, and uses a default 0.5-second
-  maximum keyframe interval. Those settings trade some compression efficiency
-  for faster random seeks and a shorter decode/reorder queue. Any frame
-  duplication or removal needed for rate normalization occurs offline; runtime
-  playback performs no frame-rate conversion. Pass the subject-view dimensions
-  (after output rotation) to `--screen_size`; runtime cropping cannot avoid
-  decoding pixels that should have been removed offline.
+  preprocess sources with `bin/preprocess_videos.py --frame_rate RATE`, where
+  `RATE` is the source's exact native CFR and the task's configured
+  `frame_rate` (for example, use `23.976023976` for `24000/1001`).
+  Preprocessing center-crops and Lanczos-scales the video, automatically
+  deinterlaces an interlaced input, rebases PTS to zero, encodes progressive
+  HEVC Main/yuv420p, enables MP4 fast-start, disables B-frames, and uses a
+  default 0.5-second maximum keyframe interval. The quality-oriented defaults
+  are libx265 preset `medium`, CRF 18, and no `fastdecode` tune because that tune
+  disables HEVC loop filters and can expose blocking/ringing in fast motion.
+  The script refuses a source/output frame-rate mismatch by default, since the
+  FFmpeg `fps` filter must duplicate or drop frames and can create periodic
+  motion blips. `--allow_frame_rate_conversion` is the explicit opt-in when
+  that motion change is intentional. Runtime playback performs no frame-rate
+  conversion. Pass the subject-view dimensions (after output rotation) to
+  `--screen_size`; runtime cropping cannot avoid decoding pixels that should
+  have been removed offline. Existing outputs must be regenerated with
+  `--overwrite` from the original master files (not a previously rate-converted
+  output) to acquire the newer scale/quality/interlace guarantees.
+- Each main-window RGB upload explicitly unbinds any pixel-unpack buffer,
+  restores packed-client-memory pixel-store state, and checks the resulting GL
+  error. This prevents stale context-global OpenGL state from turning an
+  otherwise correctly timed upload into a shifted, partial, or transiently
+  corrupted frame.
 - On Raspberry Pi, `play_video` sends one-video-presentation-frame sync pulses on BCM GPIO
   `sync_pin` (default `18`). Pulse onsets are frame locked and their successive
   intervals are sampled inclusively from `sync_interval_frames` (default
@@ -488,10 +530,11 @@ A minimal video-source portion of the configuration is:
 
 Screen Selection
 ----------------
-**Invariant: a subject window is opened only by `bin.utils.setup_task_window()`.**
+**Invariant: a subject window is opened by `bin.utils.setup_task_window()` and
+closed by `bin.utils.close_task_window()`.**
 This is a privileged task boundary, not a convenience wrapper. Any change to
-screen discovery, synchronization, task startup, or window placement must
-retain that call in every subject-facing task and run
+screen discovery, synchronization, task startup, window placement, or cleanup
+must retain that pair in every subject-facing task and run
 `tests/test_screen_path_policy.py`. Do not add a task-local fallback path.
 
 Multi-screen tasks use `screens.main` for the subject display and `screens.experimenter` for the secondary display.
@@ -509,7 +552,7 @@ with main-input masking, the interface is withdrawn and the already-visible subj
 verified X11 focus anchor before launching a task or diagnostic. A child is not started unless that focus transfer
 completes, so the window manager cannot inherit the experimenter output as its active display. Pyglet preselection
 is best-effort during PsychoPy's Linux `screen=0` workaround; the realized native rectangle is the authoritative
-check. The non-vsync experimenter preview uses the
+check. The experimenter preview synchronizes its separate drawable to its own output and uses the
 same native fullscreen creation with scoped override-redirect so it remains on its configured output without
 altering the subject window's presentation path. Every realized native rectangle is verified; tasks, diagnostics,
 and experimenter previews all reject incorrect placement before timing begins. A preview reports ready only after

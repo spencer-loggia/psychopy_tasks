@@ -1,4 +1,5 @@
 from collections import deque
+import ctypes
 import importlib.util
 import math
 from multiprocessing import shared_memory
@@ -29,13 +30,80 @@ from bin.video_playback import (
     center_crop_bounds,
     parse_frame_rate,
     plan_video_refresh_cadence,
+    probe_video_stream,
     select_random_video_clip,
+    upload_rgb_texture,
     validate_hevc_stream,
     video_duration_seconds,
 )
 
 
 class VideoPlaybackTests(unittest.TestCase):
+    def test_video_probe_uses_container_duration_fallback(self):
+        probe_result = types.SimpleNamespace(
+            stdout=(
+                '{"streams":[{"codec_name":"hevc","duration":"N/A"}],'
+                '"format":{"duration":"12.5"}}'
+            )
+        )
+        with (
+            patch("bin.video_playback.shutil.which", return_value="/ffprobe"),
+            patch(
+                "bin.video_playback.subprocess.run",
+                return_value=probe_result,
+            ) as run,
+        ):
+            stream = probe_video_stream("clip.mp4")
+
+        self.assertEqual(stream["codec_name"], "hevc")
+        self.assertEqual(stream["duration"], "12.5")
+        self.assertEqual(run.call_args.args[0][0], "/ffprobe")
+
+    def test_texture_upload_resets_client_unpack_state_and_unbinds_pbo(self):
+        fake_gl = types.SimpleNamespace(
+            GLubyte=ctypes.c_ubyte,
+            GL_NO_ERROR=0,
+            GL_PIXEL_UNPACK_BUFFER=1,
+            GL_UNPACK_ALIGNMENT=2,
+            GL_UNPACK_ROW_LENGTH=3,
+            GL_UNPACK_SKIP_ROWS=4,
+            GL_UNPACK_SKIP_PIXELS=5,
+            GL_UNPACK_IMAGE_HEIGHT=6,
+            GL_UNPACK_SKIP_IMAGES=7,
+            GL_UNPACK_SWAP_BYTES=8,
+            GL_UNPACK_LSB_FIRST=9,
+            GL_TEXTURE0=10,
+            GL_TEXTURE_2D=11,
+            GL_RGB=12,
+            GL_UNSIGNED_BYTE=13,
+            glGetError=Mock(return_value=0),
+            glBindBuffer=Mock(),
+            glPixelStorei=Mock(),
+            glActiveTexture=Mock(),
+            glBindTexture=Mock(),
+            glTexSubImage2D=Mock(),
+        )
+        pyglet = types.ModuleType("pyglet")
+        pyglet.gl = fake_gl
+        rgb = np.zeros((2, 4, 3), dtype=np.uint8)
+
+        with patch.dict(sys.modules, {"pyglet": pyglet}):
+            upload_rgb_texture(types.SimpleNamespace(_texID=99), rgb)
+
+        fake_gl.glBindBuffer.assert_called_once_with(
+            fake_gl.GL_PIXEL_UNPACK_BUFFER,
+            0,
+        )
+        self.assertIn(
+            ((fake_gl.GL_UNPACK_ALIGNMENT, 1), {}),
+            [(call.args, call.kwargs) for call in fake_gl.glPixelStorei.call_args_list],
+        )
+        self.assertIn(
+            ((fake_gl.GL_UNPACK_ROW_LENGTH, 0), {}),
+            [(call.args, call.kwargs) for call in fake_gl.glPixelStorei.call_args_list],
+        )
+        fake_gl.glTexSubImage2D.assert_called_once()
+
     @staticmethod
     def _make_buffered_stream_state_machine():
         frame_bytes = 2 * 1 * 3
@@ -764,6 +832,25 @@ class VideoPlaybackTests(unittest.TestCase):
                 "sleep",
                 side_effect=clock.sleep,
             ) as sleep,
+            patch.object(
+                video_utils,
+                "query_glx_swap_interval",
+                return_value=(1, "GLX_EXT_swap_control"),
+            ),
+            patch.object(
+                video_utils,
+                "query_glx_sync_values",
+                side_effect=[
+                    (
+                        {"ust": 100_000_000, "msc": 100, "sbc": 10},
+                        "GLX_OML_sync_control",
+                    ),
+                    (
+                        {"ust": 100_133_333, "msc": 108, "sbc": 13},
+                        "GLX_OML_sync_control",
+                    ),
+                ],
+            ),
         ):
             result = video_utils.play_video_fill_screen(
                 win=win,
@@ -836,6 +923,19 @@ class VideoPlaybackTests(unittest.TestCase):
         self.assertEqual(result["display_warmup_flips"], 2)
         self.assertEqual(result["dropped_frames"], 0)
         self.assertEqual(result["late_frame_count"], 1)
+        self.assertEqual(result["timing_validation_status"], "WARN")
+        self.assertEqual(result["main_vblank_validation_status"], "PASS")
+        self.assertEqual(result["glx_swap_interval"], 1)
+        self.assertEqual(result["main_vblank_delta_msc"], 8)
+        self.assertEqual(result["main_vblank_expected_delta_msc"], 8)
+        self.assertEqual(result["main_vblank_delta_sbc"], 3)
+        self.assertEqual(result["main_vblank_expected_delta_sbc"], 3)
+        self.assertTrue(result["source_pts_contiguous"])
+        self.assertEqual(len(result["frame_timing_records"]), 3)
+        self.assertEqual(
+            result["realized_refresh_hold_histogram"],
+            {4: 1, 1: 1, 3: 1},
+        )
         onset_callback.assert_called_once_with(flip_time(3))
         warning_messages = [
             call.args[1]
@@ -849,6 +949,24 @@ class VideoPlaybackTests(unittest.TestCase):
                 for message in warning_messages
             )
         )
+        validation_messages = [
+            call.args[1]
+            for call in message_logger.log.call_args_list
+            if "video_frame_validation" in call.args[1]
+        ]
+        self.assertEqual(len(validation_messages), 1)
+        self.assertIn("status=WARN", validation_messages[0])
+        self.assertIn("source_pts_contiguous=1", validation_messages[0])
+        self.assertIn("cadence_mismatches=2", validation_messages[0])
+        vblank_messages = [
+            call.args[1]
+            for call in message_logger.log.call_args_list
+            if "video_main_vblank_validation" in call.args[1]
+        ]
+        self.assertEqual(len(vblank_messages), 1)
+        self.assertIn("status=PASS", vblank_messages[0])
+        self.assertIn("delta_msc=8 expected_delta_msc=8", vblank_messages[0])
+        self.assertIn("delta_sbc=3 expected_delta_sbc=3", vblank_messages[0])
 
         self.assertEqual(frame_publisher.publish_rgb.call_count, 3)
         publish_calls = frame_publisher.publish_rgb.call_args_list
@@ -916,6 +1034,40 @@ class VideoPlaybackTests(unittest.TestCase):
         self.assertEqual(cadence.refresh_count_histogram, ((2, 4),))
         self.assertEqual(cadence.total_refreshes, 8)
         self.assertEqual(cadence.final_phase_error_s, 0.0)
+
+    def test_timing_validation_passes_correct_three_two_pulldown(self):
+        video_utils = self._load_utils_without_psychopy_runtime()
+        onset_s = 100.0
+        records = [
+            {
+                "source_frame_index": frame_index,
+                "source_media_time_s": frame_index / 24.0,
+                "expected_source_pts_s": frame_index / 24.0,
+                "flip_requested_perf_s": flip_s - 0.001,
+                "actual_flip_perf_s": flip_s,
+            }
+            for frame_index, flip_s in enumerate(
+                (onset_s, onset_s + 3.0 / 60.0, onset_s + 5.0 / 60.0)
+            )
+        ]
+
+        validation = video_utils._summarize_video_frame_timing(
+            records,
+            clip_offset_perf_s=onset_s + 8.0 / 60.0,
+            expected_frame_count=3,
+            video_frame_rate=24.0,
+            display_refresh_rate=60.0,
+            planned_refresh_counts=(3, 2, 3),
+            timing_failure_threshold_s=0.5 / 60.0 + 0.001,
+            aborted=False,
+            source_frames_skipped=0,
+        )
+
+        self.assertEqual(validation["status"], "PASS")
+        self.assertTrue(validation["source_pts_contiguous"])
+        self.assertTrue(validation["nonuniform_cadence"])
+        self.assertEqual(validation["cadence_mismatch_count"], 0)
+        self.assertEqual(validation["realized_hold_histogram"], {3: 2, 2: 1})
 
     def test_refresh_cadence_absorbs_5994_rate_without_phase_drift(self):
         cadence = plan_video_refresh_cadence(1800, 30.0, 59.94)
@@ -1023,7 +1175,6 @@ class PlayVideoTaskTests(unittest.TestCase):
             "avg_frame_rate": source_rate,
         }
         fake_utils = types.ModuleType("bin.utils")
-        fake_utils.probe_video_stream = Mock(return_value=stream)
         fake_utils.setup_task_window = Mock(
             return_value=(win, main_screen, None)
         )
@@ -1032,12 +1183,23 @@ class PlayVideoTaskTests(unittest.TestCase):
             return_value=(float(monitor_rate), 1.0 / float(monitor_rate))
         )
         fake_utils.play_video_fill_screen = Mock()
+        fake_utils.verify_task_window_vblank = Mock(
+            return_value=types.SimpleNamespace(
+                primary_verification_detail="test main output confirmed",
+                primary_lease=types.SimpleNamespace(changed=False),
+                refresh_sync_requested=True,
+                swap_interval=1,
+                swap_interval_detail="test swap interval",
+            )
+        )
+        fake_utils.close_task_window = Mock(return_value="test restore")
 
         module = self._load_task_module(
             fake_utils,
             fake_screen,
             fake_psychopy,
         )
+        module.probe_video_stream = Mock(return_value=stream)
         messages = []
         session_logs = types.SimpleNamespace(
             event_logger=types.SimpleNamespace(
@@ -1229,19 +1391,29 @@ class PlayVideoTaskTests(unittest.TestCase):
         }
         play_video_fill_screen = Mock(return_value=playback_result)
         fake_utils = types.ModuleType("bin.utils")
-        fake_utils.probe_video_stream = Mock(return_value=stream)
         fake_utils.setup_task_window = Mock(
             return_value=(win, main_screen, experimenter_screen)
         )
         fake_utils.make_bg_rect = Mock(return_value=object())
         fake_utils.resolve_frame_rate = Mock(return_value=(60.0, 1.0 / 60.0))
         fake_utils.play_video_fill_screen = play_video_fill_screen
+        fake_utils.verify_task_window_vblank = Mock(
+            return_value=types.SimpleNamespace(
+                primary_verification_detail="test main output confirmed",
+                primary_lease=types.SimpleNamespace(changed=False),
+                refresh_sync_requested=True,
+                swap_interval=1,
+                swap_interval_detail="test swap interval",
+            )
+        )
+        fake_utils.close_task_window = Mock(return_value="test restore")
 
         module = self._load_task_module(
             fake_utils,
             fake_screen,
             fake_psychopy,
         )
+        module.probe_video_stream = Mock(return_value=stream)
         with self.assertRaisesRegex(ValueError, "num_clips must be a positive integer"):
             module.run_task([], 2.0, "unused", num_clips=0)
 
@@ -1340,6 +1512,7 @@ class PlayVideoTaskTests(unittest.TestCase):
         self.assertEqual(playback_kwargs["video_frame_rate"], 30.0)
         self.assertEqual(playback_kwargs["video_frame_count"], 60)
         self.assertEqual(playback_kwargs["display_refresh_rate"], 60.0)
+        self.assertNotIn("require_main_vblank_validation", playback_kwargs)
         cadence = playback_kwargs["refresh_cadence"]
         self.assertEqual(cadence.frame_refresh_counts, (2,) * 60)
         self.assertEqual(cadence.total_refreshes, 120)
@@ -1376,7 +1549,14 @@ class PlayVideoTaskTests(unittest.TestCase):
         self.assertIn("native_size=2560x1600", geometry_message)
         self.assertIn("subject_size=1600x2560", geometry_message)
         self.assertIn("stimulus_rotation_deg=90", geometry_message)
-        self.assertFalse(any("swap_interval" in message for message in messages))
+        vblank_message = next(
+            message
+            for message in messages
+            if message.startswith("main_vblank_reference")
+        )
+        self.assertIn("output=MAIN", vblank_message)
+        self.assertIn("swap_interval=1", vblank_message)
+        self.assertIn("status=confirmed", vblank_message)
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 from bin.screen import (
     ExperimenterPreview,
     MAIN_SCREEN_ENV,
+    MainDisplayVBlankSession,
     MainDisplayFrameTimingMonitor,
     SCREEN_ENV_OVERRIDE_ENV,
     SECONDARY_SCREEN_ENV,
@@ -17,12 +18,14 @@ from bin.screen import (
     _bind_linux_pyglet_display,
     _get_latest_preview_command,
     _parse_xrandr_query,
+    _parse_xrandr_primary_output,
     _wait_for_preview_startup,
     build_reward_hit_boxes,
     compute_aspect_cover_size,
     compute_centered_aspect_fit,
     configure_window_vsync,
     enforce_window_vsync,
+    ensure_xrandr_primary_output,
     format_experimenter_label,
     load_screen_config,
     measure_window_flip_rate,
@@ -31,17 +34,158 @@ from bin.screen import (
     reward_level_color,
     rotate_centered_point,
     resolve_window_frame_rate,
+    restore_xrandr_primary_output,
     resolve_task_screens,
     resolve_scene_size,
     scale_scene_point,
     select_screen,
     set_tk_window_fullscreen,
     software_stimulus_rotation,
+    verify_xrandr_primary_output,
     verify_psychopy_window_screen,
 )
 
 
 class ScreenConfigTests(unittest.TestCase):
+    def test_main_display_vblank_session_owns_validation_and_cleanup(self):
+        screen = ScreenGeometry(
+            index=0,
+            x=0,
+            y=0,
+            width=2560,
+            height=1600,
+            name="HDMI-2",
+        )
+        lease = types.SimpleNamespace(
+            target_output="HDMI-2",
+            previous_output="HDMI-1",
+            changed=True,
+            detail="test lease",
+        )
+        win = types.SimpleNamespace(
+            waitBlanking=False,
+            winHandle=types.SimpleNamespace(
+                switch_to=Mock(),
+                set_vsync=Mock(),
+                activate=Mock(),
+            ),
+            close=Mock(),
+        )
+        session = MainDisplayVBlankSession(
+            screen=screen,
+            primary_lease=lease,
+        )
+
+        with (
+            patch("bin.screen.sys.platform", "linux"),
+            patch(
+                "bin.screen.verify_xrandr_primary_output",
+                return_value="confirmed resolved main output HDMI-2 XRandR primary",
+            ),
+            patch(
+                "bin.glx_timing.query_glx_swap_interval",
+                return_value=(1, "GLX_EXT_swap_control"),
+            ),
+            patch(
+                "bin.screen.restore_xrandr_primary_output",
+                return_value="restored HDMI-1",
+            ) as restore,
+        ):
+            self.assertIs(session.validate(win), session)
+            close_detail = session.close(win)
+
+        self.assertTrue(session.refresh_sync_requested)
+        self.assertEqual(session.swap_interval, 1)
+        win.winHandle.switch_to.assert_called_once_with()
+        win.winHandle.set_vsync.assert_called_once_with(True)
+        win.close.assert_called_once_with()
+        restore.assert_called_once_with(lease)
+        self.assertEqual(close_detail, "restored HDMI-1")
+        self.assertTrue(session.window_closed)
+        self.assertTrue(session.primary_released)
+
+    def test_xrandr_main_output_is_made_primary_and_restored(self):
+        screen = ScreenGeometry(
+            index=0,
+            x=0,
+            y=0,
+            width=2560,
+            height=1600,
+            name="HDMI-2",
+        )
+        before = types.SimpleNamespace(
+            stdout=(
+                "HDMI-1 connected primary 1920x1080+2560+0\n"
+                "HDMI-2 connected 2560x1600+0+0\n"
+            )
+        )
+        after = types.SimpleNamespace(
+            stdout=(
+                "HDMI-1 connected 1920x1080+2560+0\n"
+                "HDMI-2 connected primary 2560x1600+0+0\n"
+            )
+        )
+        command_result = types.SimpleNamespace(stdout="")
+
+        with (
+            patch("bin.screen.sys.platform", "linux"),
+            patch(
+                "bin.screen.subprocess.run",
+                side_effect=[before, command_result, after, command_result],
+            ) as run,
+        ):
+            lease = ensure_xrandr_primary_output(screen, required=True)
+            restore_detail = restore_xrandr_primary_output(lease)
+
+        self.assertTrue(lease.changed)
+        self.assertEqual(lease.previous_output, "HDMI-1")
+        self.assertIn("restored", restore_detail)
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [
+                ["xrandr", "--query"],
+                ["xrandr", "--output", "HDMI-2", "--primary"],
+                ["xrandr", "--query"],
+                ["xrandr", "--output", "HDMI-1", "--primary"],
+            ],
+        )
+
+    def test_xrandr_primary_parser_is_explicit(self):
+        self.assertEqual(
+            _parse_xrandr_primary_output(
+                "HDMI-2 connected primary 2560x1600+0+0\n"
+                "HDMI-1 connected 1920x1080+2560+0"
+            ),
+            "HDMI-2",
+        )
+        self.assertIsNone(
+            _parse_xrandr_primary_output(
+                "HDMI-2 connected 2560x1600+0+0"
+            )
+        )
+
+    def test_xrandr_primary_verification_rejects_secondary_output(self):
+        screen = ScreenGeometry(
+            index=0,
+            x=0,
+            y=0,
+            width=2560,
+            height=1600,
+            name="HDMI-2",
+        )
+        query = types.SimpleNamespace(
+            stdout=(
+                "HDMI-1 connected primary 1920x1080+2560+0\n"
+                "HDMI-2 connected 2560x1600+0+0\n"
+            )
+        )
+        with (
+            patch("bin.screen.sys.platform", "linux"),
+            patch("bin.screen.subprocess.run", return_value=query),
+            self.assertRaisesRegex(RuntimeError, "HDMI-2.*not XRandR primary"),
+        ):
+            verify_xrandr_primary_output(screen, required=True)
+
     def test_psychopy_display_constructor_enumerates_target_first(self):
         target_info = ScreenGeometry(
             index=1, x=0, y=0, width=1600, height=2560, name="HDMI-2"

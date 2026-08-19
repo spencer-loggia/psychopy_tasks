@@ -65,11 +65,13 @@
             "csc2_experiment": {
                 "launch": [
                     "task/active_foraging.py",
-                    "task/match2cue.py"
+                    "task/match2cue.py",
+                    "task/play_video.py"
                 ],
                 "config": [
                     "config_files/csc2/yuri_rigtrain_noseq_nomem_20260615.json",
-                    "config_files/csc2/match2cue_auxillary.json"
+                    "config_files/csc2/match2cue_auxillary.json",
+                    "test_configs/play_video_config.json"
                 ],
                 "order_mode": "sequential",
                 "n_iters": null

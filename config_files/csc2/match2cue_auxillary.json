@@ -8,10 +8,10 @@
   "colors_tsv": "./task/resources/csc2/match2cue_background.tsv",
 
   "pump_delay_time": 0.2,
-  "pump_pulse_time_seconds": 0.6,
+  "pump_pulse_time_seconds": 0.4,
   "inter_pump_interval": 0.2, 
 
-  "reward_match_cue_prob": 0.7,
+  "reward_match_cue_prob": 0.6,
   "correct_num_pulse": 2,
   "tie_mode": "all",
 
@@ -41,8 +41,8 @@
 
   "self_initiation": true,
   "match_cue_duration": 0.5,
-  "delay_time": 0.0,
-  "iti": 0.75,
+  "delay_time": 0.4,
+  "iti": 1.0,
   "duration": 0.0,
   "num_afc": 2,
   "choice_time": 2.0,

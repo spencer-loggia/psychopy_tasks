@@ -871,7 +871,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
             except Exception:
                 pass
         try:
-            win.close()
+            utils.close_task_window(win)
         except Exception:
             pass
     return task_end_status

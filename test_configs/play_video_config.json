@@ -6,7 +6,7 @@
   "clip_duration_seconds": 60.0,
   "seek_timeout_seconds": 30.0,
   "num_clips": 1, 
-  "frame_rate": 30,
+  "frame_rate": 24,
   "output_dir": "./logs",
   "screens": {
     "main": null,
@@ -20,5 +20,5 @@
 
   "pump_pin": 0,
   "pump_pulse_time_seconds": 0.25,
-  "pump_interval": 5.0  
+  "pump_interval": 8.0  
 }

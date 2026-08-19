@@ -35,7 +35,10 @@ class VideoPreprocessingTests(unittest.TestCase):
             "width": 1280,
             "height": 720,
             "avg_frame_rate": "30/1",
+            "r_frame_rate": "30/1",
             "start_time": "0.0",
+            "field_order": "progressive",
+            "has_b_frames": 0,
         }
         stream.update(overrides)
         return stream
@@ -96,6 +99,46 @@ class VideoPreprocessingTests(unittest.TestCase):
                 ",fps=fps=30:round=near,setpts=PTS-STARTPTS"
             )
         )
+        self.assertIn("scale=1280:720:flags=lanczos", filter_chain)
+
+    def test_filter_deinterlaces_before_crop_and_scale(self):
+        filter_chain = preprocess_videos.build_filter(
+            1920,
+            1080,
+            1280,
+            720,
+            frame_rate=30.0,
+            deinterlace=True,
+        )
+
+        self.assertTrue(filter_chain.startswith("bwdif="))
+        self.assertLess(filter_chain.index("bwdif="), filter_chain.index("crop="))
+
+    def test_processed_output_must_be_progressive_and_have_no_b_frames(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "clip.mp4"
+            for overrides, expected_message in (
+                ({"field_order": "tt"}, "not explicitly progressive"),
+                ({"has_b_frames": 2}, "retains reordered B-frames"),
+            ):
+                with (
+                    self.subTest(overrides=overrides),
+                    patch.object(
+                        preprocess_videos,
+                        "probe_video",
+                        return_value=self._valid_stream(**overrides),
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        expected_message,
+                    ):
+                        preprocess_videos.validate_processed_video(
+                            "ffprobe",
+                            output_path,
+                            expected_size=(1280, 720),
+                            expected_frame_rate=30.0,
+                        )
 
     def test_encoder_disables_b_frames_for_low_latency_random_seek(self):
         with tempfile.TemporaryDirectory() as temp_dir:

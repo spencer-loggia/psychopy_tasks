@@ -436,6 +436,7 @@ def run_task(
             screen_info=experimenter_screen,
             sync_to_refresh=False,
         )
+        utils.verify_task_window_vblank(main_win)
         pylogging.console.setLevel(pylogging.CRITICAL)
         try:
             main_win.mouseVisible = False
@@ -829,12 +830,16 @@ def run_task(
             session_logs.close()
         except Exception:
             pass
-        for win in (main_win, exp_win):
-            if win is not None:
-                try:
-                    win.close()
-                except Exception:
-                    pass
+        if exp_win is not None:
+            try:
+                exp_win.close()
+            except Exception:
+                pass
+        if main_win is not None:
+            try:
+                utils.close_task_window(main_win)
+            except Exception:
+                pass
 
 
 def main():

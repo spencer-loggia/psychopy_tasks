@@ -38,6 +38,11 @@ class ScreenPathPolicyTests(unittest.TestCase):
                 1,
                 f"{filename} must open its subject window exactly once through utils.setup_task_window",
             )
+            self.assertEqual(
+                calls.count("utils.close_task_window"),
+                1,
+                f"{filename} must close its subject window exactly once through utils.close_task_window",
+            )
 
     def test_task_code_cannot_bypass_screen_resolution_or_window_verification(self):
         forbidden_names = {

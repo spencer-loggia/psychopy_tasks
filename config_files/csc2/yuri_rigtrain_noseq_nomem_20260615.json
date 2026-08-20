@@ -1,24 +1,22 @@
 { 
   "config_name": "csc2_foraging_classic",
-  "subject": "test_env1",
+  "subject": "test",
   "n_colors": 36,
   "n_shapes": 36, 
   "n_lum_levels": 11,
   "shapes_tsv": "./task/resources/csc2/shape_definitions.tsv",
   "colors_tsv": "./task/resources/csc2/mt2_062026_amoledB_colors.tsv",
   "freq_space_tsv": {
-    "test_env1": "./task/resources/csc2/freq_space_TY.csv",
+    "test": "./task/resources/csc2/freq_space_TY.csv",
     "Yuri": "./task/resources/csc2/freq_space_TY.csv",
     "Tina": "./task/resources/csc2/freq_space_TY.csv",
-    "test_env2": "./task/resources/csc2/freq_space_SB.csv",
     "Buzz": "./task/resources/csc2/freq_space_SB.csv",
     "Sally": "./task/resources/csc2/freq_space_SB.csv"
   },
   "reward_space_tsv": {
-    "test_env1": "./task/resources/csc2/reward_space_TY.csv",
+    "test": "./task/resources/csc2/reward_space_TY.csv",
     "Yuri": "./task/resources/csc2/reward_space_TY.csv",
     "Tina": "./task/resources/csc2/reward_space_TY.csv",
-    "test_env2": "./task/resources/csc2/reward_space_SB.csv",
     "Buzz": "./task/resources/csc2/reward_space_SB.csv",
     "Sally": "./task/resources/csc2/reward_space_SB.csv"
   },

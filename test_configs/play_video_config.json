@@ -19,6 +19,6 @@
   "sync_pulse_frames": 1,
 
   "pump_pin": 0,
-  "pump_pulse_time_seconds": 0.25,
-  "pump_interval": 8.0  
+  "pump_pulse_time_seconds": 0.35,
+  "pump_interval": 12.0  
 }

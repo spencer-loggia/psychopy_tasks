@@ -10,7 +10,7 @@
     "mask_main_inputs": true,
     "experiment_quiet_mode": true,
     "main_touchscreen_xinput": "WaveShare WaveShare",
-    "subjects": {"Yuri": "Y", "Sally": "S", "Buzz": "B", "Tina": "T", "Wooster": "W", "Jeeves": "J"},
+    "subjects": {"Test": "TST", "Yuri": "Y", "Sally": "S", "Buzz": "B", "Tina": "T", "Wooster": "W", "Jeeves": "J"},
     "tasks": {
         "CSC1": {
             "classic": {

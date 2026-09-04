@@ -7,12 +7,12 @@
   "shapes_tsv": "./task/resources/csc2/match2cue_shape_definitions.tsv",
   "colors_tsv": "./task/resources/csc2/match2cue_background.tsv",
 
-  "pump_delay_time": 0.2,
-  "pump_pulse_time_seconds": 0.3,
+  "pump_delay_time": 0.1,
+  "pump_pulse_time_seconds": 0.15,
   "inter_pump_interval": 0.2, 
 
-  "reward_match_cue_prob": 0.4,
-  "correct_num_pulse": 2,
+  "reward_match_cue_prob": 1.0,
+  "correct_num_pulse": 3,
   "tie_mode": "all",
 
 
@@ -44,7 +44,7 @@
   "delay_time": 0.5,
   "iti": 1.0,
   "duration": 0.0,
-  "num_afc": 3,
+  "num_afc": 2,
   "choice_time": 2.0,
   "isi": 0.0,
   "fixed_positions": false,

@@ -463,6 +463,8 @@ def run_task(
         colors = colors_all
         bg_rgb = tuple((128, 128, 128) if bg is None else bg)
 
+    print(f"INTENDED BACKGROUND RGB: {bg_rgb}")
+
     shapes = utils.load_shape_definitions(Path(shapes_tsv))
     color_ids = [int(cid) for cid in colors.keys()]
     shape_ids = [int(sid) for sid in shapes.keys()]

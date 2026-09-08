@@ -1,7 +1,7 @@
 { 
   "config_name": "human_raspi_test_nodelay",
   "shapes_tsv": "./task/resources/csc1/csc1_shapes/shape_definitions_csc1.tsv",
-  "colors_tsv": "./task/resources/csc1/csc1_colors/csc1_color_definition.tsv",
+  "colors_tsv": "./task/resources/csc1/csc1_colors/new_screen_colors_rgb_all.tsv",
   "pump_delay_time": 0.0,
   "pump_pulse_time_seconds": 0.6,
   "inter_pump_interval": 0.1, 
@@ -22,7 +22,7 @@
   "n": 100,
 
   "fullscreen": true,
-  "win_size": null,
+  "win_size": [2560, 1600],
   "fixation_size": 0,
   "dot_size": 40,
   "dot_color": [50, 50, 50],

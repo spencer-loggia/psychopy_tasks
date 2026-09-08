@@ -2179,7 +2179,9 @@ def present_trial_with_persistent_dots(
     When ``detect_pre_options_cue_touch`` is enabled, a fresh press on the
     pre-options cue is logged once. ``on_pre_options_cue_touch`` runs after the
     cue's configured frame duration and after it has been cleared from the main
-    display. A truthy callback return value aborts the trial.
+    display. A truthy callback return value aborts the trial. In sequential
+    mode, ``isi`` also controls an unchanged dot-scene hold between consecutive
+    stimuli.
     """
     from psychopy import core as _core
 
@@ -2248,6 +2250,8 @@ def present_trial_with_persistent_dots(
         return False
 
     def _frame_event_name(kind: str, option_idx: Optional[int] = None) -> str:
+        if kind == "inter_stimulus":
+            return "inter_stimulus_interval"
         if event_profile in {"active_foraging", "match2cue"}:
             if kind == "dot":
                 if sequential:
@@ -3001,7 +3005,38 @@ def present_trial_with_persistent_dots(
                     cue_dot.fillColor = rgb255_to_psychopy(dot_color)
                     cue_dot.fillColorSpace = "rgb"
                     dot_records[-1]["color"] = tuple(dot_color)
-            elif cue_dot is not None and dots:
+            # In sequential trials, `isi` governs both the dot cue and a
+            # distinct hold between stimuli. During that hold, the
+            # post-stimulus dot scene remains visible and unchanged. The hold
+            # is not shown after the final stimulus, immediately before choice.
+            if idx < len(trial_options) and isi_frames > 0:
+                first_flip = True
+                _show_preview([])
+                with frame_timing_monitor.continuous_sequence():
+                    for _ in range(isi_frames):
+                        if _abort_from_input(
+                            "experimenter_exit_during_inter_stimulus_interval"
+                        ):
+                            return True, None
+                        bg_rect.draw()
+                        for d in dots:
+                            d.draw()
+                        if fix is not None:
+                            fix.draw()
+                        break_timing = flip_with_timestamps(win)
+                        if first_flip:
+                            logger.log_frame_flip(
+                                trial_num=trial_num,
+                                event=_frame_event_name("inter_stimulus"),
+                                timestamp_perf_s=break_timing.actual_perf_s,
+                                requested_timestamp_perf_s=(
+                                    break_timing.requested_perf_s
+                                ),
+                                requested_duration=isi_plan.requested_s,
+                            )
+                            first_flip = False
+
+            if not is_memory and cue_dot is not None and dots:
                 dots.pop()
                 dot_records.pop()
 

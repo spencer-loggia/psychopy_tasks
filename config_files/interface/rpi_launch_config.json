@@ -47,7 +47,10 @@
                 "launch": "task/active_foraging.py",
                 "config": "config_files/csc2/yuri_rigtrain_noseq_nomem_20260615.json"
             }, 
-            "sequential": {},
+            "seq_mem": {
+                "launch": "task/active_foraging.py",
+                "config": "config_files/csc2/yuri_rigtrain_seq_mem_20260908.json"
+            },
             "memory": {
                 "launch": "task/active_foraging.py",
                 "config": "config_files/csc2/yuri_rigtrain_no_seq_mem_20260803.json"
@@ -64,14 +67,10 @@
         "loops": {
             "csc2_experiment": {
                 "launch": [
-                    "task/match2cue.py",
-                    "task/active_foraging.py",
-                    "task/play_video.py"
+                    "task/active_foraging.py"
                 ],
                 "config": [
-                    "config_files/csc2/match2cue_auxillary.json",
-                    "config_files/csc2/yuri_rigtrain_noseq_nomem_20260615.json",
-                    "test_configs/play_video_config.json"
+                    "config_files/csc2/yuri_rigtrain_seq_mem_20260908.json"
                 ],
                 "order_mode": "sequential",
                 "n_iters": null

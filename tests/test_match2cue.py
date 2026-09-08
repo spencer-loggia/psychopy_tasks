@@ -338,6 +338,7 @@ class Match2CueEventTests(unittest.TestCase):
         self.assertEqual(definitions["match_cue_on"].code, 116)
         self.assertEqual(definitions["match_cue_touch"].code, 202)
         self.assertEqual(definitions["delay_start"].code, 114)
+        self.assertEqual(definitions["inter_stimulus_interval"].code, 117)
         self.assertEqual(library.ensure("option_3_dot", "frame_flip").code, 1003)
         self.assertEqual(library.ensure("option_3_on", "frame_flip").code, 1103)
 

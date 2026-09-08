@@ -91,6 +91,11 @@
       "event_type": "frame_flip",
       "description": "The match-to-cue target stimulus became visible."
     },
+    "inter_stimulus_interval": {
+      "code": 117,
+      "event_type": "frame_flip",
+      "description": "The unchanged dot-only interval between sequential stimuli began."
+    },
     "cue_touch": {
       "code": 200,
       "event_type": "interaction",
@@ -162,7 +167,8 @@
       "gray_inter_trial_interval",
       "option_touch",
       "trial_start_signal_on",
-      "trial_start_signal_off"
+      "trial_start_signal_off",
+      "inter_stimulus_interval"
     ],
     "play_video": [
       "video_clip_start",
@@ -189,7 +195,8 @@
       "buzzer_on",
       "buzzer_off",
       "options_dot",
-      "options_on"
+      "options_on",
+      "inter_stimulus_interval"
     ],
     "match2cue": [
       "onset_cue_on",
@@ -205,7 +212,8 @@
       "pump_on",
       "pump_off",
       "options_dot",
-      "options_on"
+      "options_on",
+      "inter_stimulus_interval"
     ],
     "afc_csc1": [
       "onset_cue_on",

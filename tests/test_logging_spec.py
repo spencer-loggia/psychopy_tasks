@@ -226,6 +226,7 @@ class LoggingSpecTests(unittest.TestCase):
 
     def test_shared_library_expands_active_foraging_option_templates(self):
         definitions, event_patterns = load_task_event_definitions("active_foraging")
+        self.assertIn("inter_stimulus_interval", definitions)
         library = EventCodeLibrary(definitions, event_patterns=event_patterns)
 
         option_dot = library.ensure("option_2_dot", "frame_flip")
@@ -297,6 +298,7 @@ class LoggingSpecTests(unittest.TestCase):
         definitions, _ = load_task_event_definitions("afc_trial_sequence")
 
         self.assertIn("trial_cue", definitions)
+        self.assertIn("inter_stimulus_interval", definitions)
         self.assertEqual(definitions["trial_cue"].code, 104)
 
     def test_play_video_registers_frame_locked_sync_edges(self):

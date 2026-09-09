@@ -21,7 +21,7 @@
     "Sally": "./task/resources/csc2/reward_space_SB.csv"
   },
   "pump_delay_time": 0.2,
-  "pump_pulse_time_seconds": 0.50,
+  "pump_pulse_time_seconds": 0.55,
   "inter_pump_interval": 0.1, 
   "timeout_duration_seconds": 2.0,
   "reward_to_pulse_map": {

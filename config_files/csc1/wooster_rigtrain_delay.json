@@ -23,6 +23,7 @@
 
   "fullscreen": true,
   "win_size": [2560, 1600],
+  "colors_tsv_has_bg_row": true,
   "fixation_size": 0,
   "dot_size": 40,
   "dot_color": [50, 50, 50],

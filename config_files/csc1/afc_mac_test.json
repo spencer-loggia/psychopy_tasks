@@ -1,8 +1,9 @@
 {
   "config_name": "afc_csc1_mac_test",
-  "colors_tsv": "task/resources/csc1/csc1_colors/csc1_color_definition.tsv",
+  "colors_tsv": "task/resources/csc1/csc1_colors/new_screen_colors_rgb_all.tsv",
   "shapes_tsv": "task/resources/csc1/csc1_shapes/shape_definitions_csc1.tsv",
   "output_dir": "./logs",
+  
 
   "n": 10,
   "num_afc": 4,
@@ -20,7 +21,6 @@
   
 
   "refresh_rate": 60,
-  "bg": [128, 128, 128],
   "dot_size": 10,
   "dot_color": [155, 155, 155],
 

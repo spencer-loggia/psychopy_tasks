@@ -14,7 +14,7 @@
   "ibi": 1.0,
   "isi": 0.0,
 
-  "image_size": [128, 128],
+  "image_size": [64, 64],
   "win_size": [1200, 900],
   "fullscreen": false,
   "fixed_positions": true,

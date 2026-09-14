@@ -2148,9 +2148,7 @@ def present_delayed_afc_trial(
 
     # Mandatory self-initiation cue: show the checkerboard cue and wait for a *new*
     # click/touch inside its bounds before beginning the AFC cue/delay/choice sequence.
-    
     try:
-        onset_cue.pos = (0, 0)
         onset_cue.opacity = 1.0
     except Exception:
         pass

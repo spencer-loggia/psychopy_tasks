@@ -1045,6 +1045,11 @@ def run_task(
             sigma_frac=0.22,
             zero_threshold=1,
         )
+
+        onset_stim.pos = (
+            0.0,
+            -float(main_scene_size[1]) / 3.0
+        )
         msg_logger.log(
             "INFO",
             "checkerboard_onset_cue_required source=utils.make_onset_cue_stim "

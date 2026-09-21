@@ -100,6 +100,22 @@ still activates its button while a swipe does not accidentally launch it.
 The top-level task menu has an End Experiment button. It closes the current experiment and returns to the root
 menu; Desktop, Shutdown, and mode switching are available only from that root menu.
 
+Data synchronization
+--------------------
+
+The interface config's `remote_data_url` is the NFS-backed destination for the contents of the local `logs`
+directory. Cleanup runs at startup, when **End Experiment** is pressed, and before shutdown; it does not run after
+individual tasks or blocks. Cleanup first verifies that the destination exists on an NFS filesystem and contains
+at least one file or directory. If either check fails, it prints a warning and leaves all local data untouched.
+
+When storage is available, the launcher uses `rsync --archive` to copy the contents of `logs`. A modal progress
+window prevents tasks from launching during the copy and offers **Cancel Sync**. Cancelling or any rsync failure
+retains every local experiment. After a fully successful copy, all but the most recently modified experiment are
+removed from the local cache. Generated data directories are excluded by `.gitignore`.
+
+Code updates use `remote_git_url` from the same interface config (normally an NFS-mounted repository path). Each
+cleanup runs `git reset --hard` and then pulls from that explicit URL rather than the checkout's default remote.
+
 Run System Diagnostic uses the configured `environment.python` interpreter and does not create an experiment or
 block. It checks that PsychoPy can import, `lgpio` can open GPIO chip 0, and the Pi-Plates DAQC2 driver can read the
 board supply voltage on ADC channel 8. It creates the GL/window stack on worker cores, waits until the launcher has

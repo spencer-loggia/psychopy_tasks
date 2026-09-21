@@ -10,6 +10,8 @@
     "mask_main_inputs": true,
     "experiment_quiet_mode": true,
     "main_touchscreen_xinput": "WaveShare WaveShare",
+    "remote_git_url": "/mnt/data/task_mirror",
+    "remote_data_url": "/mnt/data/",
     "subjects": {"Test": "TST", "Yuri": "Y", "Sally": "S", "Buzz": "B", "Tina": "T", "Wooster": "W", "Jeeves": "J"},
     "tasks": {
         "CSC1": {

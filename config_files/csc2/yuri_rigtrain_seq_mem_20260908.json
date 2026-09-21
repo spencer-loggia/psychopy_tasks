@@ -47,8 +47,8 @@
   "seed": null,
   "output_dir": "./logs",
   "screens": {
-    "main": null,
-    "experimenter": null
+    "main": 0,
+    "experimenter": 0
   },
   "n": 50,
 
@@ -75,6 +75,6 @@
   "fixed_positions": true,
   "sequential": true,
   "is_memory": true,
-  "raspi": true,
-  "touchscreen": true
+  "raspi": false,
+  "touchscreen": false
 }

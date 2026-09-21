@@ -1,0 +1,55 @@
+{
+  "config_name": "match2cue_test",
+  "subject": "test_env1",
+  "n_colors": 36,
+  "n_shapes": 36,
+  "n_lum_levels": 11,
+  "shapes_tsv": "./task/resources/csc2/shape_definitions.tsv",
+  "colors_tsv": "./task/resources/csc2/mt2_062026_amoledB_colors.tsv",
+
+  "pump_delay_time": 0.1,
+  "pump_pulse_time_seconds": 0.4,
+  "inter_pump_interval": 0.1, 
+
+  "reward_match_cue_prob": 1.0,
+  "correct_num_pulse": 3,
+  "tie_mode": "all",
+
+
+  "daq": {
+    "address": 0
+  },
+  "pump_pin": 0,
+  "trial_start_pin": 18,
+
+  "seed": null,
+  "output_dir": "./logs",
+  "screens": {
+    "main": 0,
+    "experimenter": 0
+  },
+  "n": 40,
+
+  "fullscreen": true,
+  "fixation_size": 0,
+  "dot_size": 40,
+  "dot_color": [50, 50, 50],
+  "init_dot_color": [50, 50, 50],
+  "center_point": null,
+  "stim_range_radius": null,
+  "image_size": [150, 150],
+
+  "self_initiation": true,
+  "match_cue_duration": 0.2,
+  "delay_time": 0.5,
+  "iti": 0.50,
+  "duration": 0.2,
+  "num_afc": 2,
+  "choice_time": 2.0,
+  "isi": 0.1,
+  "fixed_positions": false,
+  "sequential": true,
+  "is_memory": true,
+  "raspi": false,
+  "touchscreen": false
+}

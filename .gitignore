@@ -1,10 +1,10 @@
 # Large python gitignore file with ignores for all major OS and intllij products.
 
-# local
-logs
-sample_images
-tests/output
-tests/outputs
+# Generated experiment data and local test assets
+/logs/
+/sample_images/
+/tests/output/
+/tests/outputs/
 task/resources/video
 task/passive_viewing_csc1.py
 

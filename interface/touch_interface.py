@@ -38,6 +38,7 @@ from interface.rig_mode import (
     normalize_is_rig,
     target_mode_for_current_mode,
 )
+from interface.data_sync import ExperimentDataSync, SyncPlan, terminate_process
 from interface.experiment_manager import (
     ExperimentManager,
     PreparedBlock,
@@ -57,7 +58,6 @@ from interface.x11_idle_guard import (
 )
 
 
-IDLE_CLEANUP_MS = 30 * 60 * 1000
 BUTTON_BG = "#f7f7f7"
 BUTTON_ACTIVE_BG = "#d9d9d9"
 SHUTDOWN_BUTTON_BG = "#b91c1c"
@@ -368,6 +368,7 @@ class TouchInterfaceApp:
             raise KeyError("Config must define environment.python")
 
         self.task_active = False
+        self.cleanup_active = False
         self.status_var = tk.StringVar(value="Ready")
         self.page_title_var = tk.StringVar(value="Task Launcher")
         self.page_stack: list[tuple[str, Dict[str, Any]]] = []
@@ -377,10 +378,9 @@ class TouchInterfaceApp:
 
         if self.idle_guard is not None:
             self.idle_guard.enter_idle()
-        self.startup()
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._exit_to_desktop)
-        self._schedule_idle_cleanup()
+        self.startup()
 
     def _is_launchable_task(self, task_cfg: Dict[str, Any]) -> bool:
         return "launch" in task_cfg
@@ -417,31 +417,154 @@ class TouchInterfaceApp:
             print(f"Could not sync time: {e}")
 
     def pull_latest_code(self) -> None:
+        remote_git_url = str(self.cfg.get("remote_git_url", "")).strip()
+        if not remote_git_url:
+            print("Could not pull latest code: remote_git_url is not configured")
+            return
         try:
-            subprocess.run(
-                ["git", "pull"],
-                cwd=self.working_dir,
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
+            for command in (
+                ["git", "reset", "--hard"],
+                ["git", "pull", remote_git_url],
+            ):
+                subprocess.run(
+                    command,
+                    cwd=self.working_dir,
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
         except Exception as e:
             print(f"Could not pull latest code: {e}")
 
     def startup(self) -> None:
         os.chdir(self.working_dir)
-        # attempt to rectify system timezone
-        self.attempt_rectify_timezone()
-        self.pull_latest_code()
+        self.cleanup()
 
     def cleanup(self) -> None:
-        quiet_mode = getattr(self, "quiet_mode", None)
-        if self.experiment is not None or (
-            quiet_mode is not None and quiet_mode.active
-        ):
+        if getattr(self, "cleanup_active", False):
             return
-        self.attempt_rectify_timezone()
-        self.pull_latest_code()
+        self.cleanup_active = True
+        try:
+            if not self.sync_data():
+                return
+            self.attempt_rectify_timezone()
+            self.pull_latest_code()
+        finally:
+            self.cleanup_active = False
+
+    def sync_data(self) -> bool:
+        """Sync experiment directories; return false only when the user cancels."""
+        remote_value = str(self.cfg.get("remote_data_url", "")).strip()
+        data_sync = ExperimentDataSync(
+            self.working_dir / "logs",
+            Path(remote_value) if remote_value else None,
+        )
+        preparation = data_sync.prepare()
+        if preparation.warning:
+            print(f"Data sync warning: {preparation.warning}")
+        if preparation.plan is None:
+            return True
+
+        plan = preparation.plan
+        self.status_var.set(f"Syncing {len(plan.experiments)} experiment(s)...")
+        self.root.update_idletasks()
+        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as error_file:
+            try:
+                process = subprocess.Popen(
+                    plan.command,
+                    cwd=self.working_dir,
+                    stdout=subprocess.DEVNULL,
+                    stderr=error_file,
+                    text=True,
+                )
+            except OSError as exc:
+                print(f"Data sync warning: could not start rsync: {exc}")
+                return True
+
+            cancelled = self._show_sync_dialog(process, plan)
+            returncode = process.wait()
+            error_file.seek(0)
+            error_detail = error_file.read().strip()
+
+        if cancelled:
+            print("Data sync cancelled; no local data was removed")
+            self.status_var.set("Data sync cancelled")
+            return False
+        if returncode != 0:
+            detail = error_detail or f"rsync exited with status {returncode}"
+            print(f"Data sync warning: {detail}")
+            self.status_var.set("Data sync failed; local data retained")
+            return True
+
+        try:
+            removed = data_sync.prune(plan)
+        except OSError as exc:
+            print(f"Data prune warning: {exc}")
+            self.status_var.set("Data synced; some old local data could not be removed")
+            return True
+
+        self.status_var.set(
+            f"Data synced; retained {plan.retained_experiment.name} locally "
+            f"and removed {len(removed)} older experiment(s)"
+        )
+        return True
+
+    def _show_sync_dialog(self, process: subprocess.Popen, plan: SyncPlan) -> bool:
+        """Block launcher actions while keeping a responsive cancel button."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Syncing Experiment Data")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        cancelled = False
+
+        tk.Label(
+            dialog,
+            text=(
+                f"Syncing {len(plan.experiments)} experiment(s) to\n"
+                f"{plan.destination}\n\n"
+                "Old local experiments are removed only after a successful sync."
+            ),
+            font=("Helvetica", 16),
+            padx=28,
+            pady=24,
+            justify="center",
+        ).pack(fill="both", expand=True)
+
+        def cancel() -> None:
+            nonlocal cancelled
+            if cancelled:
+                return
+            cancelled = True
+            terminate_process(process)
+            dialog.destroy()
+
+        cancel_button = tk.Button(
+            dialog,
+            text="Cancel Sync",
+            command=cancel,
+            font=("Helvetica", 18, "bold"),
+            padx=20,
+            pady=14,
+            bg=SHUTDOWN_BUTTON_BG,
+            fg="white",
+            activebackground=SHUTDOWN_BUTTON_ACTIVE_BG,
+            activeforeground="white",
+        )
+        cancel_button.pack(fill="x", padx=28, pady=(0, 24))
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+
+        def poll_process() -> None:
+            if process.poll() is None:
+                dialog.after(100, poll_process)
+                return
+            if dialog.winfo_exists():
+                dialog.destroy()
+
+        dialog.after(100, poll_process)
+        self.root.wait_window(dialog)
+        return cancelled
 
     def _initialize_is_rig_mode(self) -> str:
         raw_mode = os.environ.get(IS_RIG_ENV_VAR)
@@ -507,21 +630,13 @@ class TouchInterfaceApp:
         return True
 
     def _switch_rig_mode(self) -> None:
-        if self.task_active:
+        if self.task_active or getattr(self, "cleanup_active", False):
             self.status_var.set("Cannot switch modes while a task is running")
             return
 
         target_mode = target_mode_for_current_mode(self.is_rig)
         if self._run_mode_script(target_mode):
             self._render_root_menu()
-
-    def _schedule_idle_cleanup(self) -> None:
-        self.root.after(IDLE_CLEANUP_MS, self._run_idle_cleanup_if_needed)
-
-    def _run_idle_cleanup_if_needed(self) -> None:
-        if not self.task_active and self.experiment is None:
-            self.cleanup()
-        self._schedule_idle_cleanup()
 
     def _build_ui(self) -> None:
         self.root.title("Experiment Manager")
@@ -636,8 +751,8 @@ class TouchInterfaceApp:
         self.root.update_idletasks()
 
     def _run_system_diagnostic(self) -> None:
-        if self.task_active:
-            self.status_var.set("Cannot run diagnostic while a task is running")
+        if self.task_active or getattr(self, "cleanup_active", False):
+            self.status_var.set("Cannot run diagnostic during another operation")
             return
 
         diagnostic_path = self.working_dir / "task" / "system_diagnostic.py"
@@ -748,7 +863,7 @@ class TouchInterfaceApp:
         self._create_root_menu_button(len(self.subjects_cfg))
 
     def _select_subject(self, subject_name: str, subject_code: str) -> None:
-        if self.experiment is not None:
+        if self.experiment is not None or getattr(self, "cleanup_active", False):
             return
         quiet_mode = getattr(self, "quiet_mode", None)
         try:
@@ -894,7 +1009,7 @@ class TouchInterfaceApp:
         self._place_button(button, row_idx)
 
     def _end_experiment(self) -> None:
-        if self.task_active:
+        if self.task_active or getattr(self, "cleanup_active", False):
             self.status_var.set("Cannot end experiment while a task is running")
             return
         quiet_mode = getattr(self, "quiet_mode", None)
@@ -906,6 +1021,7 @@ class TouchInterfaceApp:
             self.status_var.set("Could not restore quiet mode")
             return
         self.experiment = None
+        self.cleanup()
         self._render_root_menu()
 
     def _shutdown_command(self) -> list[str]:
@@ -914,7 +1030,7 @@ class TouchInterfaceApp:
         return ["sudo", "-n", "shutdown", "-h", "now"]
 
     def _shutdown_system(self) -> None:
-        if self.task_active:
+        if self.task_active or getattr(self, "cleanup_active", False):
             self.status_var.set("Cannot shut down while a task is running")
             return
 
@@ -994,7 +1110,7 @@ class TouchInterfaceApp:
                         self.experiment.finish_block(block)
 
     def _run_task(self, task_name: str, task_cfg: Dict[str, Any]) -> None:
-        if self.task_active:
+        if self.task_active or getattr(self, "cleanup_active", False):
             return
         if self.experiment is None:
             messagebox.showerror("Launch Error", "Select a subject before launching a task")

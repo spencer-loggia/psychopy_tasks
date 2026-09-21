@@ -14,6 +14,7 @@ class TouchInterfaceNavigationTests(unittest.TestCase):
         app.page_title_var = Mock()
         app.status_var = Mock()
         app._clear_buttons = Mock()
+        app.cleanup = Mock()
         return app
 
     def test_root_menu_has_five_system_actions_in_order(self):
@@ -68,6 +69,7 @@ class TouchInterfaceNavigationTests(unittest.TestCase):
 
         self.assertIsNone(app.experiment)
         app.quiet_mode.exit.assert_called_once_with()
+        app.cleanup.assert_called_once_with()
         app._render_root_menu.assert_called_once_with()
 
     def test_active_task_prevents_ending_experiment(self):

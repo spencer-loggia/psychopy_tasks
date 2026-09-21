@@ -72,38 +72,38 @@ class ExperimentDataSync:
 
     def prepare(self) -> SyncPreparation:
         """Validate storage and return an immutable sync plan when work exists."""
-        destination = self.remote_data_dir
-        if destination is None:
+        remote_root = self.remote_data_dir
+        if remote_root is None:
             return SyncPreparation(
                 None,
                 "remote_data_url is not configured; data was not synced",
             )
-        filesystem_type = self._filesystem_type(destination)
+        filesystem_type = self._filesystem_type(remote_root)
         if filesystem_type not in NFS_FILESYSTEM_TYPES:
             detail = filesystem_type or "unknown"
             return SyncPreparation(
                 None,
                 f"Data destination is not on a mounted NFS filesystem "
-                f"({destination}; type={detail}); data was not synced",
+                f"({remote_root}; type={detail}); data was not synced",
             )
 
-        if not destination.is_dir():
+        if not remote_root.is_dir():
             return SyncPreparation(
                 None,
-                f"Data destination is unavailable or is not a directory: {destination}",
+                f"Data destination is unavailable or is not a directory: {remote_root}",
             )
 
         try:
-            next(destination.iterdir())
+            next(remote_root.iterdir())
         except StopIteration:
             return SyncPreparation(
                 None,
-                f"Data destination is empty and may not be mounted: {destination}",
+                f"Data destination is empty and may not be mounted: {remote_root}",
             )
         except OSError as exc:
             return SyncPreparation(
                 None,
-                f"Could not read data destination {destination}: {exc}",
+                f"Could not read data destination {remote_root}: {exc}",
             )
 
         try:
@@ -121,7 +121,7 @@ class ExperimentDataSync:
                 source=self.logs_dir,
                 experiments=tuple(experiments),
                 retained_experiment=retained,
-                destination=destination,
+                destination=remote_root / "experiments",
             )
         )
 

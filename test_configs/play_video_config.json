@@ -1,7 +1,7 @@
 {
   "config_name": "play_video",
   "video_files": [
-    "/mnt/data/videos/preproc/monkey_kingdom.mp4"
+    "/mnt/data/stim_videos/preproc/monkey_kingdom.mp4"
   ],
   "clip_duration_seconds": 60.0,
   "seek_timeout_seconds": 30.0,

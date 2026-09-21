@@ -65,6 +65,7 @@ class ExperimentDataSyncTests(unittest.TestCase):
             plan = prepared.plan
             self.assertEqual(plan.experiments, (older, newest))
             self.assertEqual(plan.retained_experiment, newest)
+            self.assertEqual(plan.destination, remote / "experiments")
             self.assertEqual(
                 plan.command,
                 [
@@ -72,7 +73,7 @@ class ExperimentDataSyncTests(unittest.TestCase):
                     "--archive",
                     "--",
                     f"{logs}/",
-                    f"{remote}/",
+                    f"{remote / 'experiments'}/",
                 ],
             )
 
@@ -192,7 +193,7 @@ class TouchInterfaceCleanupTests(unittest.TestCase):
                     source=Path("/work/tree/logs"),
                     experiments=(Path("/work/tree/logs/exp_001"),),
                     retained_experiment=Path("/work/tree/logs/exp_001"),
-                    destination=Path("/mnt/data"),
+                    destination=Path("/mnt/data/experiments"),
                 )
                 data_sync = Mock()
                 data_sync.prepare.return_value = SyncPreparation(plan)

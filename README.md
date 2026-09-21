@@ -105,10 +105,11 @@ and returns to the root menu; Desktop, Shutdown, and mode switching are availabl
 Data synchronization
 --------------------
 
-The interface config's `remote_data_url` is the NFS-backed destination for the contents of the local `logs`
-directory. Cleanup runs at startup, when **End Experiment** is pressed, and before shutdown; it does not run after
-individual tasks or blocks. Cleanup first verifies that the destination exists on an NFS filesystem and contains
-at least one file or directory. If either check fails, it prints a warning and leaves all local data untouched.
+The interface config's `remote_data_url` is the NFS-backed storage root. The contents of the local `logs`
+directory are copied into `remote_data_url/experiments/`, not directly into the storage root. Cleanup runs at
+startup, when **End Experiment** is pressed, and before shutdown; it does not run after individual tasks or blocks.
+Cleanup first verifies that the configured root exists on an NFS filesystem and contains at least one file or
+directory. If either check fails, it prints a warning and leaves all local data untouched.
 
 When storage is available, the launcher uses `rsync --archive` to copy the contents of `logs`. A modal progress
 window prevents tasks from launching during the copy and offers **Cancel Sync**. Cancelling or any rsync failure

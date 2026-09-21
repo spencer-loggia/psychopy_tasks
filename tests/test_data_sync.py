@@ -158,7 +158,7 @@ class TouchInterfaceCleanupTests(unittest.TestCase):
             ],
         )
 
-    def test_cleanup_blocks_reentry_and_runs_sync_before_maintenance(self):
+    def test_cleanup_blocks_reentry_and_pulls_before_sync(self):
         app = self._app()
         events = []
         app.sync_data = Mock(side_effect=lambda: events.append("sync") or True)
@@ -169,10 +169,10 @@ class TouchInterfaceCleanupTests(unittest.TestCase):
 
         app.cleanup()
 
-        self.assertEqual(events, ["sync", "time", "pull"])
+        self.assertEqual(events, ["pull", "sync", "time"])
         self.assertFalse(app.cleanup_active)
 
-    def test_cancelled_sync_ends_cleanup_without_other_work(self):
+    def test_cancelled_sync_ends_cleanup_after_pull_without_time_check(self):
         app = self._app()
         app.sync_data = Mock(return_value=False)
         app.attempt_rectify_timezone = Mock()
@@ -181,7 +181,7 @@ class TouchInterfaceCleanupTests(unittest.TestCase):
         app.cleanup()
 
         app.attempt_rectify_timezone.assert_not_called()
-        app.pull_latest_code.assert_not_called()
+        app.pull_latest_code.assert_called_once_with()
         self.assertFalse(app.cleanup_active)
 
     def test_cancelled_or_failed_rsync_never_prunes(self):

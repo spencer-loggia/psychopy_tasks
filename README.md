@@ -120,6 +120,7 @@ experiment are removed from the local cache. Generated data directories are excl
 
 Code updates use `remote_git_url` from the same interface config (normally an NFS-mounted repository path). Each
 cleanup runs `git reset --hard` and then pulls from that explicit URL rather than the checkout's default remote.
+This code update is attempted before data synchronization starts.
 
 Run System Diagnostic uses the configured `environment.python` interpreter and does not create an experiment or
 block. It checks that PsychoPy can import, `lgpio` can open GPIO chip 0, and the Pi-Plates DAQC2 driver can read the

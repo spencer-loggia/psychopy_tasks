@@ -446,10 +446,10 @@ class TouchInterfaceApp:
             return
         self.cleanup_active = True
         try:
+            self.pull_latest_code()
             if not self.sync_data():
                 return
             self.attempt_rectify_timezone()
-            self.pull_latest_code()
         finally:
             self.cleanup_active = False
 

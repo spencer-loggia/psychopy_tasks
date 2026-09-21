@@ -16,7 +16,7 @@ Launch the touch interface with an interface configuration:
 python interface/touch_interface.py --config config_files/interface/rpi_launch_config.json
 ```
 
-The interface opens on a root menu with Start Experiment, Run System Diagnostic, the context-dependent Rig
+The interface opens on a root menu with Start Experiment, Run System Diagnostic, Shell, the context-dependent Rig
 Mode/Portable Mode switch, Desktop, and Shutdown actions. Start Experiment opens subject selection. The launch
 config's `subjects` object maps each displayed full name to the short subject code used in directory names.
 Selecting a subject starts a new experiment under `logs`:
@@ -97,8 +97,10 @@ The subject and task option area scrolls with a mouse wheel (including X11 Butto
 vertically with one finger. A touch drag must move at least 12 pixels before it becomes a scroll, so a normal tap
 still activates its button while a swipe does not accidentally launch it.
 
-The top-level task menu has an End Experiment button. It closes the current experiment and returns to the root
-menu; Desktop, Shutdown, and mode switching are available only from that root menu.
+The root menu and top-level task menu both have a Shell button. On the Raspberry Pi it opens a new LXTerminal on
+the experimenter display, starts in `environment.working_dir`, and activates the virtual environment containing
+`environment.python`. The top-level task menu also has an End Experiment button. It closes the current experiment
+and returns to the root menu; Desktop, Shutdown, and mode switching are available only from that root menu.
 
 Data synchronization
 --------------------

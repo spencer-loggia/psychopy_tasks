@@ -707,9 +707,10 @@ class TouchInterfaceApp:
 
         self._create_start_experiment_button(0)
         self._create_diagnostic_button(1)
-        self._create_rig_mode_button(2)
-        self._create_desktop_button(3)
-        self._create_shutdown_button(4)
+        self._create_shell_button(2)
+        self._create_rig_mode_button(3)
+        self._create_desktop_button(4)
+        self._create_shutdown_button(5)
 
     def _create_start_experiment_button(self, row_idx: int) -> None:
         button = tk.Button(
@@ -728,6 +729,66 @@ class TouchInterfaceApp:
             **self._button_kwargs(),
         )
         self._place_button(button, row_idx)
+
+    def _create_shell_button(self, row_idx: int) -> None:
+        button = tk.Button(
+            self.button_container,
+            text="Shell",
+            command=self._launch_shell,
+            **self._button_kwargs(),
+        )
+        self._place_button(button, row_idx)
+
+    def _launch_shell(self) -> None:
+        """Open an LXTerminal on the experimenter display in the task venv."""
+        if self.task_active or getattr(self, "cleanup_active", False):
+            self.status_var.set("Cannot open shell during another operation")
+            return
+
+        try:
+            python_path = Path(self.python_cmd).expanduser()
+            if not python_path.is_absolute():
+                python_path = (self.working_dir / python_path).resolve()
+            venv_bin = python_path.parent
+            venv_dir = venv_bin.parent
+            if venv_bin.name != "bin":
+                raise ValueError(
+                    "environment.python must point to a virtual-environment "
+                    "interpreter inside a bin directory"
+                )
+
+            env = os.environ.copy()
+            env["VIRTUAL_ENV"] = str(venv_dir)
+            env["PATH"] = os.pathsep.join(
+                part
+                for part in (str(venv_bin), env.get("PATH", ""))
+                if part
+            )
+            env.pop("PYTHONHOME", None)
+
+            # LXTerminal accepts standard X geometry offsets even though its
+            # short help describes only the columns/rows portion.  The
+            # experimenter screen is the secondary screen resolved for this
+            # interface, so an inset from its origin keeps the new window on it.
+            x = int(self.screen_info.x) + 24
+            y = int(self.screen_info.y) + 24
+            x_offset = f"+{x}" if x >= 0 else str(x)
+            y_offset = f"+{y}" if y >= 0 else str(y)
+            geometry = f"80x24{x_offset}{y_offset}"
+            command = [
+                "lxterminal",
+                "--no-remote",
+                "--title=neuro_tasks shell",
+                f"--geometry={geometry}",
+                f"--working-directory={self.working_dir}",
+            ]
+            subprocess.Popen(command, cwd=self.working_dir, env=env)
+        except Exception as exc:
+            print(f"Could not launch shell: {exc}", file=sys.stderr)
+            self.status_var.set("Shell launch failed")
+            return
+
+        self.status_var.set("Shell opened on secondary monitor")
 
     def _hide_interface_for_process(self) -> None:
         self.root.withdraw()
@@ -903,7 +964,8 @@ class TouchInterfaceApp:
             row_idx += 1
 
         if len(self.page_stack) == 1:
-            self._create_end_experiment_button(row_idx)
+            self._create_shell_button(row_idx)
+            self._create_end_experiment_button(row_idx + 1)
         else:
             self._create_back_button(row_idx)
 

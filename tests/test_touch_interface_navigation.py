@@ -1,6 +1,8 @@
 import unittest
-from unittest.mock import Mock
+from pathlib import Path
+from unittest.mock import Mock, patch
 
+from bin.screen import ScreenGeometry
 from interface.touch_interface import TouchInterfaceApp
 
 
@@ -17,11 +19,12 @@ class TouchInterfaceNavigationTests(unittest.TestCase):
         app.cleanup = Mock()
         return app
 
-    def test_root_menu_has_five_system_actions_in_order(self):
+    def test_root_menu_has_six_system_actions_in_order(self):
         app = self._app()
         app.page_stack = [("Tasks", {})]
         app._create_start_experiment_button = Mock()
         app._create_diagnostic_button = Mock()
+        app._create_shell_button = Mock()
         app._create_rig_mode_button = Mock()
         app._create_desktop_button = Mock()
         app._create_shutdown_button = Mock()
@@ -32,14 +35,16 @@ class TouchInterfaceNavigationTests(unittest.TestCase):
         app.page_title_var.set.assert_called_once_with("Experiment Manager")
         app._create_start_experiment_button.assert_called_once_with(0)
         app._create_diagnostic_button.assert_called_once_with(1)
-        app._create_rig_mode_button.assert_called_once_with(2)
-        app._create_desktop_button.assert_called_once_with(3)
-        app._create_shutdown_button.assert_called_once_with(4)
+        app._create_shell_button.assert_called_once_with(2)
+        app._create_rig_mode_button.assert_called_once_with(3)
+        app._create_desktop_button.assert_called_once_with(4)
+        app._create_shutdown_button.assert_called_once_with(5)
 
-    def test_top_level_task_menu_ends_experiment_without_system_actions(self):
+    def test_top_level_task_menu_has_shell_and_end_experiment(self):
         app = self._app()
         app.page_stack = [("Tasks", {"Demo": {"launch": "demo.py"}})]
         app._create_task_button = Mock()
+        app._create_shell_button = Mock()
         app._create_end_experiment_button = Mock()
         app._create_diagnostic_button = Mock()
         app._create_rig_mode_button = Mock()
@@ -53,7 +58,8 @@ class TouchInterfaceNavigationTests(unittest.TestCase):
             "Demo",
             {"launch": "demo.py"},
         )
-        app._create_end_experiment_button.assert_called_once_with(1)
+        app._create_shell_button.assert_called_once_with(1)
+        app._create_end_experiment_button.assert_called_once_with(2)
         app._create_diagnostic_button.assert_not_called()
         app._create_rig_mode_button.assert_not_called()
         app._create_desktop_button.assert_not_called()
@@ -118,6 +124,55 @@ class TouchInterfaceNavigationTests(unittest.TestCase):
 
         app.idle_guard.enter_idle.assert_called_once_with()
         app.root.deiconify.assert_not_called()
+
+    def test_shell_launch_uses_working_directory_secondary_screen_and_venv(self):
+        app = self._app()
+        app.working_dir = Path("/work/neuro_tasks")
+        app.python_cmd = "/opt/psychopy/.venv/bin/python"
+        app.screen_info = ScreenGeometry(
+            index=1,
+            x=1920,
+            y=0,
+            width=800,
+            height=480,
+            name="HDMI-2",
+        )
+
+        with patch.dict(
+            "interface.touch_interface.os.environ",
+            {"PATH": "/usr/bin", "PYTHONHOME": "/wrong/python"},
+            clear=True,
+        ), patch("interface.touch_interface.subprocess.Popen") as popen:
+            app._launch_shell()
+
+        command = popen.call_args.args[0]
+        kwargs = popen.call_args.kwargs
+        self.assertEqual(
+            command[0:3],
+            ["lxterminal", "--no-remote", "--title=neuro_tasks shell"],
+        )
+        self.assertIn("--geometry=80x24+1944+24", command)
+        self.assertIn("--working-directory=/work/neuro_tasks", command)
+        self.assertEqual(kwargs["cwd"], app.working_dir)
+        self.assertEqual(kwargs["env"]["VIRTUAL_ENV"], "/opt/psychopy/.venv")
+        self.assertEqual(kwargs["env"]["PATH"], "/opt/psychopy/.venv/bin:/usr/bin")
+        self.assertNotIn("PYTHONHOME", kwargs["env"])
+        app.status_var.set.assert_called_once_with("Shell opened on secondary monitor")
+
+    def test_shell_launch_failure_is_written_to_console(self):
+        app = self._app()
+        app.working_dir = Path("/work/neuro_tasks")
+        app.python_cmd = "/opt/psychopy/.venv/bin/python"
+        app.screen_info = ScreenGeometry(1, 1920, 0, 800, 480, "HDMI-2")
+
+        with patch(
+            "interface.touch_interface.subprocess.Popen",
+            side_effect=FileNotFoundError("lxterminal"),
+        ), patch("builtins.print") as print_mock:
+            app._launch_shell()
+
+        self.assertEqual(print_mock.call_args.args[0], "Could not launch shell: lxterminal")
+        app.status_var.set.assert_called_once_with("Shell launch failed")
 
 
 if __name__ == "__main__":

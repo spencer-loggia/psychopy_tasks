@@ -42,6 +42,8 @@ class SyncPlan:
         return [
             "rsync",
             "--archive",
+            "--no-owner",
+            "--no-group",
             "--",
             f"{self.source}/",
             f"{self.destination}/",

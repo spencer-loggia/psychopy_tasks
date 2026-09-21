@@ -111,10 +111,12 @@ startup, when **End Experiment** is pressed, and before shutdown; it does not ru
 Cleanup first verifies that the configured root exists on an NFS filesystem and contains at least one file or
 directory. If either check fails, it prints a warning and leaves all local data untouched.
 
-When storage is available, the launcher uses `rsync --archive` to copy the contents of `logs`. A modal progress
-window prevents tasks from launching during the copy and offers **Cancel Sync**. Cancelling or any rsync failure
-retains every local experiment. After a fully successful copy, all but the most recently modified experiment are
-removed from the local cache. Generated data directories are excluded by `.gitignore`.
+When storage is available, the launcher uses `rsync --archive --no-owner --no-group` to copy the contents of
+`logs`. Owner and group metadata are intentionally not preserved because NFS root-squashing commonly rejects
+those changes; experiment contents, timestamps, permissions, directories, and symlinks are still preserved. A
+modal progress window prevents tasks from launching during the copy and offers **Cancel Sync**. Cancelling or any
+rsync failure retains every local experiment. After a fully successful copy, all but the most recently modified
+experiment are removed from the local cache. Generated data directories are excluded by `.gitignore`.
 
 Code updates use `remote_git_url` from the same interface config (normally an NFS-mounted repository path). Each
 cleanup runs `git reset --hard` and then pulls from that explicit URL rather than the checkout's default remote.

@@ -71,6 +71,8 @@ class ExperimentDataSyncTests(unittest.TestCase):
                 [
                     "rsync",
                     "--archive",
+                    "--no-owner",
+                    "--no-group",
                     "--",
                     f"{logs}/",
                     f"{remote / 'experiments'}/",

@@ -47,8 +47,8 @@
   "seed": null,
   "output_dir": "./logs",
   "screens": {
-    "main": 0,
-    "experimenter": 0
+    "main": null,
+    "experimenter": null
   },
   "n": 50,
 
@@ -72,9 +72,9 @@
   "num_afc": 2,
   "choice_time": 2.0,
   "isi": 0.1,
-  "fixed_positions": true,
+  "fixed_positions": false,
   "sequential": true,
   "is_memory": true,
-  "raspi": false,
-  "touchscreen": false
+  "raspi": true,
+  "touchscreen": true
 }

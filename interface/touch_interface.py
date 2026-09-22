@@ -439,17 +439,16 @@ class TouchInterfaceApp:
 
     def startup(self) -> None:
         os.chdir(self.working_dir)
-        self.cleanup()
+        self.pull_latest_code()
 
     def cleanup(self) -> None:
         if getattr(self, "cleanup_active", False):
             return
         self.cleanup_active = True
+        self.pull_latest_code()
         try:
-            self.pull_latest_code()
             if not self.sync_data():
                 return
-            self.attempt_rectify_timezone()
         finally:
             self.cleanup_active = False
 

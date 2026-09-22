@@ -37,6 +37,19 @@ contains:
 source config. A row is written with a blank `end_time` before the subprocess starts and is updated when it exits,
 so an interrupted or failed block remains visible in the experiment record.
 
+### `config_name` convention
+
+`config_name` is a stable analysis-family identifier, not a unique name for one configuration or run. Assign the
+same value as broadly as possible to tasks whose trial records have compatible meanings and would normally be
+pooled for analysis. For example, all active-foraging configurations in the same analysis family should retain
+one `config_name` across sequential and simultaneous presentation, memory and non-memory variants, different AFC
+counts, stimulus durations, other timing values, and display changes. Downstream analysis should distinguish
+those variants with their specific config fields (for example `sequential`, `is_memory`, `num_afc`, or
+`duration`) from the block's generated `config.json`. Subject names, dates, rig names, and labels such as
+`test`, `memory`, or `delay` should likewise not be added merely to make the name unique. Use a different
+`config_name` only when the task's trial meaning or fields are incompatible enough that its trials should not be
+combined with the existing family. Config filenames and interface menu labels can remain specific and descriptive.
+
 The launch config must contain `subjects`, `tasks`, and `initial_state` objects. `initial_state` is copied into
 `state.json`, then its `subject` field is set to the selected full subject name. Eye calibration uses this state
 shape:
@@ -243,28 +256,6 @@ operation finishes.
 If input remapping fails after a task starts, the manager stops that task, restores the guarded idle state, records
 the block end, and reports the launch failure. An exact touchscreen name is rig-specific; enable masking only after
 copying the name from that rig's `xinput list --name-only` output.
-
-Generate sample images (for quick testing)
-```bash
-python bin/generate_sample_images.py --out_dir ./sample_images --num 6 --size 512 512
-```
-
-Run the task
-```bash
-python task/random_image_sequence.py \
-  --images_dir ./sample_images \
-  --n 6 \
-  --duration 0.5 \
-  --bg 128 128 128 \
-  --output_dir ./logs \
-  --seed 42 \
-  --fullscreen
-```
-
-Notes
-- Images are preloaded into RAM with `load_image_arrays()` before any flips, then converted into `ImageStim`s tied to the active `Window`. This minimizes disk I/O during timing-critical presentation.
-- If `--n` is greater than available images, sampling is done with replacement.
-- In `active_foraging`, `match2cue`, and the current image-sequence presentation paths, timing-critical visual sections use frame-counted `win.flip()` loops rather than `core.wait()`. Remaining `core.wait()` usage is limited to non-visual polling or housekeeping paths and is not used to schedule stimulus onsets/offsets.
 
 Behavioral Terminology
 ----------------------
@@ -811,9 +802,10 @@ Configuration via JSON (required for tasks)
 -----------------------------------------
 All tasks in this repository must support loading a JSON configuration file as an alternative to specifying parameters via command-line arguments. The config file should allow you to set experiment-level parameters such as:
 
+- `config_name` (string): stable, broad analysis-family identifier following the convention above; it is not a per-run or per-variant label
 - `images_dir` (string): path to image resources
 - `output_dir` (string): path where logs and metadata will be saved
-- `n` (int): number of trials; for standalone sequence tasks, each image or clip presentation is one trial
+- `n` (int): number of trials for tasks that use this field; `play_video` uses `num_clips` instead
 - `duration` (number): stimulus presentation duration in seconds. For `active_foraging` and `match2cue`, this must be positive when `sequential=true` or `is_memory=true`, and must be `0` only when both are false.
 - `isi` (number): pre-stimulus / inter-stimulus interval in seconds; exact meaning is task-specific
 - `iti` (number): inter-trial interval in seconds for trial-based tasks
@@ -835,6 +827,7 @@ Example JSON config (`example_config.json`):
 
 ```json
 {
+  "config_name": "random_image_sequence",
   "images_dir": "./sample_images",
   "output_dir": "./logs",
   "n": 10,

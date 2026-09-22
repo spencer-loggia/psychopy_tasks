@@ -1,6 +1,6 @@
 {
   "config_name": "afc_csc1_mac_test",
-  "colors_tsv": "./task/resources/csc1/csc1_colors/matched_grey_csc1_raspi_colors.tsv",
+  "colors_tsv": "./task/resources/csc1/csc1_colors/corrected_rgb_targets_pass2_reordered.tsv",
   "shapes_tsv": "./task/resources/csc1/csc1_shapes/shape_definitions_csc1.tsv",
   "output_dir": "./logs",
   

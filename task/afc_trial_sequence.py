@@ -36,7 +36,7 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from bin import utils
-from bin.frame_timing import flip_with_timestamps, plan_frame_duration
+from bin.frame_timing import flip_with_timestamps, plan_frame_duration, wait_until
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.config import load_config, validate_config
@@ -159,6 +159,9 @@ def run_task(
         "choice_touch_x",
         "choice_touch_y",
         "choice_reaction_time",
+        "main_display_transition_count",
+        "main_display_transition_misses",
+        "main_display_max_transition_error_s",
     ]
     session_logs = SessionLogBundle(
         output_root=output_dir,
@@ -245,11 +248,7 @@ def run_task(
                 requested_timestamp_perf_s=cue_timing.requested_perf_s,
                 requested_duration=isi,
             )
-            for _ in range(max(0, isi_fr - 1)):
-                bg_rect.draw()
-                if fix is not None:
-                    fix.draw()
-                win.flip()
+            wait_until(cue_timing.actual_perf_s + isi_plan.scheduled_s)
 
         trial_options = trials[trial_num - 1]
         msg_logger.log("INFO", f"trial_loaded trial_num={trial_num} stimuli={[p.name for p in trial_options]}")
@@ -338,15 +337,28 @@ def run_task(
         behavior_row["choice_reaction_time"] = (
             f"{float(choice_info['reaction_time_s']):.9f}" if choice_info is not None and choice_info.get("reaction_time_s") is not None else ""
         )
+        behavior_row["main_display_transition_count"] = trial_meta.get(
+            "main_display_transition_count",
+            "",
+        )
+        behavior_row["main_display_transition_misses"] = trial_meta.get(
+            "main_display_transition_misses",
+            "",
+        )
+        maximum_transition_error_s = trial_meta.get(
+            "main_display_max_transition_error_s"
+        )
+        behavior_row["main_display_max_transition_error_s"] = (
+            ""
+            if maximum_transition_error_s is None
+            else f"{float(maximum_transition_error_s):.9f}"
+        )
         behavior_logger.writerow(behavior_row)
 
         if iti_frames > 0:
             msg_logger.log("INFO", f"timing_quantization trial_num={trial_num} iti={iti:.6f}s-> {iti_frames}fr({iti_s:.6f}s)")
-            for _f in range(max(0, iti_frames - 1)):
-                bg_rect.draw()
-                if fix is not None:
-                    fix.draw()
-                win.flip()
+            if gray_start_perf is not None:
+                wait_until(float(gray_start_perf) + iti_plan.scheduled_s)
 
     # finished
     msg_logger.log("INFO", f"session_end status={'aborted' if aborted_task else 'done'}")

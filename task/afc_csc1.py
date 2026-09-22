@@ -39,7 +39,7 @@ if str(_project_root) not in sys.path:
 
 from bin import utils
 from bin.config import load_config, validate_config
-from bin.frame_timing import plan_frame_duration
+from bin.frame_timing import plan_frame_duration, wait_until
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.screen import (
@@ -174,6 +174,9 @@ def _build_behavior_fieldnames(num_afc: int) -> List[str]:
             "choice_touch_x",
             "choice_touch_y",
             "choice_reaction_time",
+            "main_display_transition_count",
+            "main_display_transition_misses",
+            "main_display_max_transition_error_s",
         ]
     )
     return fields
@@ -686,6 +689,7 @@ def run_task(
                 update_interval_s=0.1,
                 mouse_visible=experimenter_mouse_visible,
             )
+            utils.verify_task_window_vblank(win)
         if touchscreen:
             set_window_mouse_visible(win, False)
             try:
@@ -1032,7 +1036,7 @@ def run_task(
                 "timeout_time": timeout_time,
             },
         )
-        iti_frames, _ = quantized["iti"]
+        iti_frames, iti_s = quantized["iti"]
         timeout_frames, timeout_s = quantized["timeout_time"]
 
         onset_stim = utils.make_onset_cue_stim(
@@ -1287,6 +1291,17 @@ def run_task(
                 "choice_touch_x": _fmt_optional(choice_info.get("touch_x") if choice_info is not None else ""),
                 "choice_touch_y": _fmt_optional(choice_info.get("touch_y") if choice_info is not None else ""),
                 "choice_reaction_time": _fmt_optional(choice_info.get("reaction_time_s") if choice_info is not None else ""),
+                "main_display_transition_count": trial_meta.get(
+                    "main_display_transition_count",
+                    "",
+                ),
+                "main_display_transition_misses": trial_meta.get(
+                    "main_display_transition_misses",
+                    "",
+                ),
+                "main_display_max_transition_error_s": _fmt_optional(
+                    trial_meta.get("main_display_max_transition_error_s")
+                ),
             }
             for idx, (sid, cid) in enumerate(trial_options):
                 behavior_row[f"option_{idx}_shape"] = int(sid)
@@ -1299,15 +1314,25 @@ def run_task(
 
             if iti_frames > 0:
                 _show_preview_afc_scene(phase="inter-trial interval")
-                for _ in range(max(0, int(iti_frames) - 1)):
-                    if _poll_experimenter_controls():
-                        task_end_notes = "experimenter_exit"
-                        msg_logger.log("WARN", f"experimenter_exit_during_iti trial_num={trial_num}")
-                        break
-                    bg_rect.draw()
-                    if fix is not None:
-                        fix.draw()
-                    win.flip()
+                post_choice_delay_present = bool(
+                    (is_correct and float(reward_pulse_s) > 0.0)
+                    or ((not is_correct) and timeout_frames > 0)
+                )
+                gray_start_perf = trial_meta.get("gray_flip_perf_s")
+                iti_start_perf = (
+                    time.perf_counter()
+                    if post_choice_delay_present or gray_start_perf is None
+                    else float(gray_start_perf)
+                )
+                if not wait_until(
+                    iti_start_perf + iti_s,
+                    poll_callback=_poll_experimenter_controls,
+                ):
+                    task_end_notes = "experimenter_exit"
+                    msg_logger.log(
+                        "WARN",
+                        f"experimenter_exit_during_iti trial_num={trial_num}",
+                    )
                 if task_end_notes != "done":
                     break
             else:

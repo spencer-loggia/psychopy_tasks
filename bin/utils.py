@@ -26,13 +26,19 @@ from .screen import (
     enforce_window_vsync,
     initialize_psychopy_window,
     MainDisplayVBlankSession,
-    MainDisplayFrameTimingMonitor,
     oriented_size,
     resolve_task_screens,
     resolve_window_frame_rate,
     serialize_preview_image,
 )
-from .frame_timing import flip_with_timestamps, plan_frame_duration
+from .frame_timing import (
+    FrameTransitionScheduler,
+    capture_perf_counter_on_flip,
+    flip_submission_time,
+    flip_with_timestamps,
+    plan_frame_duration,
+    wait_until_flip_submission,
+)
 from .glx_timing import query_glx_swap_interval, query_glx_sync_values
 from .buffered_video import (
     BufferedVideoFrameStream,
@@ -411,11 +417,6 @@ def _set_gpio_level_on_flip(lgpio_module, chip, pin: int, level: int) -> None:
         )
 
 
-def _capture_perf_counter_on_flip(target: Dict[str, float]) -> None:
-    """Capture the flip callback time before slower hardware callbacks run."""
-    target["actual_perf_s"] = time.perf_counter()
-
-
 def play_video_fill_screen(
     win: visual.Window,
     video_path: Union[str, Path],
@@ -618,9 +619,6 @@ def play_video_fill_screen(
     timing_failure_threshold_s = (
         0.5 * display_frame_period_s + 0.001
     )
-    # Submit just before the nearest-VBL decision boundary. The blocking swap
-    # performs the quantization; this lead is only scheduling headroom.
-    flip_submit_lead_s = 0.49 * display_frame_period_s
     frame_stream = None
     prepared_frame = None
     clear_flip_completed = False
@@ -688,14 +686,11 @@ def play_video_fill_screen(
         abort_reason = reason
 
     def _wait_for_flip_submission(target_perf_s: float) -> None:
-        """Sleep once until the safe submission window for an absolute VBL."""
-        remaining_s = (
-            float(target_perf_s)
-            - flip_submit_lead_s
-            - time.perf_counter()
+        """Wait for the shared nearest-refresh submission window."""
+        wait_until_flip_submission(
+            target_perf_s,
+            display_frame_period_s,
         )
-        if remaining_s > 0.0:
-            time.sleep(remaining_s)
 
     try:
         frame_stream = BufferedVideoFrameStream(
@@ -818,6 +813,9 @@ def play_video_fill_screen(
             # timing report is flushed by the task after the clip.
             _flush_message_logger(msg_logger)
 
+            # Swap once per source-frame transition. On a faster display the
+            # front buffer naturally holds that source frame across the
+            # intervening refreshes (for example, two refreshes at 30-on-60).
             for expected_frame_index in range(video_frame_count):
                 reason = _poll_abort_reason()
                 if reason:
@@ -895,7 +893,7 @@ def play_video_fill_screen(
 
                 flip_perf_capture: Dict[str, float] = {}
                 win.callOnFlip(
-                    _capture_perf_counter_on_flip,
+                    capture_perf_counter_on_flip,
                     flip_perf_capture,
                 )
                 for edge in sync_edges:
@@ -1070,7 +1068,7 @@ def play_video_fill_screen(
         clear_flip_perf_capture: Dict[str, float] = {}
         try:
             win.callOnFlip(
-                _capture_perf_counter_on_flip,
+                capture_perf_counter_on_flip,
                 clear_flip_perf_capture,
             )
             if sync_schedule is not None:
@@ -2203,9 +2201,7 @@ def present_trial_with_persistent_dots(
     else:
         fps = float(fps)
         frame_dur = 1.0 / float(fps)
-    frame_timing_monitor = MainDisplayFrameTimingMonitor(win, frame_dur)
-    if trial_meta is not None:
-        trial_meta["_main_display_frame_timing_monitor"] = frame_timing_monitor
+    transition_scheduler = FrameTransitionScheduler(frame_dur)
 
     rotation_degrees = float(stimulus_rotation_degrees)
     if not math.isfinite(rotation_degrees):
@@ -2450,6 +2446,7 @@ def present_trial_with_persistent_dots(
     cue_s = cue_plan.scheduled_s
     delay_frames = delay_plan.frame_count
     delay_s = delay_plan.scheduled_s
+    next_visual_target_perf_s: Optional[float] = None
     if pre_options_cue_image is not None:
         cue_stim = make_image_stim_from_array(
             win,
@@ -2538,63 +2535,82 @@ def present_trial_with_persistent_dots(
                 trial_meta["match_cue_touched"] = True
                 trial_meta["match_cue_touch_perf_s"] = touch_perf
 
-        first_flip = True
-        with frame_timing_monitor.continuous_sequence():
-            for _ in range(cue_frames):
-                if _event.getKeys(["escape"]):
-                    _log_message(msg_logger, "WARN", f"escape_pressed trial_num={trial_num} during_match_cue=1")
-                    return True, None
-                if _should_abort("experimenter_exit_during_match_cue"):
-                    return True, None
-                bg_rect.draw()
-                cue_stim.draw()
-                if fix is not None:
-                    fix.draw()
-                flip_timing = flip_with_timestamps(win)
-                if first_flip:
-                    cue_perf = flip_timing.actual_perf_s
-                    _commit_trial_start_signal(
-                        cue_perf,
-                        flip_timing.requested_perf_s,
-                    )
-                    _set_initiation_time(cue_perf)
-                    logger.log_frame_flip(
-                        trial_num=trial_num,
-                        event=pre_options_cue_event,
-                        timestamp_perf_s=cue_perf,
-                        requested_timestamp_perf_s=flip_timing.requested_perf_s,
-                        requested_duration=cue_plan.requested_s,
-                    )
-                    first_flip = False
+        bg_rect.draw()
+        cue_stim.draw()
+        if fix is not None:
+            fix.draw()
+        cue_timing = flip_with_timestamps(win)
+        cue_perf = cue_timing.actual_perf_s
+        _commit_trial_start_signal(cue_perf, cue_timing.requested_perf_s)
+        _set_initiation_time(cue_perf)
+        logger.log_frame_flip(
+            trial_num=trial_num,
+            event=pre_options_cue_event,
+            timestamp_perf_s=cue_perf,
+            requested_timestamp_perf_s=cue_timing.requested_perf_s,
+            requested_duration=cue_plan.requested_s,
+        )
 
-                _poll_pre_options_cue_touch()
+        def _poll_pre_options_cue_phase() -> bool:
+            if _event.getKeys(["escape"]):
+                _log_message(
+                    msg_logger,
+                    "WARN",
+                    f"escape_pressed trial_num={trial_num} during_match_cue=1",
+                )
+                return True
+            if _should_abort("experimenter_exit_during_match_cue"):
+                return True
+            _poll_pre_options_cue_touch()
+            return False
 
-        if detect_pre_options_cue_touch:
-            # Close the match-cue touch window on its offset flip, then poll
-            # once more so a short tap during the final displayed frame is not
-            # lost. Reward delivery stays outside the frame-counted cue loop.
+        cue_offset_target = transition_scheduler.target_after(
+            cue_perf,
+            cue_plan,
+        )
+        clear_timing = None
+        if detect_pre_options_cue_touch or delay_frames > 0:
+            # A blank is a real visual transition when it closes the touch
+            # window or begins the configured delay. Draw it once and retain
+            # it in the front buffer for the entire static phase.
             _show_preview([])
             bg_rect.draw()
             if fix is not None:
                 fix.draw()
-            clear_timing = flip_with_timestamps(win)
-            if trial_meta is not None:
+            clear_timing = transition_scheduler.flip_at(
+                win,
+                cue_offset_target,
+                poll_callback=_poll_pre_options_cue_phase,
+            )
+            if clear_timing is None:
+                return True, None
+            if detect_pre_options_cue_touch and trial_meta is not None:
                 trial_meta["match_cue_clear_flip_perf_s"] = (
                     clear_timing.actual_perf_s
                 )
                 trial_meta["match_cue_clear_flip_requested_perf_s"] = (
                     clear_timing.requested_perf_s
                 )
-            _log_message(
-                msg_logger,
-                "INFO",
-                (
-                    f"match_cue_cleared trial_num={trial_num} "
-                    f"timestamp_perf_s={clear_timing.actual_perf_s:.9f} "
-                    "reason=match_cue_touch_window_end"
-                ),
-            )
-            _poll_pre_options_cue_touch()
+            if detect_pre_options_cue_touch:
+                _log_message(
+                    msg_logger,
+                    "INFO",
+                    (
+                        f"match_cue_cleared trial_num={trial_num} "
+                        f"timestamp_perf_s={clear_timing.actual_perf_s:.9f} "
+                        "reason=match_cue_touch_window_end"
+                    ),
+                )
+                # Include a short tap that began during the final cue frame.
+                _poll_pre_options_cue_touch()
+            if delay_frames > 0:
+                logger.log_frame_flip(
+                    trial_num=trial_num,
+                    event=pre_options_delay_event,
+                    timestamp_perf_s=clear_timing.actual_perf_s,
+                    requested_timestamp_perf_s=clear_timing.requested_perf_s,
+                    requested_duration=delay_plan.requested_s,
+                )
 
         match_cue_reward_callback_ran = bool(
             pre_options_cue_touched and on_pre_options_cue_touch is not None
@@ -2603,50 +2619,22 @@ def present_trial_with_persistent_dots(
             if on_pre_options_cue_touch():
                 return True, None
 
-        delay_frames_remaining = delay_frames
-        delay_already_started = False
-        if (
-            clear_timing is not None
-            and not match_cue_reward_callback_ran
-            and delay_frames_remaining > 0
-        ):
-            # When no match-cue reward runs, the touch-window closing flip is
-            # also the first configured delay frame. Do not add an extra frame
-            # merely because touch detection was enabled.
-            logger.log_frame_flip(
-                trial_num=trial_num,
-                event=pre_options_delay_event,
-                timestamp_perf_s=clear_timing.actual_perf_s,
-                requested_timestamp_perf_s=clear_timing.requested_perf_s,
-                requested_duration=delay_plan.requested_s,
+        if delay_frames > 0:
+            # Reward delivery intentionally precedes the configured delay. The
+            # screen is already blank, so no marker-only swap is needed.
+            delay_start_perf = (
+                time.perf_counter()
+                if match_cue_reward_callback_ran
+                else clear_timing.actual_perf_s
             )
-            delay_frames_remaining -= 1
-            delay_already_started = True
-
-        if delay_frames_remaining > 0:
-            _show_preview([])
-            first_flip = not delay_already_started
-            with frame_timing_monitor.continuous_sequence():
-                for _ in range(delay_frames_remaining):
-                    if _event.getKeys(["escape"]):
-                        _log_message(msg_logger, "WARN", f"escape_pressed trial_num={trial_num} during_match_delay=1")
-                        return True, None
-                    if _should_abort("experimenter_exit_during_match_delay"):
-                        return True, None
-                    bg_rect.draw()
-                    if fix is not None:
-                        fix.draw()
-                    flip_timing = flip_with_timestamps(win)
-                    if first_flip:
-                        delay_perf = flip_timing.actual_perf_s
-                        logger.log_frame_flip(
-                            trial_num=trial_num,
-                            event=pre_options_delay_event,
-                            timestamp_perf_s=delay_perf,
-                            requested_timestamp_perf_s=flip_timing.requested_perf_s,
-                            requested_duration=delay_plan.requested_s,
-                        )
-                        first_flip = False
+            next_visual_target_perf_s = transition_scheduler.target_after(
+                delay_start_perf,
+                delay_plan,
+            )
+        elif clear_timing is None:
+            # With no intervening blank, the first option directly replaces
+            # the match cue on its planned offset refresh.
+            next_visual_target_perf_s = cue_offset_target
 
     # Quantize durations to frames and log rounding in message logger.
     stim_frames, stim_s = stim_plan.frame_count, stim_plan.scheduled_s
@@ -2677,9 +2665,9 @@ def present_trial_with_persistent_dots(
     choice_window_s = float(choice_s)
     choice_deadline = None
     choice_input_armed = False
+    clear_scene_prepared = False
     pos_list = list(positions)
     stims: List[visual.ImageStim] = []
-    names: List[str] = []
     preview_images: List[Dict[str, Any]] = []
     choice_hit_targets: List[visual.Rect] = []
  
@@ -2861,10 +2849,10 @@ def present_trial_with_persistent_dots(
     def _choice_transition_request_deadline() -> Optional[float]:
         if choice_deadline is None:
             return None
-        # Submit the clearing frame before the midpoint between the two
-        # surrounding refreshes so it realizes on the refresh nearest the
-        # requested end rather than one refresh after it.
-        return max(float(choice_perf), choice_deadline - (frame_dur / 2.0))
+        return max(
+            float(choice_perf),
+            flip_submission_time(choice_deadline, frame_dur),
+        )
 
     def _record_gray_flip(
         perf_s: float,
@@ -2879,12 +2867,10 @@ def present_trial_with_persistent_dots(
     def _build_stimulus(p, pos):
         if isinstance(p, tuple) and len(p) == 2:
             sid, cid = p
-            name = f"shape{sid}_color{cid}"
             pil_img = preloaded.get((sid, cid))
             if pil_img is None:
                 pil_img = preloaded.get(p)
         else:
-            name = getattr(p, "name", str(p))
             pil_img = preloaded[p]
         stim = make_image_stim_from_array(
             win,
@@ -2894,7 +2880,7 @@ def present_trial_with_persistent_dots(
             ori=rotation_degrees,
         )
         stim.pos = pos
-        return name, pil_img, stim
+        return pil_img, stim
 
     def _make_dot(pos, color_rgb):
         dot = _visual.Circle(
@@ -2908,9 +2894,29 @@ def present_trial_with_persistent_dots(
         dot.pos = pos
         return dot
 
+    def _flip_prepared_scene(
+        target_perf_s: Optional[float],
+        abort_reason: str,
+        before_flip_callback: Optional[Callable[[], None]] = None,
+    ):
+        if target_perf_s is None:
+            if _abort_from_input(abort_reason):
+                return None
+            if before_flip_callback is not None:
+                before_flip_callback()
+            return flip_with_timestamps(win)
+        return transition_scheduler.flip_at(
+            win,
+            target_perf_s,
+            poll_callback=lambda: _abort_from_input(abort_reason),
+            poll_interval_s=poll_interval_s,
+            before_flip_callback=before_flip_callback,
+        )
+
     if sequential:
+        presentation_items = []
         for idx, (p, pos) in enumerate(zip(trial_options, positions), start=1):
-            name, pil_img, stim = _build_stimulus(p, pos)
+            pil_img, stim = _build_stimulus(p, pos)
             stims_for_choice.append(stim)
             reward_level = (
                 preview_reward_levels[idx - 1]
@@ -2924,77 +2930,85 @@ def present_trial_with_persistent_dots(
                 stim_sizes.append(tuple(stim.size))
             except Exception:
                 stim_sizes.append((0.0, 0.0))
+            presentation_items.append(
+                (idx, pos, pil_img, stim, reward_level)
+            )
 
+        for idx, pos, pil_img, stim, reward_level in presentation_items:
             cue_dot = None
             if isi_frames > 0:
                 cue_color = init_dot_color if init_dot_color is not None else dot_color
                 cue_dot = _make_dot(pos, cue_color)
                 dots.append(cue_dot)
                 dot_records.append({"pos": tuple(pos), "radius": float(dot_size) / 2.0, "color": tuple(cue_color)})
-                first_flip = True
-                _show_preview([])
                 if not _arm_trial_start_signal():
                     return True, None
-                with frame_timing_monitor.continuous_sequence():
-                    for _ in range(isi_frames):
-                        if _abort_from_input("experimenter_exit_during_isi"):
-                            return True, None
-                        bg_rect.draw()
-                        for d in dots:
-                            d.draw()
-                        if fix is not None:
-                            fix.draw()
-                        dot_timing = flip_with_timestamps(win)
-                        if first_flip:
-                            dot_perf = dot_timing.actual_perf_s
-                            _commit_trial_start_signal(
-                                dot_perf,
-                                dot_timing.requested_perf_s,
-                            )
-                            _set_initiation_time(dot_perf)
-                            logger.log_frame_flip(
-                                trial_num=trial_num,
-                                event=_frame_event_name("dot", idx),
-                                timestamp_perf_s=dot_perf,
-                                requested_timestamp_perf_s=dot_timing.requested_perf_s,
-                                requested_duration=isi_plan.requested_s,
-                            )
-                            first_flip = False
+                bg_rect.draw()
+                for d in dots:
+                    d.draw()
+                if fix is not None:
+                    fix.draw()
+                dot_timing = _flip_prepared_scene(
+                    next_visual_target_perf_s,
+                    "experimenter_exit_during_isi",
+                )
+                if dot_timing is None:
+                    return True, None
+                dot_perf = dot_timing.actual_perf_s
+                _commit_trial_start_signal(
+                    dot_perf,
+                    dot_timing.requested_perf_s,
+                )
+                _set_initiation_time(dot_perf)
+                logger.log_frame_flip(
+                    trial_num=trial_num,
+                    event=_frame_event_name("dot", idx),
+                    timestamp_perf_s=dot_perf,
+                    requested_timestamp_perf_s=dot_timing.requested_perf_s,
+                    requested_duration=isi_plan.requested_s,
+                )
+                _show_preview([])
+                next_visual_target_perf_s = transition_scheduler.target_after(
+                    dot_perf,
+                    isi_plan,
+                )
 
-            first_flip = True
             current_preview_image = [
                 _make_preview_image_entry(pil_img, stim, reward_level)
             ]
-            _show_preview(current_preview_image)
             if not _arm_trial_start_signal():
                 return True, None
-            with frame_timing_monitor.continuous_sequence():
-                for _ in range(stim_frames):
-                    if _abort_from_input("experimenter_exit_during_stimulus"):
-                        return True, None
-                    bg_rect.draw()
-                    for d in dots:
-                        d.draw()
-                    stim.draw()
-                    if fix is not None:
-                        fix.draw()
-                    stim_timing = flip_with_timestamps(win)
-                    flip_ps = stim_timing.psychopy_s
-                    if first_flip:
-                        flip_perf = stim_timing.actual_perf_s
-                        _commit_trial_start_signal(
-                            flip_perf,
-                            stim_timing.requested_perf_s,
-                        )
-                        _set_initiation_time(flip_perf)
-                        logger.log_frame_flip(
-                            trial_num=trial_num,
-                            event=_frame_event_name("stim", idx),
-                            timestamp_perf_s=flip_perf,
-                            requested_timestamp_perf_s=stim_timing.requested_perf_s,
-                            requested_duration=stim_plan.requested_s,
-                        )
-                        first_flip = False
+            bg_rect.draw()
+            for d in dots:
+                d.draw()
+            stim.draw()
+            if fix is not None:
+                fix.draw()
+            stim_timing = _flip_prepared_scene(
+                next_visual_target_perf_s,
+                "experimenter_exit_during_stimulus",
+            )
+            if stim_timing is None:
+                return True, None
+            flip_ps = stim_timing.psychopy_s
+            flip_perf = stim_timing.actual_perf_s
+            _commit_trial_start_signal(
+                flip_perf,
+                stim_timing.requested_perf_s,
+            )
+            _set_initiation_time(flip_perf)
+            logger.log_frame_flip(
+                trial_num=trial_num,
+                event=_frame_event_name("stim", idx),
+                timestamp_perf_s=flip_perf,
+                requested_timestamp_perf_s=stim_timing.requested_perf_s,
+                requested_duration=stim_plan.requested_s,
+            )
+            _show_preview(current_preview_image)
+            next_visual_target_perf_s = transition_scheduler.target_after(
+                flip_perf,
+                stim_plan,
+            )
 
             if is_memory:
                 if cue_dot is None:
@@ -3010,31 +3024,29 @@ def present_trial_with_persistent_dots(
             # post-stimulus dot scene remains visible and unchanged. The hold
             # is not shown after the final stimulus, immediately before choice.
             if idx < len(trial_options) and isi_frames > 0:
-                first_flip = True
+                bg_rect.draw()
+                for d in dots:
+                    d.draw()
+                if fix is not None:
+                    fix.draw()
+                break_timing = _flip_prepared_scene(
+                    next_visual_target_perf_s,
+                    "experimenter_exit_during_inter_stimulus_interval",
+                )
+                if break_timing is None:
+                    return True, None
+                logger.log_frame_flip(
+                    trial_num=trial_num,
+                    event=_frame_event_name("inter_stimulus"),
+                    timestamp_perf_s=break_timing.actual_perf_s,
+                    requested_timestamp_perf_s=break_timing.requested_perf_s,
+                    requested_duration=isi_plan.requested_s,
+                )
                 _show_preview([])
-                with frame_timing_monitor.continuous_sequence():
-                    for _ in range(isi_frames):
-                        if _abort_from_input(
-                            "experimenter_exit_during_inter_stimulus_interval"
-                        ):
-                            return True, None
-                        bg_rect.draw()
-                        for d in dots:
-                            d.draw()
-                        if fix is not None:
-                            fix.draw()
-                        break_timing = flip_with_timestamps(win)
-                        if first_flip:
-                            logger.log_frame_flip(
-                                trial_num=trial_num,
-                                event=_frame_event_name("inter_stimulus"),
-                                timestamp_perf_s=break_timing.actual_perf_s,
-                                requested_timestamp_perf_s=(
-                                    break_timing.requested_perf_s
-                                ),
-                                requested_duration=isi_plan.requested_s,
-                            )
-                            first_flip = False
+                next_visual_target_perf_s = transition_scheduler.target_after(
+                    break_timing.actual_perf_s,
+                    isi_plan,
+                )
 
             if not is_memory and cue_dot is not None and dots:
                 dots.pop()
@@ -3046,10 +3058,16 @@ def present_trial_with_persistent_dots(
                     s.draw()
                 if fix is not None:
                     fix.draw()
-                _arm_choice_input()
-                off_timing = flip_with_timestamps(win)
+                off_timing = _flip_prepared_scene(
+                    next_visual_target_perf_s,
+                    "experimenter_exit_during_choice_start",
+                    before_flip_callback=_arm_choice_input,
+                )
+                if off_timing is None:
+                    return True, None
                 off_flip = off_timing.psychopy_s
                 off_perf = off_timing.actual_perf_s
+                next_visual_target_perf_s = None
                 _build_choice_hit_targets()
                 _start_choice_window(
                     off_flip,
@@ -3060,9 +3078,8 @@ def present_trial_with_persistent_dots(
 
     else:
         for item_index, (p, pos) in enumerate(zip(trial_options, positions)):
-            name, pil_img, stim = _build_stimulus(p, pos)
+            pil_img, stim = _build_stimulus(p, pos)
             stims.append(stim)
-            names.append(name)
             reward_level = (
                 preview_reward_levels[item_index]
                 if preview_reward_levels is not None
@@ -3082,79 +3099,70 @@ def present_trial_with_persistent_dots(
                 dot = _make_dot(pos, cue_color)
                 dots.append(dot)
                 dot_records.append({"pos": tuple(pos), "radius": float(dot_size) / 2.0, "color": tuple(cue_color)})
-            first_flip = True
-            _show_preview([])
             if not _arm_trial_start_signal():
                 return True, None
-            with frame_timing_monitor.continuous_sequence():
-                for _ in range(isi_frames):
-                    if _abort_from_input("experimenter_exit_during_isi"):
-                        return True, None
-                    bg_rect.draw()
-                    for d in dots:
-                        d.draw()
-                    if fix is not None:
-                        fix.draw()
-                    dot_timing = flip_with_timestamps(win)
-                    if first_flip:
-                        dot_perf = dot_timing.actual_perf_s
-                        _commit_trial_start_signal(
-                            dot_perf,
-                            dot_timing.requested_perf_s,
-                        )
-                        _set_initiation_time(dot_perf)
-                        logger.log_frame_flip(
-                            trial_num=trial_num,
-                            event=_frame_event_name("dot"),
-                            timestamp_perf_s=dot_perf,
-                            requested_timestamp_perf_s=dot_timing.requested_perf_s,
-                            requested_duration=isi_plan.requested_s,
-                        )
-                        first_flip = False
+            bg_rect.draw()
+            for d in dots:
+                d.draw()
+            if fix is not None:
+                fix.draw()
+            dot_timing = _flip_prepared_scene(
+                next_visual_target_perf_s,
+                "experimenter_exit_during_isi",
+            )
+            if dot_timing is None:
+                return True, None
+            dot_perf = dot_timing.actual_perf_s
+            _commit_trial_start_signal(dot_perf, dot_timing.requested_perf_s)
+            _set_initiation_time(dot_perf)
+            logger.log_frame_flip(
+                trial_num=trial_num,
+                event=_frame_event_name("dot"),
+                timestamp_perf_s=dot_perf,
+                requested_timestamp_perf_s=dot_timing.requested_perf_s,
+                requested_duration=isi_plan.requested_s,
+            )
+            _show_preview([])
+            next_visual_target_perf_s = transition_scheduler.target_after(
+                dot_perf,
+                isi_plan,
+            )
 
-        _show_preview(preview_images)
         if not _arm_trial_start_signal():
             return True, None
-        first_flip = True
-        flip_ps = None
-        flip_perf = None
-        with frame_timing_monitor.continuous_sequence():
-            for _ in range(stim_frames if is_memory else 1):
-                if _abort_from_input("experimenter_exit_during_stimulus"):
-                    return True, None
-                bg_rect.draw()
-                for d in dots:
-                    d.draw()
-                for s in stims:
-                    s.draw()
-                if fix is not None:
-                    fix.draw()
-                if first_flip and not is_memory:
-                    _arm_choice_input()
-                stim_timing = flip_with_timestamps(win)
-                flip_ps = stim_timing.psychopy_s
-                if first_flip:
-                    flip_perf = stim_timing.actual_perf_s
-                    _commit_trial_start_signal(
-                        flip_perf,
-                        stim_timing.requested_perf_s,
-                    )
-                    _set_initiation_time(flip_perf)
-                    stim_request = (
-                        stim_plan.requested_s
-                        if is_memory
-                        else choice_plan.requested_s
-                    )
-                    logger.log_frame_flip(
-                        trial_num=trial_num,
-                        event=_frame_event_name("stim"),
-                        timestamp_perf_s=flip_perf,
-                        requested_timestamp_perf_s=stim_timing.requested_perf_s,
-                        requested_duration=stim_request,
-                    )
-                    first_flip = False
-        if flip_perf is None:
-            flip_perf = time.perf_counter()
+        bg_rect.draw()
+        for d in dots:
+            d.draw()
+        for s in stims:
+            s.draw()
+        if fix is not None:
+            fix.draw()
+        stim_timing = _flip_prepared_scene(
+            next_visual_target_perf_s,
+            "experimenter_exit_during_stimulus",
+            before_flip_callback=(
+                _arm_choice_input if not is_memory else None
+            ),
+        )
+        if stim_timing is None:
+            return True, None
+        flip_ps = stim_timing.psychopy_s
+        flip_perf = stim_timing.actual_perf_s
+        _commit_trial_start_signal(flip_perf, stim_timing.requested_perf_s)
+        _set_initiation_time(flip_perf)
+        stim_request = (
+            stim_plan.requested_s
+            if is_memory
+            else choice_plan.requested_s
+        )
+        logger.log_frame_flip(
+            trial_num=trial_num,
+            event=_frame_event_name("stim"),
+            timestamp_perf_s=flip_perf,
+            requested_timestamp_perf_s=stim_timing.requested_perf_s,
+            requested_duration=stim_request,
+        )
+        _show_preview(preview_images)
         if not is_memory:
             _build_choice_hit_targets()
             _start_choice_window(
@@ -3162,18 +3170,11 @@ def present_trial_with_persistent_dots(
                 flip_perf,
                 stim_timing.requested_perf_s,
             )
-        elif choice_started and choice_deadline is not None:
-            if _poll_choice_until(min(choice_deadline, flip_perf + frame_dur)):
-                return True, None
-
-        if not is_memory:
-            transition_request_deadline = _choice_transition_request_deadline()
-            if (
-                transition_request_deadline is not None
-                and _poll_choice_until(transition_request_deadline)
-            ):
-                return True, None
         else:
+            next_visual_target_perf_s = transition_scheduler.target_after(
+                flip_perf,
+                stim_plan,
+            )
             if not dots:
                 for pos in positions:
                     dot = _make_dot(pos, dot_color)
@@ -3202,10 +3203,16 @@ def present_trial_with_persistent_dots(
                     s.draw()
             if fix is not None:
                 fix.draw()
-            _arm_choice_input()
-            choice_timing = flip_with_timestamps(win)
+            choice_timing = _flip_prepared_scene(
+                next_visual_target_perf_s,
+                "experimenter_exit_during_choice_start",
+                before_flip_callback=_arm_choice_input,
+            )
+            if choice_timing is None:
+                return True, None
             choice_flip = choice_timing.psychopy_s
             choice_perf_now = choice_timing.actual_perf_s
+            next_visual_target_perf_s = None
             _build_choice_hit_targets()
             _start_choice_window(
                 choice_flip,
@@ -3214,20 +3221,44 @@ def present_trial_with_persistent_dots(
             )
             _show_preview([] if is_memory else (stims_for_choice_preview if sequential else preview_images))
 
+        # Prepare the static gray scene once while the choice remains visible
+        # in the front buffer. A response can therefore transition on the next
+        # refresh without spending its headroom redrawing the scene.
+        bg_rect.draw()
+        if fix is not None:
+            fix.draw()
+        clear_scene_prepared = True
+
         transition_request_deadline = _choice_transition_request_deadline()
         if transition_request_deadline is not None:
             if _poll_choice_until(transition_request_deadline):
                 return True, None
 
-    bg_rect.draw()
-    if fix is not None:
-        fix.draw()
-    clear_timing = flip_with_timestamps(win)
+    if not clear_scene_prepared:
+        bg_rect.draw()
+        if fix is not None:
+            fix.draw()
+    if click_registered or choice_deadline is None:
+        clear_timing = flip_with_timestamps(win)
+    else:
+        clear_timing = transition_scheduler.flip_at(win, choice_deadline)
+        if clear_timing is None:
+            return True, None
     _show_preview([])
     _record_gray_flip(
         clear_timing.actual_perf_s,
         clear_timing.requested_perf_s,
     )
+    if trial_meta is not None:
+        trial_meta["main_display_transition_count"] = (
+            transition_scheduler.transition_count
+        )
+        trial_meta["main_display_transition_misses"] = (
+            transition_scheduler.missed_transition_count
+        )
+        trial_meta["main_display_max_transition_error_s"] = (
+            transition_scheduler.maximum_absolute_error_s
+        )
     return False, chosen_info
 
 
@@ -3545,6 +3576,7 @@ def present_delayed_afc_trial(
     else:
         fps = float(fps)
         frame_dur = 1.0 / fps
+    transition_scheduler = FrameTransitionScheduler(frame_dur)
 
     isi_plan = plan_frame_duration(isi, fps)
     cue_plan = plan_frame_duration(cue_time, fps, minimum_frames=1)
@@ -3809,70 +3841,85 @@ def present_delayed_afc_trial(
                 break
         _core.wait(0.01)
 
+    next_visual_target_perf_s: Optional[float] = None
     if isi_frames > 0:
-        first_flip = True
-        for _ in range(isi_frames):
-            if _abort_from_input("during_pre_cue_isi"):
-                return True, None
-            _draw_blank()
-            flip_with_timestamps(win)
-            if first_flip:
-                _log_message(msg_logger, "INFO", f"pre_cue_interval trial_num={trial_num} duration_s={isi_s:.6f}")
-                first_flip = False
+        if _abort_from_input("during_pre_cue_isi"):
+            return True, None
+        _draw_blank()
+        isi_timing = flip_with_timestamps(win)
+        next_visual_target_perf_s = transition_scheduler.target_after(
+            isi_timing.actual_perf_s,
+            isi_plan,
+        )
+        _log_message(
+            msg_logger,
+            "INFO",
+            f"pre_cue_interval trial_num={trial_num} duration_s={isi_s:.6f}",
+        )
 
-    first_flip = True
     if not _arm_trial_start_signal():
         return True, None
-    for _ in range(cue_frames):
+    bg_rect.draw()
+    cue_stim.draw()
+    _draw_fixation_if_requested()
+    if next_visual_target_perf_s is None:
         if _abort_from_input("during_cue"):
             return True, None
-        bg_rect.draw()
-        cue_stim.draw()
-        _draw_fixation_if_requested()
         cue_timing = flip_with_timestamps(win)
-        if first_flip:
-            cue_perf = cue_timing.actual_perf_s
-            _commit_trial_start_signal(
-                cue_perf,
-                cue_timing.requested_perf_s,
-            )
-            _set_initiation_time(cue_perf)
-            if trial_meta is not None:
-                trial_meta["cue_flip_perf_s"] = float(cue_perf)
-                trial_meta["cue_feature"] = cue_feature
-                trial_meta["choice_feature"] = choice_feature
-                trial_meta["target_pair"] = target_pair
-                trial_meta["target_shape_id"] = int(target_pair[0])
-                trial_meta["target_color_id"] = target_pair[1]
-                trial_meta["choice_pairs"] = list(trial_options)
-            logger.log_frame_flip(
-                trial_num=trial_num,
-                event="feature_cue_on",
-                timestamp_perf_s=cue_perf,
-                requested_timestamp_perf_s=cue_timing.requested_perf_s,
-                requested_duration=cue_plan.requested_s,
-            )
-            first_flip = False
+    else:
+        cue_timing = transition_scheduler.flip_at(
+            win,
+            next_visual_target_perf_s,
+            poll_callback=lambda: _abort_from_input("during_pre_cue_isi"),
+        )
+        if cue_timing is None:
+            return True, None
+    cue_perf = cue_timing.actual_perf_s
+    _commit_trial_start_signal(cue_perf, cue_timing.requested_perf_s)
+    _set_initiation_time(cue_perf)
+    if trial_meta is not None:
+        trial_meta["cue_flip_perf_s"] = float(cue_perf)
+        trial_meta["cue_feature"] = cue_feature
+        trial_meta["choice_feature"] = choice_feature
+        trial_meta["target_pair"] = target_pair
+        trial_meta["target_shape_id"] = int(target_pair[0])
+        trial_meta["target_color_id"] = target_pair[1]
+        trial_meta["choice_pairs"] = list(trial_options)
+    logger.log_frame_flip(
+        trial_num=trial_num,
+        event="feature_cue_on",
+        timestamp_perf_s=cue_perf,
+        requested_timestamp_perf_s=cue_timing.requested_perf_s,
+        requested_duration=cue_plan.requested_s,
+    )
+    next_visual_target_perf_s = transition_scheduler.target_after(
+        cue_perf,
+        cue_plan,
+    )
 
     if delay_frames > 0:
-        first_flip = True
-        for _ in range(delay_frames):
-            if _abort_from_input("during_delay"):
-                return True, None
-            _draw_blank()
-            delay_timing = flip_with_timestamps(win)
-            if first_flip:
-                delay_perf = delay_timing.actual_perf_s
-                if trial_meta is not None:
-                    trial_meta["delay_flip_perf_s"] = float(delay_perf)
-                logger.log_frame_flip(
-                    trial_num=trial_num,
-                    event="delay_start",
-                    timestamp_perf_s=delay_perf,
-                    requested_timestamp_perf_s=delay_timing.requested_perf_s,
-                    requested_duration=delay_plan.requested_s,
-                )
-                first_flip = False
+        _draw_blank()
+        delay_timing = transition_scheduler.flip_at(
+            win,
+            next_visual_target_perf_s,
+            poll_callback=lambda: _abort_from_input("during_cue"),
+        )
+        if delay_timing is None:
+            return True, None
+        delay_perf = delay_timing.actual_perf_s
+        if trial_meta is not None:
+            trial_meta["delay_flip_perf_s"] = float(delay_perf)
+        logger.log_frame_flip(
+            trial_num=trial_num,
+            event="delay_start",
+            timestamp_perf_s=delay_perf,
+            requested_timestamp_perf_s=delay_timing.requested_perf_s,
+            requested_duration=delay_plan.requested_s,
+        )
+        next_visual_target_perf_s = transition_scheduler.target_after(
+            delay_perf,
+            delay_plan,
+        )
 
     def _match_choice(click_pos: Tuple[float, float]) -> Optional[int]:
         for idx, target in enumerate(choice_hit_targets, start=1):
@@ -3887,8 +3934,14 @@ def present_delayed_afc_trial(
     for stim in choice_stims:
         stim.draw()
     _draw_fixation_if_requested()
-    mouse_presses.reset()
-    choice_timing = flip_with_timestamps(win)
+    choice_timing = transition_scheduler.flip_at(
+        win,
+        next_visual_target_perf_s,
+        poll_callback=lambda: _abort_from_input("during_delay"),
+        before_flip_callback=mouse_presses.reset,
+    )
+    if choice_timing is None:
+        return True, None
     choice_perf = choice_timing.actual_perf_s
     if trial_meta is not None:
         trial_meta["choice_start_perf_s"] = float(choice_perf)
@@ -3910,7 +3963,7 @@ def present_delayed_afc_trial(
     choice_deadline = choice_perf + float(choice_s)
     choice_transition_request_deadline = max(
         choice_perf,
-        choice_deadline - (frame_dur / 2.0),
+        flip_submission_time(choice_deadline, frame_dur),
     )
     choice_info: Optional[Dict[str, Any]] = None
     start_touch = mouse_presses.poll()
@@ -3947,6 +4000,9 @@ def present_delayed_afc_trial(
                 "choice_feature": choice_feature,
             }
 
+    # Prepare the next visual state once; the front buffer keeps the choices
+    # visible while input is polled.
+    _draw_blank()
     poll_interval_s = 0.002
     while (
         time.perf_counter() < choice_transition_request_deadline
@@ -3999,13 +4055,26 @@ def present_delayed_afc_trial(
         if remaining > 0:
             _core.wait(min(poll_interval_s, remaining))
 
-    _draw_blank()
-    gray_timing = flip_with_timestamps(win)
+    if choice_info is None:
+        gray_timing = transition_scheduler.flip_at(win, choice_deadline)
+        if gray_timing is None:
+            return True, None
+    else:
+        gray_timing = flip_with_timestamps(win)
     gray_perf = gray_timing.actual_perf_s
     _record_gray_flip(gray_perf)
     if trial_meta is not None:
         trial_meta["gray_flip_requested_perf_s"] = float(
             gray_timing.requested_perf_s
+        )
+        trial_meta["main_display_transition_count"] = (
+            transition_scheduler.transition_count
+        )
+        trial_meta["main_display_transition_misses"] = (
+            transition_scheduler.missed_transition_count
+        )
+        trial_meta["main_display_max_transition_error_s"] = (
+            transition_scheduler.maximum_absolute_error_s
         )
 
     if choice_info is None:

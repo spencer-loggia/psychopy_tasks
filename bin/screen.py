@@ -237,63 +237,6 @@ def _safe_log_message(msg_logger, level: str, message: str) -> None:
         pass
 
 
-class MainDisplayFrameTimingMonitor:
-    """Count missed refreshes only inside continuous flip sequences."""
-
-    def __init__(self, win, frame_duration_s: float):
-        self.win = win
-        self.frame_duration_s = float(frame_duration_s)
-        if not np.isfinite(self.frame_duration_s) or self.frame_duration_s <= 0.0:
-            raise ValueError("frame_duration_s must be a positive finite value")
-        self.missed_refreshes = 0
-
-    @contextmanager
-    def continuous_sequence(self):
-        previous_recording = bool(
-            getattr(self.win, "recordFrameIntervals", False)
-        )
-        had_refresh_threshold = hasattr(self.win, "refreshThreshold")
-        previous_refresh_threshold = getattr(
-            self.win,
-            "refreshThreshold",
-            None,
-        )
-        count_before = None
-        try:
-            self.win.recordFrameIntervals = False
-            self.win.refreshThreshold = self.frame_duration_s * 1.5
-            count_before = int(getattr(self.win, "nDroppedFrames", 0))
-            self.win.recordFrameIntervals = True
-        except Exception:
-            count_before = None
-
-        try:
-            yield
-        finally:
-            if count_before is not None:
-                try:
-                    self.missed_refreshes += max(
-                        0,
-                        int(getattr(self.win, "nDroppedFrames", 0))
-                        - count_before,
-                    )
-                except Exception:
-                    pass
-            try:
-                self.win.recordFrameIntervals = False
-                if previous_recording:
-                    self.win.recordFrameIntervals = True
-            except Exception:
-                pass
-            try:
-                if had_refresh_threshold:
-                    self.win.refreshThreshold = previous_refresh_threshold
-                else:
-                    delattr(self.win, "refreshThreshold")
-            except Exception:
-                pass
-
-
 @dataclass(frozen=True)
 class ScreenGeometry:
     index: int
@@ -2214,7 +2157,7 @@ def _experimenter_preview_process(
             color=_preview_rgb255_to_psychopy((0, 0, 0)),
             allowStencil=False,
             allowGUI=False,
-            waitBlanking=True,
+            waitBlanking=False,
         )
     except Exception as exc:
         _report_startup(
@@ -2224,10 +2167,10 @@ def _experimenter_preview_process(
             }
         )
         raise
-    # This is a separate process/drawable. Synchronizing it to its own output
-    # prevents mirror tearing without changing or backpressuring the subject
-    # window's main-output swap interval.
-    configure_window_vsync(win, True)
+    # The preview is diagnostic and updates at a low fixed rate. Never let its
+    # separate drawable wait on a second output's vertical blank and contend
+    # with the timing-critical subject window.
+    configure_window_vsync(win, False)
     last_cursor_apply_s = 0.0
     if mouse_visible is not None:
         set_window_mouse_visible(win, bool(mouse_visible))

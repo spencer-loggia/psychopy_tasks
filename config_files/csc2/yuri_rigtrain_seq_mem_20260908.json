@@ -68,7 +68,7 @@
 
   "self_initiation": true,
   "iti": 0.50,
-  "duration": 0.2,
+  "duration": 0.25,
   "num_afc": 2,
   "choice_time": 2.0,
   "isi": 0.1,

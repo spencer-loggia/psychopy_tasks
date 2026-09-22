@@ -783,7 +783,7 @@ def run_task(
                     f"experimenter_video_mirror mode=single_decode_latest_frame_wins "
                     f"shared_memory={frame_publisher.name} capacity_bytes={maximum_frame_bytes}"
                     f" slots={frame_publisher.slot_count} publish_interval_s=0.1 "
-                    "vsync=secondary_output_independent "
+                    "vsync=disabled_on_experimenter_output "
                     "main_swap_reference_unchanged=1 "
                     "frame_pacing=new_source_frame"
                 ),

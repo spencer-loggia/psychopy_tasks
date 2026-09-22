@@ -11,7 +11,6 @@ from the full configured stimulus space, so duplicate matches are possible.
 from __future__ import annotations
 
 import argparse
-from contextlib import nullcontext
 import os
 import random
 import sys
@@ -39,7 +38,11 @@ from bin.afc_stimuli import (
 )
 from bin.config import load_config, validate_config
 from bin.daqc2_outputs import DAQC2DigitalOutputs
-from bin.frame_timing import plan_frame_duration, validate_requested_durations
+from bin.frame_timing import (
+    plan_frame_duration,
+    validate_requested_durations,
+    wait_until,
+)
 from bin.logger import SessionLogBundle
 from bin.match2cue_logic import (
     Match2CueTrial,
@@ -171,7 +174,9 @@ def _build_behavior_fieldnames(num_afc: int) -> List[str]:
             "choice_touch_x",
             "choice_touch_y",
             "choice_reaction_time",
-            "main_display_dropped_frames",
+            "main_display_transition_count",
+            "main_display_transition_misses",
+            "main_display_max_transition_error_s",
         ]
     )
     return fields
@@ -337,6 +342,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 os.environ.get(IS_RIG_ENV_VAR),
             ),
         )
+        utils.verify_task_window_vblank(win)
 
     main_scene_size = resolve_scene_size(
         main_screen,
@@ -688,17 +694,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 pre_options_delay=delay_time,
                 stimulus_rotation_degrees=stimulus_rotation_degrees,
             )
-            timing_monitor = trial_meta.get("_main_display_frame_timing_monitor")
             if aborted:
-                if timing_monitor is not None:
-                    msg_logger.log(
-                        "INFO",
-                        (
-                            f"main_display_timing trial_num={trial_num} "
-                            f"missed_refreshes={timing_monitor.missed_refreshes} "
-                            "scope=continuous_frame_sequences"
-                        ),
-                    )
                 if task_end_status == "done":
                     task_end_status = "aborted"
                 break
@@ -801,35 +797,45 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 behavior_row[f"lum_{option_idx}"] = lum_idx
 
             show_preview_idle()
-            hold_frames = iti_frames if outcome.reward_delivered else max(0, iti_frames - 1)
-            timing_context = (
-                timing_monitor.continuous_sequence()
-                if timing_monitor is not None and hold_frames > 0
-                else nullcontext()
+            if iti_frames > 0:
+                iti_start_perf = (
+                    time.perf_counter()
+                    if outcome.reward_delivered
+                    else float(gray_start_perf)
+                )
+                iti_completed = wait_until(
+                    iti_start_perf + iti_plan.scheduled_s,
+                    poll_callback=poll_controls,
+                )
+                if not iti_completed and task_end_status == "done":
+                    task_end_status = "experimenter_exit"
+
+            transition_count = trial_meta.get(
+                "main_display_transition_count",
+                "",
             )
-            with timing_context:
-                for _ in range(hold_frames):
-                    if poll_controls():
-                        if task_end_status == "done":
-                            task_end_status = "experimenter_exit"
-                        break
-                    bg_rect.draw()
-                    if fix is not None:
-                        fix.draw()
-                    win.flip()
-            missed_refreshes = (
-                timing_monitor.missed_refreshes
-                if timing_monitor is not None
-                else ""
+            transition_misses = trial_meta.get(
+                "main_display_transition_misses",
+                "",
             )
-            behavior_row["main_display_dropped_frames"] = missed_refreshes
+            maximum_transition_error_s = trial_meta.get(
+                "main_display_max_transition_error_s",
+                "",
+            )
+            behavior_row["main_display_transition_count"] = transition_count
+            behavior_row["main_display_transition_misses"] = transition_misses
+            behavior_row["main_display_max_transition_error_s"] = (
+                _optional_float(maximum_transition_error_s)
+            )
             behavior_logger.writerow(behavior_row)
             msg_logger.log(
                 "INFO",
                 (
                     f"main_display_timing trial_num={trial_num} "
-                    f"missed_refreshes={missed_refreshes} "
-                    "scope=continuous_frame_sequences"
+                    f"transitions={transition_count} "
+                    f"misses={transition_misses} "
+                    f"max_abs_error_s={maximum_transition_error_s} "
+                    "scope=scheduled_visual_transitions"
                 ),
             )
             if task_end_status != "done":

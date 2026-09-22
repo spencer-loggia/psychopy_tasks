@@ -21,7 +21,6 @@ Config keys required/additional:
 
 """
 import argparse
-from contextlib import nullcontext
 import os
 import sys
 import time
@@ -45,7 +44,11 @@ from bin.affinity import (
 from bin.daqc2_outputs import DAQC2DigitalOutputs
 from bin.afc_geometry import compute_afc_positions, stimulus_size
 from bin.afc_stimuli import render_afc_stimulus
-from bin.frame_timing import plan_frame_duration, validate_requested_durations
+from bin.frame_timing import (
+    plan_frame_duration,
+    validate_requested_durations,
+    wait_until,
+)
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 import numpy as np
@@ -182,7 +185,9 @@ def _build_behavior_fieldnames(num_afc: int) -> List[str]:
             "choice_touch_x",
             "choice_touch_y",
             "choice_reaction_time",
-            "main_display_dropped_frames",
+            "main_display_transition_count",
+            "main_display_transition_misses",
+            "main_display_max_transition_error_s",
         ]
     )
     return fieldnames
@@ -597,6 +602,7 @@ def run_task(
             update_interval_s=0.1,
             mouse_visible=experimenter_mouse_visible,
         )
+        utils.verify_task_window_vblank(win)
     if touchscreen:
         try:
             exp_cursor_state = "none"
@@ -1070,17 +1076,7 @@ def run_task(
                 reward_levels=[reward_map.get(pair, 0) for pair in trial_options],
                 stimulus_rotation_degrees=stimulus_rotation_degrees,
             )
-            timing_monitor = trial_meta.get("_main_display_frame_timing_monitor")
             if aborted:
-                if timing_monitor is not None:
-                    msg_logger.log(
-                        "INFO",
-                        (
-                            f"main_display_timing trial_num={trial_num} "
-                            f"missed_refreshes={timing_monitor.missed_refreshes} "
-                            "scope=continuous_frame_sequences"
-                        ),
-                    )
                 if task_end_notes == "done" and _poll_experimenter_controls():
                     task_end_notes = "experimenter_exit"
                     msg_logger.log("WARN", f"experimenter_exit_during_trial trial_num={trial_num}")
@@ -1256,38 +1252,53 @@ def run_task(
                 behavior_row["choice_made_lum"] = int(chosen_lum_row)
 
             if iti_frames > 0:
-                post_choice_delay_present = (choice_info is not None) and ((num_pulses > 0) or (apply_timeout > 0))
-                hold_frames = iti_frames if post_choice_delay_present else max(0, iti_frames - 1)
-                _show_preview_idle()
-                timing_context = (
-                    timing_monitor.continuous_sequence()
-                    if timing_monitor is not None and hold_frames > 0
-                    else nullcontext()
+                post_choice_delay_present = (
+                    choice_info is not None
+                    and ((num_pulses > 0) or (apply_timeout > 0))
                 )
-                with timing_context:
-                    for _ in range(hold_frames):
-                        if _poll_experimenter_controls():
-                            task_end_notes = "experimenter_exit"
-                            msg_logger.log("WARN", f"experimenter_exit_during_iti trial_num={trial_num}")
-                            break
-                        bg_rect.draw()
-                        if fix is not None:
-                            fix.draw()
-                        win.flip()
+                iti_start_perf = (
+                    time.perf_counter()
+                    if post_choice_delay_present
+                    else float(gray_start_perf)
+                )
+                _show_preview_idle()
+                iti_completed = wait_until(
+                    iti_start_perf + iti_plan.scheduled_s,
+                    poll_callback=_poll_experimenter_controls,
+                )
+                if not iti_completed:
+                    task_end_notes = "experimenter_exit"
+                    msg_logger.log(
+                        "WARN",
+                        f"experimenter_exit_during_iti trial_num={trial_num}",
+                    )
 
-            missed_refreshes = (
-                timing_monitor.missed_refreshes
-                if timing_monitor is not None
-                else ""
+            transition_count = trial_meta.get(
+                "main_display_transition_count",
+                "",
             )
-            behavior_row["main_display_dropped_frames"] = missed_refreshes
+            transition_misses = trial_meta.get(
+                "main_display_transition_misses",
+                "",
+            )
+            maximum_transition_error_s = trial_meta.get(
+                "main_display_max_transition_error_s",
+                "",
+            )
+            behavior_row["main_display_transition_count"] = transition_count
+            behavior_row["main_display_transition_misses"] = transition_misses
+            behavior_row["main_display_max_transition_error_s"] = (
+                _fmt_optional(maximum_transition_error_s)
+            )
             behavior_logger.writerow(behavior_row)
             msg_logger.log(
                 "INFO",
                 (
                     f"main_display_timing trial_num={trial_num} "
-                    f"missed_refreshes={missed_refreshes} "
-                    "scope=continuous_frame_sequences"
+                    f"transitions={transition_count} "
+                    f"misses={transition_misses} "
+                    f"max_abs_error_s={maximum_transition_error_s} "
+                    "scope=scheduled_visual_transitions"
                 ),
             )
             if task_end_notes != "done":

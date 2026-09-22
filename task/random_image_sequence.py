@@ -28,7 +28,12 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from bin import utils
-from bin.frame_timing import flip_with_timestamps, plan_frame_duration
+from bin.frame_timing import (
+    FrameTransitionScheduler,
+    flip_with_timestamps,
+    plan_frame_duration,
+    wait_until,
+)
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.config import load_config, validate_config
@@ -150,6 +155,7 @@ def run_task(
         final_fix_plan.frame_count,
         final_fix_plan.scheduled_s,
     )
+    transition_scheduler = FrameTransitionScheduler(frame_dur)
     try:
         msg_logger.log(
             "INFO",
@@ -174,65 +180,81 @@ def run_task(
         stim = utils.make_image_stim_from_array(win, pil_img, size=None, bg_rgb_255=None)
         image_stims.append((p.name, stim))
 
-    # initial blank flip draw background
-    win.flip()
-
     # Pre-sequence ISI: show the gray background for `isi` seconds before the
     # first stimulus. This implements the requested sequence: gray(ISI) ->
     # stim(duration) -> gray(ISI) -> stim(duration) ...
+    next_visual_target_perf_s = None
     if isi_frames > 0:
-        # Pre-sequence ISI for exactly isi_frames frames
-        first_flip = True
-        for _f in range(isi_frames):
-            bg_rect.draw()
-            if fix is not None:
-                fix.draw()
-            isi_timing = flip_with_timestamps(win)
-            if first_flip:
-                logger.log_frame_flip(
-                    trial_num=None,
-                    event="gray_pre_sequence",
-                    timestamp_perf_s=isi_timing.actual_perf_s,
-                    requested_timestamp_perf_s=isi_timing.requested_perf_s,
-                    requested_duration=isi,
-                )
-                first_flip = False
+        bg_rect.draw()
+        if fix is not None:
+            fix.draw()
+        isi_timing = flip_with_timestamps(win)
+        logger.log_frame_flip(
+            trial_num=None,
+            event="gray_pre_sequence",
+            timestamp_perf_s=isi_timing.actual_perf_s,
+            requested_timestamp_perf_s=isi_timing.requested_perf_s,
+            requested_duration=isi,
+        )
+        next_visual_target_perf_s = transition_scheduler.target_after(
+            isi_timing.actual_perf_s,
+            isi_plan,
+        )
 
     aborted = False
 
+    def _poll_escape() -> bool:
+        nonlocal aborted
+        if not event.getKeys(["escape"]):
+            return False
+        aborted = True
+        return True
+
     # Main loop
     for idx, (img_name, stim) in enumerate(image_stims, start=1):
-        first_flip = True
-        for _f in range(stim_frames):
-            stim.draw()
-            if fix is not None:
-                fix.draw()  # fixation on top
-            stim_timing = flip_with_timestamps(win)
-            if first_flip:
-                logger.log_frame_flip(
-                    trial_num=idx,
-                    event="stimulus_on",
-                    timestamp_perf_s=stim_timing.actual_perf_s,
-                    requested_timestamp_perf_s=stim_timing.requested_perf_s,
-                    requested_duration=duration,
-                )
-                msg_logger.log("INFO", f"stimulus_presented trial_num={idx} stimulus_name={img_name}")
-                first_flip = False
-            # Abort?
-            if event.getKeys(["escape"]):
-                msg_logger.log("WARN", f"escape_pressed trial_num={idx}")
-                aborted = True
+        stim.draw()
+        if fix is not None:
+            fix.draw()
+        if next_visual_target_perf_s is None:
+            if _poll_escape():
                 break
-        if aborted:
-            break
+            stim_timing = flip_with_timestamps(win)
+        else:
+            stim_timing = transition_scheduler.flip_at(
+                win,
+                next_visual_target_perf_s,
+                poll_callback=_poll_escape,
+            )
+            if stim_timing is None:
+                break
+        logger.log_frame_flip(
+            trial_num=idx,
+            event="stimulus_on",
+            timestamp_perf_s=stim_timing.actual_perf_s,
+            requested_timestamp_perf_s=stim_timing.requested_perf_s,
+            requested_duration=duration,
+        )
+        msg_logger.log(
+            "INFO",
+            f"stimulus_presented trial_num={idx} stimulus_name={img_name}",
+        )
+        next_visual_target_perf_s = transition_scheduler.target_after(
+            stim_timing.actual_perf_s,
+            stim_plan,
+        )
+
         is_last_stimulus = idx == len(image_stims)
-        # The gray-onset flip is the first frame of a non-zero ISI/final
-        # fixation. Skip it between stimuli when the nearest-frame ISI is zero.
         if is_last_stimulus or isi_frames > 0:
             bg_rect.draw()
             if fix is not None:
                 fix.draw()
-            gray_timing = flip_with_timestamps(win)
+            gray_timing = transition_scheduler.flip_at(
+                win,
+                next_visual_target_perf_s,
+                poll_callback=_poll_escape,
+            )
+            if gray_timing is None:
+                break
             logger.log_frame_flip(
                 trial_num=idx,
                 event=(
@@ -244,6 +266,10 @@ def run_task(
                 requested_timestamp_perf_s=gray_timing.requested_perf_s,
                 requested_duration=1.0 if is_last_stimulus else isi,
             )
+            next_visual_target_perf_s = transition_scheduler.target_after(
+                gray_timing.actual_perf_s,
+                final_fix_plan if is_last_stimulus else isi_plan,
+            )
         behavior_logger.writerow(
             {
                 "trial_num": idx,
@@ -251,28 +277,28 @@ def run_task(
                 "requested_duration": f"{duration:.9f}",
             }
         )
-        # ISI between images
-        for _f in range(
-            max(0, isi_frames - 1) if not is_last_stimulus else 0
-        ):
-            bg_rect.draw()
-            if fix is not None:
-                fix.draw()
-            win.flip()
-        # Abort?
-        if event.getKeys(["escape"]):
+        if _poll_escape():
             msg_logger.log("WARN", f"escape_pressed trial_num={idx}")
-            aborted = True
             break
 
     # Final fixation and cleanup
-    if not aborted:
-        for _f in range(max(0, final_fix_frames - 1)):
-            bg_rect.draw()
-            if fix is not None:
-                fix.draw()
-            win.flip()
+    if not aborted and next_visual_target_perf_s is not None:
+        if not wait_until(
+            next_visual_target_perf_s,
+            poll_callback=_poll_escape,
+        ):
+            msg_logger.log("WARN", "escape_pressed during_final_fixation=1")
 
+    msg_logger.log(
+        "INFO",
+        (
+            "main_display_timing "
+            f"transitions={transition_scheduler.transition_count} "
+            f"misses={transition_scheduler.missed_transition_count} "
+            f"max_abs_error_s={transition_scheduler.maximum_absolute_error_s:.9f} "
+            "scope=scheduled_visual_transitions"
+        ),
+    )
     msg_logger.log("INFO", f"session_end status={'aborted' if aborted else 'done'}")
     session_logs.close()
     utils.close_task_window(win)

@@ -50,7 +50,7 @@
     "main": null,
     "experimenter": null
   },
-  "n": 50,
+  "n": 100,
 
   "fullscreen": true,
   "fixation_size": 20,
@@ -69,7 +69,7 @@
 
   "self_initiation": true,
   "hold_before_choice": false,
-  "hold_cue_to_init_time_s": 0.2,
+  "hold_cue_to_init_time_s": 0.25,
   "iti": 0.50,
   "duration": 0.25,
   "num_afc": 2,

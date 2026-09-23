@@ -34,7 +34,7 @@
   "stroke_color": [0, 0, 0],
   "stroke_linejoin": "round",
   "stroke_linecap": "round",
-  "image_size": [300, 300],
+  "image_size": [64, 64],
 
 
   "self_initiation": true,

@@ -47,8 +47,8 @@
   "seed": null,
   "output_dir": "./logs",
   "screens": {
-    "main": 0,
-    "experimenter": 0
+    "main": null,
+    "experimenter": null
   },
   "n": 50,
 

@@ -7,7 +7,7 @@
         "main": null,
         "experimenter": null
     },
-    "record_experiment_video": true,
+    "record_experiment_video": false,
     "video_config": "config_files/video/config.json",
     "mask_main_inputs": true,
     "experiment_quiet_mode": true,

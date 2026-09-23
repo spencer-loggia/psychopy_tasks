@@ -2,10 +2,22 @@ import math
 import random
 import unittest
 
-from bin.afc_geometry import compute_afc_positions, resolve_stimulus_circle
+from bin.afc_geometry import (
+    compute_afc_positions,
+    resolve_stimulus_circle,
+    screen_px_to_psychopy,
+)
 
 
 class AFCGeometryTests(unittest.TestCase):
+    def test_screen_position_is_converted_from_upper_left_origin(self):
+        self.assertEqual(screen_px_to_psychopy((0, 0), (2560, 1600)), (-1280.0, 800.0))
+        self.assertEqual(screen_px_to_psychopy((1280, 800), (2560, 1600)), (0.0, 0.0))
+
+    def test_screen_position_must_be_inside_main_screen(self):
+        with self.assertRaisesRegex(ValueError, "outside"):
+            screen_px_to_psychopy((2561, 800), (2560, 1600))
+
     def test_fixed_positions_are_evenly_spaced_on_configured_circle(self):
         screen_positions, psychopy_positions = compute_afc_positions(
             fixed_positions=True,

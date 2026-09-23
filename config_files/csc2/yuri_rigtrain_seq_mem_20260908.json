@@ -47,13 +47,13 @@
   "seed": null,
   "output_dir": "./logs",
   "screens": {
-    "main": null,
-    "experimenter": null
+    "main": 0,
+    "experimenter": 0
   },
   "n": 50,
 
   "fullscreen": true,
-  "fixation_size": 0,
+  "fixation_size": 20,
   "dot_size": 40,
   "dot_color": [50, 50, 50],
   "init_dot_color": [50, 50, 50],
@@ -64,9 +64,12 @@
   "stroke_linejoin": "round",
   "stroke_linecap": "round",
   "image_size": [150, 150],
-
+  "initiation_cue_center_position": null,
+  "initiation_cue_style": "checker",
 
   "self_initiation": true,
+  "hold_before_choice": false,
+  "hold_cue_to_init_time_s": 0.2,
   "iti": 0.50,
   "duration": 0.25,
   "num_afc": 2,

@@ -25,7 +25,7 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from bin import utils
-from bin.afc_geometry import compute_afc_positions, stimulus_size
+from bin.afc_geometry import compute_afc_positions, screen_px_to_psychopy, stimulus_size
 from bin.afc_stimuli import (
     AFCStimulusSpace,
     StimulusKey,
@@ -37,6 +37,7 @@ from bin.afc_stimuli import (
     stimulus_to_json,
 )
 from bin.config import load_config, validate_config
+from bin.initiation import INITIATION_CONFIG_KEYS, resolve_initiation_config
 from bin.daqc2_outputs import DAQC2DigitalOutputs
 from bin.frame_timing import (
     plan_frame_duration,
@@ -143,7 +144,6 @@ def _build_behavior_fieldnames(num_afc: int) -> List[str]:
     fields = [
         "trial_num",
         "initiation_time",
-        "reaction_time",
         "cue_shape",
         "cue_color",
         "cue_lum",
@@ -197,6 +197,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
+    initiation_config = resolve_initiation_config(cfg)
     subject_value = cfg["subject"]
     if not isinstance(subject_value, str) or not subject_value.strip():
         raise ValueError("Config field 'subject' must be a non-empty string")
@@ -367,6 +368,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     fix = utils.make_fixation_cross(
         win,
         size=fixation_size,
+        color=(255, 255, 255),
         ori=stimulus_rotation_degrees,
     )
     bg_rect = utils.make_bg_rect(win, space.bg)
@@ -375,14 +377,23 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     init_dot_value = cfg.get("init_dot_color")
     init_dot_color = tuple(init_dot_value) if init_dot_value is not None else None
     onset_stim = None
+    pressed_onset_stim = None
     if self_initiation:
-        onset_stim = utils.make_onset_cue_stim(
+        onset_position = (
+            (0.0, 0.0)
+            if initiation_config.cue_center_position is None
+            else screen_px_to_psychopy(
+                initiation_config.cue_center_position,
+                main_scene_size,
+                field_name="initiation_cue_center_position",
+            )
+        )
+        onset_stim, pressed_onset_stim = utils.make_initiation_cue_stims(
             win,
             bg_rgb_255=space.bg,
-            size_frac=0.125,
-            cells=8,
-            sigma_frac=0.22,
-            zero_threshold=1,
+            cue_color=init_dot_color if init_dot_color is not None else dot_color,
+            style=initiation_config.cue_style,
+            position=onset_position,
             ori=stimulus_rotation_degrees,
         )
 
@@ -399,7 +410,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
             images=[],
             dots=[],
             fixation_size=(int(getattr(fix, "height", 0)) if fix is not None else None),
-            fixation_color=(0, 0, 0),
+            fixation_color=(255, 255, 255),
             status_counts=status_counts,
             highlight_box=None,
             main_rotation_deg=stimulus_rotation_degrees,
@@ -668,6 +679,10 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 init_dot_color=init_dot_color,
                 bg_rgb_255=space.bg,
                 onset_cue=onset_stim,
+                pressed_onset_cue=pressed_onset_stim,
+                hold_before_choice=initiation_config.hold_before_choice,
+                hold_cue_to_init_time_s=initiation_config.hold_cue_to_init_time_s,
+                white_fixation_until_choice=True,
                 detect_pre_options_cue_touch=(
                     reward_settings.reward_match_cue_prob > 0.0
                 ),
@@ -755,9 +770,6 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
             behavior_row: Dict[str, Any] = {
                 "trial_num": trial_num,
                 "initiation_time": _optional_float(trial_meta.get("initiation_time_s")),
-                "reaction_time": _optional_float(
-                    choice_info.get("reaction_time_s") if choice_info is not None else None
-                ),
                 "cue_shape": cue_shape,
                 "cue_color": cue_color,
                 "cue_lum": cue_lum,
@@ -899,6 +911,7 @@ def main() -> None:
                 "n",
                 "match_cue_duration",
                 "delay_time",
+                *INITIATION_CONFIG_KEYS,
             ],
             allow_zero_duration=True,
         )

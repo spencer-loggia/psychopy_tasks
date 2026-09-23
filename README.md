@@ -696,6 +696,16 @@ Active Foraging Positioning
 ---------------------------
 `active_foraging` places every stimulus center on a stimulus circle in native main-framebuffer pixel coordinates. `center_point` is `[x, y]` with origin at the upper-left of the native `2560x1600` screen. When `center_point` is `null`, it defaults to the exact middle of the main screen. `stim_range_radius` is the circle radius in pixels. When it is `null`, it defaults to half the distance from `center_point` to the closest screen edge. Authored image sizes remain `[width, height]`; their native axis-aligned bounds swap after a 90-degree turn, which placement and overlap checks account for.
 
+Active foraging and match-to-cue require four self-initiation settings. `initiation_cue_center_position` is either
+`null` for the screen center or `[x, y]` in the same upper-left-origin native framebuffer coordinates.
+`initiation_cue_style` is `"checker"` for the legacy Gaussian-masked checkerboard or `"blob"` for a
+Gaussian-faded cue in `init_dot_color`; both styles have the same dimensions and darken when pressed.
+`hold_cue_to_init_time_s` is the continuous cue-hold duration required to initiate a trial.
+`hold_before_choice=true` keeps the pressed cue visible and requires that hold through the pre-choice phases.
+A missing or out-of-cue touch lasting at most 100 ms is tolerated. A longer break aborts only the current trial,
+logs `initiation_cue_release`, and starts the inter-trial interval. When a fixation cross is enabled, it is white
+before and after choice and black while the choice window is open.
+
 - `fixed_positions=true`: locations are evenly spaced around the circle. The spacing angle is `2*pi / num_afc`, and the first location is offset by half that spacing from the point directly below `center_point`.
 - `fixed_positions=false`: locations are random points on the circle, with rejected draws when stimulus bounding boxes would overlap.
 - Custom `center_point` and `stim_range_radius` values can be provided in JSON or as `--center_point X Y --stim_range_radius R`.
@@ -776,7 +786,7 @@ never rewarded.
 pulses; when omitted, it defaults to `pump_pulse_time_seconds`. The pulse interval is not added after the final
 pulse. `reward_match_cue_prob` is an independent probability from `0` to `1`, defaulting to `0`, that a fresh tap
 on the displayed matching stimulus earns one pump pulse. The tap is accepted only while the matching stimulus is
-visible; a held checkerboard-initiation press does not count. Reward delivery occurs after match-cue offset so the
+visible; a held initiation press does not count. Reward delivery occurs after match-cue offset so the
 configured `match_cue_duration` remains frame-accurate. Match-cue and manual rewards always use one pulse and are
 not multiplied by `correct_num_pulse`.
 
@@ -789,7 +799,8 @@ must contain exactly one data row—the background gray—and `n_lum_levels` sho
 `n_colors * n_lum_levels` non-background rows. `n_shapes` must match the number of rows in `shapes_tsv` in either
 mode.
 
-The match-to-cue event log adds `match_cue_on`, `match_cue_touch`, and `delay_start`. The behavior log records cue
+The match-to-cue event log adds `match_cue_on`, `match_cue_touch`, and `delay_start`. Both tasks log
+`initiation_cue_release` when a required hold is broken for more than 100 ms. The behavior log records cue
 and option feature indices, `matching_option_count`, `tie_mode`, `choice_correct`, `match_cue_tapped`,
 `match_cue_reward_probability`, `match_cue_reward_delivered`, `reward_probability`, `reward_delivered`, and
 `choice_reward_pulse_count`, in addition to the shared choice/touch timing fields. The existing

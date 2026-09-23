@@ -34,7 +34,11 @@
   "stim_range_radius": null,
   "image_size": [150, 150],
 
+  "initiation_cue_center_position": null,
+  "initiation_cue_style": "checker",
   "self_initiation": true,
+  "hold_before_choice": false,
+  "hold_cue_to_init_time_s": 0.0,
   "match_cue_duration": 0.5,
   "delay_time": 0.5,
   "iti": 0.5,

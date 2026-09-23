@@ -5,7 +5,8 @@ Also supports loading SVG by rasterizing to a requested pixel size (via cairosvg
 
 Modularity helpers included:
 - make_bg_rect: create a full-window background rect in one call.
-- make_onset_cue_stim: build a checkerboard ImageStim with a centered 2D Gaussian alpha mask.
+- make_onset_cue_stim: build a checker or blob ImageStim with a Gaussian alpha mask.
+- make_initiation_cue_stims: build matched idle and pressed initiation cues.
 """
 from pathlib import Path
 import math
@@ -62,7 +63,11 @@ from .stimulus_files import (
     load_shape_definitions as _load_shape_definitions,
     split_background_from_palette as _split_background_from_palette,
 )
-from .touch_input import MousePressTracker, advance_release_armed_touch_gate
+from .touch_input import (
+    MousePressTracker,
+    TouchHoldTracker,
+)
+from .initiation import build_initiation_cue_image
 
 # Global debug flag: when True, utilities may write debug files (PNG) to logs/
 # Default is False; tasks can enable it via CLI (--debug) or config.
@@ -2044,53 +2049,71 @@ def make_onset_cue_stim(
     sigma_frac: float = 0.22,
     zero_threshold: int = 1,
     ori: float = 0.0,
+    style: str = "checker",
+    cue_color: Optional[Tuple[int, int, int]] = None,
+    pressed: bool = False,
 ):
-    """Create a checkerboard onset cue ImageStim with a centered 2D Gaussian alpha mask.
+    """Create a checker or gray-blob onset cue with a Gaussian alpha mask.
 
     Parameters:
     - size_frac: fraction of min(window size) for cue edge length
     - cells: number of checkerboard cells per side
     - sigma_frac: sigma expressed as a fraction of cue width
     - zero_threshold: values <= this threshold in [0..255] are set to 0 in the mask
+    - style: ``checker`` for the legacy checkerboard or ``blob`` for a solid
+      ``cue_color`` that fades into the background
+    - pressed: darken the cue to provide immediate press feedback
     """
-    from PIL import Image, ImageDraw
-
     w = int(max(4, min(win.size) * float(size_frac)))
     if w <= 0:
         w = 400
-
-    # Build checkerboard RGB on top of background color
-    cb = Image.new("RGB", (w, w), color=(int(bg_rgb_255[0]), int(bg_rgb_255[1]), int(bg_rgb_255[2])))
-    draw = ImageDraw.Draw(cb)
-    cell = max(2, w // int(cells))
-    for y in range(0, w, cell):
-        for x in range(0, w, cell):
-            xi = x // cell
-            yi = y // cell
-            fill = (0, 0, 0) if ((xi + yi) % 2 == 0) else (255, 255, 255)
-            draw.rectangle([x, y, x + cell - 1, y + cell - 1], fill=fill)
-
-    # 2D Gaussian mask centered at cue
-    cx = (w - 1) / 2.0
-    cy = (w - 1) / 2.0
-    sigma = max(2.0, w * float(sigma_frac))
-    yy, xx = np.mgrid[0:w, 0:w]
-    gauss = np.exp(-0.5 * (((xx - cx) / sigma) ** 2 + ((yy - cy) / sigma) ** 2))
-    mask_arr = np.clip(gauss * 255.0, 0, 255)
-    mask_u8 = mask_arr.astype(np.uint8)
-    if zero_threshold is not None and zero_threshold > 0:
-        mask_u8[mask_u8 <= int(zero_threshold)] = 0
-    cb.putalpha(Image.fromarray(mask_u8, mode="L"))
+    cue_image = build_initiation_cue_image(
+        w,
+        bg_rgb_255=bg_rgb_255,
+        style=style,
+        cue_color=cue_color,
+        cells=cells,
+        sigma_frac=sigma_frac,
+        zero_threshold=zero_threshold,
+        pressed=pressed,
+    )
 
     # Convert to ImageStim (preserve alpha; ImageStim builder will provide proper mask)
     stim = make_image_stim_from_array(
-        win, cb, size=(w, w), bg_rgb_255=None, ori=ori
+        win, cue_image, size=(w, w), bg_rgb_255=None, ori=ori
     )
     try:
         stim.pos = (0, 0)
     except Exception:
         pass
     return stim
+
+
+def make_initiation_cue_stims(
+    win: visual.Window,
+    *,
+    bg_rgb_255: Tuple[int, int, int],
+    cue_color: Tuple[int, int, int],
+    style: str,
+    position: Tuple[float, float] = (0.0, 0.0),
+    ori: float = 0.0,
+) -> Tuple[visual.ImageStim, visual.ImageStim]:
+    """Build matched idle and darkened initiation cues for a task."""
+    cue_kwargs = {
+        "bg_rgb_255": bg_rgb_255,
+        "size_frac": 0.125,
+        "cells": 8,
+        "sigma_frac": 0.22,
+        "zero_threshold": 1,
+        "ori": ori,
+        "style": style,
+        "cue_color": cue_color,
+    }
+    idle_cue = make_onset_cue_stim(win, **cue_kwargs)
+    pressed_cue = make_onset_cue_stim(win, pressed=True, **cue_kwargs)
+    idle_cue.pos = position
+    pressed_cue.pos = position
+    return idle_cue, pressed_cue
 
 
 def _send_led_pulse_on_flip(chip, pin: int, duration_us: int):
@@ -2138,6 +2161,10 @@ def present_trial_with_persistent_dots(
     init_dot_color: Optional[Tuple[int, int, int]] = None,
     bg_rgb_255: Optional[Tuple[int, int, int]] = None,
     onset_cue: Optional[visual.ImageStim] = None,
+    pressed_onset_cue: Optional[visual.ImageStim] = None,
+    hold_before_choice: bool = False,
+    hold_cue_to_init_time_s: float = 0.0,
+    white_fixation_until_choice: bool = False,
     msg_logger=None,
     fps: Optional[float] = None,
     raspi: bool = False,
@@ -2206,6 +2233,10 @@ def present_trial_with_persistent_dots(
     rotation_degrees = float(stimulus_rotation_degrees)
     if not math.isfinite(rotation_degrees):
         raise ValueError("stimulus_rotation_degrees must be finite")
+    hold_cue_to_init_time_s = float(hold_cue_to_init_time_s)
+    if not math.isfinite(hold_cue_to_init_time_s) or hold_cue_to_init_time_s < 0.0:
+        raise ValueError("hold_cue_to_init_time_s must be finite and non-negative")
+    hold_before_choice = bool(hold_before_choice and onset_cue is not None)
 
     cue_plan = plan_frame_duration(
         pre_options_cue_duration,
@@ -2231,8 +2262,49 @@ def present_trial_with_persistent_dots(
     from psychopy import event as _event
     mouse = _event.Mouse(win=win)
     mouse_presses = MousePressTracker(mouse)
+    initiation_hold = TouchHoldTracker(
+        hold_cue_to_init_time_s,
+        max_break_s=0.100,
+    )
+    held_initiation_cue_visible = False
+    enforce_initiation_hold = hold_before_choice
+    initiation_cue_released = False
+    fixation_color = (255, 255, 255) if white_fixation_until_choice else (0, 0, 0)
     trial_start_signal_armed_s: Optional[float] = None
     trial_start_signal_sent = False
+
+    def _set_fixation_color(color_rgb: Tuple[int, int, int]) -> None:
+        nonlocal fixation_color
+        fixation_color = tuple(int(value) for value in color_rgb)
+        if fix is None:
+            return
+        try:
+            fix.color = rgb255_to_psychopy(fixation_color)
+            fix.colorSpace = "rgb"
+        except Exception:
+            pass
+
+    def _cue_contains(position: Tuple[float, float]) -> bool:
+        if onset_cue is None:
+            return False
+        try:
+            cue_width, cue_height = onset_cue.size
+        except Exception:
+            cue_width, cue_height = (200.0, 200.0)
+        cue_x, cue_y = getattr(onset_cue, "pos", (0.0, 0.0))
+        return bool(
+            abs(float(position[0]) - float(cue_x)) <= float(cue_width) / 2.0
+            and abs(float(position[1]) - float(cue_y)) <= float(cue_height) / 2.0
+        )
+
+    def _draw_pre_choice_overlay() -> None:
+        if held_initiation_cue_visible and pressed_onset_cue is not None:
+            pressed_onset_cue.draw()
+        if fix is not None:
+            fix.draw()
+
+    if white_fixation_until_choice:
+        _set_fixation_color((255, 255, 255))
 
     def _should_abort(notes: str) -> bool:
         if external_abort_checker is None:
@@ -2279,6 +2351,8 @@ def present_trial_with_persistent_dots(
     def _interaction_event_name(kind: str) -> str:
         if kind == "cue_touch":
             return "cue_touch"
+        if kind == "cue_release":
+            return "initiation_cue_release"
         return "option_touch"
 
     def _arm_trial_start_signal() -> bool:
@@ -2342,6 +2416,24 @@ def present_trial_with_persistent_dots(
         if experimenter_preview is None or bg_rgb_255 is None:
             return
         preview_items = list(images or [])
+        hitbox_items = list(preview_items)
+        if held_initiation_cue_visible and pressed_onset_cue is not None:
+            preview_items.append(
+                {
+                    "image_payload": serialize_preview_image(
+                        getattr(pressed_onset_cue, "image", None)
+                    ),
+                    "pos": tuple(
+                        float(value)
+                        for value in getattr(pressed_onset_cue, "pos", (0.0, 0.0))
+                    ),
+                    "size": tuple(
+                        float(value)
+                        for value in getattr(pressed_onset_cue, "size", (200.0, 200.0))
+                    ),
+                    "ori": float(getattr(pressed_onset_cue, "ori", rotation_degrees)),
+                }
+            )
         fixation_size = None
         try:
             fixation_size = float(getattr(fix, "height"))
@@ -2353,11 +2445,11 @@ def present_trial_with_persistent_dots(
             images=_preview_images(preview_items),
             dots=_preview_dots(),
             hit_boxes=build_reward_hit_boxes(
-                preview_items,
+                hitbox_items,
                 hitbox_scale=choice_hitbox_scale,
             ),
             fixation_size=fixation_size,
-            fixation_color=(0, 0, 0),
+            fixation_color=fixation_color,
             main_rotation_deg=rotation_degrees,
         )
 
@@ -2376,17 +2468,86 @@ def present_trial_with_persistent_dots(
             entry["reward_level"] = int(reward_level)
         return entry
 
+    def _log_initiation_cue_release(release_perf_s: float) -> None:
+        nonlocal initiation_cue_released, held_initiation_cue_visible
+        if initiation_cue_released:
+            return
+        initiation_cue_released = True
+        held_initiation_cue_visible = False
+        logger.log_interaction(
+            trial_num=trial_num,
+            event=_interaction_event_name("cue_release"),
+            timestamp_perf_s=float(release_perf_s),
+        )
+        if trial_meta is not None:
+            trial_meta["initiation_cue_released"] = True
+            trial_meta["initiation_cue_release_perf_s"] = float(release_perf_s)
+        _log_message(
+            msg_logger,
+            "INFO",
+            f"initiation_cue_released trial_num={trial_num}",
+        )
+
+    def _finish_released_trial() -> Tuple[bool, None]:
+        nonlocal held_initiation_cue_visible
+        held_initiation_cue_visible = False
+        if white_fixation_until_choice:
+            _set_fixation_color((255, 255, 255))
+        bg_rect.draw()
+        if fix is not None:
+            fix.draw()
+        gray_timing = flip_with_timestamps(win)
+        _show_preview([])
+        if trial_meta is not None:
+            trial_meta["gray_flip_perf_s"] = float(gray_timing.actual_perf_s)
+            if gray_timing.requested_perf_s is not None:
+                trial_meta["gray_flip_requested_perf_s"] = float(
+                    gray_timing.requested_perf_s
+                )
+            trial_meta["main_display_transition_count"] = (
+                transition_scheduler.transition_count
+            )
+            trial_meta["main_display_transition_misses"] = (
+                transition_scheduler.missed_transition_count
+            )
+            trial_meta["main_display_max_transition_error_s"] = (
+                transition_scheduler.maximum_absolute_error_s
+            )
+        return False, None
+
+    def _poll_held_initiation_cue() -> bool:
+        if not enforce_initiation_hold or initiation_cue_released:
+            return initiation_cue_released
+        touch_sample = mouse_presses.poll()
+        now = time.perf_counter()
+        hold_sample = initiation_hold.update(
+            touch_sample.down and _cue_contains(touch_sample.position),
+            now,
+        )
+        if hold_sample.released:
+            _log_initiation_cue_release(hold_sample.missing_since_s or now)
+            return True
+        return False
+
+    def _interrupted_result() -> Tuple[bool, None]:
+        if initiation_cue_released:
+            return _finish_released_trial()
+        return True, None
+
     if onset_cue is not None:
+        if pressed_onset_cue is None:
+            pressed_onset_cue = onset_cue
         try:
-            onset_cue.pos = (0, 0)
             onset_cue.opacity = 1.0
             onset_cue.ori = rotation_degrees
+            pressed_onset_cue.pos = onset_cue.pos
+            pressed_onset_cue.opacity = 1.0
+            pressed_onset_cue.ori = rotation_degrees
         except Exception:
             pass
         bg_rect.draw()
         onset_cue.draw()
-        if fix is not None:
-            fix.draw()
+        _draw_pre_choice_overlay()
         try:
             _show_preview(
                 [
@@ -2402,8 +2563,8 @@ def present_trial_with_persistent_dots(
             pass
         if not _arm_trial_start_signal():
             return True, None
-        # Arm before the vsync-blocked flip so even a press and release that
-        # both arrive during the flip remain observable through click timing.
+        # Reset immediately before the response-opening flip. A press already
+        # held here is ignored; a new press or short tap during the flip is not.
         mouse_presses.reset()
         oc_timing = flip_with_timestamps(win)
         oc_perf = oc_timing.actual_perf_s
@@ -2414,6 +2575,7 @@ def present_trial_with_persistent_dots(
             timestamp_perf_s=oc_perf,
             requested_timestamp_perf_s=oc_timing.requested_perf_s,
         )
+        initiation_started = False
         while True:
             if _event.getKeys(["escape"]):
                 _log_message(msg_logger, "WARN", f"escape_pressed trial_num={trial_num} during_onset_cue=1")
@@ -2423,24 +2585,83 @@ def present_trial_with_persistent_dots(
 
             touch_sample = mouse_presses.poll()
             click_pos = touch_sample.position
-            if touch_sample.active:
+            now = time.perf_counter()
+            if (
+                not initiation_started
+                and touch_sample.press_started
+                and _cue_contains(click_pos)
+            ):
+                initiation_started = True
+                initiation_hold.start(now)
+                _set_initiation_time(now)
+                logger.log_interaction(
+                    trial_num=trial_num,
+                    event=_interaction_event_name("cue_touch"),
+                    timestamp_perf_s=now,
+                )
+                bg_rect.draw()
+                pressed_onset_cue.draw()
+                if fix is not None:
+                    fix.draw()
+                flip_with_timestamps(win)
                 try:
-                    oc_w, oc_h = onset_cue.size
-                except Exception:
-                    oc_w, oc_h = (200, 200)
-                oc_x, oc_y = getattr(onset_cue, "pos", (0, 0))
-                if abs(click_pos[0] - oc_x) <= oc_w / 2.0 and abs(click_pos[1] - oc_y) <= oc_h / 2.0:
-                    click_perf = time.perf_counter()
-                    _set_initiation_time(click_perf)
-                    logger.log_interaction(
-                        trial_num=trial_num,
-                        event=_interaction_event_name("cue_touch"),
-                        timestamp_perf_s=click_perf,
+                    _show_preview(
+                        [
+                            {
+                                "image_payload": serialize_preview_image(
+                                    getattr(pressed_onset_cue, "image", None)
+                                ),
+                                "pos": tuple(float(value) for value in pressed_onset_cue.pos),
+                                "size": tuple(float(value) for value in pressed_onset_cue.size),
+                                "ori": float(getattr(pressed_onset_cue, "ori", rotation_degrees)),
+                            }
+                        ]
                     )
+                except Exception:
+                    pass
+
+            if initiation_started:
+                hold_sample = initiation_hold.update(
+                    touch_sample.down and _cue_contains(click_pos),
+                    now,
+                )
+                if hold_sample.qualified:
+                    held_initiation_cue_visible = hold_before_choice
                     _show_preview([])
                     break
+                if hold_sample.released:
+                    if hold_before_choice:
+                        _log_initiation_cue_release(
+                            hold_sample.missing_since_s or now
+                        )
+                        return _finish_released_trial()
+                    if trial_meta is not None:
+                        trial_meta.pop("initiation_time_s", None)
+                    initiation_started = False
+                    initiation_hold.reset()
+                    bg_rect.draw()
+                    onset_cue.draw()
+                    if fix is not None:
+                        fix.draw()
+                    flip_with_timestamps(win)
+                    mouse_presses.reset()
+                    try:
+                        _show_preview(
+                            [
+                                {
+                                    "image_payload": serialize_preview_image(
+                                        getattr(onset_cue, "image", None)
+                                    ),
+                                    "pos": tuple(float(value) for value in onset_cue.pos),
+                                    "size": tuple(float(value) for value in onset_cue.size),
+                                    "ori": float(getattr(onset_cue, "ori", rotation_degrees)),
+                                }
+                            ]
+                        )
+                    except Exception:
+                        pass
 
-            _core.wait(0.01)
+            _core.wait(0.002)
 
     cue_frames = cue_plan.frame_count
     cue_s = cue_plan.scheduled_s
@@ -2468,13 +2689,12 @@ def present_trial_with_persistent_dots(
         if not _arm_trial_start_signal():
             return True, None
         pre_options_cue_touched = False
-        pre_options_cue_touch_armed = True
         cue_touch_target = None
         clear_timing = None
         if detect_pre_options_cue_touch:
-            # A held checkerboard-initiation press must be released before the
-            # matching cue can accept a touch.
-            pre_options_cue_touch_armed = not mouse_presses.reset()
+            # A held initiation press must be released before the matching cue
+            # can accept a touch.
+            mouse_presses.reset()
             cue_touch_target = visual.Rect(
                 win,
                 width=max(1.0, float(cue_stim.size[0]) * float(choice_hitbox_scale)),
@@ -2488,17 +2708,11 @@ def present_trial_with_persistent_dots(
             )
 
         def _poll_pre_options_cue_touch() -> None:
-            nonlocal pre_options_cue_touched, pre_options_cue_touch_armed
+            nonlocal pre_options_cue_touched
             if not detect_pre_options_cue_touch or pre_options_cue_touched:
                 return
             touch_sample = mouse_presses.poll()
-            pre_options_cue_touch_armed, touch_is_eligible = (
-                advance_release_armed_touch_gate(
-                    pre_options_cue_touch_armed,
-                    touch_sample,
-                )
-            )
-            if not touch_is_eligible:
+            if not touch_sample.press_started:
                 return
             click_pos = touch_sample.position
             try:
@@ -2512,16 +2726,15 @@ def present_trial_with_persistent_dots(
                     and abs(click_pos[1] - cue_y)
                     <= (cue_h * float(choice_hitbox_scale)) / 2.0
                 )
-            if touch_sample.press_started:
-                _log_message(
-                    msg_logger,
-                    "INFO",
-                    (
-                        f"match_cue_touch_attempt trial_num={trial_num} "
-                        f"click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f}) "
-                        f"matched={int(cue_contains_touch)}"
-                    ),
-                )
+            _log_message(
+                msg_logger,
+                "INFO",
+                (
+                    f"match_cue_touch_attempt trial_num={trial_num} "
+                    f"click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f}) "
+                    f"matched={int(cue_contains_touch)}"
+                ),
+            )
             if not cue_contains_touch:
                 return
             touch_perf = time.perf_counter()
@@ -2537,8 +2750,9 @@ def present_trial_with_persistent_dots(
 
         bg_rect.draw()
         cue_stim.draw()
-        if fix is not None:
-            fix.draw()
+        _draw_pre_choice_overlay()
+        if _poll_held_initiation_cue():
+            return _finish_released_trial()
         cue_timing = flip_with_timestamps(win)
         cue_perf = cue_timing.actual_perf_s
         _commit_trial_start_signal(cue_perf, cue_timing.requested_perf_s)
@@ -2561,6 +2775,8 @@ def present_trial_with_persistent_dots(
                 return True
             if _should_abort("experimenter_exit_during_match_cue"):
                 return True
+            if _poll_held_initiation_cue():
+                return True
             _poll_pre_options_cue_touch()
             return False
 
@@ -2575,15 +2791,14 @@ def present_trial_with_persistent_dots(
             # it in the front buffer for the entire static phase.
             _show_preview([])
             bg_rect.draw()
-            if fix is not None:
-                fix.draw()
+            _draw_pre_choice_overlay()
             clear_timing = transition_scheduler.flip_at(
                 win,
                 cue_offset_target,
                 poll_callback=_poll_pre_options_cue_phase,
             )
             if clear_timing is None:
-                return True, None
+                return _interrupted_result()
             if detect_pre_options_cue_touch and trial_meta is not None:
                 trial_meta["match_cue_clear_flip_perf_s"] = (
                     clear_timing.actual_perf_s
@@ -2767,6 +2982,17 @@ def present_trial_with_persistent_dots(
         mouse_presses.reset()
         choice_input_armed = True
 
+    def _prepare_choice_display() -> None:
+        nonlocal held_initiation_cue_visible
+        held_initiation_cue_visible = False
+        if white_fixation_until_choice:
+            _set_fixation_color((0, 0, 0))
+
+    def _open_choice_input() -> None:
+        nonlocal enforce_initiation_hold
+        enforce_initiation_hold = False
+        _arm_choice_input()
+
     def _start_choice_window(
         start_flip_ps,
         start_perf: float,
@@ -2794,7 +3020,7 @@ def present_trial_with_persistent_dots(
             requested_duration=choice_plan.requested_s,
         )
 
-        if start_touch.active and choice_perf is not None:
+        if start_touch.press_started and choice_perf is not None:
             touch_onset_perf = time.perf_counter()
             chosen_idx = _match_choice_target(start_click_pos)
             start_click_pos_acquired, chosen_idx = _acquire_choice_target(
@@ -2815,6 +3041,8 @@ def present_trial_with_persistent_dots(
         if _event.getKeys(["escape"]):
             _log_message(msg_logger, "WARN", f"escape_pressed trial_num={trial_num} reason={reason}")
             return True
+        if _poll_held_initiation_cue():
+            return True
         return _should_abort(reason)
 
     def _poll_choice_until(deadline_perf: float) -> bool:
@@ -2825,17 +3053,14 @@ def present_trial_with_persistent_dots(
 
             touch_sample = mouse_presses.poll()
             click_pos = touch_sample.position
-            touch_started = touch_sample.press_started
-
-            if touch_sample.active and choice_perf is not None:
+            if touch_sample.press_started and choice_perf is not None:
                 touch_onset_perf = time.perf_counter()
                 chosen_idx = _match_choice_target(click_pos)
 
-                if chosen_idx is None and touch_started:
+                if chosen_idx is None:
                     click_pos, chosen_idx = _acquire_choice_target(click_pos, chosen_idx, touch_onset_perf)
 
-                if touch_started:
-                    _log_choice_touch_attempt(click_pos, chosen_idx, origin="touch_start")
+                _log_choice_touch_attempt(click_pos, chosen_idx, origin="touch_start")
 
                 if chosen_idx is not None:
                     _commit_choice(chosen_idx, click_pos, touch_onset_perf)
@@ -2946,14 +3171,13 @@ def present_trial_with_persistent_dots(
                 bg_rect.draw()
                 for d in dots:
                     d.draw()
-                if fix is not None:
-                    fix.draw()
+                _draw_pre_choice_overlay()
                 dot_timing = _flip_prepared_scene(
                     next_visual_target_perf_s,
                     "experimenter_exit_during_isi",
                 )
                 if dot_timing is None:
-                    return True, None
+                    return _interrupted_result()
                 dot_perf = dot_timing.actual_perf_s
                 _commit_trial_start_signal(
                     dot_perf,
@@ -2982,14 +3206,13 @@ def present_trial_with_persistent_dots(
             for d in dots:
                 d.draw()
             stim.draw()
-            if fix is not None:
-                fix.draw()
+            _draw_pre_choice_overlay()
             stim_timing = _flip_prepared_scene(
                 next_visual_target_perf_s,
                 "experimenter_exit_during_stimulus",
             )
             if stim_timing is None:
-                return True, None
+                return _interrupted_result()
             flip_ps = stim_timing.psychopy_s
             flip_perf = stim_timing.actual_perf_s
             _commit_trial_start_signal(
@@ -3027,14 +3250,13 @@ def present_trial_with_persistent_dots(
                 bg_rect.draw()
                 for d in dots:
                     d.draw()
-                if fix is not None:
-                    fix.draw()
+                _draw_pre_choice_overlay()
                 break_timing = _flip_prepared_scene(
                     next_visual_target_perf_s,
                     "experimenter_exit_during_inter_stimulus_interval",
                 )
                 if break_timing is None:
-                    return True, None
+                    return _interrupted_result()
                 logger.log_frame_flip(
                     trial_num=trial_num,
                     event=_frame_event_name("inter_stimulus"),
@@ -3053,6 +3275,7 @@ def present_trial_with_persistent_dots(
                 dot_records.pop()
 
             if (not is_memory) and idx == len(trial_options):
+                _prepare_choice_display()
                 bg_rect.draw()
                 for s in stims_for_choice:
                     s.draw()
@@ -3061,10 +3284,10 @@ def present_trial_with_persistent_dots(
                 off_timing = _flip_prepared_scene(
                     next_visual_target_perf_s,
                     "experimenter_exit_during_choice_start",
-                    before_flip_callback=_arm_choice_input,
+                    before_flip_callback=_open_choice_input,
                 )
                 if off_timing is None:
-                    return True, None
+                    return _interrupted_result()
                 off_flip = off_timing.psychopy_s
                 off_perf = off_timing.actual_perf_s
                 next_visual_target_perf_s = None
@@ -3104,14 +3327,13 @@ def present_trial_with_persistent_dots(
             bg_rect.draw()
             for d in dots:
                 d.draw()
-            if fix is not None:
-                fix.draw()
+            _draw_pre_choice_overlay()
             dot_timing = _flip_prepared_scene(
                 next_visual_target_perf_s,
                 "experimenter_exit_during_isi",
             )
             if dot_timing is None:
-                return True, None
+                return _interrupted_result()
             dot_perf = dot_timing.actual_perf_s
             _commit_trial_start_signal(dot_perf, dot_timing.requested_perf_s)
             _set_initiation_time(dot_perf)
@@ -3130,22 +3352,26 @@ def present_trial_with_persistent_dots(
 
         if not _arm_trial_start_signal():
             return True, None
+        if not is_memory:
+            _prepare_choice_display()
         bg_rect.draw()
         for d in dots:
             d.draw()
         for s in stims:
             s.draw()
-        if fix is not None:
+        if is_memory:
+            _draw_pre_choice_overlay()
+        elif fix is not None:
             fix.draw()
         stim_timing = _flip_prepared_scene(
             next_visual_target_perf_s,
             "experimenter_exit_during_stimulus",
             before_flip_callback=(
-                _arm_choice_input if not is_memory else None
+                _open_choice_input if not is_memory else None
             ),
         )
         if stim_timing is None:
-            return True, None
+            return _interrupted_result()
         flip_ps = stim_timing.psychopy_s
         flip_perf = stim_timing.actual_perf_s
         _commit_trial_start_signal(flip_perf, stim_timing.requested_perf_s)
@@ -3194,6 +3420,7 @@ def present_trial_with_persistent_dots(
 
     if not click_registered:
         if not choice_started:
+            _prepare_choice_display()
             bg_rect.draw()
             if is_memory:
                 for d in dots:
@@ -3206,10 +3433,10 @@ def present_trial_with_persistent_dots(
             choice_timing = _flip_prepared_scene(
                 next_visual_target_perf_s,
                 "experimenter_exit_during_choice_start",
-                before_flip_callback=_arm_choice_input,
+                before_flip_callback=_open_choice_input,
             )
             if choice_timing is None:
-                return True, None
+                return _interrupted_result()
             choice_flip = choice_timing.psychopy_s
             choice_perf_now = choice_timing.actual_perf_s
             next_visual_target_perf_s = None
@@ -3224,6 +3451,8 @@ def present_trial_with_persistent_dots(
         # Prepare the static gray scene once while the choice remains visible
         # in the front buffer. A response can therefore transition on the next
         # refresh without spending its headroom redrawing the scene.
+        if white_fixation_until_choice:
+            _set_fixation_color((255, 255, 255))
         bg_rect.draw()
         if fix is not None:
             fix.draw()
@@ -3235,6 +3464,8 @@ def present_trial_with_persistent_dots(
                 return True, None
 
     if not clear_scene_prepared:
+        if white_fixation_until_choice:
+            _set_fixation_color((255, 255, 255))
         bg_rect.draw()
         if fix is not None:
             fix.draw()

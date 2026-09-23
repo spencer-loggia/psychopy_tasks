@@ -14,6 +14,8 @@ Config keys required/additional:
 - shapes_tsv: path to TSV file with ID, PATH (SVG)
 - image_size: [W, H]
 - num_afc, n, duration, isi, iti, choice_time, dot_size, dot_color, init_dot_color
+- initiation_cue_center_position, initiation_cue_style, hold_before_choice,
+  hold_cue_to_init_time_s
 - pump_delay_time: delay in seconds between a rewarded choice and the first pump pulse
 - inter_pump_interval: optional delay in seconds between pump pulses; defaults to pump_pulse_time_seconds
 - trial_start_pin is a Raspberry Pi BCM GPIO pin; pump_pin and buzz_pin are
@@ -42,7 +44,7 @@ from bin.affinity import (
     set_process_cpu_affinity,
 )
 from bin.daqc2_outputs import DAQC2DigitalOutputs
-from bin.afc_geometry import compute_afc_positions, stimulus_size
+from bin.afc_geometry import compute_afc_positions, screen_px_to_psychopy, stimulus_size
 from bin.afc_stimuli import render_afc_stimulus
 from bin.frame_timing import (
     plan_frame_duration,
@@ -53,6 +55,7 @@ from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 import numpy as np
 from bin.config import load_config, resolve_subject_mapped_value, validate_config
+from bin.initiation import INITIATION_CONFIG_KEYS, resolve_initiation_config
 from bin.screen import (
     ExperimenterPreview,
     describe_screen,
@@ -172,7 +175,7 @@ def _decode_trial_payload(payload: dict) -> Tuple[List[Tuple[int, int]], List[Tu
 
 
 def _build_behavior_fieldnames(num_afc: int) -> List[str]:
-    fieldnames = ["trial_num", "initiation_time", "reaction_time"]
+    fieldnames = ["trial_num", "initiation_time"]
     for opt_idx in range(int(num_afc)):
         fieldnames.extend([f"shape_{opt_idx}", f"color_{opt_idx}", f"lum_{opt_idx}"])
     fieldnames.extend(
@@ -302,6 +305,10 @@ def run_task(
     image_size: Optional[Tuple[int, int]] = None,
     debug: bool = False,
     self_initiation: bool = False,
+    initiation_cue_center_position: Optional[Tuple[float, float]] = None,
+    initiation_cue_style: str = "checker",
+    hold_before_choice: bool = False,
+    hold_cue_to_init_time_s: float = 0.0,
     fixation_size: Optional[int] = None,
     refresh_rate: Optional[float] = None,
     touchscreen: bool = False,
@@ -668,6 +675,7 @@ def run_task(
     fix = utils.make_fixation_cross(
         win,
         size=fixation_size,
+        color=(255, 255, 255),
         ori=stimulus_rotation_degrees,
     )
     reward_counts = {0: 0, 1: 0, 2: 0, 3: 0}
@@ -693,7 +701,7 @@ def run_task(
             images=[],
             dots=[],
             fixation_size=preview_fixation_size,
-            fixation_color=(0, 0, 0),
+            fixation_color=(255, 255, 255),
             reward_counts=reward_counts,
             highlight_box=None,
             main_rotation_deg=stimulus_rotation_degrees,
@@ -762,7 +770,7 @@ def run_task(
             images=images,
             dots=dots,
             fixation_size=preview_fixation_size,
-            fixation_color=(0, 0, 0),
+            fixation_color=(255, 255, 255),
             reward_counts=reward_counts,
             highlight_box=highlight_box,
             main_rotation_deg=stimulus_rotation_degrees,
@@ -785,19 +793,25 @@ def run_task(
 
     # If self-initiation requested, build an onset cue ImageStim via utility
     onset_stim = None
+    pressed_onset_stim = None
     if self_initiation:
-        try:
-            onset_stim = utils.make_onset_cue_stim(
-                win,
-                bg_rgb_255=bg,
-                size_frac=0.125,
-                cells=8,
-                sigma_frac=0.22,
-                zero_threshold=1,
-                ori=stimulus_rotation_degrees,
+        onset_position = (
+            (0.0, 0.0)
+            if initiation_cue_center_position is None
+            else screen_px_to_psychopy(
+                initiation_cue_center_position,
+                main_scene_size,
+                field_name="initiation_cue_center_position",
             )
-        except Exception:
-            onset_stim = None
+        )
+        onset_stim, pressed_onset_stim = utils.make_initiation_cue_stims(
+            win,
+            bg_rgb_255=bg,
+            cue_color=init_dot_color if init_dot_color is not None else dot_color,
+            style=initiation_cue_style,
+            position=onset_position,
+            ori=stimulus_rotation_degrees,
+        )
 
     # Create background rectangle via utility
     bg_rect = utils.make_bg_rect(win, bg)
@@ -1060,6 +1074,10 @@ def run_task(
                 init_dot_color=init_dot_color,
                 bg_rgb_255=bg,
                 onset_cue=onset_stim,
+                pressed_onset_cue=pressed_onset_stim,
+                hold_before_choice=hold_before_choice,
+                hold_cue_to_init_time_s=hold_cue_to_init_time_s,
+                white_fixation_until_choice=True,
                 msg_logger=msg_logger,
                 fps=fps,
                 raspi=bool(raspi and pigpio_pi is not None),
@@ -1230,7 +1248,6 @@ def run_task(
             behavior_row: Dict[str, Any] = {
                 "trial_num": trial_num,
                 "initiation_time": _fmt_optional(trial_meta.get("initiation_time_s")),
-                "reaction_time": _fmt_optional(choice_info.get("reaction_time_s") if choice_info is not None else ""),
                 "choice_made_index": chosen_idx_row,
                 "choice_made_color": "",
                 "choice_made_shape": "",
@@ -1351,6 +1368,7 @@ def main():
             "freq_space_tsv",
             "reward_space_tsv",
             "n",
+            *INITIATION_CONFIG_KEYS,
         ],
         allow_zero_duration=True,
     )
@@ -1366,6 +1384,7 @@ def main():
         cli_main=args.main_screen,
         cli_experimenter=args.experimenter_screen,
     )
+    initiation_config = resolve_initiation_config(cfg)
 
     colors_tsv = _get("colors_tsv", cfg.get("colors_tsv"))
     shapes_tsv = _get("shapes_tsv", cfg.get("shapes_tsv"))
@@ -1449,6 +1468,10 @@ def main():
             image_size=image_size,
             debug=debug,
             self_initiation=_get("self_initiation", cfg.get("self_initiation", False)),
+            initiation_cue_center_position=initiation_config.cue_center_position,
+            initiation_cue_style=initiation_config.cue_style,
+            hold_before_choice=initiation_config.hold_before_choice,
+            hold_cue_to_init_time_s=initiation_config.hold_cue_to_init_time_s,
             fixation_size=_get("fixation_size", cfg.get("fixation_size", None)),
             refresh_rate=refresh_rate,
             touchscreen=touchscreen,

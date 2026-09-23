@@ -227,6 +227,7 @@ class LoggingSpecTests(unittest.TestCase):
     def test_shared_library_expands_active_foraging_option_templates(self):
         definitions, event_patterns = load_task_event_definitions("active_foraging")
         self.assertIn("inter_stimulus_interval", definitions)
+        self.assertEqual(definitions["initiation_cue_release"].code, 203)
         library = EventCodeLibrary(definitions, event_patterns=event_patterns)
 
         option_dot = library.ensure("option_2_dot", "frame_flip")

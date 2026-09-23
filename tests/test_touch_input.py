@@ -1,9 +1,8 @@
 import unittest
 
 from bin.touch_input import (
-    MousePressSample,
     MousePressTracker,
-    advance_release_armed_touch_gate,
+    TouchHoldTracker,
 )
 
 
@@ -38,7 +37,7 @@ class MousePressTrackerTests(unittest.TestCase):
         )
         tracker = MousePressTracker(mouse)
 
-        self.assertFalse(tracker.reset())
+        tracker.reset()
         sample = tracker.poll()
 
         self.assertFalse(sample.down)
@@ -99,46 +98,63 @@ class MousePressTrackerTests(unittest.TestCase):
         )
         tracker = MousePressTracker(mouse)
 
-        self.assertTrue(tracker.reset())
+        tracker.reset()
         self.assertFalse(tracker.poll().press_started)
         self.assertFalse(tracker.poll().press_started)
         self.assertTrue(tracker.poll().press_started)
 
+    def test_repeated_clicks_do_not_poison_later_response_windows(self):
+        up = ((0, 0, 0), (0.0, 0.0, 0.0), (0, 0))
+        press = ((1, 0, 0), (0.001, 0.0, 0.0), (10, 10))
+        mouse = FakeMouse([up, *([press, up] * 100), up, press, up, up, press])
+        tracker = MousePressTracker(mouse)
 
-class ReleaseArmedTouchGateTests(unittest.TestCase):
-    def test_held_initiation_press_stays_blocked_until_release(self):
-        held = MousePressSample((0.0, 0.0), (True, False, False), False, False)
-        released = MousePressSample((0.0, 0.0), (False, False, False), False, False)
-        new_press = MousePressSample((5.0, 6.0), (True, False, False), True, False)
+        tracker.reset()
+        for _ in range(100):
+            self.assertTrue(tracker.poll().press_started)
+            self.assertFalse(tracker.poll().press_started)
 
-        armed, eligible = advance_release_armed_touch_gate(False, held)
-        self.assertFalse(armed)
-        self.assertFalse(eligible)
+        tracker.reset()
+        self.assertTrue(tracker.poll().press_started)
+        self.assertFalse(tracker.poll().press_started)
 
-        armed, eligible = advance_release_armed_touch_gate(armed, released)
-        self.assertTrue(armed)
-        self.assertFalse(eligible)
+        tracker.reset()
+        self.assertTrue(tracker.poll().press_started)
 
-        armed, eligible = advance_release_armed_touch_gate(armed, new_press)
-        self.assertTrue(armed)
-        self.assertTrue(eligible)
 
-    def test_buffered_repress_during_flip_arms_and_activates_gate(self):
-        buffered_repress = MousePressSample(
-            (5.0, 6.0),
-            (False, False, False),
-            True,
-            True,
-        )
+class TouchHoldTrackerTests(unittest.TestCase):
+    def test_short_registration_break_is_tolerated(self):
+        tracker = TouchHoldTracker(0.2, max_break_s=0.1)
 
-        armed, eligible = advance_release_armed_touch_gate(
-            False,
-            buffered_repress,
-        )
+        tracker.start(10.0)
+        self.assertFalse(tracker.update(False, 10.05).released)
+        self.assertFalse(tracker.update(True, 10.09).released)
+        final = tracker.update(True, 10.21)
 
-        self.assertTrue(armed)
-        self.assertTrue(eligible)
+        self.assertTrue(final.qualified)
+        self.assertFalse(final.released)
 
+    def test_break_longer_than_tolerance_records_release_start(self):
+        tracker = TouchHoldTracker(0.5, max_break_s=0.1)
+
+        tracker.start(20.0)
+        tracker.update(False, 20.2)
+        final = tracker.update(False, 20.300001)
+
+        self.assertTrue(final.released)
+        self.assertFalse(final.qualified)
+        self.assertEqual(final.missing_since_s, 20.2)
+
+    def test_reset_allows_a_new_hold(self):
+        tracker = TouchHoldTracker(0.1)
+        tracker.start(1.0)
+        tracker.update(False, 1.0)
+        self.assertTrue(tracker.update(False, 1.100001).released)
+
+        tracker.reset()
+        tracker.start(2.0)
+
+        self.assertTrue(tracker.update(True, 2.1).qualified)
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,7 +9,9 @@ state is already up, but the timestamp still records the press.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+import math
+import time
+from typing import Any, Callable, Optional, Sequence
 
 
 @dataclass(frozen=True)
@@ -31,23 +33,87 @@ class MousePressSample:
         return self.down or self.press_started
 
 
-def advance_release_armed_touch_gate(
-    armed: bool,
-    sample: MousePressSample,
-) -> tuple[bool, bool]:
-    """Advance a touch gate that ignores a press held before it opened.
+@dataclass(frozen=True)
+class TouchHoldSample:
+    """State of a continuous touch hold after one tracker update."""
 
-    Returns ``(armed, eligible_now)``. A buffered press arms and activates the
-    gate because it proves that a release/re-press occurred during a blocking
-    display flip.
+    qualified: bool
+    released: bool
+    missing_since_s: Optional[float]
+
+
+class TouchHoldTracker:
+    """Track a held touch while tolerating short input-registration gaps.
+
+    ``touch_registered`` should be true only while a touch is both down and
+    within its required target. Tolerated gaps remain part of the elapsed hold
+    because they represent presumed registration errors rather than releases.
     """
-    if armed:
-        return True, sample.active
-    if sample.buffered_press:
-        return True, True
-    if not sample.down:
-        return True, False
-    return False, False
+
+    def __init__(
+        self,
+        required_hold_s: float,
+        *,
+        max_break_s: float = 0.100,
+        clock: Callable[[], float] = time.perf_counter,
+    ) -> None:
+        required_hold_s = float(required_hold_s)
+        max_break_s = float(max_break_s)
+        if not math.isfinite(required_hold_s) or required_hold_s < 0.0:
+            raise ValueError("required_hold_s must be finite and non-negative")
+        if not math.isfinite(max_break_s) or max_break_s < 0.0:
+            raise ValueError("max_break_s must be finite and non-negative")
+        self.required_hold_s = required_hold_s
+        self.max_break_s = max_break_s
+        self._clock = clock
+        self.reset()
+
+    def reset(self) -> None:
+        self._started_s: Optional[float] = None
+        self._missing_since_s: Optional[float] = None
+        self._released = False
+
+    def start(self, timestamp_s: Optional[float] = None) -> None:
+        now = self._resolve_time(timestamp_s)
+        self._started_s = now
+        self._missing_since_s = None
+        self._released = False
+
+    def update(
+        self,
+        touch_registered: bool,
+        timestamp_s: Optional[float] = None,
+    ) -> TouchHoldSample:
+        now = self._resolve_time(timestamp_s)
+        if self._started_s is None:
+            if touch_registered:
+                self._started_s = now
+            return self._sample(now)
+
+        if not self._released:
+            if touch_registered:
+                self._missing_since_s = None
+            else:
+                if self._missing_since_s is None:
+                    self._missing_since_s = now
+                if now - self._missing_since_s > self.max_break_s:
+                    self._released = True
+        return self._sample(now)
+
+    def _resolve_time(self, timestamp_s: Optional[float]) -> float:
+        now = self._clock() if timestamp_s is None else float(timestamp_s)
+        if not math.isfinite(now):
+            raise ValueError("touch-hold timestamps must be finite")
+        return now
+
+    def _sample(self, now: float) -> TouchHoldSample:
+        started = self._started_s is not None
+        elapsed_s = max(0.0, now - self._started_s) if started else 0.0
+        return TouchHoldSample(
+            qualified=bool(started and not self._released and elapsed_s >= self.required_hold_s),
+            released=self._released,
+            missing_since_s=self._missing_since_s,
+        )
 
 
 def _as_bool_tuple(value: Any) -> tuple[bool, ...]:
@@ -96,17 +162,17 @@ class MousePressTracker:
         except Exception:
             pass
 
-    def reset(self) -> bool:
-        """Discard earlier presses and return whether a button is held now.
+    def reset(self) -> None:
+        """Discard earlier presses and begin a fresh response window.
 
         This should be called immediately before the flip that opens a response
-        window.  Reading first pumps pending window-system events; resetting
-        second makes any press arriving during the blocking flip observable.
+        window. Capturing the current state prevents an already-held press from
+        becoming a new edge; resetting its clock preserves presses that arrive
+        during the blocking flip.
         """
         buttons, _ = self._read_buttons_and_times()
         self._previous_down = any(buttons)
         self._reset_click_times()
-        return self._previous_down
 
     def poll(self) -> MousePressSample:
         """Pump events and return held, edge, and short-tap information."""

@@ -58,12 +58,25 @@ def resolve_stimulus_circle(
     return center_px, radius_px
 
 
-def _screen_px_to_psychopy(
+def screen_px_to_psychopy(
     position_px: Tuple[float, float],
     effective_win_size: Tuple[int, int],
+    *,
+    field_name: str = "position",
 ) -> Tuple[float, float]:
     width_px, height_px = float(effective_win_size[0]), float(effective_win_size[1])
-    return position_px[0] - (width_px / 2.0), (height_px / 2.0) - position_px[1]
+    if width_px <= 0.0 or height_px <= 0.0:
+        raise ValueError(f"Invalid main screen size: {effective_win_size}")
+    if len(position_px) != 2:
+        raise ValueError(f"{field_name} must contain exactly two pixel coordinates")
+    x_px, y_px = float(position_px[0]), float(position_px[1])
+    if not (math.isfinite(x_px) and math.isfinite(y_px)):
+        raise ValueError(f"{field_name} coordinates must be finite")
+    if not (0.0 <= x_px <= width_px and 0.0 <= y_px <= height_px):
+        raise ValueError(
+            f"{field_name}=({x_px}, {y_px}) is outside the main screen bounds {effective_win_size}"
+        )
+    return x_px - (width_px / 2.0), (height_px / 2.0) - y_px
 
 
 def _circle_point(
@@ -158,7 +171,7 @@ def compute_afc_positions(
         )
 
     positions = [
-        _screen_px_to_psychopy(pos_px, effective_win_size)
+        screen_px_to_psychopy(pos_px, effective_win_size)
         for pos_px in sampled_positions_px
     ]
     return sampled_positions_px, positions

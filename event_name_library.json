@@ -111,6 +111,11 @@
       "event_type": "interaction",
       "description": "A fresh touch or click was registered on the displayed match-to-cue target stimulus."
     },
+    "initiation_cue_release": {
+      "code": 203,
+      "event_type": "interaction",
+      "description": "The required initiation-cue hold was released for more than 100 milliseconds before choice."
+    },
     "trial_start_signal_on": {
       "code": 300,
       "event_type": "signal",
@@ -187,6 +192,7 @@
       "choice_start",
       "grey_inter_trial_interval",
       "cue_touch",
+      "initiation_cue_release",
       "option_touch",
       "trial_start_signal_on",
       "trial_start_signal_off",
@@ -205,6 +211,7 @@
       "choice_start",
       "gray_inter_trial_interval",
       "cue_touch",
+      "initiation_cue_release",
       "match_cue_touch",
       "option_touch",
       "trial_start_signal_on",

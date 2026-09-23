@@ -55,6 +55,21 @@ immediately before each block subprocess and stops it when that subprocess
 finishes. The output is `camera.h264` in the block's existing output directory;
 `video_config` in the launcher config selects this recorder configuration.
 
+## Live preview
+
+Run the lightweight four-camera preview with:
+
+```bash
+python -m video.live_preview
+```
+
+It requests the configured camera mode and frame rate, displays the complete
+four-camera strip in a `1280x180` native preview window, and shows the measured
+FPS in the title bar. Close the window to exit. The script replaces itself with
+`rpicam-hello`, so there is no Python frame loop, copying, or encoding. Override
+the display size with `--width` and `--height`; this changes only the preview
+stream, not the selected sensor mode.
+
 ## Command-line check
 
 Inspect the command without touching the camera:

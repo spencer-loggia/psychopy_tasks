@@ -57,6 +57,7 @@ from interface.x11_idle_guard import (
     wait_for_task_process,
 )
 from video import record as record_video
+from video.recorder import RecordingError
 
 
 BUTTON_BG = "#f7f7f7"
@@ -1144,13 +1145,19 @@ class TouchInterfaceApp:
                     raise ValueError(
                         "video_config must be a path when record_experiment_video is true"
                     )
-                recording = record_video(
-                    block.output_dir / "camera.h264",
-                    config_path=_resolve_candidate(
-                        video_config,
-                        (self.working_dir, self.config_dir),
-                    ),
-                )
+                try:
+                    recording = record_video(
+                        block.output_dir / "camera.h264",
+                        config_path=_resolve_candidate(
+                            video_config,
+                            (self.working_dir, self.config_dir),
+                        ),
+                    )
+                except RecordingError as exc:
+                    print(
+                        f"Video recording warning for block {block.block_num}: {exc}",
+                        file=sys.stderr,
+                    )
             process = subprocess.Popen(
                 cmd,
                 cwd=self.working_dir,
@@ -1176,7 +1183,13 @@ class TouchInterfaceApp:
         finally:
             try:
                 if recording is not None:
-                    recording.stop()
+                    try:
+                        recording.stop()
+                    except RecordingError as exc:
+                        print(
+                            f"Video recording warning for block {block.block_num}: {exc}",
+                            file=sys.stderr,
+                        )
             finally:
                 try:
                     self._restore_interface_after_process()

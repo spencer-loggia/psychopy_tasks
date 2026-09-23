@@ -1,4 +1,5 @@
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,6 +18,7 @@ from interface.x11_idle_guard import (
     mask_main_inputs_enabled,
     wait_for_task_process,
 )
+from video.recorder import RecordingError
 
 
 class X11IdleGuardTests(unittest.TestCase):
@@ -358,6 +360,54 @@ class X11IdleGuardTests(unittest.TestCase):
             config_path=video_config.resolve(),
         )
         recording.stop.assert_called_once_with()
+        app.experiment.finish_block.assert_called_once_with(block)
+
+    def test_interface_continues_block_when_video_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            block_dir = root / "1_demo"
+            block_dir.mkdir()
+            block = PreparedBlock(
+                block_num=1,
+                block_name="demo",
+                launch_path=root / "demo.py",
+                config_path=block_dir / "config.json",
+                output_dir=block_dir,
+            )
+            app = object.__new__(TouchInterfaceApp)
+            app.cfg = {
+                "record_experiment_video": True,
+                "video_config": "video.json",
+            }
+            app.config_dir = root
+            app.python_cmd = "python"
+            app.working_dir = root
+            app.root = Mock()
+            app.status_var = Mock()
+            app.idle_guard = None
+            app.experiment = Mock()
+            app.experiment.subprocess_environment.return_value = {}
+            process = Mock()
+
+            with patch(
+                "interface.touch_interface.record_video",
+                side_effect=RecordingError("camera unavailable"),
+            ), patch(
+                "interface.touch_interface.subprocess.Popen",
+                return_value=process,
+            ) as popen, patch(
+                "interface.touch_interface.wait_for_task_process",
+                return_value=0,
+            ) as wait_for_process, patch("builtins.print") as print_mock:
+                result = app._run_block(block)
+
+        self.assertEqual(result.returncode, 0)
+        popen.assert_called_once()
+        wait_for_process.assert_called_once()
+        print_mock.assert_called_once_with(
+            "Video recording warning for block 1: camera unavailable",
+            file=sys.stderr,
+        )
         app.experiment.finish_block.assert_called_once_with(block)
 
     def test_desktop_exit_restores_touchscreen_before_destroying_interface(self):

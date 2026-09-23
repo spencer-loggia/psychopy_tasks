@@ -7,6 +7,8 @@
         "main": null,
         "experimenter": null
     },
+    "record_experiment_video": true,
+    "video_config": "video/config.json",
     "mask_main_inputs": true,
     "experiment_quiet_mode": true,
     "main_touchscreen_xinput": "WaveShare WaveShare",

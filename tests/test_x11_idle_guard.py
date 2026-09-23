@@ -299,6 +299,67 @@ class X11IdleGuardTests(unittest.TestCase):
         app.experiment.finish_block.assert_called_once_with(block)
         self.assertFalse((block.output_dir / ".task_window_ready").exists())
 
+    def test_interface_records_video_for_exact_block_lifetime(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            block_dir = root / "1_demo"
+            block_dir.mkdir()
+            video_config = root / "video.json"
+            video_config.write_text("{}\n", encoding="utf-8")
+            block = PreparedBlock(
+                block_num=1,
+                block_name="demo",
+                launch_path=root / "demo.py",
+                config_path=block_dir / "config.json",
+                output_dir=block_dir,
+            )
+            app = object.__new__(TouchInterfaceApp)
+            app.cfg = {
+                "record_experiment_video": True,
+                "video_config": "video.json",
+            }
+            app.config_dir = root
+            app.python_cmd = "python"
+            app.working_dir = root
+            app.root = Mock()
+            app.status_var = Mock()
+            app.idle_guard = None
+            app.experiment = Mock()
+            app.experiment.subprocess_environment.return_value = {}
+            recording = Mock()
+            events = []
+            recording.stop.side_effect = lambda: events.append("video stopped")
+
+            with patch(
+                "interface.touch_interface.record_video",
+                side_effect=lambda *args, **kwargs: (
+                    events.append("video started") or recording
+                ),
+            ) as start_video, patch(
+                "interface.touch_interface.subprocess.Popen",
+                side_effect=lambda *args, **kwargs: (
+                    events.append("task started") or Mock()
+                ),
+            ), patch(
+                "interface.touch_interface.wait_for_task_process",
+                side_effect=lambda *args, **kwargs: (
+                    events.append("task stopped") or 0
+                ),
+            ):
+                result = app._run_block(block)
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(
+            events,
+            ["video started", "task started", "task stopped", "video stopped"],
+        )
+        start_video.assert_called_once_with(
+            block.output_dir / "camera.h264",
+            config_path=video_config.resolve(),
+        )
+        recording.stop.assert_called_once_with()
+        app.experiment.finish_block.assert_called_once_with(block)
+
     def test_desktop_exit_restores_touchscreen_before_destroying_interface(self):
         app = object.__new__(TouchInterfaceApp)
         app.task_active = False

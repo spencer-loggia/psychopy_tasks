@@ -56,6 +56,7 @@ from interface.x11_idle_guard import (
     stop_task_process,
     wait_for_task_process,
 )
+from video import record as record_video
 
 
 BUTTON_BG = "#f7f7f7"
@@ -1134,8 +1135,22 @@ class TouchInterfaceApp:
             env[TASK_WINDOW_READY_ENV] = str(ready_path)
             env[TASK_WINDOW_RELEASE_ENV] = str(release_path)
         process: Optional[subprocess.Popen] = None
+        recording = None
         try:
             self._hide_interface_for_process()
+            if getattr(self, "cfg", {}).get("record_experiment_video", False):
+                video_config = self.cfg.get("video_config")
+                if not isinstance(video_config, str) or not video_config.strip():
+                    raise ValueError(
+                        "video_config must be a path when record_experiment_video is true"
+                    )
+                recording = record_video(
+                    block.output_dir / "camera.h264",
+                    config_path=_resolve_candidate(
+                        video_config,
+                        (self.working_dir, self.config_dir),
+                    ),
+                )
             process = subprocess.Popen(
                 cmd,
                 cwd=self.working_dir,
@@ -1160,15 +1175,19 @@ class TouchInterfaceApp:
             return subprocess.CompletedProcess(cmd, returncode)
         finally:
             try:
-                self._restore_interface_after_process()
+                if recording is not None:
+                    recording.stop()
             finally:
                 try:
-                    ready_path.unlink(missing_ok=True)
+                    self._restore_interface_after_process()
                 finally:
                     try:
-                        release_path.unlink(missing_ok=True)
+                        ready_path.unlink(missing_ok=True)
                     finally:
-                        self.experiment.finish_block(block)
+                        try:
+                            release_path.unlink(missing_ok=True)
+                        finally:
+                            self.experiment.finish_block(block)
 
     def _run_task(self, task_name: str, task_cfg: Dict[str, Any]) -> None:
         if self.task_active or getattr(self, "cleanup_active", False):

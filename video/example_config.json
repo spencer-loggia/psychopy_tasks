@@ -1,0 +1,17 @@
+{
+  "executable": "rpicam-vid",
+  "camera": 0,
+  "sensor_mode": "5120:720:8",
+  "output_width": 3840,
+  "output_height": 540,
+  "framerate": 30,
+  "bitrate": 8000000,
+  "intra_period": 60,
+  "denoise": "cdn_off",
+  "low_latency": true,
+  "inline_headers": true,
+  "cpu_affinity": [1, 2, 3],
+  "nice": 5,
+  "startup_check_seconds": 0.35,
+  "extra_args": []
+}

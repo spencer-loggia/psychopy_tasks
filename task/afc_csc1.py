@@ -1042,10 +1042,10 @@ def run_task(
         onset_stim = utils.make_onset_cue_stim(
             win,
             bg_rgb_255=bg_rgb,
-            size_frac=0.15,
-            cells=16,
-            sigma_frac=0.22,
-            zero_threshold=1,
+            size_frac=0.35,
+            cells=36,
+            sigma_frac=0.10,
+            zero_threshold=0.5,
         )
 
         onset_stim.pos = (

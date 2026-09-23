@@ -7,14 +7,14 @@
   "shapes_tsv": "./task/resources/csc2/shape_definitions.tsv",
   "colors_tsv": "./task/resources/csc2/mt2_062026_amoledB_colors.tsv",
   "freq_space_tsv": {
-    "test": "./task/resources/csc2/freq_space_TY.csv",
+    "Test": "./task/resources/csc2/freq_space_TY.csv",
     "Yuri": "./task/resources/csc2/freq_space_TY.csv",
     "Tina": "./task/resources/csc2/freq_space_TY.csv",
     "Buzz": "./task/resources/csc2/freq_space_SB.csv",
     "Sally": "./task/resources/csc2/freq_space_SB.csv"
   },
   "reward_space_tsv": {
-    "test": "./task/resources/csc2/reward_space_TY.csv",
+    "Test": "./task/resources/csc2/reward_space_TY.csv",
     "Yuri": "./task/resources/csc2/reward_space_TY.csv",
     "Tina": "./task/resources/csc2/reward_space_TY.csv",
     "Buzz": "./task/resources/csc2/reward_space_SB.csv",

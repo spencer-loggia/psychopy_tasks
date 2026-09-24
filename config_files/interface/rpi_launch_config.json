@@ -44,6 +44,10 @@
                     "launch": "task/afc_csc1.py",
                     "config": "config_files/csc1/human_raspi_test_delay.json"
                 }
+            }, 
+            "gallery": {
+                "launch": "task/stim_set_gallery.py",
+                "config": "config_files/csc1/gallery_raspi.json"
             }
         },
         "CSC2": {

@@ -1,0 +1,93 @@
+{
+  "config_name": "gallery",
+  "colors_tsv": [
+    {
+      "path": "./task/resources/csc1/csc1_colors/olive_green_rgb_targets_pass1.tsv",
+      "title": "Olive Green Colors",
+      "background_id": 0,
+      "exclude_ids": [
+        0
+      ],
+      "split_luminance": true,
+      "high_lum_ids": [
+        1,
+        3,
+        5,
+        7,
+        9,
+        11,
+        13
+      ],
+      "low_lum_ids": [
+        2,
+        4,
+        6,
+        8,
+        10,
+        12,
+        14
+      ]
+    },
+    {
+      "path": "./task/resources/csc1/csc1_colors/corrected_rgb_targets_pass2_reordered.tsv",
+      "title": "Original Target Colors",
+      "background_id": 0,
+      "exclude_ids": [
+        0
+      ],
+      "split_luminance": true,
+      "high_lum_ids": [
+        1,
+        3,
+        5,
+        7,
+        9,
+        11,
+        13
+      ],
+      "low_lum_ids": [
+        2,
+        4,
+        6,
+        8,
+        10,
+        12,
+        14
+      ]
+    }
+  ],
+  "shapes_tsv": [
+    {
+      "path": "./task/resources/csc1/csc1_shapes/shape_definitions_csc1.tsv",
+      "title": "CSC1 Shapes"
+    }
+  ],
+    
+  "screens": {
+    "main": null,
+    "experimenter": null
+  },
+
+  "fullscreen": true,
+  "win_size": [2560, 1600],
+
+  "colors_tsv_has_bg_row": true,
+  "bg": null,
+  "image_size": [
+    64,
+    64
+  ],
+  "shape_color": [
+    0,
+    0,
+    0
+  ],
+  "radius": null,
+  "luminance_circle_radius": null,
+  "luminance_circle_offset_y": null,
+  "start_angle": 90.0,
+  "clockwise": false,
+  "show_labels": false,
+  "show_page_title": true,
+  "show_luminance_labels": true
+}

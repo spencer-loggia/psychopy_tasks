@@ -5,5 +5,9 @@
       "path": "./task/resources/csc1/csc1_colors/corrected_rgb_targets_pass2_reordered.tsv",
       "title": "csc1_colors"
     }
-  ]
+  ],
+  "screens": {
+    "experimenter": null
+  },
+  "fullscreen": true
 }

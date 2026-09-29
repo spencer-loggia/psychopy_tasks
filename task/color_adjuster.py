@@ -2,42 +2,33 @@
 """
 RGB Color Adjuster for Raspberry Pi
 
-Usage:
-    python3 rgb_color_adjuster.py
-    python3 rgb_color_adjuster.py colors.tsv
-    python3 rgb_color_adjuster.py gallery_config.json
+Features
+--------
+- Reads CSV/TSV color files with required columns: id, r, g, b
+- Can be launched with a JSON config containing a colors_tsv list
+- Opens fullscreen on the configured experimenter display
+- Shows only the live adjusted color (not a side-by-side original)
+- Uses large touch-friendly RGB sliders
+- Saves adjusted RGB and RGB-delta files after every Save & Next
 
-Supported direct color files:
-    CSV or TSV with required columns:
-        id, r, g, b
+Run:
+    python3 rgb_color_adjuster.py rgb_adjuster_config.json
 
-Supported JSON config:
-    {
-      "config_name": "gallery",
-      "colors_tsv": [
-        {
-          "path": "./task/resources/colors.tsv",
-          "title": "My Colors",
-          ...
-        }
-      ]
+Config screen behavior:
+    "screens": {
+        "experimenter": null
     }
 
-If the JSON config contains multiple colors_tsv entries, the app asks which
-dataset to open.
-
-Relative paths in the JSON config are resolved relative to the config file.
-
-Outputs:
-    <input_stem>_adjusted_rgb.csv/tsv
-    <input_stem>_delta_rgb.csv/tsv
-
-Each click of "Save & Next" immediately updates both output files.
+experimenter may be:
+- null or "auto": second connected monitor if available, otherwise primary
+- an integer such as 0 or 1
+- a monitor name such as "HDMI-1"
 """
 
 import csv
 import json
 import re
+import subprocess
 import sys
 import tkinter as tk
 from pathlib import Path
@@ -110,16 +101,9 @@ def read_color_file(path):
                         g = clamp(round(float(row[g_col])))
                         b = clamp(round(float(row[b_col])))
                     except (ValueError, TypeError, KeyError):
-                        raise ValueError(
-                            f"Invalid RGB value on row {row_number}."
-                        )
+                        raise ValueError(f"Invalid RGB value on row {row_number}.")
 
-                    colors.append({
-                        "id": color_id,
-                        "r": r,
-                        "g": g,
-                        "b": b,
-                    })
+                    colors.append({"id": color_id, "r": r, "g": g, "b": b})
 
                 return colors, use_delimiter
 
@@ -141,22 +125,16 @@ def load_config(config_path):
 
     entries = config.get("colors_tsv")
     if not isinstance(entries, list) or not entries:
-        raise ValueError(
-            'Config must contain a non-empty "colors_tsv" array.'
-        )
+        raise ValueError('Config must contain a non-empty "colors_tsv" array.')
 
     resolved_entries = []
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
-            raise ValueError(
-                f'colors_tsv entry {index + 1} must be an object.'
-            )
+            raise ValueError(f"colors_tsv entry {index + 1} must be an object.")
 
         rel_path = entry.get("path")
         if not rel_path:
-            raise ValueError(
-                f'colors_tsv entry {index + 1} is missing "path".'
-            )
+            raise ValueError(f'colors_tsv entry {index + 1} is missing "path".')
 
         color_path = Path(rel_path)
         if not color_path.is_absolute():
@@ -170,44 +148,175 @@ def load_config(config_path):
     return config, resolved_entries
 
 
+def get_connected_monitors(root):
+    """Return monitor dictionaries with name, x, y, width, height, primary."""
+    monitors = []
+
+    try:
+        result = subprocess.run(
+            ["xrandr", "--listmonitors"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                match = re.match(
+                    r"^\s*(\d+):\s+([^\s]+).*?(\d+)/\d+x(\d+)/\d+\+(-?\d+)\+(-?\d+)\s+(\S+)\s*$",
+                    line,
+                )
+                if match:
+                    index, flags, width, height, x, y, name = match.groups()
+                    monitors.append({
+                        "index": int(index),
+                        "name": name,
+                        "x": int(x),
+                        "y": int(y),
+                        "width": int(width),
+                        "height": int(height),
+                        "primary": "*" in flags,
+                    })
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    if not monitors:
+        try:
+            result = subprocess.run(
+                ["xrandr", "--query"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=2,
+            )
+            if result.returncode == 0:
+                index = 0
+                for line in result.stdout.splitlines():
+                    match = re.match(
+                        r"^(\S+)\s+connected(?:\s+(primary))?\s+(\d+)x(\d+)\+(-?\d+)\+(-?\d+)",
+                        line,
+                    )
+                    if match:
+                        name, primary, width, height, x, y = match.groups()
+                        monitors.append({
+                            "index": index,
+                            "name": name,
+                            "x": int(x),
+                            "y": int(y),
+                            "width": int(width),
+                            "height": int(height),
+                            "primary": bool(primary),
+                        })
+                        index += 1
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    if not monitors:
+        monitors = [{
+            "index": 0,
+            "name": "default",
+            "x": 0,
+            "y": 0,
+            "width": root.winfo_screenwidth(),
+            "height": root.winfo_screenheight(),
+            "primary": True,
+        }]
+
+    return monitors
+
+
+def choose_experimenter_monitor(root, config):
+    monitors = get_connected_monitors(root)
+    setting = (config or {}).get("screens", {}).get("experimenter")
+
+    if setting is None or str(setting).strip().lower() in {"auto", "second", "secondary"}:
+        if len(monitors) > 1:
+            return monitors[1]
+        primary = next((m for m in monitors if m.get("primary")), None)
+        return primary or monitors[0]
+
+    if isinstance(setting, int):
+        if 0 <= setting < len(monitors):
+            return monitors[setting]
+        raise ValueError(
+            f"Experimenter screen index {setting} does not exist. "
+            f"Connected monitors: {[m['name'] for m in monitors]}"
+        )
+
+    setting_text = str(setting).strip()
+    if setting_text.isdigit():
+        idx = int(setting_text)
+        if 0 <= idx < len(monitors):
+            return monitors[idx]
+
+    for monitor in monitors:
+        if monitor["name"].lower() == setting_text.lower():
+            return monitor
+
+    raise ValueError(
+        f"Experimenter screen '{setting}' was not found. "
+        f"Connected monitors: {[m['name'] for m in monitors]}"
+    )
+
+
+def place_fullscreen_on_monitor(root, monitor, fullscreen=True):
+    """Move the window to one monitor, then fullscreen it there."""
+    root.attributes("-fullscreen", False)
+    root.overrideredirect(False)
+    root.geometry(
+        f"{monitor['width']}x{monitor['height']}+{monitor['x']}+{monitor['y']}"
+    )
+    root.update_idletasks()
+    root.update()
+
+    if fullscreen:
+        # On Raspberry Pi / X11 this normally fullscreens on the monitor the
+        # window was moved to. If the WM rejects it, the exact monitor-sized
+        # geometry still leaves the application filling that display.
+        try:
+            root.attributes("-fullscreen", True)
+        except tk.TclError:
+            root.overrideredirect(True)
+            root.geometry(
+                f"{monitor['width']}x{monitor['height']}+{monitor['x']}+{monitor['y']}"
+            )
+
+
 class DatasetChooser(tk.Toplevel):
     def __init__(self, parent, entries, config_name=""):
         super().__init__(parent)
-        self.parent = parent
         self.entries = entries
         self.result = None
 
         self.title("Choose Color Set")
-        self.geometry("620x360")
-        self.resizable(True, True)
+        self.geometry("760x480")
         self.transient(parent)
         self.grab_set()
 
-        outer = tk.Frame(self, padx=16, pady=16)
+        outer = tk.Frame(self, padx=24, pady=24)
         outer.pack(fill="both", expand=True)
 
         heading = "Choose a color dataset"
         if config_name:
-            heading += f" — {config_name}"
+            heading += f" - {config_name}"
 
         tk.Label(
             outer,
             text=heading,
-            font=("Arial", 16, "bold"),
+            font=("Arial", 22, "bold"),
             anchor="w",
-        ).pack(fill="x", pady=(0, 12))
+        ).pack(fill="x", pady=(0, 18))
 
         self.listbox = tk.Listbox(
             outer,
-            font=("Arial", 12),
+            font=("Arial", 18),
             activestyle="dotbox",
         )
         self.listbox.pack(fill="both", expand=True)
 
         for entry in entries:
             title = entry.get("title") or Path(entry["_resolved_path"]).name
-            path_text = entry.get("path", "")
-            self.listbox.insert("end", f"{title}    [{path_text}]")
+            self.listbox.insert("end", title)
 
         self.listbox.selection_set(0)
         self.listbox.activate(0)
@@ -215,24 +324,24 @@ class DatasetChooser(tk.Toplevel):
         self.listbox.bind("<Return>", lambda _e: self.choose())
 
         buttons = tk.Frame(outer)
-        buttons.pack(fill="x", pady=(12, 0))
+        buttons.pack(fill="x", pady=(18, 0))
 
         tk.Button(
             buttons,
             text="Cancel",
             command=self.cancel,
-            font=("Arial", 12),
-            padx=16,
-            pady=8,
+            font=("Arial", 18),
+            padx=24,
+            pady=14,
         ).pack(side="left")
 
         tk.Button(
             buttons,
             text="Open",
             command=self.choose,
-            font=("Arial", 12, "bold"),
-            padx=24,
-            pady=8,
+            font=("Arial", 18, "bold"),
+            padx=32,
+            pady=14,
         ).pack(side="right")
 
         self.protocol("WM_DELETE_WINDOW", self.cancel)
@@ -255,105 +364,102 @@ class ColorAdjuster:
         root,
         input_path,
         dataset_title=None,
+        config=None,
         config_path=None,
         config_entry=None,
     ):
         self.root = root
         self.input_path = Path(input_path).resolve()
         self.dataset_title = dataset_title or self.input_path.stem
+        self.config = config or {}
         self.config_path = Path(config_path).resolve() if config_path else None
         self.config_entry = config_entry or {}
 
         self.colors, self.delimiter = read_color_file(self.input_path)
-
         if not self.colors:
             raise ValueError("No colors were found in the input file.")
 
         ext = ".tsv" if self.delimiter == "\t" else ".csv"
         stem = self.input_path.stem
-        self.adjusted_path = self.input_path.with_name(
-            f"{stem}_adjusted_rgb{ext}"
-        )
-        self.delta_path = self.input_path.with_name(
-            f"{stem}_delta_rgb{ext}"
-        )
+        self.adjusted_path = self.input_path.with_name(f"{stem}_adjusted_rgb{ext}")
+        self.delta_path = self.input_path.with_name(f"{stem}_delta_rgb{ext}")
 
         self.results = [None] * len(self.colors)
         self.current_index = 0
 
-        self.root.title(f"RGB Color Adjuster — {self.dataset_title}")
-        self.root.geometry("900x680")
-        self.root.minsize(760, 600)
+        self.root.title(f"RGB Color Adjuster - {self.dataset_title}")
+        self.root.configure(bg="black")
+        self.root.bind("<Escape>", self.exit_fullscreen)
+        self.root.bind("<F11>", self.toggle_fullscreen)
+        self.root.bind("<Return>", lambda _e: self.save_and_next())
+
+        self.fullscreen = bool(self.config.get("fullscreen", True))
+        self.monitor = choose_experimenter_monitor(self.root, self.config)
 
         self.build_ui()
         self.load_current_color()
+
+        # Move first, then fullscreen after Tk has drawn the controls.
+        self.root.after(
+            100,
+            lambda: place_fullscreen_on_monitor(
+                self.root, self.monitor, self.fullscreen
+            ),
+        )
+
+    def exit_fullscreen(self, _event=None):
+        self.fullscreen = False
+        try:
+            self.root.attributes("-fullscreen", False)
+        except tk.TclError:
+            pass
+        self.root.overrideredirect(False)
+
+    def toggle_fullscreen(self, _event=None):
+        self.fullscreen = not self.fullscreen
+        place_fullscreen_on_monitor(self.root, self.monitor, self.fullscreen)
 
     def build_ui(self):
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
 
-        top = tk.Frame(self.root, padx=16, pady=12)
+        # Compact status bar. No original-color swatch/value is shown.
+        top = tk.Frame(self.root, padx=24, pady=14)
         top.grid(row=0, column=0, sticky="ew")
         top.columnconfigure(1, weight=1)
 
         self.progress_label = tk.Label(
-            top, text="", font=("Arial", 14, "bold"), anchor="w"
+            top,
+            text="",
+            font=("Arial", 22, "bold"),
+            anchor="w",
         )
         self.progress_label.grid(row=0, column=0, sticky="w")
 
-        self.name_label = tk.Label(
-            top, text="", font=("Arial", 18, "bold"), anchor="e"
+        self.id_label = tk.Label(
+            top,
+            text="",
+            font=("Arial", 24, "bold"),
+            anchor="e",
         )
-        self.name_label.grid(row=0, column=1, sticky="e")
+        self.id_label.grid(row=0, column=1, sticky="e")
 
-        if self.dataset_title:
-            tk.Label(
-                top,
-                text=self.dataset_title,
-                font=("Arial", 11),
-                anchor="w",
-            ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
-
-        preview = tk.Frame(self.root, padx=16, pady=8)
-        preview.grid(row=1, column=0, sticky="nsew")
-        preview.columnconfigure(0, weight=1)
-        preview.columnconfigure(1, weight=1)
-        preview.rowconfigure(1, weight=1)
-
-        tk.Label(preview, text="Original", font=("Arial", 13, "bold")).grid(
-            row=0, column=0, pady=(0, 6)
-        )
-        tk.Label(preview, text="Adjusted", font=("Arial", 13, "bold")).grid(
-            row=0, column=1, pady=(0, 6)
-        )
-
-        self.original_swatch = tk.Frame(
-            preview, relief="solid", borderwidth=2, width=300, height=300
-        )
-        self.original_swatch.grid(
-            row=1, column=0, padx=(0, 8), sticky="nsew"
-        )
-        self.original_swatch.grid_propagate(False)
-
+        # The adjusted color occupies almost all available screen area.
         self.adjusted_swatch = tk.Frame(
-            preview, relief="solid", borderwidth=2, width=300, height=300
+            self.root,
+            bg="black",
+            relief="flat",
+            borderwidth=0,
         )
         self.adjusted_swatch.grid(
-            row=1, column=1, padx=(8, 0), sticky="nsew"
+            row=1,
+            column=0,
+            sticky="nsew",
+            padx=18,
+            pady=(0, 12),
         )
-        self.adjusted_swatch.grid_propagate(False)
 
-        self.original_value_label = tk.Label(
-            preview, text="", font=("Courier", 12)
-        )
-        self.original_value_label.grid(row=2, column=0, pady=(8, 0))
-
-        self.adjusted_value_label = tk.Label(
-            preview, text="", font=("Courier", 12)
-        )
-        self.adjusted_value_label.grid(row=2, column=1, pady=(8, 0))
-
-        controls = tk.Frame(self.root, padx=20, pady=12)
+        controls = tk.Frame(self.root, padx=28, pady=18)
         controls.grid(row=2, column=0, sticky="ew")
         controls.columnconfigure(1, weight=1)
 
@@ -365,61 +471,59 @@ class ColorAdjuster:
         self.make_slider(controls, 1, "G", self.g_var)
         self.make_slider(controls, 2, "B", self.b_var)
 
+        info = tk.Frame(controls)
+        info.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(12, 12))
+        info.columnconfigure(0, weight=1)
+        info.columnconfigure(1, weight=1)
+
+        self.adjusted_value_label = tk.Label(
+            info,
+            text="",
+            font=("Courier", 20, "bold"),
+            anchor="w",
+        )
+        self.adjusted_value_label.grid(row=0, column=0, sticky="w")
+
         self.delta_label = tk.Label(
-            controls,
+            info,
             text="Delta: R +0   G +0   B +0",
-            font=("Courier", 12, "bold"),
-            anchor="center",
+            font=("Courier", 20, "bold"),
+            anchor="e",
         )
-        self.delta_label.grid(
-            row=3, column=0, columnspan=3, sticky="ew", pady=(6, 10)
-        )
+        self.delta_label.grid(row=0, column=1, sticky="e")
 
         buttons = tk.Frame(controls)
         buttons.grid(row=4, column=0, columnspan=3, sticky="ew")
         buttons.columnconfigure(0, weight=1)
-        buttons.columnconfigure(1, weight=1)
+        buttons.columnconfigure(1, weight=2)
 
         self.reset_button = tk.Button(
             buttons,
             text="Reset",
             command=self.reset_current,
-            font=("Arial", 13),
-            padx=16,
-            pady=10,
+            font=("Arial", 22, "bold"),
+            padx=24,
+            pady=18,
         )
-        self.reset_button.grid(row=0, column=0, padx=(0, 8), sticky="ew")
+        self.reset_button.grid(row=0, column=0, padx=(0, 12), sticky="ew")
 
         self.next_button = tk.Button(
             buttons,
             text="Save & Next",
             command=self.save_and_next,
-            font=("Arial", 13, "bold"),
-            padx=16,
-            pady=10,
+            font=("Arial", 22, "bold"),
+            padx=28,
+            pady=18,
         )
-        self.next_button.grid(row=0, column=1, padx=(8, 0), sticky="ew")
-
-        footer_text = (
-            f"Input: {self.input_path.name}    "
-            f"Outputs: {self.adjusted_path.name}, {self.delta_path.name}"
-        )
-        footer = tk.Label(
-            self.root,
-            text=footer_text,
-            anchor="w",
-            padx=16,
-            pady=8,
-        )
-        footer.grid(row=3, column=0, sticky="ew")
+        self.next_button.grid(row=0, column=1, padx=(12, 0), sticky="ew")
 
     def make_slider(self, parent, row, label, variable):
         tk.Label(
             parent,
             text=label,
-            font=("Arial", 14, "bold"),
+            font=("Arial", 26, "bold"),
             width=2,
-        ).grid(row=row, column=0, sticky="w")
+        ).grid(row=row, column=0, sticky="w", pady=6)
 
         slider = tk.Scale(
             parent,
@@ -429,16 +533,20 @@ class ColorAdjuster:
             variable=variable,
             showvalue=False,
             resolution=1,
+            width=48,
+            sliderlength=82,
+            borderwidth=3,
+            highlightthickness=0,
             command=lambda _value: self.update_preview(),
         )
-        slider.grid(row=row, column=1, sticky="ew", padx=8)
+        slider.grid(row=row, column=1, sticky="ew", padx=18, pady=6)
 
         tk.Label(
             parent,
             textvariable=variable,
             width=4,
-            font=("Courier", 12),
-        ).grid(row=row, column=2)
+            font=("Courier", 24, "bold"),
+        ).grid(row=row, column=2, pady=6)
 
     def load_current_color(self):
         color = self.colors[self.current_index]
@@ -446,14 +554,7 @@ class ColorAdjuster:
         self.progress_label.config(
             text=f"Color {self.current_index + 1} of {len(self.colors)}"
         )
-        self.name_label.config(text=f"ID: {color['id']}")
-
-        original_hex = rgb_to_hex(color["r"], color["g"], color["b"])
-        self.original_swatch.config(bg=original_hex)
-        self.original_value_label.config(
-            text=f"RGB({color['r']}, {color['g']}, {color['b']})   "
-                 f"{original_hex.upper()}"
-        )
+        self.id_label.config(text=f"ID: {color['id']}")
 
         existing = self.results[self.current_index]
         if existing is None:
@@ -487,9 +588,7 @@ class ColorAdjuster:
         dg = g - original["g"]
         db = b - original["b"]
 
-        self.delta_label.config(
-            text=f"Delta: R {dr:+d}   G {dg:+d}   B {db:+d}"
-        )
+        self.delta_label.config(text=f"Delta: R {dr:+d}   G {dg:+d}   B {db:+d}")
 
     def reset_current(self):
         color = self.colors[self.current_index]
@@ -558,12 +657,8 @@ class ColorAdjuster:
             self.load_current_color()
             return
 
-        messagebox.showinfo(
-            "Finished",
-            "All colors have been saved.\n\n"
-            f"Adjusted RGB:\n{self.adjusted_path}\n\n"
-            f"RGB deltas:\n{self.delta_path}",
-        )
+        # Avoid opening a dialog on another display at the end. The app simply
+        # leaves the final color visible and disables editing buttons.
         self.next_button.config(state="disabled", text="Finished")
         self.reset_button.config(state="disabled")
 
@@ -624,18 +719,21 @@ def main():
                 root,
                 color_path,
                 dataset_title=title,
+                config=config,
                 config_path=input_path,
                 config_entry=selected,
             )
         else:
             root.deiconify()
-            ColorAdjuster(root, input_path)
+            ColorAdjuster(root, input_path, config={"fullscreen": True})
 
         root.mainloop()
 
     except Exception as exc:
-        messagebox.showerror("Error", str(exc))
-        root.destroy()
+        try:
+            messagebox.showerror("Error", str(exc))
+        finally:
+            root.destroy()
         raise
 
 

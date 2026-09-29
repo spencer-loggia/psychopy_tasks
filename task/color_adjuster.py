@@ -227,7 +227,7 @@ def get_connected_monitors(root):
 
 def choose_experimenter_monitor(root, config):
     monitors = get_connected_monitors(root)
-    setting = (config or {}).get("screens", {}).get("experimenter")
+    setting = (config or {}).get("screens", {}).get("main")
 
     if setting is None or str(setting).strip().lower() in {"auto", "second", "secondary"}:
         if len(monitors) > 1:
@@ -239,7 +239,7 @@ def choose_experimenter_monitor(root, config):
         if 0 <= setting < len(monitors):
             return monitors[setting]
         raise ValueError(
-            f"Experimenter screen index {setting} does not exist. "
+            f"main screen index {setting} does not exist. "
             f"Connected monitors: {[m['name'] for m in monitors]}"
         )
 
@@ -254,7 +254,7 @@ def choose_experimenter_monitor(root, config):
             return monitor
 
     raise ValueError(
-        f"Experimenter screen '{setting}' was not found. "
+        f"Main screen '{setting}' was not found. "
         f"Connected monitors: {[m['name'] for m in monitors]}"
     )
 

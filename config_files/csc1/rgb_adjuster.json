@@ -1,0 +1,9 @@
+{
+  "config_name": "rgb_adjuster",
+  "colors_tsv": [
+    {
+      "path": "./task/resources/csc1/csc1_colors/corrected_rgb_targets_pass2_reordered.tsv",
+      "title": "csc1_colors"
+    }
+  ]
+}

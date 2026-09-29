@@ -6,7 +6,7 @@ Features
 --------
 - Reads CSV/TSV color files with required columns: id, r, g, b
 - Can be launched with a JSON config containing a colors_tsv list
-- Opens fullscreen on the configured experimenter display
+- Opens fullscreen on the configured main display
 - Shows only the live adjusted color (not a side-by-side original)
 - Uses large touch-friendly RGB sliders
 - Saves adjusted RGB and RGB-delta files after every Save & Next
@@ -16,11 +16,11 @@ Run:
 
 Config screen behavior:
     "screens": {
-        "experimenter": null
+        "main": null
     }
 
-experimenter may be:
-- null or "auto": second connected monitor if available, otherwise primary
+main may be:
+- null or "auto": primary monitor, otherwise monitor 0
 - an integer such as 0 or 1
 - a monitor name such as "HDMI-1"
 """
@@ -225,13 +225,13 @@ def get_connected_monitors(root):
     return monitors
 
 
-def choose_experimenter_monitor(root, config):
+def choose_main_monitor(root, config):
     monitors = get_connected_monitors(root)
     setting = (config or {}).get("screens", {}).get("main")
 
-    if setting is None or str(setting).strip().lower() in {"auto", "second", "secondary"}:
-        if len(monitors) > 1:
-            return monitors[1]
+    # For the main display, null/auto means: use the monitor marked primary.
+    # If xrandr does not report a primary monitor, fall back to monitor 0.
+    if setting is None or str(setting).strip().lower() in {"auto", "main", "primary"}:
         primary = next((m for m in monitors if m.get("primary")), None)
         return primary or monitors[0]
 
@@ -394,7 +394,7 @@ class ColorAdjuster:
         self.root.bind("<Return>", lambda _e: self.save_and_next())
 
         self.fullscreen = bool(self.config.get("fullscreen", True))
-        self.monitor = choose_experimenter_monitor(self.root, self.config)
+        self.monitor = choose_main_monitor(self.root, self.config)
 
         self.build_ui()
         self.load_current_color()

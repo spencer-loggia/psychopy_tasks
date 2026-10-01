@@ -101,8 +101,8 @@
   "colors_tsv_has_bg_row": true,
   "bg": null,
   "image_size": [
-    128,
-    128
+    256,
+    256
   ],
   "shape_color": [
     0,

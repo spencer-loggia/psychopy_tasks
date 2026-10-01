@@ -7,6 +7,7 @@
 /tests/outputs/
 task/resources/video
 task/passive_viewing_csc1.py
+create_rgb_swatch_images.py
 
 
 # Byte-compiled / optimized / DLL files

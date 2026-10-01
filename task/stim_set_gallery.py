@@ -576,7 +576,7 @@ def main() -> None:
         radius = (
             float(args.radius)
             if args.radius is not None
-            else 0.78 * float(min(scene_size))
+            else 0.34 * float(min(scene_size))
         )
 
         # Pre-render every static page once. Color pages are split into

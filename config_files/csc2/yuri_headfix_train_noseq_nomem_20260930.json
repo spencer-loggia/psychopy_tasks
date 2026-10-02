@@ -21,9 +21,9 @@
     "Sally": "./task/resources/csc2/reward_space_SB.csv"
   },
   "pump_delay_time": 0.2,
-  "pump_pulse_time_seconds": 0.4,
+  "pump_pulse_time_seconds": 0.7,
   "inter_pump_interval": 0.1, 
-  "timeout_duration_seconds": 3.0,
+  "timeout_duration_seconds": 2.0,
   "reward_to_pulse_map": {
     "0": 0,
     "1": 0,
@@ -71,13 +71,13 @@
   "hold_before_choice": false,
   "hold_cue_to_init_time_s": 0.25,
   "iti": 0.50,
-  "duration": 0.25,
+  "duration": 0.0,
   "num_afc": 2,
   "choice_time": 2.0,
   "isi": 0.1,
   "fixed_positions": false,
-  "sequential": true,
-  "is_memory": true,
+  "sequential": false,
+  "is_memory": false,
   "raspi": true,
   "touchscreen": true
 }

@@ -8,6 +8,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional
 import tkinter as tk
@@ -38,7 +40,12 @@ from interface.rig_mode import (
     normalize_is_rig,
     target_mode_for_current_mode,
 )
-from interface.data_sync import ExperimentDataSync, SyncPlan, terminate_process
+from interface.data_sync import (
+    ExperimentDataSync,
+    SyncPlan,
+    run_command_bounded,
+    terminate_process,
+)
 from interface.experiment_manager import (
     ExperimentManager,
     PreparedBlock,
@@ -66,6 +73,23 @@ SHUTDOWN_BUTTON_BG = "#b91c1c"
 SHUTDOWN_BUTTON_ACTIVE_BG = "#7f1d1d"
 TOUCH_SCROLL_THRESHOLD_PX = 12
 WHEEL_SCROLL_UNITS = 3
+REMOTE_GIT_TIMEOUT_SECONDS = 10
+DATA_SYNC_STALL_TIMEOUT_SECONDS = 60
+
+
+class CleanupResult(Enum):
+    SUCCESS = "success"
+    UNAVAILABLE = "unavailable"
+    CANCELLED = "cancelled"
+
+    def __bool__(self) -> bool:
+        return self is CleanupResult.SUCCESS
+
+
+class SyncDialogResult(Enum):
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    TIMED_OUT = "timed_out"
 
 
 def parse_args() -> argparse.Namespace:
@@ -418,107 +442,177 @@ class TouchInterfaceApp:
         except Exception as e:
             print(f"Could not sync time: {e}")
 
-    def pull_latest_code(self) -> None:
+    def pull_latest_code(self) -> bool:
+        """Pull from the configured mirror, returning whether it was reachable."""
         remote_git_url = str(self.cfg.get("remote_git_url", "")).strip()
         if not remote_git_url:
-            print("Could not pull latest code: remote_git_url is not configured")
-            return
+            print(
+                "Code update error: remote_git_url is not configured",
+                file=sys.stderr,
+            )
+            return False
         try:
             for command in (
                 ["git", "reset", "--hard"],
                 ["git", "pull", remote_git_url],
             ):
-                subprocess.run(
+                run_command_bounded(
                     command,
                     cwd=self.working_dir,
                     check=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
+                    timeout_s=REMOTE_GIT_TIMEOUT_SECONDS,
                 )
-        except Exception as e:
-            print(f"Could not pull latest code: {e}")
+        except subprocess.TimeoutExpired as exc:
+            print(
+                f"Code update error: command timed out after "
+                f"{exc.timeout} second(s): {' '.join(exc.cmd)}",
+                file=sys.stderr,
+            )
+            return False
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or str(exc)).strip()
+            print(f"Code update error: {detail}", file=sys.stderr)
+            return False
+        except Exception as exc:
+            print(f"Code update error: {exc}", file=sys.stderr)
+            return False
+        return True
 
     def startup(self) -> None:
         os.chdir(self.working_dir)
         self.pull_latest_code()
 
-    def cleanup(self) -> None:
+    def cleanup(self) -> CleanupResult:
+        """Attempt both remotes and distinguish success, failure, and cancel."""
         if getattr(self, "cleanup_active", False):
-            return
+            return CleanupResult.UNAVAILABLE
         self.cleanup_active = True
-        self.pull_latest_code()
         try:
-            if not self.sync_data():
-                return
+            code_available = self.pull_latest_code()
+            try:
+                data_result = self.sync_data()
+            except Exception as exc:
+                print(f"Data sync error: {exc}", file=sys.stderr)
+                data_result = CleanupResult.UNAVAILABLE
+            if data_result is CleanupResult.CANCELLED:
+                return CleanupResult.CANCELLED
+            if code_available and data_result is CleanupResult.SUCCESS:
+                return CleanupResult.SUCCESS
+            return CleanupResult.UNAVAILABLE
         finally:
             self.cleanup_active = False
 
-    def sync_data(self) -> bool:
-        """Sync experiment directories; return false only when the user cancels."""
+    def sync_data(self) -> CleanupResult:
+        """Sync data, preserving cancellation separately from network failure."""
         remote_value = str(self.cfg.get("remote_data_url", "")).strip()
         data_sync = ExperimentDataSync(
             self.working_dir / "logs",
             Path(remote_value) if remote_value else None,
         )
-        preparation = data_sync.prepare()
+        try:
+            preparation = data_sync.prepare()
+        except Exception as exc:
+            print(f"Data sync error: {exc}", file=sys.stderr)
+            return CleanupResult.UNAVAILABLE
         if preparation.warning:
-            print(f"Data sync warning: {preparation.warning}")
+            print(f"Data sync error: {preparation.warning}", file=sys.stderr)
+            return CleanupResult.UNAVAILABLE
         if preparation.plan is None:
-            return True
+            return CleanupResult.SUCCESS
 
         plan = preparation.plan
         self.status_var.set(f"Syncing {len(plan.experiments)} experiment(s)...")
         self.root.update_idletasks()
-        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as error_file:
+        with tempfile.TemporaryFile(
+            mode="w+t", encoding="utf-8"
+        ) as error_file, tempfile.TemporaryFile(
+            mode="w+t", encoding="utf-8"
+        ) as progress_file:
             try:
                 process = subprocess.Popen(
                     plan.command,
                     cwd=self.working_dir,
-                    stdout=subprocess.DEVNULL,
+                    stdout=progress_file,
                     stderr=error_file,
                     text=True,
+                    start_new_session=os.name == "posix",
                 )
             except OSError as exc:
-                print(f"Data sync warning: could not start rsync: {exc}")
-                return True
+                print(
+                    f"Data sync error: could not start rsync: {exc}",
+                    file=sys.stderr,
+                )
+                return CleanupResult.UNAVAILABLE
 
-            cancelled = self._show_sync_dialog(process, plan)
-            returncode = process.wait()
+            dialog_result = self._show_sync_dialog(process, plan, progress_file)
+            if dialog_result is SyncDialogResult.CANCELLED:
+                print("Data sync cancelled; no local data was removed")
+                self.status_var.set("Data sync cancelled")
+                return CleanupResult.CANCELLED
+            if dialog_result is SyncDialogResult.TIMED_OUT:
+                print(
+                    f"Data sync error: rsync made no progress for "
+                    f"{DATA_SYNC_STALL_TIMEOUT_SECONDS} seconds",
+                    file=sys.stderr,
+                )
+                self.status_var.set("Data sync timed out; local data retained")
+                return CleanupResult.UNAVAILABLE
+
+            returncode = process.poll()
+            if returncode is None:
+                print(
+                    "Data sync error: rsync did not exit after its dialog closed",
+                    file=sys.stderr,
+                )
+                self.status_var.set("Data sync failed; local data retained")
+                return CleanupResult.UNAVAILABLE
             error_file.seek(0)
             error_detail = error_file.read().strip()
 
-        if cancelled:
-            print("Data sync cancelled; no local data was removed")
-            self.status_var.set("Data sync cancelled")
-            return False
         if returncode != 0:
             detail = error_detail or f"rsync exited with status {returncode}"
-            print(f"Data sync warning: {detail}")
+            print(f"Data sync error: {detail}", file=sys.stderr)
             self.status_var.set("Data sync failed; local data retained")
-            return True
+            return CleanupResult.UNAVAILABLE
 
         try:
             removed = data_sync.prune(plan)
         except OSError as exc:
             print(f"Data prune warning: {exc}")
             self.status_var.set("Data synced; some old local data could not be removed")
-            return True
+            return CleanupResult.SUCCESS
 
         self.status_var.set(
             f"Data synced; retained {plan.retained_experiment.name} locally "
             f"and removed {len(removed)} older experiment(s)"
         )
-        return True
+        return CleanupResult.SUCCESS
 
-    def _show_sync_dialog(self, process: subprocess.Popen, plan: SyncPlan) -> bool:
-        """Block launcher actions while keeping a responsive cancel button."""
+    def _show_sync_dialog(
+        self,
+        process: subprocess.Popen,
+        plan: SyncPlan,
+        progress_file: Optional[Any] = None,
+    ) -> SyncDialogResult:
+        """Keep sync responsive and stop it after a period without progress."""
         dialog = tk.Toplevel(self.root)
         dialog.title("Syncing Experiment Data")
         dialog.transient(self.root)
         dialog.resizable(False, False)
         dialog.grab_set()
-        cancelled = False
+        outcome: Optional[SyncDialogResult] = None
+        poll_after_id: Optional[str] = None
+
+        def progress_size() -> int:
+            if progress_file is None:
+                return 0
+            try:
+                return os.fstat(progress_file.fileno()).st_size
+            except (OSError, ValueError):
+                return 0
+
+        last_progress_size = progress_size()
+        last_progress_at = time.monotonic()
 
         tk.Label(
             dialog,
@@ -533,13 +627,30 @@ class TouchInterfaceApp:
             justify="center",
         ).pack(fill="both", expand=True)
 
-        def cancel() -> None:
-            nonlocal cancelled
-            if cancelled:
+        def finish(result: SyncDialogResult, *, stop_process: bool) -> None:
+            nonlocal outcome, poll_after_id
+            if outcome is not None:
                 return
-            cancelled = True
-            terminate_process(process)
-            dialog.destroy()
+            outcome = result
+            if stop_process:
+                terminate_process(
+                    process,
+                    process_group=os.name == "posix",
+                )
+            if poll_after_id is not None:
+                try:
+                    dialog.after_cancel(poll_after_id)
+                except tk.TclError:
+                    pass
+                poll_after_id = None
+            try:
+                if dialog.winfo_exists():
+                    dialog.destroy()
+            except tk.TclError:
+                pass
+
+        def cancel() -> None:
+            finish(SyncDialogResult.CANCELLED, stop_process=True)
 
         cancel_button = tk.Button(
             dialog,
@@ -557,15 +668,29 @@ class TouchInterfaceApp:
         dialog.protocol("WM_DELETE_WINDOW", cancel)
 
         def poll_process() -> None:
-            if process.poll() is None:
-                dialog.after(100, poll_process)
+            nonlocal last_progress_at, last_progress_size, poll_after_id
+            poll_after_id = None
+            if process.poll() is not None:
+                finish(SyncDialogResult.COMPLETED, stop_process=False)
                 return
-            if dialog.winfo_exists():
-                dialog.destroy()
 
-        dialog.after(100, poll_process)
-        self.root.wait_window(dialog)
-        return cancelled
+            now = time.monotonic()
+            current_progress_size = progress_size()
+            if current_progress_size > last_progress_size:
+                last_progress_size = current_progress_size
+                last_progress_at = now
+            if now - last_progress_at >= DATA_SYNC_STALL_TIMEOUT_SECONDS:
+                finish(SyncDialogResult.TIMED_OUT, stop_process=True)
+                return
+            poll_after_id = dialog.after(100, poll_process)
+
+        poll_after_id = dialog.after(100, poll_process)
+        try:
+            self.root.wait_window(dialog)
+        finally:
+            if outcome is None:
+                finish(SyncDialogResult.CANCELLED, stop_process=True)
+        return outcome or SyncDialogResult.CANCELLED
 
     def _initialize_is_rig_mode(self) -> str:
         raw_mode = os.environ.get(IS_RIG_ENV_VAR)
@@ -1092,16 +1217,87 @@ class TouchInterfaceApp:
             return ["shutdown", "-h", "now"]
         return ["sudo", "-n", "shutdown", "-h", "now"]
 
+    def _ask_retry_data_network(self) -> bool:
+        """Show a blocking, touch-sized retry choice for shutdown cleanup."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Data Network")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        retry = False
+
+        tk.Label(
+            dialog,
+            text="Data network not available. Try again?",
+            font=("Helvetica", 20, "bold"),
+            padx=36,
+            pady=30,
+            justify="center",
+        ).pack(fill="both", expand=True)
+
+        button_frame = tk.Frame(dialog)
+        button_frame.pack(fill="x", padx=28, pady=(0, 28))
+        button_frame.grid_columnconfigure(0, weight=1)
+        button_frame.grid_columnconfigure(1, weight=1)
+
+        def choose(should_retry: bool) -> None:
+            nonlocal retry
+            retry = should_retry
+            dialog.destroy()
+
+        yes_button = tk.Button(
+            button_frame,
+            text="Yes",
+            command=lambda: choose(True),
+            font=("Helvetica", 20, "bold"),
+            height=2,
+            padx=24,
+            pady=16,
+            bg=BUTTON_BG,
+            activebackground=BUTTON_ACTIVE_BG,
+        )
+        yes_button.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+
+        no_button = tk.Button(
+            button_frame,
+            text="No",
+            command=lambda: choose(False),
+            font=("Helvetica", 20, "bold"),
+            height=2,
+            padx=24,
+            pady=16,
+            bg=SHUTDOWN_BUTTON_BG,
+            fg="white",
+            activebackground=SHUTDOWN_BUTTON_ACTIVE_BG,
+            activeforeground="white",
+        )
+        no_button.grid(row=0, column=1, sticky="ew", padx=(10, 0))
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+        yes_button.focus_set()
+        self.root.wait_window(dialog)
+        return retry
+
     def _shutdown_system(self) -> None:
         if self.task_active or getattr(self, "cleanup_active", False):
             self.status_var.set("Cannot shut down while a task is running")
             return
 
-        self.status_var.set("Cleaning up before shutdown...")
-        self.root.update_idletasks()
-
         try:
-            self.cleanup()
+            while True:
+                self.status_var.set("Cleaning up before shutdown...")
+                self.root.update_idletasks()
+                cleanup_result = self.cleanup()
+                if cleanup_result is CleanupResult.SUCCESS:
+                    break
+                if cleanup_result is CleanupResult.CANCELLED:
+                    self.status_var.set("Shutdown cancelled")
+                    return
+
+                self.status_var.set("Data network not available")
+                if not self._ask_retry_data_network():
+                    break
+
             subprocess.run(
                 self._shutdown_command(),
                 check=True,

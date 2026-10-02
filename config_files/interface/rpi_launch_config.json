@@ -62,7 +62,12 @@
             "memory": {
                 "launch": "task/active_foraging.py",
                 "config": "config_files/csc2/yuri_rigtrain_no_seq_mem_20260803.json"
+            },
+            "headfix_train": {
+                "launch": "task/active_foraging.py",
+                "config": "config_files/csc2/yuri_headfix_train_noseq_nomem_20260930.json"
             }
+            
         },
         "Match2Cue": {
             "launch": "task/match2cue.py",

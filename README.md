@@ -119,21 +119,29 @@ Data synchronization
 --------------------
 
 The interface config's `remote_data_url` is the NFS-backed storage root. The contents of the local `logs`
-directory are copied into `remote_data_url/experiments/`, not directly into the storage root. Cleanup runs at
-startup, when **End Experiment** is pressed, and before shutdown; it does not run after individual tasks or blocks.
-Cleanup first verifies that the configured root exists on an NFS filesystem and contains at least one file or
-directory. If either check fails, it prints a warning and leaves all local data untouched.
+directory are copied into `remote_data_url/experiments/`, not directly into the storage root. Cleanup runs when
+**End Experiment** is pressed and before shutdown; it does not run at startup or after individual tasks or blocks.
+Cleanup checks both `remote_git_url` and `remote_data_url`, including that the data root is a mounted, non-empty NFS
+filesystem. An unavailable remote, failed operation, or timeout is logged and normal interface operation continues,
+with local experiment data left untouched unless synchronization completes successfully.
 
-When storage is available, the launcher uses `rsync --archive --no-owner --no-group` to copy the contents of
-`logs`. Owner and group metadata are intentionally not preserved because NFS root-squashing commonly rejects
-those changes; experiment contents, timestamps, permissions, directories, and symlinks are still preserved. A
-modal progress window prevents tasks from launching during the copy and offers **Cancel Sync**. Cancelling or any
-rsync failure retains every local experiment. After a fully successful copy, all but the most recently modified
-experiment are removed from the local cache. Generated data directories are excluded by `.gitignore`.
+When storage is available, the launcher uses `rsync --archive --timeout=30 --progress --no-owner --no-group`
+to copy the contents of `logs`. In addition to rsync's own I/O timeout, the launcher stops a transfer after 60 seconds
+without progress; active transfers have no total-duration limit. Owner and group metadata are intentionally not
+preserved because NFS root-squashing commonly rejects those changes; experiment contents, timestamps, permissions,
+directories, and symlinks are still preserved. A modal progress window prevents tasks from launching during the copy
+and offers **Cancel Sync**. Cancelling aborts the current operation without removing local data; during shutdown, it
+also cancels shutdown. Any rsync failure retains every local experiment. After a fully successful copy, all but the
+most recently modified experiment are removed from the local cache. Generated data directories are excluded by
+`.gitignore`.
 
-Code updates use `remote_git_url` from the same interface config (normally an NFS-mounted repository path). Each
-cleanup runs `git reset --hard` and then pulls from that explicit URL rather than the checkout's default remote.
-This code update is attempted before data synchronization starts.
+Code updates use `remote_git_url` from the same interface config (normally an NFS-mounted repository path). At
+startup the launcher makes a bounded update attempt; a failure or timeout is logged without preventing the interface
+from opening. Each later cleanup also runs `git reset --hard` and pulls from that explicit URL before data
+synchronization starts.
+
+Only shutdown turns a network-cleanup failure into a blocking prompt: **Data network not available. Try again?**
+**Yes** retries cleanup, while **No** proceeds with shutdown.
 
 Run System Diagnostic uses the configured `environment.python` interpreter and does not create an experiment or
 block. It checks that PsychoPy can import, `lgpio` can open GPIO chip 0, and the Pi-Plates DAQC2 driver can read the

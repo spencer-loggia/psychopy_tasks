@@ -2264,7 +2264,7 @@ def present_trial_with_persistent_dots(
     mouse_presses = MousePressTracker(mouse)
     initiation_hold = TouchHoldTracker(
         hold_cue_to_init_time_s,
-        max_break_s=0.100,
+        max_break_s=0.070,
     )
     held_initiation_cue_visible = False
     enforce_initiation_hold = hold_before_choice

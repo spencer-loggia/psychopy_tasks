@@ -32,6 +32,9 @@ def load_config(path: str) -> Dict[str, Any]:
             raise ValueError(f"Error parsing JSON config '{path}': {e.msg} (line {e.lineno} col {e.colno})") from e
     if not isinstance(cfg, dict):
         raise ValueError("Config file must contain a top-level JSON object")
+    from .eye_tracking_config import resolve_eye_tracking_paths
+
+    resolve_eye_tracking_paths(cfg, p.parent)
     return cfg
 
 

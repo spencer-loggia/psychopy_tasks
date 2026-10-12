@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 import json
 import math
@@ -20,6 +20,7 @@ from bin import utils
 from bin.config import load_config
 from bin.daqc2_outputs import DAQC2DigitalOutputs
 from bin.eye_calibration_preview import _make_fixation_cross, _draw_fixation_cross
+from bin.eye_tracking_config import load_eye_tracking_settings
 from bin.eye_tracking import (
     UARTEyeTracker,
     UARTEyeTrackerConfig,
@@ -122,6 +123,7 @@ def run_task(
     uart_config=None,
     filter_config=None,
     initial_calibration=None,
+    initial_gain_anchor_px=None,
     x_scale_limits=(-0.02, 0.02),
     y_scale_limits=(-0.02, 0.02),
     fix_diameter=0.05,
@@ -188,6 +190,7 @@ def run_task(
     last_revision = last_zero_count = 0
     last_error = None
     latest_state = None
+    gain_anchor_px = initial_gain_anchor_px
     exit_requested = False
     try:
         outputs.open()
@@ -281,6 +284,10 @@ def run_task(
 
         while not should_exit():
             latest_state = tracker.get_state()
+            if gain_anchor_px is None and latest_state.valid:
+                # Hold one reference throughout slider drags. Zero explicitly
+                # replaces it; moving the fixation target must not replace it.
+                gain_anchor_px = latest_state.smoothed_position
             if latest_state.error != last_error:
                 msg_logger.log(
                     "WARN" if latest_state.error else "INFO",
@@ -289,13 +296,21 @@ def run_task(
                 last_error = latest_state.error
             controls = preview.get_calibration_controls()
             if controls["revision"] != last_revision:
-                calibration.x_scale, calibration.y_scale = (
-                    controls["x_scale"],
-                    controls["y_scale"],
-                )
+                if gain_anchor_px is not None:
+                    calibration.set_gains(
+                        x_scale=controls["x_scale"],
+                        y_scale=controls["y_scale"],
+                        anchor_px=gain_anchor_px,
+                    )
+                else:
+                    # No observed position exists to anchor yet. This only
+                    # initializes sensitivity; invalid data never sets offsets.
+                    calibration.x_scale = controls["x_scale"]
+                    calibration.y_scale = controls["y_scale"]
                 fixation = (controls["fix_x"], controls["fix_y"])
                 if controls["zero_count"] != last_zero_count:
                     if latest_state.valid:
+                        gain_anchor_px = latest_state.smoothed_position
                         calibration.set_offsets_for_fixation(
                             fixation_fraction=fixation,
                             x_px=latest_state.x_smooth_px,
@@ -368,6 +383,7 @@ def run_task(
                 "saved_at": datetime.now().isoformat(timespec="seconds"),
                 "main_native_size_px": list(main_size),
                 "main_rotation_deg": rotation,
+                "gain_anchor_px": gain_anchor_px,
                 "fixation_acceptance": {
                     "fix_diameter": fix_diameter,
                     "fix_accept_percent": accept_fraction,
@@ -410,11 +426,6 @@ def run_task(
 def main():
     args = parse_args()
     cfg = load_config(args.config) if args.config else {}
-    uart = dict(cfg.get("uart", {}))
-    if args.uart_device is not None:
-        uart["device"] = args.uart_device
-    if args.simulate_eye is not None:
-        uart["simulate"] = args.simulate_eye
     daq = cfg.get("daq", {})
     if any(
         key in daq
@@ -429,15 +440,14 @@ def main():
         raise ValueError(
             "Analog eye input config is obsolete; use uart and recalibrate in crop-local pixels"
         )
-    # The experiment manager flattens unset history values as JSON null. Those
-    # must fall back to the task's initial settings, not become float(None).
-    values = {}
-    for key, default in asdict(EyeCalibration()).items():
-        value = cfg.get(key)
-        if value is None:
-            value = cfg.get(f"initial_{key}", default)
-        values[key] = float(default if value is None else value)
-    calibration = EyeCalibration(**values)
+    settings = load_eye_tracking_settings(cfg, for_calibration=True)
+    # Apply CLI overrides after loading, including inherited UART settings.
+    overrides = {}
+    if args.uart_device is not None:
+        overrides["device"] = args.uart_device
+    if args.simulate_eye is not None:
+        overrides["simulate"] = args.simulate_eye
+    uart_config = replace(settings.uart, **overrides)
     path = run_task(
         output_dir=args.output_dir or cfg.get("output_dir", "logs"),
         config_name=cfg.get("config_name", "calibrate_eye_tracker"),
@@ -456,9 +466,10 @@ def main():
             cfg.get("fixation_cross_size", cfg.get("fixation_size", 40))
         ),
         fixation_cross_weight=float(cfg.get("fixation_cross_weight", 6)),
-        uart_config=UARTEyeTrackerConfig(**uart),
-        filter_config=EyeFilterConfig(**cfg.get("eye_filter", {})),
-        initial_calibration=calibration,
+        uart_config=uart_config,
+        filter_config=settings.filter,
+        initial_calibration=settings.calibration,
+        initial_gain_anchor_px=settings.gain_anchor_px,
         x_scale_limits=cfg.get("x_scale_limits", (-0.02, 0.02)),
         y_scale_limits=cfg.get("y_scale_limits", (-0.02, 0.02)),
         fix_diameter=float(cfg.get("fix_diameter", 0.05)),

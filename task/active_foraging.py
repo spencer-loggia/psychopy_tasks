@@ -51,6 +51,7 @@ from bin.frame_timing import (
     validate_requested_durations,
     wait_until,
 )
+from bin.eye_tracking_config import load_eye_tracking_settings
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 import numpy as np
@@ -339,6 +340,7 @@ def run_task(
     stroke_linejoin: Optional[str] = None,
     stroke_linecap: Optional[str] = None,
     screen_config: Optional[Dict[str, Any]] = None,
+    eye_tracking_config=None,
 ):
     resolved_subject = "" if subject is None else str(subject).strip()
     freq_space_tsv = resolve_subject_mapped_value(
@@ -378,6 +380,7 @@ def run_task(
     resolved_config_name = str(config_name).strip() if config_name else "active_foraging"
     behavior_fieldnames = _build_behavior_fieldnames(num_afc)
     session_logs = SessionLogBundle(
+        eye_tracking_config=eye_tracking_config,
         output_root=output_dir,
         task_name="active_foraging",
         config_name=resolved_config_name,
@@ -601,6 +604,7 @@ def run_task(
     if experimenter_screen is not None:
         experimenter_preview = ExperimenterPreview(
             experimenter_screen,
+            eye_tracking_shared=session_logs.eye_tracking_preview,
             task_label=resolved_config_name,
             subject=resolved_subject or "(not set)",
             current_trial_num=1,
@@ -1449,6 +1453,7 @@ def main():
 
     try:
         task_end_status = run_task(
+            eye_tracking_config=load_eye_tracking_settings(cfg),
             colors_tsv=colors_tsv,
             shapes_tsv=shapes_tsv,
             n_trials=n_trials,

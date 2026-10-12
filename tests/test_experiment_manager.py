@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from bin.logger import SessionLogBundle
+from bin.eye_tracking_config import load_eye_tracking_settings
 from interface.experiment_manager import (
     EVENT_LIBRARY_ENV,
     EXACT_SESSION_DIR_ENV,
@@ -132,6 +133,10 @@ class ExperimentManagerTests(unittest.TestCase):
                             "x_offset": 0.3,
                             "y_offset": -0.4,
                             "ignored_metadata": True,
+                            "input_units": "crop_local_pixels",
+                            "uart": {"device": "/dev/test-uart", "simulate": True},
+                            "filter": {"ema_gamma": 0.2},
+                            "gain_anchor_px": [100, 50],
                         }
                     }
                 ),
@@ -153,7 +158,8 @@ class ExperimentManagerTests(unittest.TestCase):
             self.assertEqual(rows[0]["end_time"], "500.000")
 
             (root / "configs" / "demo.json").write_text(
-                json.dumps({"config_name": "changed_again", "task_value": 1000}),
+                json.dumps({"config_name": "changed_again", "task_value": 1000,
+                            "eye_tracking": {"enabled": True, "calibration_file": "older.json"}}),
                 encoding="utf-8",
             )
             clock.value = 101.0
@@ -167,6 +173,12 @@ class ExperimentManagerTests(unittest.TestCase):
             self.assertEqual(second_config["task_value"], 1000)
             self.assertEqual(second_config["x_scale"], 0.1)
             self.assertEqual(second_config["y_scale"], -0.2)
+            settings = load_eye_tracking_settings(second_config)
+            self.assertEqual(settings.uart.device, "/dev/test-uart")
+            self.assertTrue(settings.uart.simulate)
+            self.assertEqual(settings.filter.ema_gamma, 0.2)
+            self.assertEqual(settings.gain_anchor_px, (100, 50))
+            self.assertEqual(settings.calibration.x_scale, 0.1)
 
     def test_generated_block_persists_launcher_screen_selection(self):
         with tempfile.TemporaryDirectory() as tmpdir:

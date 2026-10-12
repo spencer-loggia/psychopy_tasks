@@ -34,6 +34,7 @@ from bin.frame_timing import (
     plan_frame_duration,
     wait_until,
 )
+from bin.eye_tracking_config import load_eye_tracking_settings
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.config import load_config, validate_config
@@ -79,6 +80,7 @@ def run_task(
     refresh_rate: Optional[float] = None,
     config_name: Optional[str] = None,
     screen_config: Optional[Dict[str, Any]] = None,
+    eye_tracking_config=None,
 ):
     # Enable or disable debug outputs (writing debug PNGs)
     utils.set_debug(debug)
@@ -121,6 +123,7 @@ def run_task(
 
     resolved_config_name = str(config_name).strip() if config_name else "random_image_sequence"
     session_logs = SessionLogBundle(
+        eye_tracking_config=eye_tracking_config,
         output_root=output_dir,
         task_name="random_image_sequence",
         config_name=resolved_config_name,
@@ -339,6 +342,7 @@ def main():
 
     try:
         aborted_by_user = run_task(
+            eye_tracking_config=load_eye_tracking_settings(cfg),
             images_dir=_get("images_dir", cfg.get("images_dir")),
             n=int(_get("n", cfg.get("n", 10))),
             duration=float(_get("duration", cfg.get("duration"))),

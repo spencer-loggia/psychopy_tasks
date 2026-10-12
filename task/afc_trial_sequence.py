@@ -37,6 +37,7 @@ if str(_project_root) not in sys.path:
 
 from bin import utils
 from bin.frame_timing import flip_with_timestamps, plan_frame_duration, wait_until
+from bin.eye_tracking_config import load_eye_tracking_settings
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.config import load_config, validate_config
@@ -112,6 +113,7 @@ def run_task(
     raspi_pin: int = 18,
     config_name: Optional[str] = None,
     screen_config: Optional[Dict[str, Any]] = None,
+    eye_tracking_config=None,
 ):
     # Configure debug behavior before any rasterization
     utils.set_debug(debug)
@@ -164,6 +166,7 @@ def run_task(
         "main_display_max_transition_error_s",
     ]
     session_logs = SessionLogBundle(
+        eye_tracking_config=eye_tracking_config,
         output_root=output_dir,
         task_name="afc_trial_sequence",
         config_name=resolved_config_name,
@@ -423,6 +426,7 @@ def main():
 
     try:
         aborted_by_user = run_task(
+            eye_tracking_config=load_eye_tracking_settings(cfg),
             images_dir=images_dir,
             n_trials=n_trials,
             num_afc=num_afc,

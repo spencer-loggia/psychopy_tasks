@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Optional
 
 from bin.config import load_config
+from bin.eye_tracking_config import resolve_eye_tracking_paths
 from bin.logger import (
     CALIBRATION_FILENAME,
     EVENT_LIBRARY_ENV,
@@ -155,6 +156,7 @@ class ExperimentManager:
         self.started_perf_s = float(perf_counter())
         self.started_at = now or dt.datetime.now()
         self.blocks: list[dict[str, Any]] = []
+        self._eye_calibration_path: Optional[Path] = None
 
         initial_state = self.launch_config.get("initial_state")
         if not isinstance(initial_state, dict):
@@ -263,6 +265,17 @@ class ExperimentManager:
         block_config["output_dir"] = str(output_dir)
         block_config["subject"] = self.subject_name
         block_config.update(injected)
+        resolve_eye_tracking_paths(block_config, self.launch_config_path.parent)
+        # History intentionally retains only declared scalar state fields.
+        # Also reference the accepted source artifact so enabled eye tracking
+        # inherits UART/filter settings, units and the gain anchor losslessly.
+        if self._eye_calibration_path is not None:
+            eye_options = block_config.setdefault("eye_tracking", {})
+            if isinstance(eye_options, dict):
+                # Match the metadata to the same latest history entry whose
+                # coefficients were injected above, even if the source task
+                # config originally referenced an older calibration file.
+                eye_options["calibration_file"] = str(self._eye_calibration_path)
         block_config["fullscreen"] = True
         runtime_screen_override = str(
             os.environ.get(SCREEN_ENV_OVERRIDE_ENV, "")
@@ -335,6 +348,8 @@ class ExperimentManager:
             entry = {field: copy.deepcopy(candidate[field]) for field in required_fields}
             entry["set_time"] = self.milliseconds_since_start()
             history.append(entry)
+            if state_name == "eye_tracker_calibration":
+                self._eye_calibration_path = calibration_path.resolve()
             changed = True
         if changed:
             self._write_state()

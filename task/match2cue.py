@@ -44,6 +44,7 @@ from bin.frame_timing import (
     validate_requested_durations,
     wait_until,
 )
+from bin.eye_tracking_config import load_eye_tracking_settings
 from bin.logger import SessionLogBundle
 from bin.match2cue_logic import (
     Match2CueTrial,
@@ -275,6 +276,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
 
     config_name = str(cfg.get("config_name", "match2cue")).strip() or "match2cue"
     session_logs = SessionLogBundle(
+        eye_tracking_config=load_eye_tracking_settings(cfg),
         output_root=str(cfg.get("output_dir", "./logs")),
         task_name="match2cue",
         config_name=config_name,
@@ -331,6 +333,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     if experimenter_screen is not None:
         experimenter_preview = ExperimenterPreview(
             experimenter_screen,
+            eye_tracking_shared=session_logs.eye_tracking_preview,
             task_label=config_name,
             subject=subject,
             current_trial_num=1,

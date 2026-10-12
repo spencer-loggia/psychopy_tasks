@@ -1776,6 +1776,7 @@ def _experimenter_preview_process(
     startup_sender,
     calibration_config=None,
     calibration_controls_shared=None,
+    eye_tracking_shared=None,
 ) -> None:
     startup_reported = False
 
@@ -2215,6 +2216,31 @@ def _experimenter_preview_process(
             win.close()
         return
     mouse = event.Mouse(win=win)
+    gaze_dot = None
+    last_gaze_redraw_s = 0.0
+    if eye_tracking_shared is not None:
+        from .task_eye_tracking import read_preview_gaze
+
+        gaze_dot = visual.Circle(
+            win, radius=5, units="pix", autoLog=False,
+            fillColor=_preview_rgb255_to_psychopy((40, 120, 255)),
+            lineColor=_preview_rgb255_to_psychopy((255, 255, 255)),
+        )
+
+    def _draw_gaze(layout):
+        # UART calibration already returns fractions of the subject-oriented
+        # scene. Apply that scene's fitted box once, with no second rotation.
+        if gaze_dot is None or layout is None:
+            return
+        fraction = read_preview_gaze(eye_tracking_shared)
+        if fraction is not None:
+            gaze_dot.pos = tuple(
+                center + value * size for center, value, size in zip(
+                    layout["box_center"], fraction, layout["box_size"]
+                )
+            )
+            gaze_dot.draw()
+
     last_mouse_down = False
     last_bg_rgb = (0, 0, 0)
     current_reward_counts = None
@@ -2578,7 +2604,11 @@ def _experimenter_preview_process(
                                 shared_movie_stim,
                                 shared_frame.rgb,
                             )
-                    if not shared_frame_updated and not redraw_requested:
+                    gaze_redraw_due = (
+                        gaze_dot is not None
+                        and time.perf_counter() - last_gaze_redraw_s >= float(update_interval_ms) / 1000.0
+                    )
+                    if not shared_frame_updated and not redraw_requested and not gaze_redraw_due:
                         # Published video arrives at most every 100 ms. A
                         # 2-ms mailbox poll woke this worker about 500 times/s
                         # and competed with ffpyplayer on the Pi cores for no
@@ -2595,7 +2625,9 @@ def _experimenter_preview_process(
                     if movie_outline_rect is not None:
                         movie_outline_rect.draw()
                     _draw_overlay(movie_layout)
+                    _draw_gaze(movie_layout)
                     win.flip()
+                    last_gaze_redraw_s = time.perf_counter()
                     continue
 
                 static_scene["canvas_bg_rect"].draw()
@@ -2612,6 +2644,7 @@ def _experimenter_preview_process(
                     static_scene["highlight_box"].draw()
                 static_scene["preview_outline_rect"].draw()
                 _draw_overlay()
+                _draw_gaze(static_scene.get("layout"))
                 win.flip()
             except Exception:
                 static_scene = _build_static_scene(
@@ -2664,6 +2697,7 @@ class ExperimenterPreview:
         mouse_visible: Optional[bool] = True,
         startup_timeout_s: float = 10.0,
         calibration_config: Optional[Dict[str, Any]] = None,
+        eye_tracking_shared=None,
     ):
         self.screen_info = screen_info
         self.task_label = task_label
@@ -2727,6 +2761,7 @@ class ExperimenterPreview:
                 startup_sender,
                 calibration_config,
                 self._calibration_controls,
+                eye_tracking_shared,
             ),
             daemon=True,
         )

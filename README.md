@@ -656,8 +656,11 @@ Eye data and calibration:
 - Output fractions refer to the oriented subject scene, including the actual window size in windowed mode:
   x=-0.5 is left, x=0.5 right, y=-0.5 bottom and y=0.5 top. The preview preserves that scene's aspect ratio.
 
-Click the preview to move the fixation target. The bottom and left sliders adjust x/y scale; `zero` (or `z` on
-the experimenter display) maps the current valid, smoothed eye position to that target. Invalid gaze is hidden
+Click the preview to move the fixation target. The bottom and left sliders adjust x/y gain around the last
+zeroed eye position, keeping that position fixed while changing sensitivity to movement. Before the first zero,
+the first valid sample provides the anchor. Moving the target does not change this anchor; `zero` (or `z` on
+the experimenter display) maps the current valid, smoothed eye position to that target and replaces the anchor.
+The anchor survives saving/reloading, including a gain of zero or a change of sign. Invalid gaze is hidden
 and its status is displayed. The green reward button or `r` delivers a manual pulse; Exit or Escape ends the task.
 
 Reward and fixation settings:
@@ -676,8 +679,43 @@ Reward and fixation settings:
 
 On normal exit, `calibration.json` retains the existing top-level `eye_tracker_calibration` object and four
 scale/offset keys used by the experiment manager. Additional metadata records pixel input units, `eye_id: 0`,
-UART/filter settings, oriented/native screen dimensions, rotation and latest sample validity. The session
+UART/filter settings, gain anchor, oriented/native screen dimensions, rotation and latest sample validity. The session
 also contains message and pump event logs.
+
+Eye tracking in presentation tasks
+---------------------------------
+`active_foraging`, `play_video`, `match2cue`, `afc_csc1`, `afc_trial_sequence`, and `random_image_sequence`
+use the same Eye 0 UART reader and calibration loader. Enable it in a task config with
+`"eye_tracking": {"enabled": true}`. The experiment manager passes the latest calibration coefficients and
+references the calibration artifact so UART/filter settings and pixel-coordinate metadata also carry forward.
+Within an experiment, a newly completed calibration supersedes an older `calibration_file` reference.
+For a standalone task, reference a saved file instead:
+
+```json
+"eye_tracking": {
+  "enabled": true,
+  "calibration_file": "../calibrations/calibration.json"
+}
+```
+
+Relative paths are resolved against the source config before the manager copies it into a block. Embedded
+`eye_tracker_calibration` objects or histories are also accepted. Non-null flat calibration coefficients take
+precedence; null placeholders fall back to saved values. All four coefficients are required for enabled
+presentation tasks. Explicit `eye_tracking.uart` and `eye_tracking.filter` settings override saved settings
+(for example, `"uart": {"simulate": true}` for a hardware-free check). Eye tracking defaults to disabled and
+is independent of `raspi`, which controls reward hardware. Saved UART settings include `simulate`; override
+it to `false` when switching a simulated calibration to hardware, and recalibrate on the rig.
+
+Tasks with an experimenter preview show a blue gaze marker in the subject-oriented scene, including video.
+Invalid, stale and offscreen gaze is hidden. The two sequence tasks currently have no experimenter preview,
+but provide the same main-thread gaze access. No choices or stimulus timing depend on gaze at present.
+
+For future gaze-dependent task logic, use `session_logs.eye_tracking.get_position()` in the main task thread:
+it returns an unclamped `(x, y)` pair in centered subject-scene fractions, or `None` when invalid/stale.
+`get_state()` provides raw/smoothed crop pixels, validity, timestamps and frame metadata. Check that
+`session_logs.eye_tracking` is not `None` when eye tracking is optional. Both methods read the worker's latest
+state without serial I/O on the presentation thread. `"show_preview": false` disables the marker while keeping
+that API available. The session owns tracker startup/shutdown; gaze updates do not alter stimulus commands.
 
 CPU Affinity for Timing-Critical Tasks
 --------------------------------------

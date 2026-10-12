@@ -40,6 +40,7 @@ if str(_project_root) not in sys.path:
 from bin import utils
 from bin.config import load_config, validate_config
 from bin.frame_timing import plan_frame_duration, wait_until
+from bin.eye_tracking_config import load_eye_tracking_settings
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.screen import (
@@ -451,6 +452,7 @@ def run_task(
     choice_hitbox_scale: float = 1.0,
     config_name: Optional[str] = None,
     screen_config: Optional[Dict[str, Any]] = None,
+    eye_tracking_config=None,
 ) -> None:
     utils.set_debug(debug)
     cue_time = float(cue_time)
@@ -561,6 +563,7 @@ def run_task(
     resolved_config_name = str(config_name).strip() if config_name else "afc_csc1"
     behavior_fieldnames = _build_behavior_fieldnames(num_afc)
     session_logs = SessionLogBundle(
+        eye_tracking_config=eye_tracking_config,
         output_root=output_dir,
         task_name="afc_csc1",
         config_name=resolved_config_name,
@@ -684,6 +687,7 @@ def run_task(
         if experimenter_screen is not None:
             experimenter_preview = ExperimenterPreview(
                 experimenter_screen,
+                eye_tracking_shared=session_logs.eye_tracking_preview,
                 task_label=resolved_config_name,
                 start_perf_s=time.perf_counter(),
                 update_interval_s=0.1,
@@ -1428,6 +1432,7 @@ def main():
 
     try:
         task_end_status = run_task(
+            eye_tracking_config=load_eye_tracking_settings(cfg),
             colors_tsv=_get("colors_tsv", cfg.get("colors_tsv")),
             shapes_tsv=_get("shapes_tsv", cfg.get("shapes_tsv")),
             n_trials=int(_get("n", cfg.get("n"))),

@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 
 import bin
 from bin.eye_tracking import EyeTrackerState, UARTEyeTrackerConfig
+from bin.eye_tracking_config import load_eye_tracking_settings
 from bin.screen import ScreenGeometry
 
 
@@ -97,9 +98,9 @@ class EyeCalibrationTaskTests(unittest.TestCase):
         )
         task.utils.setup_task_window.return_value = win, main, secondary
         preview, tracker, outputs = Mock(), Mock(), Mock()
-        preview.poll.side_effect = [False, True]
+        preview.poll.side_effect = [False, False, False, False, True]
         preview.consume_manual_reward_request.return_value = False
-        preview.get_calibration_controls.return_value = {
+        first_controls = {
             "x_scale": 0.005,
             "y_scale": -0.005,
             "fix_x": 0.25,
@@ -107,14 +108,39 @@ class EyeCalibrationTaskTests(unittest.TestCase):
             "revision": 1,
             "zero_count": 1,
         }
+        preview.get_calibration_controls.side_effect = [
+            first_controls,
+            {
+                **first_controls,
+                "revision": 2,
+                "fix_x": -0.2,
+                "fix_y": 0.2,
+                "x_scale": 0.01,
+                "y_scale": -0.015,
+            },
+            {**first_controls, "revision": 3, "x_scale": 0, "y_scale": 0},
+            {**first_controls, "revision": 4, "x_scale": -0.01, "y_scale": 0.01},
+        ]
         outputs.validate_bit.return_value = 0
-        tracker.get_state.return_value = EyeTrackerState(
+        first_state = EyeTrackerState(
             timestamp_perf_s=1,
             sample_index=1,
             valid=True,
             x_smooth_px=100,
             y_smooth_px=50,
         )
+        from dataclasses import replace
+
+        tracker.get_state.side_effect = [first_state] + [
+            replace(
+                first_state,
+                x_smooth_px=110,
+                y_smooth_px=60,
+                sample_index=i,
+                timestamp_perf_s=1 + i * 0.01,
+            )
+            for i in (2, 3, 4)
+        ]
         with tempfile.TemporaryDirectory() as tmp, patch.object(
             task, "ExperimenterPreview", return_value=preview
         ) as preview_class, patch.object(
@@ -129,17 +155,35 @@ class EyeCalibrationTaskTests(unittest.TestCase):
                 uart_config=UARTEyeTrackerConfig(simulate=True),
             )
             saved = json.loads(result.read_text())["eye_tracker_calibration"]
+            reloaded = load_eye_tracking_settings(
+                {"eye_tracking": {"enabled": True, "calibration_file": str(result)}}
+            )
         self.assertEqual(saved["main_screen_size_px"], [600, 800])
         self.assertEqual(saved["main_native_size_px"], [800, 600])
         self.assertEqual(saved["main_rotation_deg"], 90)
         self.assertEqual(saved["input_units"], "crop_local_pixels")
-        self.assertAlmostEqual(saved["x_offset"], -0.25)
-        self.assertAlmostEqual(saved["y_offset"], 0)
+        self.assertAlmostEqual(saved["x_offset"], 1.25)
+        self.assertAlmostEqual(saved["y_offset"], -0.75)
+        self.assertEqual(reloaded.gain_anchor_px, (100, 50))
+        # Moving the target, doubling gain, crossing zero and reversing sign
+        # must all preserve the previously zeroed position's mapping.
+        for call, expected in zip(
+            preview.show_calibration_state.call_args_list,
+            [(0.25, -0.25), (0.35, -0.4), (0.25, -0.25), (0.15, -0.15)],
+        ):
+            for actual, value in zip(call.kwargs["eye_fraction"], expected):
+                self.assertAlmostEqual(actual, value)
+        for actual, expected in zip(
+            reloaded.calibration.map_position(100, 50), (0.25, -0.25)
+        ):
+            self.assertAlmostEqual(actual, expected)
         self.assertEqual(
             preview_class.call_args.kwargs["calibration_config"]["subject_size"],
             (600, 800),
         )
-        self.assertEqual(task._draw_fixation_cross.call_args.args[1], (-200, -150))
+        self.assertEqual(
+            task._draw_fixation_cross.call_args_list[0].args[1], (-200, -150)
+        )
         task.utils.verify_task_window_vblank.assert_called_once_with(win)
         task.utils.close_task_window.assert_called_once_with(win)
         tracker.stop.assert_called_once()

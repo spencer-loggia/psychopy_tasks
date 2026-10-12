@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import json
 import math
 import os
@@ -511,6 +511,7 @@ class SessionLogBundle:
         when: Optional[dt.datetime] = None,
         auto_flush: bool = True,
         event_name_library_path: Optional[str | Path] = None,
+        eye_tracking_config=None,
     ):
         self.session_clock = SessionClock(started_at=when)
         exact_session_dir = os.environ.get(EXACT_SESSION_DIR_ENV)
@@ -563,6 +564,22 @@ class SessionLogBundle:
                 filename=f"{safe_name}.tsv",
                 auto_flush=auto_flush,
             )
+        self.eye_tracking = None
+        if eye_tracking_config is not None:
+            from .task_eye_tracking import TaskEyeTrackingSession
+
+            try:
+                self.eye_tracking = TaskEyeTrackingSession(eye_tracking_config)
+                self.message_logger.log(
+                    "INFO", f"eye_tracking_started eye_id=0 settings={json.dumps(asdict(eye_tracking_config))}"
+                )
+            except Exception:
+                self.close()
+                raise
+
+    @property
+    def eye_tracking_preview(self):
+        return self.eye_tracking.preview_state if self.eye_tracking is not None else None
 
     def flush(self) -> None:
         self.event_logger.flush()
@@ -573,6 +590,14 @@ class SessionLogBundle:
             table_logger.flush()
 
     def close(self) -> None:
+        eye_error = None
+        if self.eye_tracking is not None:
+            try:
+                self.eye_tracking.close()
+            except Exception as exc:
+                eye_error = exc
+                self.message_logger.log("ERROR", f"eye_tracking_cleanup_failed error={exc}")
+            self.eye_tracking = None
         self.flush()
         self.event_library.export_used(self.session_dir / EVENT_CODE_LIBRARY_FILENAME)
         self.event_logger.close()
@@ -581,3 +606,5 @@ class SessionLogBundle:
             self.behavior_logger.close()
         for table_logger in self.table_loggers.values():
             table_logger.close()
+        if eye_error is not None:
+            raise eye_error

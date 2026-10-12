@@ -23,6 +23,7 @@ from bin.config import load_config, validate_config
 from bin.daqc2_outputs import DAQC2DigitalOutputs, PeriodicDOUTPulseController
 from bin.buffered_video import DEFAULT_BUFFER_BYTES
 from bin.frame_timing import plan_frame_duration
+from bin.eye_tracking_config import load_eye_tracking_settings
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.video_playback import (
@@ -123,6 +124,7 @@ def run_task(
     pump_interval: Optional[float] = None,
     frame_rate: float = 30.0,
     video_buffer_megabytes: float = DEFAULT_BUFFER_BYTES / (1024 * 1024),
+    eye_tracking_config=None,
 ):
     if isinstance(num_clips, bool) or not isinstance(num_clips, int) or num_clips <= 0:
         raise ValueError("num_clips must be a positive integer")
@@ -262,6 +264,7 @@ def run_task(
 
     resolved_config_name = str(config_name).strip() if config_name else "play_video"
     session_logs = SessionLogBundle(
+        eye_tracking_config=eye_tracking_config,
         output_root=output_dir,
         task_name="play_video",
         config_name=resolved_config_name,
@@ -768,6 +771,7 @@ def run_task(
             frame_publisher = SharedVideoFrameBuffer(maximum_frame_bytes)
             experimenter_preview = ExperimenterPreview(
                 experimenter_screen,
+                eye_tracking_shared=session_logs.eye_tracking_preview,
                 task_label=resolved_config_name,
                 start_perf_s=time.perf_counter(),
                 update_interval_s=0.1,
@@ -1098,6 +1102,7 @@ def main():
 
     try:
         stop_reason = run_task(
+            eye_tracking_config=load_eye_tracking_settings(cfg),
             video_files=_get("video_files", []),
             clip_duration_seconds=_get("clip_duration_seconds", None),
             output_dir=_get("output_dir", "./logs"),

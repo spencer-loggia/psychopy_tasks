@@ -1456,6 +1456,8 @@ class PlayVideoTaskTests(unittest.TestCase):
                 self.messages.append((level, message))
 
         class FakeSessionLogs:
+            eye_tracking_preview = None
+
             def __init__(self):
                 self.event_logger = FakeEventLogger()
                 self.message_logger = FakeMessageLogger()

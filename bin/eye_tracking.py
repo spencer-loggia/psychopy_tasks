@@ -82,6 +82,18 @@ class EyeCalibration:
         self.x_offset = float(fixation_fraction[0]) - self.x_scale * x_px
         self.y_offset = float(fixation_fraction[1]) - self.y_scale * y_px
 
+    def set_gains(self, *, x_scale: float, y_scale: float, anchor_px) -> None:
+        """Change sensitivity around a fixed eye position, preserving its mapping.
+
+        Crop coordinates have a large DC component. Merely changing the slope
+        of ``scale * pixel + offset`` shifts the calibrated zero. Compensating
+        the affine intercept makes gain act on displacement from the anchor.
+        Keep the anchor fixed throughout a drag, including crossing gain zero.
+        """
+        self.x_offset += (self.x_scale - x_scale) * anchor_px[0]
+        self.y_offset += (self.y_scale - y_scale) * anchor_px[1]
+        self.x_scale, self.y_scale = float(x_scale), float(y_scale)
+
     def to_json_dict(self) -> dict:
         return {
             **asdict(self),
@@ -123,7 +135,7 @@ class EyePositionFilter:
     """Validate status before deduplication, then smooth only Eye 0.
 
     A duplicate can still announce a blink, a stopped camera or stale data.
-    Restarted services are latched unusable until the calibration task restarts:
+    Restarted services are latched unusable until the task restarts:
     their ROI configuration may have changed along with the service-start ID.
     """
 
@@ -157,7 +169,8 @@ class EyePositionFilter:
             self._restarted = True
         if self._restarted:
             return self.invalidate(
-                "service_restarted", error="Eye tracker restarted; restart calibration"
+                "service_restarted",
+                error="Eye tracker restarted; restart task and check calibration",
             )
         if status.status != StatusCode.OK or status.flags & StatusFlag.ERROR:
             return self.invalidate(
@@ -235,7 +248,7 @@ class EyePositionFilter:
 class UARTEyeTracker:
     """Own the UART in one worker thread, leaving both screen loops responsive."""
 
-    def __init__(self, *, uart_config=None, filter_config=None):
+    def __init__(self, *, uart_config=None, filter_config=None, on_state=None):
         self.config = uart_config or UARTEyeTrackerConfig()
         self.filter = EyePositionFilter(
             uart_config=self.config, filter_config=filter_config
@@ -243,6 +256,8 @@ class UARTEyeTracker:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
+        self._on_state = on_state
+        self._callback_error = None
 
     def start(self):
         if self._thread is not None:
@@ -269,6 +284,20 @@ class UARTEyeTracker:
             raise RuntimeError(
                 f"Eye tracker STOP_TRACKING failed: {self._cleanup_error}"
             )
+        if self._callback_error is not None:
+            raise RuntimeError(f"Eye sample consumer failed: {self._callback_error}")
+
+    def _publish_state(self):
+        """Optional worker-side consumer; never perform serial/file I/O on flip."""
+        if self._on_state is None or self._callback_error is not None:
+            return
+        try:
+            self._on_state(self.get_state())
+        except Exception as exc:
+            self._callback_error = str(exc)
+            with self._lock:
+                self.filter.invalidate("consumer_error", error=str(exc))
+            self._stop.set()
 
     def _run(self):
         channel = None
@@ -288,6 +317,7 @@ class UARTEyeTracker:
                     status = controller.send_state_command(CommandCode.START_TRACKING)
                     with self._lock:
                         self.filter.consume(status, now_s=time.perf_counter())
+                    self._publish_state()
             next_poll = time.perf_counter()
             while not self._stop.is_set():
                 try:
@@ -313,6 +343,7 @@ class UARTEyeTracker:
                 except Exception as exc:
                     with self._lock:
                         self.filter.invalidate("uart_error", error=str(exc))
+                self._publish_state()
                 next_poll = max(
                     next_poll + 1 / self.config.poll_rate_hz, time.perf_counter()
                 )
@@ -320,6 +351,7 @@ class UARTEyeTracker:
         except Exception as exc:
             with self._lock:
                 self.filter.invalidate("uart_error", error=str(exc))
+            self._publish_state()
         finally:
             try:
                 if start_attempted and controller is not None:
@@ -332,6 +364,15 @@ class UARTEyeTracker:
                         channel.close()
                     except Exception as exc:
                         self._cleanup_error = str(exc)
+            with self._lock:
+                # Preserve startup/link failures for the main task to inspect
+                # even after the worker has closed its serial channel.
+                previous = self.filter.state
+                self.filter.invalidate(
+                    previous.rejection_reason if previous.error else "stopped",
+                    error=getattr(self, "_cleanup_error", None) or previous.error,
+                )
+            self._publish_state()
 
 
 class FixationWindow:

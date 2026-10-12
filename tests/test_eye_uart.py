@@ -1,0 +1,169 @@
+"""Wire compatibility and real stream framing, without a Pi or camera."""
+
+import json
+import os
+from pathlib import Path
+import pty
+import struct
+import threading
+import time
+import unittest
+from unittest.mock import Mock
+
+from bin.eye_tracker_wire.controller import (
+    EyeTrackerController,
+    SerialPacketChannel,
+    ResponseTimeout,
+    CommandRejected,
+    AcknowledgementTimeout,
+    _extract_status_packet,
+)
+from bin.eye_tracker_wire.protocol import (
+    CommandCode,
+    CommandPacket,
+    ProtocolError,
+    StatusCode,
+    crc32c,
+    encode_command,
+    decode_command,
+    decode_status,
+)
+
+FIXTURE = json.loads((Path(__file__).parent / "fixtures/eye_uart_v1.json").read_text())
+STATUS_BYTES = bytes.fromhex(FIXTURE["status"])
+
+
+def status_bytes(*, sequence=42, code=0, edits=()):
+    packet = bytearray(STATUS_BYTES)
+    struct.pack_into("<I", packet, 12, sequence)
+    struct.pack_into("<H", packet, 6, code)
+    for offset, value in edits:
+        packet[offset] = value
+    struct.pack_into("<I", packet, 60, crc32c(packet[:60]))
+    return bytes(packet)
+
+
+class UARTProtocolTests(unittest.TestCase):
+    def test_codec_matches_upstream_golden_packets(self):
+        self.assertEqual(crc32c(b"123456789"), 0xE3069283)
+        self.assertEqual(
+            encode_command(CommandPacket(CommandCode.START_TRACKING, 42, 111222333)),
+            bytes.fromhex(FIXTURE["start_command"]),
+        )
+        status = decode_status(STATUS_BYTES)
+        self.assertEqual(status.eyes[0].x, 123.25)
+        self.assertEqual(status.eyes[0].y, -45.5)
+        self.assertEqual(status.eyes[0].pupil_diameter, 12.5)
+        self.assertEqual(status.eyes[1].x, 999)
+        self.assertEqual(status.session_id, 321)
+        self.assertEqual(status.result_age_ms, 2)
+
+    def test_corruption_reserved_and_invalid_flags_rejected(self):
+        for edits in (
+            ((2, 2),),
+            ((3, 1),),
+            ((4, 128),),
+            ((35, 3),),
+            ((35, 0),),
+            ((32, 0), (33, 0)),
+            ((58, 3),),
+            ((59, 1),),
+        ):
+            with self.subTest(edits=edits), self.assertRaises(ProtocolError):
+                decode_status(status_bytes(edits=edits))
+        corrupt = bytearray(STATUS_BYTES)
+        corrupt[28] ^= 1
+        with self.assertRaises(ProtocolError):
+            decode_status(bytes(corrupt))
+
+    def test_stream_resynchronizes_after_noise_corruption_and_split_magic(self):
+        pending = bytearray(b"noiseE")
+        self.assertIsNone(_extract_status_packet(pending))
+        self.assertEqual(pending, b"E")
+        pending.extend(STATUS_BYTES[1:20])
+        self.assertIsNone(_extract_status_packet(pending))
+        pending.extend(STATUS_BYTES[20:])
+        self.assertEqual(_extract_status_packet(pending), STATUS_BYTES)
+        corrupt = bytearray(STATUS_BYTES)
+        corrupt[22] ^= 1
+        pending.extend(corrupt + STATUS_BYTES)
+        self.assertEqual(_extract_status_packet(pending), STATUS_BYTES)
+        self.assertFalse(pending)
+
+    def test_state_retry_is_byte_identical_and_poll_uses_next_sequence(self):
+        channel = Mock()
+        channel.exchange.side_effect = [
+            ResponseTimeout("lost ACK"),
+            status_bytes(),
+            status_bytes(sequence=43),
+        ]
+        controller = EyeTrackerController(
+            channel, initial_sequence=42, retries=1, retry_delay_s=0
+        )
+        controller.send_state_command(CommandCode.START_TRACKING)
+        controller.poll()
+        calls = channel.exchange.call_args_list
+        self.assertEqual(calls[0].args[0], calls[1].args[0])
+        self.assertEqual(calls[0].args[1], 10)
+        self.assertEqual(decode_command(calls[2].args[0]).sequence, 43)
+
+    def test_rejected_state_and_mismatched_ack_are_not_success(self):
+        channel = Mock()
+        channel.exchange.return_value = status_bytes(code=StatusCode.INVALID_STATE)
+        controller = EyeTrackerController(channel, initial_sequence=42, retries=0)
+        with self.assertRaises(CommandRejected):
+            controller.send_state_command(CommandCode.START_TRACKING)
+        channel.exchange.return_value = status_bytes(sequence=999)
+        with self.assertRaises(AcknowledgementTimeout):
+            controller.send_state_command(CommandCode.STOP_TRACKING)
+
+    def test_sequence_zero_protocol_error_is_surfaced_without_waiting(self):
+        channel = Mock()
+        channel.exchange.return_value = status_bytes(
+            sequence=0, code=StatusCode.BAD_CRC
+        )
+        controller = EyeTrackerController(channel, initial_sequence=42)
+        with self.assertRaises(ProtocolError):
+            controller.poll()
+
+    def test_serial_exchange_handles_fragmented_response_and_late_ack(self):
+        master, slave = pty.openpty()
+        path = os.ttyname(slave)
+        channel = None
+        worker_errors = []
+        try:
+            # Pseudo-terminals use a portable baud; wire pacing is not simulated.
+            channel = SerialPacketChannel(path, baud=9600)
+
+            def peer():
+                try:
+                    request = bytearray()
+                    while len(request) < 64:
+                        request.extend(os.read(master, 64 - len(request)))
+                    self.assertEqual(decode_command(bytes(request)).sequence, 42)
+                    response = (
+                        b"noise" + status_bytes(sequence=41) + status_bytes(sequence=42)
+                    )
+                    for start in range(0, len(response), 7):
+                        os.write(master, response[start : start + 7])
+                        time.sleep(0.001)
+                except BaseException as exc:
+                    worker_errors.append(exc)
+
+            worker = threading.Thread(target=peer, daemon=True)
+            worker.start()
+            response = channel.exchange(
+                encode_command(CommandPacket(CommandCode.POLL, 42)), 1
+            )
+            worker.join(1)
+            self.assertEqual(decode_status(response).request_sequence, 42)
+            self.assertFalse(worker_errors)
+        finally:
+            if channel is not None:
+                channel.close()
+            os.close(slave)
+            os.close(master)
+
+
+if __name__ == "__main__":
+    unittest.main()

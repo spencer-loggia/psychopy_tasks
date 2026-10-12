@@ -67,7 +67,7 @@ class ScreenPathPolicyTests(unittest.TestCase):
             low_level_calls = [
                 name for name in calls if name.rsplit(".", 1)[-1] == "setup_window"
             ]
-            expected = ["utils.setup_window"] if path.name == "calibrate_eye_tracker.py" else []
+            expected = []
             self.assertEqual(
                 low_level_calls,
                 expected,

@@ -1774,6 +1774,8 @@ def _experimenter_preview_process(
     video_start_perf_shared,
     stop_event,
     startup_sender,
+    calibration_config=None,
+    calibration_controls_shared=None,
 ) -> None:
     startup_reported = False
 
@@ -2174,6 +2176,44 @@ def _experimenter_preview_process(
     last_cursor_apply_s = 0.0
     if mouse_visible is not None:
         set_window_mouse_visible(win, bool(mouse_visible))
+    if calibration_config is not None:
+        # Calibration needs interactive scale/target controls, but uses exactly
+        # the same verified, non-vsync secondary window and process lifecycle
+        # as task previews. Keep its renderer out of the general scene code.
+        try:
+            from .eye_calibration_preview import EyeCalibrationControls
+
+            controls = EyeCalibrationControls(
+                win,
+                preview_canvas_size,
+                calibration_config,
+                calibration_controls_shared,
+                reward_event,
+                exit_event,
+            )
+            payload = {}
+            controls.draw(payload)
+            win.flip()
+            _report_startup({
+                "ok": True,
+                "placement": getattr(
+                    win, "_neuro_tasks_screen_placement", describe_screen(screen_info)
+                ),
+            })
+            while not stop_event.is_set():
+                latest = _get_latest_preview_command(command_queue)
+                if latest is not None:
+                    payload = latest
+                controls.poll_controls()
+                controls.draw(payload)
+                win.flip()
+                core.wait(max(0.02, update_interval_ms / 1000.0))
+        except Exception as exc:
+            _report_startup({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            raise
+        finally:
+            win.close()
+        return
     mouse = event.Mouse(win=win)
     last_mouse_down = False
     last_bg_rgb = (0, 0, 0)
@@ -2623,6 +2663,7 @@ class ExperimenterPreview:
         update_interval_s: float = 0.1,
         mouse_visible: Optional[bool] = True,
         startup_timeout_s: float = 10.0,
+        calibration_config: Optional[Dict[str, Any]] = None,
     ):
         self.screen_info = screen_info
         self.task_label = task_label
@@ -2652,6 +2693,14 @@ class ExperimenterPreview:
         self._reward_event = self._ctx.Event()
         self._exit_event = self._ctx.Event()
         self._stop_event = self._ctx.Event()
+        self._calibration_controls = None
+        if calibration_config is not None:
+            initial = calibration_config["calibration"]
+            self._calibration_controls = self._ctx.Array(
+                "d",
+                [initial["x_scale"], initial["y_scale"], 0, 0, 0, 0],
+                lock=True,
+            )
         self._video_start_perf_shared = self._ctx.Value(
             "d",
             float("nan"),
@@ -2676,6 +2725,8 @@ class ExperimenterPreview:
                 self._video_start_perf_shared,
                 self._stop_event,
                 startup_sender,
+                calibration_config,
+                self._calibration_controls,
             ),
             daemon=True,
         )
@@ -2759,6 +2810,23 @@ class ExperimenterPreview:
             return False
         self._reward_event.clear()
         return True
+
+    def get_calibration_controls(self) -> dict:
+        """Read scale/target values and the zero-button counter atomically."""
+        if self._calibration_controls is None:
+            raise RuntimeError("Preview was not opened with calibration controls")
+        with self._calibration_controls.get_lock():
+            values = list(self._calibration_controls[:])
+        fields = ("x_scale", "y_scale", "fix_x", "fix_y", "revision", "zero_count")
+        return dict(zip(fields, values))
+
+    def show_calibration_state(self, *, eye_fraction, eye_valid, status_text) -> None:
+        self._send({
+            "type": "calibration",
+            "eye_fraction": list(eye_fraction),
+            "eye_valid": bool(eye_valid),
+            "status_text": str(status_text),
+        })
 
     def set_trial_progress(self, current_trial_num: int, total_trials: Optional[int]) -> None:
         self.current_trial_num = int(current_trial_num)

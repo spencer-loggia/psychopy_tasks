@@ -193,9 +193,8 @@ Experiment-managed task/subprocess policies:
   native activation, and final realized-rectangle verification. On Linux it also makes the resolved subject
   output XRandR-primary, confirms swap interval 1 on that drawable, and restores the previous primary output when
   `bin.utils.close_task_window()` closes it. Every subject task must use this matching setup/close pair.
-  `bin.utils.setup_window()` is reserved for an
-  already-resolved auxiliary calibration window; the diagnostic and preview process are the only other low-level
-  window-factory users. `tests/test_screen_path_policy.py` enforces this invariant for every current task and
+  Secondary calibration controls use the shared `ExperimenterPreview` process.
+  The diagnostic and preview process are the only other low-level window-factory users. `tests/test_screen_path_policy.py` enforces this invariant for every current task and
   rejects future direct window-factory bypasses.
 
 X11 Main-Screen Idle Masking
@@ -605,43 +604,80 @@ coordinates. The experimenter process transposes the entire scene to the subject
 
 Eye Tracker Calibration
 -----------------------
-`task/calibrate_eye_tracker.py` calibrates two analog eye-position voltages from a Pi-Plates DAQC2plate.
-The reusable implementation lives in `bin/eye_tracking.py` so other tasks can consume the same smoothed,
-calibrated eye position.
-
-Run with a config:
+`task/calibrate_eye_tracker.py` calibrates **Eye 0 (the first UART slot)** from the digital eye tracker.
+`bin/eye_tracking.py` owns acquisition, validity checks, smoothing and calibration. The controller-side wire
+codec and UART routines are adapted from the companion `eye_tracker` repository; provenance and license are
+in `bin/eye_tracker_wire/SOURCE.md`. No separate checkout or camera package is needed on the task Pi.
 
 ```bash
-python task/calibrate_eye_tracker.py --config test_configs/eye_calibration_config.json
+python task/calibrate_eye_tracker.py --config test_configs/eye_calibration_config.json --raspi
 ```
 
-Important config keys:
+For a desktop control/display check, omit `--raspi` and add `--simulate_eye`. Two displays are required.
+The subject window uses the same placement, realized dimensions, rotation and vblank verification as
+`active_foraging`. Calibration controls run in the same fullscreen, non-vsync `ExperimenterPreview` process
+as other tasks. `experimenter_win_size` is no longer used; the secondary window fills its selected display.
 
-- `screens.main` and `screens.experimenter`: main subject display and experimenter display, using the same selector rules as `active_foraging`.
-- `daq.address`, `daq.x_channel`, `daq.y_channel`: DAQC2plate address and analog input channels. The bundled DAQC2plate guide documents `piplates.DAQC2plate.getADC(addr, channel)` for channels `0` through `7`; channel `8` is the board supply readback and is not used for eye position.
-- `daq.sample_rate_hz`: analog sampling rate, default `240`.
-- `daq.voltage_min` and `daq.voltage_max`: expected valid eye-position voltage range, default `-10.0` to `10.0`.
-- `eye_filter.ema_gamma`: exponential moving-average gamma, default `0.98`.
-- `eye_filter.max_voltage_step`: optional per-sample jump threshold for blink/artifact rejection. Set to `null` to disable step rejection.
-- `initial_x_scale`, `initial_y_scale`, `initial_x_offset`, `initial_y_offset`: starting voltage-to-screen mapping parameters.
-- `fix_diameter`: fixation acceptance diameter, as a fraction of the shorter main-screen dimension. Default `0.05`.
-- `fix_accept_percent`: proportion of recent frame samples that must be inside the fixation window before automatic reward. Defaults to `0.95`; values like `95` are also accepted.
-- `fix_accept_time`: rolling acceptance-window duration in seconds. Default `2.0`.
-- `pump_pin` and `pump_pulse_time_seconds`: manual reward output controlled by the green experimenter-screen button.
+Connection and protocol:
 
-The eye tracker reports centered screen fractions relative to the real main screen dimensions:
-`x=-0.5` is the left edge, `x=0.5` is the right edge, `y=-0.5` is the bottom edge, and `y=0.5` is the top edge.
-The experimenter screen draws a gray preview box with the same aspect ratio as the main screen; the blue eye dot
-and fixation cross are mapped into that box. Clicking inside the box moves the fixation cross on both screens.
-The bottom slider changes `x_scale`, the left slider changes `y_scale`, and the lower-left `x` button sets the
-offsets so the current smoothed eye position maps to the current fixation position.
-When the smoothed eye position stays within `fix_diameter` of the fixation cross for at least `fix_accept_percent`
-of the past `fix_accept_time`, the task delivers one automatic `pump_pulse_time_seconds` reward. That automatic
-reward re-arms only after fixation is broken or the fixation/calibration target is changed.
+- `uart.device` defaults to `/dev/ttyAMA10`, the Pi 5 dedicated **3-pin UART connector**. This differs from
+  `/dev/ttyAMA0` in the tracker's sample config, which selects UART0 on the 40-pin GPIO header.
+  `/dev/serial0` normally aliases the dedicated connector on Pi 5; an explicit device avoids alias ambiguity.
+  See [Raspberry Pi UART documentation](https://github.com/raspberrypi/documentation/blob/master/documentation/asciidoc/computers/configuration/interfaces.adoc).
+- Both ends must select the UART actually wired: cross TX to RX and share ground, using 3.3 V logic.
+  Disable the serial login console/getty on that device and ensure the task user has serial-port access.
+  If the tracker Pi also uses its 3-pin connector, set its `transport.uart_device` to `/dev/ttyAMA10` too.
+- Use `uart.baud: 460800`, raw 8-N-1 without flow control, matching the tracker. `uart.poll_rate_hz` defaults
+  to 100; this is a request/response protocol, not an unsolicited byte stream. Each exchange consists of a
+  64-byte command and 64-byte status with CRC-32C and echoed command sequence.
+- `uart.manage_tracking: true` sends acknowledged START_TRACKING on entry and STOP_TRACKING on exit.
+  START can also start recording if the tracker config enables `record_on_tracking`; STOP flushes it.
+  Set this option to `false` to poll an already-running tracker without changing its state.
+  State commands wait up to `uart.state_timeout_s` (10 s) and retry the identical command
+  `uart.state_retries` times (default 1). Close may wait for these acknowledgements.
 
-On exit, the task writes `calibration.json` in its session log directory. The file has one top-level
-`eye_tracker_calibration` object containing `x_scale`, `y_scale`, `x_offset`, and `y_offset`, plus DAQ/filter
-metadata. The same directory contains its message and pump signal event logs.
+Eye data and calibration:
+
+- Only slot 0 is used, whether one or two eyes are configured. Its x/y are signed Q16.16 **crop-local pixels**;
+  pupil diameter is Q12.4 and confidence is 0–255. Input x points right and input y points down.
+- CRC/flags/acknowledgements are checked before use. Blink, lost, stopped, unconfigured, stale or error states
+  cannot earn automatic rewards or set offsets. `uart.max_sample_age_s` defaults to 0.15 s; age includes the
+  reported result age, UART round trip and time since receipt. Camera timestamps are not compared across Pis.
+  Duplicate frames do not update smoothing or count as additional fixation samples. A service restart
+  invalidates the session and requires restarting calibration; its ROI coordinates may have changed.
+- `eye_filter.ema_gamma` defaults to 0 (no added smoothing); higher values below 1 retain more of the previous
+  sample. Filtering occurs at the camera frame rate, not the UART poll rate.
+- `initial_x_scale`, `initial_y_scale`, `initial_x_offset`, `initial_y_offset` initialize the linear mapping
+  `fraction = scale * crop_pixel + offset`. Runtime `x_scale`, `y_scale`, `x_offset`, `y_offset` values supplied
+  by the experiment manager take precedence when non-null. Defaults are +0.005 for x and -0.005 for y.
+  These are starting values to calibrate, not a measured mapping. **Old analog-voltage calibration values must
+  be cleared/replaced in the experiment state before use.** Changing camera ROI or analysis resolution also
+  requires recalibration. Analog DAQ input configuration is rejected rather than silently reused.
+- Output fractions refer to the oriented subject scene, including the actual window size in windowed mode:
+  x=-0.5 is left, x=0.5 right, y=-0.5 bottom and y=0.5 top. The preview preserves that scene's aspect ratio.
+
+Click the preview to move the fixation target. The bottom and left sliders adjust x/y scale; `zero` (or `z` on
+the experimenter display) maps the current valid, smoothed eye position to that target. Invalid gaze is hidden
+and its status is displayed. The green reward button or `r` delivers a manual pulse; Exit or Escape ends the task.
+
+Reward and fixation settings:
+
+- `raspi: true` enables the shared `DAQC2DigitalOutputs` adapter. `daq.address` (default 0) and
+  `daq.module_name` select the plate. `pump_pin` means **DAQC2 DOUT bit 0–7**, default 0, as in active foraging;
+  it is not a BCM GPIO pin. Logical on uses `setDOUTbit`, off uses `clrDOUTbit`. With `raspi: false`, reward
+  events are logged without hardware writes. An enabled output that fails to initialize aborts the task.
+- `pump_pulse_time_seconds` defaults to 0.25. Pulses use software timing and log actual on/off times.
+  The pump is cleared on exit or exceptions, before UART/camera shutdown.
+- `fix_diameter` is a fraction of the shorter subject-scene dimension (default 0.05).
+  `fix_accept_percent` is the fraction of distinct camera samples inside the target (default 0.95; 95 also works).
+  `fix_accept_time` sets the rolling observation duration (default 2 s; 0 disables automatic reward).
+  The current sample must be valid and inside the target, and observation gaps larger than the sample-age
+  limit reset the window. Automatic reward re-arms after fixation breaks or controls change.
+
+On normal exit, `calibration.json` retains the existing top-level `eye_tracker_calibration` object and four
+scale/offset keys used by the experiment manager. Additional metadata records pixel input units, `eye_id: 0`,
+UART/filter settings, oriented/native screen dimensions, rotation and latest sample validity. The session
+also contains message and pump event logs.
 
 CPU Affinity for Timing-Critical Tasks
 --------------------------------------

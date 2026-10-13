@@ -376,12 +376,19 @@ class UARTEyeTracker:
 
 
 class FixationWindow:
-    """Count distinct camera samples; never reward an invalid current sample."""
+    """Measure time spent fixating over a complete rolling observation window.
 
-    def __init__(self, duration_s, accept_fraction, *, max_gap_s=0.15):
+    Each distinct camera result holds until the next result. Clip those spans
+    to the exact window edges, so irregular frame timing cannot overweight a
+    burst of samples. Missing/stale observations never earn fixation credit.
+    The caller serializes access when acquisition and decisions use threads.
+    """
+
+    def __init__(self, duration_s, accept_fraction, *, max_gap_s=0.15, strict=False):
         self.duration_s = float(duration_s)
         self.accept_fraction = float(accept_fraction)
         self.max_gap_s = float(max_gap_s)
+        self.strict = strict
         self.clear()
 
     def clear(self):
@@ -396,7 +403,10 @@ class FixationWindow:
         if state.sample_index != self._last_index:
             if (
                 self.history
-                and state.timestamp_perf_s - self.history[-1][0] > self.max_gap_s
+                and (
+                    state.timestamp_perf_s - self.history[-1][0] > self.max_gap_s
+                    or state.timestamp_perf_s <= self.history[-1][0]
+                )
             ):
                 # Missing observations cannot be evidence of sustained fixation.
                 self.clear()
@@ -404,18 +414,38 @@ class FixationWindow:
             self.history.append(
                 (state.timestamp_perf_s, state.valid and bool(in_window))
             )
-        cutoff = state.timestamp_perf_s - self.duration_s
-        while len(self.history) > 1 and self.history[1][0] <= cutoff:
-            self.history.popleft()
+        elif self.history and not state.valid:
+            # A duplicate can invalidate the most recent result (blink/loss).
+            self.history[-1] = (self.history[-1][0], False)
+        return self.accepts(now_s=state.timestamp_perf_s)
+
+    def accepts(self, *, now_s):
+        """Evaluate at decision time, including expiry if the producer stops."""
+        self.acceptance = 0.0
         if not self.history or self.duration_s <= 0:
             return False
-        self.acceptance = sum(hit for _, hit in self.history) / len(self.history)
-        ready = self.history[-1][0] - self.history[0][0] >= self.duration_s
+        age = now_s - self.history[-1][0]
+        if age < 0 or age > self.max_gap_s:
+            return False
+        cutoff = now_s - self.duration_s
+        while len(self.history) > 1 and self.history[1][0] <= cutoff:
+            self.history.popleft()
+        fixated_s = 0.0
+        end_s = now_s
+        for start_s, hit in reversed(self.history):
+            if hit:
+                fixated_s += max(0.0, end_s - max(start_s, cutoff))
+            end_s = start_s
+        self.acceptance = min(1.0, fixated_s / self.duration_s)
+        ready = self.history[0][0] <= cutoff + 1e-9
+        passes = (
+            self.acceptance - self.accept_fraction > 1e-9
+            if self.strict else self.acceptance >= self.accept_fraction
+        )
         return (
-            state.valid
-            and bool(in_window)
+            self.history[-1][1]
             and ready
-            and self.acceptance >= self.accept_fraction
+            and passes
         )
 
 

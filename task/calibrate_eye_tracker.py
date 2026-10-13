@@ -20,13 +20,13 @@ from bin import utils
 from bin.config import load_config
 from bin.daqc2_outputs import DAQC2DigitalOutputs
 from bin.eye_calibration_preview import _make_fixation_cross, _draw_fixation_cross
+from bin.eye_calibration_reward import CalibrationAutoReward
 from bin.eye_tracking_config import load_eye_tracking_settings
 from bin.eye_tracking import (
     UARTEyeTracker,
     UARTEyeTrackerConfig,
     EyeCalibration,
     EyeFilterConfig,
-    FixationWindow,
     calibration_payload,
     fraction_position_within_diameter,
     fraction_to_pixels,
@@ -127,8 +127,7 @@ def run_task(
     x_scale_limits=(-0.02, 0.02),
     y_scale_limits=(-0.02, 0.02),
     fix_diameter=0.05,
-    fix_accept_percent=0.95,
-    fix_accept_time=2.0,
+    reward_interval=2.0,
     raspi=False,
     daq_address=0,
     daq_module_name="piplates.DAQC2plate",
@@ -140,16 +139,14 @@ def run_task(
     calibration = initial_calibration or EyeCalibration()
     for name, value in (
         ("fix_diameter", fix_diameter),
-        ("fix_accept_time", fix_accept_time),
         ("pump_pulse_time_seconds", pump_pulse_time_seconds),
     ):
         if not math.isfinite(value) or value < 0:
             raise ValueError(f"{name} must be finite and nonnegative")
-    accept_fraction = (
-        fix_accept_percent / 100 if fix_accept_percent > 1 else fix_accept_percent
-    )
-    if not math.isfinite(accept_fraction) or not 0 <= accept_fraction <= 1:
-        raise ValueError("fix_accept_percent must be in [0, 1] or [0, 100]")
+    if not math.isfinite(reward_interval) or reward_interval <= 0:
+        raise ValueError("reward_interval must be positive and finite")
+    if reward_interval <= pump_pulse_time_seconds:
+        raise ValueError("reward_interval must be longer than pump_pulse_time_seconds")
     for limits, value in (
         (x_scale_limits, calibration.x_scale),
         (y_scale_limits, calibration.y_scale),
@@ -183,12 +180,10 @@ def run_task(
     main_win = preview = tracker = None
     output_opened = False
     fixation = (0.0, 0.0)
-    window = FixationWindow(
-        fix_accept_time, accept_fraction, max_gap_s=uart_config.max_sample_age_s
-    )
-    auto_reward_armed = True
+    auto_reward = None
     last_revision = last_zero_count = 0
     last_attention_count = 0
+    last_auto_reward_count = 0
     attention_started_s = None
     last_error = None
     latest_state = None
@@ -217,8 +212,12 @@ def run_task(
                 "completion_status": "interrupted" if error else "complete",
                 "fixation_acceptance": {
                     "fix_diameter": fix_diameter,
-                    "fix_accept_percent": accept_fraction,
-                    "fix_accept_time": fix_accept_time,
+                    "reward_interval": reward_interval,
+                    "recent_duration_s": CalibrationAutoReward.RECENT_SECONDS,
+                    "recent_fraction_threshold": CalibrationAutoReward.RECENT_THRESHOLD,
+                    "interval_fraction_threshold": CalibrationAutoReward.INTERVAL_THRESHOLD,
+                    "threshold_comparison": "strictly_greater",
+                    "fraction_basis": "time",
                     "diameter_units": "fraction_of_shorter_subject_scene_dimension",
                 },
             }
@@ -287,7 +286,15 @@ def run_task(
             "INFO",
             f"calibration_geometry native={main_size} subject={subject_size} rotation={rotation}",
         )
-        tracker = UARTEyeTracker(uart_config=uart_config, filter_config=filter_config)
+        auto_reward = CalibrationAutoReward(
+            reward_interval=reward_interval, calibration=calibration,
+            fixation=fixation, screen_size=subject_size, fix_diameter=fix_diameter,
+            max_sample_age_s=uart_config.max_sample_age_s,
+        )
+        tracker = UARTEyeTracker(
+            uart_config=uart_config, filter_config=filter_config,
+            on_state=auto_reward.observe,
+        )
         tracker.start()
         msg_logger.log(
             "INFO",
@@ -311,6 +318,7 @@ def run_task(
             return exit_requested
 
         def reward():
+            auto_reward.reward_delivered(now_s=time.perf_counter())
             _deliver_reward_pulse(
                 outputs=outputs,
                 pump_pin=pump_pin,
@@ -318,9 +326,8 @@ def run_task(
                 logger=logger,
                 should_exit=should_exit,
             )
-            # The presentation loop cannot count samples while waiting for the
-            # pump. Require a fresh full observation window after each pulse.
-            window.clear()
+            # The UART callback continues both observation windows during the
+            # pulse. Do not discard that history or require a fixation break.
 
         while not should_exit():
             latest_state = tracker.get_state()
@@ -339,7 +346,7 @@ def run_task(
             # with the preview's requests before applying any action, so both
             # focus paths share zeroing, attention and reward behavior. Arrow
             # requests go to the slider owner and return as a normal revision.
-            main_keys = event.getKeys(["f", "z", "r", "up", "down", "right", "left"])
+            main_keys = event.getKeys(["f", "z", "r", "a", "up", "down", "right", "left"])
             x_steps = main_keys.count("right") - main_keys.count("left")
             y_steps = main_keys.count("up") - main_keys.count("down")
             if x_steps or y_steps:
@@ -385,8 +392,7 @@ def run_task(
                     controls["revision"],
                     controls["zero_count"],
                 )
-                window.clear()
-                auto_reward_armed = True
+                auto_reward.set_mapping(calibration, fixation, now_s=time.perf_counter())
                 msg_logger.log(
                     "INFO",
                     f"calibration_controls fixation={fixation} calibration={asdict(calibration)}",
@@ -398,19 +404,26 @@ def run_task(
                 diameter_fraction=fix_diameter,
                 screen_size=subject_size,
             )
-            accepted = window.update(latest_state, in_window)
+            auto_count = int(controls.get("auto_reward_count", 0))
+            toggle_count = max(main_keys.count("a"), auto_count - last_auto_reward_count)
+            last_auto_reward_count = auto_count
+            if toggle_count % 2:
+                enabled = auto_reward.toggle(now_s=time.perf_counter())
+                msg_logger.log(
+                    "INFO", f"auto_reward enabled={int(enabled)} reward_interval={reward_interval}"
+                )
+            auto_status = auto_reward.status(now_s=time.perf_counter())
             # Drain both sources every frame; simultaneous requests produce
             # one pulse rather than leaving a second queued keyboard reward.
             manual_reward = preview.consume_manual_reward_request() or "r" in main_keys
-            if manual_reward or (accepted and auto_reward_armed):
+            if manual_reward or (auto_status.due and in_window):
                 msg_logger.log(
                     "INFO",
-                    f"reward source={'manual' if manual_reward else 'fixation'} acceptance={window.acceptance:.6f}",
+                    f"reward source={'manual' if manual_reward else 'auto'} "
+                    f"fixation_recent={auto_status.recent_fraction:.6f} "
+                    f"fixation_interval={auto_status.interval_fraction:.6f}",
                 )
                 reward()
-                auto_reward_armed = False
-            elif not in_window:
-                auto_reward_armed = True
             if attention_requested:
                 # Start with the next draw (after any reward pulse). A fresh F
                 # request restarts the one-second cue rather than queuing it.
@@ -420,7 +433,9 @@ def run_task(
                 )
             status = (
                 f"Eye 0 ({latest_state.x_smooth_px:.2f}, {latest_state.y_smooth_px:.2f}) px  "
-                f"fix {window.acceptance * 100:.1f}%"
+                f"auto {'ON' if auto_status.enabled else 'OFF'} (A)\n"
+                f"fix 100ms: {auto_status.recent_fraction * 100:.1f}%  "
+                f"{reward_interval:g}s: {auto_status.interval_fraction * 100:.1f}%"
             )
             if not latest_state.valid:
                 status += f"\n{latest_state.error or latest_state.rejection_reason}"
@@ -531,8 +546,7 @@ def main():
         x_scale_limits=cfg.get("x_scale_limits", (-0.02, 0.02)),
         y_scale_limits=cfg.get("y_scale_limits", (-0.02, 0.02)),
         fix_diameter=float(cfg.get("fix_diameter", 0.05)),
-        fix_accept_percent=float(cfg.get("fix_accept_percent", 0.95)),
-        fix_accept_time=float(cfg.get("fix_accept_time", 2)),
+        reward_interval=float(cfg.get("reward_interval", cfg.get("fix_accept_time") or 2)),
         raspi=args.raspi if args.raspi is not None else cfg.get("raspi", False),
         daq_address=int(daq.get("address", cfg.get("daq_address", 0))),
         daq_module_name=daq.get(

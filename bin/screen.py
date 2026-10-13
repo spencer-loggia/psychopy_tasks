@@ -2756,10 +2756,10 @@ class ExperimenterPreview:
             initial = calibration_config["calibration"]
             self._calibration_controls = self._ctx.Array(
                 "d",
-                # First seven values are published by the preview. The last
-                # two accumulate subject-window x/y arrow steps until the
+                # Slots 0:7 and 9 are preview-published controls/counters.
+                # Slots 7:9 accumulate subject-window arrow steps until the
                 # preview consumes them; scene mailbox drops cannot lose keys.
-                [initial["x_scale"], initial["y_scale"], 0, 0, 0, 0, 0, 0, 0],
+                [initial["x_scale"], initial["y_scale"], 0, 0, 0, 0, 0, 0, 0, 0],
                 lock=True,
             )
         self._video_start_perf_shared = self._ctx.Value(
@@ -2874,7 +2874,7 @@ class ExperimenterPreview:
         return True
 
     def get_calibration_controls(self) -> dict:
-        """Read calibration values and zero/attention request counters atomically."""
+        """Read calibration values and keyboard request counters atomically."""
         if self._calibration_controls is None:
             raise RuntimeError("Preview was not opened with calibration controls")
         with self._calibration_controls.get_lock():
@@ -2883,7 +2883,7 @@ class ExperimenterPreview:
             "x_scale", "y_scale", "fix_x", "fix_y", "revision", "zero_count",
             "attention_count",
         )
-        return dict(zip(fields, values))
+        return {**dict(zip(fields, values)), "auto_reward_count": values[9]}
 
     def request_calibration_scale_steps(self, *, x_steps: int = 0, y_steps: int = 0) -> None:
         """Queue arrow steps for the process that owns the calibration sliders."""

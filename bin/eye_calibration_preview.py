@@ -425,6 +425,7 @@ class EyeCalibrationControls:
         self.fixation = (0.0, 0.0)
         self.zero_count = 0
         self.attention_count = 0
+        self.auto_reward_count = 0
         self.revision = 0
 
     def _publish_controls(self, *, calibration_changed=True):
@@ -441,10 +442,11 @@ class EyeCalibrationControls:
                 self.zero_count,
                 self.attention_count,
             ]
+            self.controls_shared[9] = self.auto_reward_count
 
     def poll_controls(self):
         keys = event.getKeys(
-            keyList=["escape", "r", "z", "f", "up", "down", "right", "left"]
+            keyList=["escape", "r", "z", "f", "a", "up", "down", "right", "left"]
         )
         with self.controls_shared.get_lock():
             x_steps, y_steps = self.controls_shared[7:9]
@@ -470,6 +472,9 @@ class EyeCalibrationControls:
             self.attention_count += 1
             # A visual cue must not reset fixation acceptance or change gain,
             # offset, or target position. Keep the calibration revision intact.
+            self._publish_controls(calibration_changed=False)
+        if "a" in keys:
+            self.auto_reward_count += keys.count("a")
             self._publish_controls(calibration_changed=False)
         down = bool(self.mouse.getPressed()[0])
         pos = self.mouse.getPos()

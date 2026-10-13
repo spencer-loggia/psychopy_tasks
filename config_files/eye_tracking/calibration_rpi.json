@@ -2,6 +2,7 @@
   "config_name": "eye_calibration",
   "raspi": true,
   "fixation_cross_size": 42,
+  "reward_interval": 2.0,
   "daq": {
     "address": 0,
     "module_name": "piplates.DAQC2plate"

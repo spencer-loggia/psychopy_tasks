@@ -667,7 +667,7 @@ the first valid sample provides the anchor. Moving the target does not change th
 maps the current valid, smoothed eye position to that target and replaces the anchor.
 The anchor survives saving/reloading, including a gain of zero or a change of sign. Invalid gaze is hidden
 and its status is displayed. The green reward button or `r` delivers a manual pulse; Exit or Escape ends the task.
-The `f`, `z`, and `r` shortcuts work with either the subject or experimenter calibration window focused.
+The `f`, `z`, `r`, and `a` shortcuts work with either the subject or experimenter calibration window focused.
 Arrow keys also work in either window: Right/Left increase/decrease x scale, and Up/Down increase/decrease
 y scale by 0.0001 per keypress, within the slider limits. The corresponding slider and its readout update
 together. These are signed adjustments: Up moves a negative y scale toward zero. The zeroed position stays fixed.
@@ -685,10 +685,20 @@ Reward and fixation settings:
 - `pump_pulse_time_seconds` defaults to 0.25. Pulses use software timing and log actual on/off times.
   The pump is cleared on exit or exceptions, before UART/camera shutdown.
 - `fix_diameter` is a fraction of the shorter subject-scene dimension (default 0.05).
-  `fix_accept_percent` is the fraction of distinct camera samples inside the target (default 0.95; 95 also works).
-  `fix_accept_time` sets the rolling observation duration (default 2 s; 0 disables automatic reward).
-  The current sample must be valid and inside the target, and observation gaps larger than the sample-age
-  limit reset the window. Automatic reward re-arms after fixation breaks or controls change.
+- Press **A** to toggle automatic rewards; the mode starts **off**. The preview shows ON/OFF and both
+  fixation percentages. `reward_interval` defaults to **2 seconds** and must exceed the pump pulse duration.
+  Each automatic reward requires **more than 95% fixation during the past 100 ms** and **more than 85%
+  during the past `reward_interval` seconds**, plus a currently valid, in-target eye position.
+- Percentages measure time inside the fixation area, using distinct camera samples and clipping their
+  held durations to each window. Blink/loss count as non-fixation; stale/error states and long observation
+  gaps invalidate history. Repeated UART replies cannot manufacture new camera observations.
+  Acquisition continues during pump pulses, so sustained fixation can earn repeated rewards without a
+  fixation break. Rewards are spaced by at least `reward_interval` between pulse onsets; if fixation fails
+  at the due time, the task waits until both criteria pass and never queues catch-up pulses.
+- Toggling the mode or changing gain, zero, or target clears history and requires a fresh full interval.
+  Manual **R** rewards remain available and postpone the next automatic reward by one interval.
+  `fix_accept_percent` is superseded by the two fixed thresholds; an older positive `fix_accept_time` is
+  used as the interval only when `reward_interval` is absent.
 
 On normal exit, `calibration.json` retains the existing top-level `eye_tracker_calibration` object and four
 scale/offset keys used by the experiment manager. Additional metadata records pixel input units, `eye_id: 0`,

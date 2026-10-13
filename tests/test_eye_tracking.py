@@ -163,6 +163,19 @@ class EyeTrackingTests(unittest.TestCase):
         )
         self.assertEqual(len(window.history), 1)
 
+    def test_fixation_fraction_weights_elapsed_time_instead_of_sample_count(self):
+        window = FixationWindow(1, 0.85, strict=True)
+        times_ms = list(range(0, 800, 100)) + list(range(800, 920)) + [920, 950, 1000]
+        for index, ms in enumerate(times_ms):
+            window.update(
+                EyeTrackerState(timestamp_perf_s=ms / 1000, sample_index=index, valid=True),
+                not 800 <= ms < 920,
+            )
+        # 120 ms outside / 1 s = 88% fixation, despite the many out-of-window
+        # samples in that brief burst and relatively sparse fixating samples.
+        self.assertAlmostEqual(window.acceptance, 0.88)
+        self.assertTrue(window.accepts(now_s=1))
+
     def test_old_sensor_frame_is_rejected_even_with_new_frame_sequence(self):
         f = EyePositionFilter()
         f.consume(sample(3), now_s=1)

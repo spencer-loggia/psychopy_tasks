@@ -42,8 +42,7 @@
     0.02
   ],
   "fix_diameter": 0.05,
-  "fix_accept_percent": 0.95,
-  "fix_accept_time": 2.0,
+  "reward_interval": 2.0,
   "raspi": false,
   "pump_pin": 0,
   "pump_pulse_time_seconds": 0.25,

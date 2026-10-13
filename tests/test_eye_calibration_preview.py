@@ -97,7 +97,7 @@ class EyeCalibrationPreviewTests(unittest.TestCase):
     def make_controls(self, canvas=(1280, 1024), subject=(1080, 1920)):
         module, mouse = load_renderer()
         self.renderer = module
-        shared = SharedControls([0.005, -0.005, 0, 0, 0, 0, 0, 0, 0])
+        shared = SharedControls([0.005, -0.005, 0, 0, 0, 0, 0, 0, 0, 0])
         controls = module.EyeCalibrationControls(
             Mock(),
             canvas,
@@ -191,6 +191,22 @@ class EyeCalibrationPreviewTests(unittest.TestCase):
         self.assertTrue(preview.consume_manual_reward_request())
         self.assertFalse(preview.consume_manual_reward_request())
         self.assertEqual(shared[:7], calibration_before)
+
+    def test_a_requests_mode_toggle_without_changing_mapping_or_arrow_requests(self):
+        controls, shared, _ = self.make_controls()
+        preview = object.__new__(ExperimenterPreview)
+        preview._calibration_controls = shared
+        original = shared[:7]
+        self.renderer.event.getKeys.return_value = ["a"]
+        controls.poll_controls()
+        self.assertEqual(preview.get_calibration_controls()["auto_reward_count"], 1)
+        self.assertEqual(shared[:7], original)
+        controls.poll_controls()
+        self.assertEqual(preview.get_calibration_controls()["auto_reward_count"], 2)
+        preview.request_calibration_scale_steps(x_steps=1)
+        controls._publish_controls(calibration_changed=False)
+        self.assertEqual(shared[7:9], [1, 0])
+        self.assertEqual(shared[:7], original)
 
     def test_arrows_update_values_readouts_and_knobs_from_either_window(self):
         for source in ("main", "preview"):

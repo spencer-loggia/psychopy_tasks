@@ -236,6 +236,98 @@ class EyeCalibrationTaskTests(unittest.TestCase):
                 with self.subTest(source=source, valid=valid):
                     self._exercise_hotkeys(source, valid)
 
+    def test_a_toggles_periodic_reward_from_either_window_while_uart_runs_during_pulses(self):
+        for source in ("main", "preview", "both"):
+            with self.subTest(source=source):
+                self._exercise_auto_reward(source)
+
+    def _exercise_auto_reward(self, source):
+        task = self.task
+        win = Mock(size=(800, 600))
+        main = ScreenGeometry(index=0, name="main", width=800, height=600, x=0, y=0)
+        secondary = ScreenGeometry(index=1, name="exp", width=800, height=600, x=800, y=0)
+        task.utils.setup_task_window.return_value = win, main, secondary
+        preview, tracker, outputs = Mock(), Mock(), Mock()
+        outputs.validate_bit.return_value = 0
+        clock = [100.0]
+        current = [EyeTrackerState(
+            timestamp_perf_s=100, sample_index=1, valid=True, rejection_reason=None
+        )]
+        consumer = [None]
+
+        def advance(duration):
+            # Simulate acquisition independent of the main loop, including
+            # its 150 ms pump waits. Only 10 ms between distinct camera frames.
+            target = clock[0] + duration
+            while clock[0] < target:
+                clock[0] = min(target, clock[0] + 0.01)
+                current[0] = replace(
+                    current[0], timestamp_perf_s=clock[0],
+                    sample_index=current[0].sample_index + 1,
+                )
+                consumer[0](current[0])
+
+        def make_tracker(**kwargs):
+            consumer[0] = kwargs["on_state"]
+            tracker.start.side_effect = lambda: consumer[0](current[0])
+            tracker.get_state.side_effect = lambda: current[0]
+            return tracker
+
+        win.flip.side_effect = lambda: advance(0.01)
+        preview.poll.side_effect = lambda: clock[0] >= 101.4
+        preview.consume_manual_reward_request.return_value = False
+        toggle_times = [100.1, 101.05]
+
+        def get_keys(keys):
+            if ("a" in keys and source in ("main", "both")
+                    and toggle_times and clock[0] >= toggle_times[0]):
+                toggle_times.pop(0)
+                return ["a"]
+            return []
+
+        def controls():
+            return {
+                "x_scale": 0.005, "y_scale": -0.005,
+                "fix_x": 0, "fix_y": 0, "revision": 0, "zero_count": 0,
+                "auto_reward_count": (
+                    sum(clock[0] >= t for t in (100.1, 101.05))
+                    if source in ("preview", "both") else 0
+                ),
+            }
+
+        preview.get_calibration_controls.side_effect = controls
+        onsets = []
+        outputs.write.side_effect = lambda bit, active: onsets.append(clock[0]) if active else None
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            task, "ExperimenterPreview", return_value=preview
+        ), patch.object(task, "UARTEyeTracker", side_effect=make_tracker), patch.object(
+            task, "DAQC2DigitalOutputs", return_value=outputs
+        ), patch.object(task.time, "perf_counter", side_effect=lambda: clock[0]), patch.object(
+            task.event, "getKeys", side_effect=get_keys
+        ), patch.object(task.core, "wait", side_effect=advance):
+            path = task.run_task(
+                output_dir=tmp, fullscreen=False, raspi=True,
+                reward_interval=0.3, pump_pulse_time_seconds=0.15,
+            )
+            saved = json.loads(path.read_text())["eye_tracker_calibration"]
+        self.assertEqual(len(onsets), 3)
+        self.assertGreaterEqual(onsets[0], 100.4)
+        for first, second in zip(onsets, onsets[1:]):
+            self.assertAlmostEqual(second - first, 0.3, delta=0.021)
+        statuses = [c.kwargs["status_text"] for c in preview.show_calibration_state.call_args_list]
+        self.assertIn("auto OFF", statuses[0])
+        self.assertTrue(any("auto ON" in status for status in statuses))
+        self.assertIn("auto OFF", statuses[-1])
+        self.assertEqual(saved["fixation_acceptance"]["reward_interval"], 0.3)
+        self.assertEqual(saved["fixation_acceptance"]["fraction_basis"], "time")
+        tracker.stop.assert_called_once()
+
+    def test_invalid_auto_reward_interval_is_rejected_before_hardware_or_windows(self):
+        for interval in (0, -1, float("nan"), float("inf"), 0.25):
+            with self.subTest(interval=interval), self.assertRaisesRegex(ValueError, "reward_interval"):
+                self.task.run_task(reward_interval=interval)
+        self.task.utils.setup_task_window.assert_not_called()
+
     def _exercise_hotkeys(self, source, valid):
         task = self.task
         win = Mock(size=(800, 600))
@@ -441,6 +533,7 @@ class EyeCalibrationTaskTests(unittest.TestCase):
             "y_offset": None,
             "initial_x_scale": 0.003,
             "initial_y_scale": -0.004,
+            "reward_interval": 1.5,
         }
         with patch.object(task, "parse_args", return_value=args), patch.object(
             task, "load_config", return_value=config
@@ -448,6 +541,7 @@ class EyeCalibrationTaskTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 task.main()
         initial = run.call_args.kwargs["initial_calibration"]
+        self.assertEqual(run.call_args.kwargs["reward_interval"], 1.5)
         self.assertEqual(
             (initial.x_scale, initial.y_scale, initial.x_offset, initial.y_offset),
             (0.003, -0.004, 0.0, 0.0),

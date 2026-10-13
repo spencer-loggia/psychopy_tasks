@@ -1,0 +1,15 @@
+{
+  "config_name": "eye_calibration",
+  "raspi": true,
+  "fixation_cross_size": 42,
+  "daq": {
+    "address": 0,
+    "module_name": "piplates.DAQC2plate"
+  },
+  "pump_pin": 0,
+  "pump_pulse_time_seconds": 0.25,
+  "uart": {
+    "device": "/dev/ttyAMA10",
+    "baud": 460800
+  }
+}

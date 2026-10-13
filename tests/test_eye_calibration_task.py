@@ -157,7 +157,7 @@ class EyeCalibrationTaskTests(unittest.TestCase):
         f_keys = iter([["f"], [], [], []])
 
         def get_keys(keys):
-            if keys == ["f", "z", "r"]:
+            if "f" in keys:
                 clock[0] += 2
                 return next(f_keys)
             return []
@@ -244,9 +244,15 @@ class EyeCalibrationTaskTests(unittest.TestCase):
             index=1, name="exp", width=1280, height=1024, x=800, y=0
         )
         task.utils.setup_task_window.return_value = win, main, secondary
-        preview, tracker, outputs = Mock(), Mock(), Mock()
-        outputs.validate_bit.return_value = 0
-        preview.poll.side_effect = [False, False, False, True]
+        preview, tracker = Mock(), Mock()
+        # Reward polls for Escape while active; stop only after three rendered
+        # frames rather than consuming a fixed number of poll calls.
+        preview.poll.side_effect = lambda: win.flip.call_count >= 3
+        plate = Mock()
+        clock = [0.0]
+        on_times, off_times = [], []
+        plate.setDOUTbit.side_effect = lambda *args: on_times.append(clock[0])
+        plate.clrDOUTbit.side_effect = lambda *args: off_times.append(clock[0])
         main_request = source in ("main", "both")
         preview_request = source in ("preview", "both")
         initial = EyeCalibration(
@@ -298,22 +304,29 @@ class EyeCalibrationTaskTests(unittest.TestCase):
                 y_smooth_px=70,
             ),
         ]
-        key_frames = iter([[], ["f", "z", "r"] if main_request else [], []])
+        key_frames = iter([
+            [], ["f", "z", "r", "right", "right", "up"] if main_request else [], []
+        ])
 
         def get_keys(keys):
-            return next(key_frames) if keys == ["f", "z", "r"] else []
+            return next(key_frames) if "f" in keys else []
+
+        def wait(duration):
+            clock[0] += duration
 
         with tempfile.TemporaryDirectory() as tmp, patch.object(
             task, "ExperimenterPreview", return_value=preview
-        ), patch.object(task, "UARTEyeTracker", return_value=tracker), patch.object(
-            task, "DAQC2DigitalOutputs", return_value=outputs
+        ), patch.object(task, "UARTEyeTracker", return_value=tracker), patch.dict(
+            sys.modules, {"_calibration_test_plate": plate}
         ), patch.object(
             task.event, "getKeys", side_effect=get_keys
-        ), patch.object(
-            task, "_deliver_reward_pulse"
-        ) as pulse:
+        ), patch.object(task.time, "perf_counter", side_effect=lambda: clock[0]), patch.object(
+            task.core, "wait", side_effect=wait
+        ):
             result = task.run_task(
-                output_dir=tmp, fullscreen=False, initial_calibration=initial
+                output_dir=tmp, fullscreen=False, initial_calibration=initial,
+                raspi=True, daq_address=2, daq_module_name="_calibration_test_plate",
+                pump_pin=3, pump_pulse_time_seconds=0.25,
             )
             saved = load_eye_tracking_settings(
                 {"eye_tracking": {"enabled": True, "calibration_file": str(result)}}
@@ -336,7 +349,14 @@ class EyeCalibrationTaskTests(unittest.TestCase):
             self.assertEqual(saved.gain_anchor_px, (100, 50))
         # R fires once even if both sources report it in the same frame; F
         # likewise starts once, without restarting on the following frame.
-        pulse.assert_called_once()
+        plate.setDOUTbit.assert_called_once_with(2, 3)
+        self.assertTrue(all(call.args == (2, 3) for call in plate.clrDOUTbit.call_args_list))
+        self.assertEqual(len(off_times), 3)  # Startup, pulse end, task cleanup.
+        self.assertAlmostEqual(off_times[1] - on_times[0], 0.25)
+        if main_request:
+            preview.request_calibration_scale_steps.assert_called_once_with(x_steps=2, y_steps=1)
+        else:
+            preview.request_calibration_scale_steps.assert_not_called()
         starts = [
             call.kwargs["attention_started_s"]
             for call in preview.show_calibration_state.call_args_list
@@ -432,6 +452,26 @@ class EyeCalibrationTaskTests(unittest.TestCase):
             (initial.x_scale, initial.y_scale, initial.x_offset, initial.y_offset),
             (0.003, -0.004, 0.0, 0.0),
         )
+
+    def test_launch_configs_enable_reward_on_pi_and_leave_desktop_disabled(self):
+        root = Path(__file__).resolve().parents[1]
+        for launcher, enabled in (
+            ("config_files/interface/rpi_launch_config.json", True),
+            ("test_configs/launch_config_rpi.json", True),
+            ("test_configs/launch_config_mac.json", False),
+        ):
+            with self.subTest(launcher=launcher):
+                config = json.loads((root / launcher).read_text())
+                entry = config["tasks"]["setup"]["calibrate_eye_tracker"]
+                argv = [entry["launch"], "--config", str(root / entry["config"])]
+                with patch.object(sys, "argv", argv), patch.object(
+                    self.task, "run_task"
+                ) as run, patch("builtins.print"):
+                    with self.assertRaises(SystemExit):
+                        self.task.main()
+                self.assertIs(run.call_args.kwargs["raspi"], enabled)
+                self.assertEqual(run.call_args.kwargs["pump_pin"], 0)
+                self.assertEqual(run.call_args.kwargs["pump_pulse_time_seconds"], 0.25)
 
 
 if __name__ == "__main__":

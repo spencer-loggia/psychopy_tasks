@@ -69,6 +69,8 @@ from video.recorder import RecordingError
 
 BUTTON_BG = "#f7f7f7"
 BUTTON_ACTIVE_BG = "#d9d9d9"
+BUTTON_SELECTION_COLOR = "#2563eb"
+MENU_KEYS = ("<Up>", "<Down>", "<Return>", "<KP_Enter>")
 SHUTDOWN_BUTTON_BG = "#b91c1c"
 SHUTDOWN_BUTTON_ACTIVE_BG = "#7f1d1d"
 TOUCH_SCROLL_THRESHOLD_PX = 12
@@ -230,6 +232,8 @@ class ScrollableButtonFrame(tk.Frame):
         self._touch_moved = False
         self._pressed_button: Optional[tk.Button] = None
         self._pressed_button_relief: Optional[str] = None
+        self._buttons: list[tk.Button] = []
+        self._selected_button: Optional[tk.Button] = None
 
         self.inner.bind("<Configure>", self._on_inner_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
@@ -260,7 +264,17 @@ class ScrollableButtonFrame(tk.Frame):
         widget.bind("<ButtonRelease-1>", self._on_touch_release, add="+")
 
     def register_button(self, button: tk.Button) -> None:
-        """Give a task button tap-to-activate and drag-to-scroll behavior."""
+        """Register a menu button for keyboard, tap, and drag navigation."""
+        self._buttons.append(button)
+        button.configure(
+            takefocus=True,
+            highlightthickness=3,
+            highlightbackground=self.inner.cget("bg"),
+            highlightcolor=BUTTON_SELECTION_COLOR,
+        )
+        button.bind("<FocusIn>", lambda event: self._on_button_focus(button), add="+")
+        if self._selected_button is None and str(button.cget("state")) != "disabled":
+            self._select_button(button)
         self._bind_wheel(button)
         button.bind(
             "<ButtonPress-1>",
@@ -272,7 +286,59 @@ class ScrollableButtonFrame(tk.Frame):
 
     def reset_scroll(self) -> None:
         self._reset_touch_gesture()
+        self._buttons.clear()
+        self._selected_button = None
         self.after_idle(lambda: self.canvas.yview_moveto(0.0))
+
+    def _select_button(self, button: tk.Button) -> None:
+        if self._selected_button is not None:
+            self._selected_button.configure(
+                highlightbackground=self.inner.cget("bg"),
+                highlightcolor=self.inner.cget("bg"),
+            )
+        self._selected_button = button
+        button.configure(
+            highlightbackground=BUTTON_SELECTION_COLOR,
+            highlightcolor=BUTTON_SELECTION_COLOR,
+        )
+
+    def _on_button_focus(self, button: tk.Button) -> None:
+        if button in self._buttons and str(button.cget("state")) != "disabled":
+            self._select_button(button)
+            self._ensure_button_visible(button)
+
+    def move_selection(self, direction: int) -> None:
+        buttons = [button for button in self._buttons if str(button.cget("state")) != "disabled"]
+        if not buttons:
+            return
+        if self._selected_button in buttons:
+            index = (buttons.index(self._selected_button) + direction) % len(buttons)
+        else:
+            index = 0 if direction > 0 else len(buttons) - 1
+        button = buttons[index]
+        self._select_button(button)
+        button.focus_set()
+        self._ensure_button_visible(button)
+
+    def invoke_selection(self) -> None:
+        button = self._selected_button
+        if button is not None and str(button.cget("state")) != "disabled":
+            button.invoke()
+
+    def _ensure_button_visible(self, button: tk.Button) -> None:
+        bbox = self.canvas.bbox("all")
+        if bbox is None or bbox[3] <= bbox[1]:
+            return
+        height = float(bbox[3] - bbox[1])
+        first, last = self.canvas.yview()
+        top = float(button.winfo_y() - bbox[1])
+        bottom = top + button.winfo_height()
+        # Leave room for the canvas to round to its wheel scroll increment.
+        margin = float(self.canvas.cget("yscrollincrement"))
+        if top < first * height:
+            self.canvas.yview_moveto(max(0.0, (top - margin) / height))
+        elif bottom > last * height:
+            self.canvas.yview_moveto((bottom + margin) / height - (last - first))
 
     def _on_mousewheel(self, event: tk.Event) -> str:
         units = wheel_scroll_units(
@@ -293,6 +359,7 @@ class ScrollableButtonFrame(tk.Frame):
         self._touch_initial_first = float(self.canvas.yview()[0])
         self._pressed_button = button
         if button is not None and str(button.cget("state")) != "disabled":
+            self._select_button(button)
             self._pressed_button_relief = str(button.cget("relief"))
             button.configure(relief="sunken")
         return "break"
@@ -787,6 +854,7 @@ class TouchInterfaceApp:
         self.button_frame.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 12))
         self.button_frame.inner.configure(bg="#e9ecef")
         self.button_container = self.button_frame.inner
+        self._bind_menu_keys(self.root)
 
         self._render_root_menu()
 
@@ -822,8 +890,24 @@ class TouchInterfaceApp:
 
     def _place_button(self, button: tk.Button, row_idx: int) -> None:
         self.button_frame.register_button(button)
+        # Widget bindings run before Tk's platform-specific Button bindings,
+        # so Return invokes the command exactly once on every platform.
+        self._bind_menu_keys(button)
         button.grid(row=row_idx, column=0, sticky="ew", pady=10, padx=10)
         self.button_container.grid_columnconfigure(0, weight=1)
+
+    def _bind_menu_keys(self, widget: tk.Misc) -> None:
+        for sequence in MENU_KEYS:
+            widget.bind(sequence, self._on_menu_key, add="+")
+
+    def _on_menu_key(self, event: tk.Event) -> str:
+        if self.task_active or self.cleanup_active or self.root.grab_current() is not None:
+            return "break"
+        if event.keysym in {"Up", "Down"}:
+            self.button_frame.move_selection(-1 if event.keysym == "Up" else 1)
+        else:
+            self.button_frame.invoke_selection()
+        return "break"
 
     def _render_root_menu(self) -> None:
         self._clear_buttons()

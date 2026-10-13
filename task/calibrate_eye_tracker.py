@@ -337,8 +337,15 @@ def run_task(
             controls = preview.get_calibration_controls()
             # Each window owns its keyboard events. Merge subject-window keys
             # with the preview's requests before applying any action, so both
-            # focus paths share zeroing, attention and reward behavior.
-            main_keys = set(event.getKeys(["f", "z", "r"]))
+            # focus paths share zeroing, attention and reward behavior. Arrow
+            # requests go to the slider owner and return as a normal revision.
+            main_keys = event.getKeys(["f", "z", "r", "up", "down", "right", "left"])
+            x_steps = main_keys.count("right") - main_keys.count("left")
+            y_steps = main_keys.count("up") - main_keys.count("down")
+            if x_steps or y_steps:
+                preview.request_calibration_scale_steps(
+                    x_steps=x_steps, y_steps=y_steps
+                )
             attention_count = controls.get("attention_count", 0)
             attention_requested = (
                 "f" in main_keys or attention_count != last_attention_count
@@ -417,6 +424,8 @@ def run_task(
             )
             if not latest_state.valid:
                 status += f"\n{latest_state.error or latest_state.rejection_reason}"
+            if not raspi:
+                status += "\nReward output disabled (raspi: false)"
             preview.show_calibration_state(
                 eye_fraction=eye_fraction,
                 eye_valid=latest_state.valid,

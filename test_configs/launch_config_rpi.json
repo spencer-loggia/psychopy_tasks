@@ -35,7 +35,7 @@
         "setup": {
             "calibrate_eye_tracker": {
                 "launch": "task/calibrate_eye_tracker.py",
-                "config": "test_configs/eye_calibration_config.json"
+                "config": "config_files/eye_tracking/calibration_rpi.json"
             },
             "prime_pump": {
                 "launch": "task/pulse_pump.py"

@@ -97,7 +97,7 @@ class EyeCalibrationPreviewTests(unittest.TestCase):
     def make_controls(self, canvas=(1280, 1024), subject=(1080, 1920)):
         module, mouse = load_renderer()
         self.renderer = module
-        shared = SharedControls([0.005, -0.005, 0, 0, 0, 0, 0])
+        shared = SharedControls([0.005, -0.005, 0, 0, 0, 0, 0, 0, 0])
         controls = module.EyeCalibrationControls(
             Mock(),
             canvas,
@@ -180,6 +180,71 @@ class EyeCalibrationPreviewTests(unittest.TestCase):
         controls.poll_controls()
         self.assertEqual(preview.get_calibration_controls()["attention_count"], 2)
         self.assertEqual(shared[:6], calibration_before)
+
+    def test_r_key_requests_one_manual_reward(self):
+        controls, shared, _ = self.make_controls()
+        preview = object.__new__(ExperimenterPreview)
+        preview._reward_event = controls.reward_event
+        calibration_before = shared[:7]
+        self.renderer.event.getKeys.return_value = ["r"]
+        controls.poll_controls()
+        self.assertTrue(preview.consume_manual_reward_request())
+        self.assertFalse(preview.consume_manual_reward_request())
+        self.assertEqual(shared[:7], calibration_before)
+
+    def test_arrows_update_values_readouts_and_knobs_from_either_window(self):
+        for source in ("main", "preview"):
+            with self.subTest(source=source):
+                controls, shared, _ = self.make_controls()
+                preview = object.__new__(ExperimenterPreview)
+                preview._calibration_controls = shared
+                original_y = controls.y_slider._knob_pos()[1]
+                for keys, expected, direction in (
+                    (["right", "up", "up"], (0.0051, -0.0048), 1),
+                    (["left", "down"], (0.0050, -0.0049), -1),
+                ):
+                    previous = (controls.x_slider.value, controls.y_slider.value)
+                    if source == "main":
+                        # Multiple requests before a preview frame must add up.
+                        for key in keys:
+                            preview.request_calibration_scale_steps(
+                                x_steps=int(key == "right") - int(key == "left"),
+                                y_steps=int(key == "up") - int(key == "down"),
+                            )
+                        # Publishing an unrelated UI action must not erase them.
+                        controls._publish_controls(calibration_changed=False)
+                    else:
+                        self.renderer.event.getKeys.return_value = keys
+                    controls.poll_controls()
+                    controls.draw({})
+                    snapshot = preview.get_calibration_controls()
+                    for axis, slider, value, old in zip(
+                        ("x", "y"), (controls.x_slider, controls.y_slider), expected, previous
+                    ):
+                        self.assertAlmostEqual(slider.value, value)
+                        self.assertAlmostEqual(snapshot[f"{axis}_scale"], value)
+                        self.assertGreater((slider.value - old) * direction, 0)
+                        self.assertIn(f"{value:.4f}", slider.text.text)
+                        self.assertEqual(slider.knob.pos, slider._knob_pos())
+                    self.assertEqual(shared[2:4], [0, 0])
+                    self.assertEqual(shared[7:9], [0, 0])
+                    self.renderer.event.getKeys.return_value = []
+                    controls.poll_controls()
+                    self.assertEqual(preview.get_calibration_controls(), snapshot)
+                self.assertGreater(controls.y_slider.knob.pos[1], original_y)
+
+    def test_arrow_steps_clamp_at_slider_limits_without_repeated_revisions(self):
+        controls, shared, _ = self.make_controls()
+        preview = object.__new__(ExperimenterPreview)
+        preview._calibration_controls = shared
+        for steps, expected in ((1000, 0.02), (-1000, -0.02)):
+            preview.request_calibration_scale_steps(x_steps=steps, y_steps=steps)
+            controls.poll_controls()
+            self.assertEqual(shared[:2], [expected, expected])
+            revision = shared[4]
+            preview.request_calibration_scale_steps(x_steps=steps, y_steps=steps)
+            controls.poll_controls()
+            self.assertEqual(shared[4], revision)
 
     def test_attention_cross_doubles_flashes_and_restores_after_one_second(self):
         controls, _, _ = self.make_controls()

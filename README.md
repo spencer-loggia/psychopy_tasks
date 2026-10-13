@@ -109,6 +109,9 @@ current block and its loop immediately.
 The subject and task option area scrolls with a mouse wheel (including X11 Button-4/5 wheel events) or by dragging
 vertically with one finger. A touch drag must move at least 12 pixels before it becomes a scroll, so a normal tap
 still activates its button while a swipe does not accidentally launch it.
+All menus also support the Up and Down arrow keys to move the blue selection outline and Enter to activate the
+selected button. Selection wraps at the ends of the menu and scrolls into view automatically, including on subject
+selection and nested task pages. Mouse and touch controls remain available.
 
 The root menu and top-level task menu both have a Shell button. On the Raspberry Pi it opens a new LXTerminal on
 the experimenter display, starts in `environment.working_dir`, and activates the virtual environment containing
@@ -610,10 +613,12 @@ codec and UART routines are adapted from the companion `eye_tracker` repository;
 in `bin/eye_tracker_wire/SOURCE.md`. No separate checkout or camera package is needed on the task Pi.
 
 ```bash
-python task/calibrate_eye_tracker.py --config test_configs/eye_calibration_config.json --raspi
+python task/calibrate_eye_tracker.py --config config_files/eye_tracking/calibration_rpi.json
 ```
 
-For a desktop control/display check, omit `--raspi` and add `--simulate_eye`. Two displays are required.
+Both Pi launchers use this config, which enables DAQC2 reward output. It uses the shared task defaults for
+calibration and filtering. For a desktop control/display check, use
+`--config test_configs/eye_calibration_config.json --simulate_eye` (reward output disabled). Two displays are required.
 The subject window uses the same placement, realized dimensions, rotation and vblank verification as
 `active_foraging`. Calibration controls run in the same fullscreen, non-vsync `ExperimenterPreview` process
 as other tasks. `experimenter_win_size` is no longer used; the secondary window fills its selected display.
@@ -663,6 +668,9 @@ maps the current valid, smoothed eye position to that target and replaces the an
 The anchor survives saving/reloading, including a gain of zero or a change of sign. Invalid gaze is hidden
 and its status is displayed. The green reward button or `r` delivers a manual pulse; Exit or Escape ends the task.
 The `f`, `z`, and `r` shortcuts work with either the subject or experimenter calibration window focused.
+Arrow keys also work in either window: Right/Left increase/decrease x scale, and Up/Down increase/decrease
+y scale by 0.0001 per keypress, within the slider limits. The corresponding slider and its readout update
+together. These are signed adjustments: Up moves a negative y scale toward zero. The zeroed position stays fixed.
 Press `f` with either calibration window focused to double the fixation cross (including stroke width) and
 flash it at 5 Hz for one second. It then returns to its normal size and steady display. Pressing `f` again
 restarts the cue; the target position, calibration and fixation acceptance area stay unchanged.
@@ -673,6 +681,7 @@ Reward and fixation settings:
   `daq.module_name` select the plate. `pump_pin` means **DAQC2 DOUT bit 0–7**, default 0, as in active foraging;
   it is not a BCM GPIO pin. Logical on uses `setDOUTbit`, off uses `clrDOUTbit`. With `raspi: false`, reward
   events are logged without hardware writes. An enabled output that fails to initialize aborts the task.
+  The preview indicates when reward output is disabled; `--raspi` enables it for a direct launch with a test config.
 - `pump_pulse_time_seconds` defaults to 0.25. Pulses use software timing and log actual on/off times.
   The pump is cleared on exit or exceptions, before UART/camera shutdown.
 - `fix_diameter` is a fraction of the shorter subject-scene dimension (default 0.05).

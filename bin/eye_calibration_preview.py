@@ -109,6 +109,13 @@ class Slider:
         frac = max(0.0, min(1.0, frac))
         self.value = self.value_min + (frac * (self.value_max - self.value_min))
 
+    def nudge(self, steps: int) -> bool:
+        """Adjust gain by 0.0001 per step, clamping to the slider limits."""
+        value = max(self.value_min, min(self.value_max, self.value + steps * 0.0001))
+        changed = value != self.value
+        self.value = value
+        return changed
+
     def draw(self) -> None:
         self.knob.pos = self._knob_pos()
         self.track.draw()
@@ -424,7 +431,9 @@ class EyeCalibrationControls:
         if calibration_changed:
             self.revision += 1
         with self.controls_shared.get_lock():
-            self.controls_shared[:] = [
+            # Leave pending main-window arrow steps untouched. Only this
+            # process writes slider values, avoiding stale UI overwrites.
+            self.controls_shared[:7] = [
                 self.x_slider.value,
                 self.y_slider.value,
                 *self.fixation,
@@ -434,7 +443,22 @@ class EyeCalibrationControls:
             ]
 
     def poll_controls(self):
-        keys = event.getKeys(keyList=["escape", "r", "z", "f"])
+        keys = event.getKeys(
+            keyList=["escape", "r", "z", "f", "up", "down", "right", "left"]
+        )
+        with self.controls_shared.get_lock():
+            x_steps, y_steps = self.controls_shared[7:9]
+            self.controls_shared[7:9] = [0, 0]
+        # Use the same sliders for both focus paths and retain repeated keys
+        # between preview frames. Signed scales change numerically, even below 0.
+        x_changed = self.x_slider.nudge(
+            int(x_steps) + keys.count("right") - keys.count("left")
+        )
+        y_changed = self.y_slider.nudge(
+            int(y_steps) + keys.count("up") - keys.count("down")
+        )
+        if x_changed or y_changed:
+            self._publish_controls()
         if "escape" in keys:
             self.exit_event.set()
         if "r" in keys:

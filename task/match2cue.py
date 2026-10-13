@@ -359,6 +359,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
         main_scene_size,
         stimulus_rotation_degrees,
     )
+    session_logs.set_eye_tracking_screen(main_scene_size, stimulus_rotation_degrees)
     msg_logger.log(
         "INFO",
         f"resolved_main_scene_size native_size={main_scene_size[0]}x{main_scene_size[1]} "

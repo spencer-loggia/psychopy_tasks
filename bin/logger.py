@@ -569,7 +569,11 @@ class SessionLogBundle:
             from .task_eye_tracking import TaskEyeTrackingSession
 
             try:
-                self.eye_tracking = TaskEyeTrackingSession(eye_tracking_config)
+                self.eye_tracking = TaskEyeTrackingSession(
+                    eye_tracking_config,
+                    output_dir=self.session_dir,
+                    start_perf_s=self.session_clock.start_perf_s,
+                )
                 self.message_logger.log(
                     "INFO", f"eye_tracking_started eye_id=0 settings={json.dumps(asdict(eye_tracking_config))}"
                 )
@@ -581,7 +585,19 @@ class SessionLogBundle:
     def eye_tracking_preview(self):
         return self.eye_tracking.preview_state if self.eye_tracking is not None else None
 
+    def set_eye_tracking_screen(self, native_size, rotation_degrees=0) -> None:
+        """Share task geometry once; eye sampling never depends on a window flip."""
+        if self.eye_tracking is not None:
+            self.eye_tracking.set_screen_geometry(native_size, rotation_degrees)
+            self.message_logger.log(
+                "INFO",
+                f"eye_recording_screen native_size={tuple(native_size)} "
+                f"rotation_deg={rotation_degrees} coordinates=centered_native_pixels",
+            )
+
     def flush(self) -> None:
+        if self.eye_tracking is not None:
+            self.eye_tracking.check_recording_error()
         self.event_logger.flush()
         self.message_logger.flush()
         if self.behavior_logger is not None:

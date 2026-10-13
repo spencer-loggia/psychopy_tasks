@@ -38,7 +38,9 @@ from bin.eye_tracking_config import load_eye_tracking_settings
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.config import load_config, validate_config
-from bin.screen import describe_screen, load_screen_config
+from bin.screen import (
+    describe_screen, load_screen_config, resolve_scene_size, software_stimulus_rotation,
+)
 
 
 def parse_args():
@@ -128,6 +130,15 @@ def run_task(
         task_name="random_image_sequence",
         config_name=resolved_config_name,
         behavior_fieldnames=["trial_num", "stimulus_name", "requested_duration"],
+    )
+    session_logs.set_eye_tracking_screen(
+        resolve_scene_size(
+            main_screen,
+            fullscreen=bool(fullscreen),
+            requested_size=win_size,
+            realized_size=tuple(win.size),
+        ),
+        software_stimulus_rotation(main_screen.rotation),
     )
     logger = session_logs.event_logger
     msg_logger = session_logs.message_logger

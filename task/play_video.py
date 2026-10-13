@@ -324,6 +324,7 @@ def run_task(
         },
         auto_flush=False,
     )
+    session_logs.set_eye_tracking_screen(native_main_size, main_rotation_deg)
     logger = session_logs.event_logger
     msg_logger = session_logs.message_logger
     behavior_logger = session_logs.behavior_logger

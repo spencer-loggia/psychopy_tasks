@@ -50,6 +50,7 @@ from bin.screen import (
     resolve_scene_size,
     serialize_preview_image,
     set_window_mouse_visible,
+    software_stimulus_rotation,
 )
 from interface.rig_mode import IS_RIG_ENV_VAR, experimenter_cursor_visible_for_touchscreen
 
@@ -722,6 +723,9 @@ def run_task(
             fullscreen=bool(fullscreen),
             requested_size=win_size,
             realized_size=tuple(win.size),
+        )
+        session_logs.set_eye_tracking_screen(
+            main_scene_size, software_stimulus_rotation(main_screen.rotation)
         )
         try:
             msg_logger.log(

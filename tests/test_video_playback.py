@@ -1210,6 +1210,7 @@ class PlayVideoTaskTests(unittest.TestCase):
             ),
             behavior_logger=types.SimpleNamespace(writerow=Mock()),
             session_dir=Path("test-session"),
+            set_eye_tracking_screen=Mock(),
             flush=Mock(),
             close=Mock(),
         )
@@ -1464,6 +1465,7 @@ class PlayVideoTaskTests(unittest.TestCase):
                 self.behavior_logger = FakeBehaviorLogger()
                 self.session_dir = Path("test-session")
                 self.closed = False
+                self.set_eye_tracking_screen = Mock()
 
             def flush(self):
                 pass
@@ -1505,6 +1507,7 @@ class PlayVideoTaskTests(unittest.TestCase):
         )
         software_stimulus_rotation.assert_called_once_with("normal")
         oriented_size.assert_called_once_with((2560, 1600), 90)
+        session_logs.set_eye_tracking_screen.assert_called_once_with((2560, 1600), 90)
 
         self.assertEqual(play_video_fill_screen.call_count, 2)
         playback_kwargs = play_video_fill_screen.call_args.kwargs

@@ -1,7 +1,11 @@
 """Exercise the shared task API and actual preview loop without rig hardware."""
 
 from dataclasses import replace
+import csv
+import math
 import multiprocessing as mp
+import os
+from pathlib import Path
 import sys
 import tempfile
 import threading
@@ -17,7 +21,7 @@ from bin.eye_tracking import (
     UARTEyeTrackerConfig,
 )
 from bin.eye_tracking_config import EyeTrackingSettings
-from bin.logger import SessionLogBundle
+from bin.logger import EXACT_SESSION_DIR_ENV, SessionLogBundle
 from bin import screen
 from bin.task_eye_tracking import TaskEyeTrackingSession, read_preview_gaze
 
@@ -108,6 +112,7 @@ class TaskEyeTrackingTests(unittest.TestCase):
                     ),
                 )
                 session = logs.eye_tracking
+                logs.set_eye_tracking_screen((800, 600), 90)
                 try:
                     deadline = time.monotonic() + 1
                     while (
@@ -124,6 +129,73 @@ class TaskEyeTrackingTests(unittest.TestCase):
                 self.assertIsNone(session.get_position())
                 self.assertFalse(session.tracker._thread.is_alive())
                 self.assertFalse(session.get_state().valid)
+                with (logs.session_dir / "eye_tracking.csv").open(newline="") as handle:
+                    self.assertTrue(list(csv.DictReader(handle)))
+                self.assertFalse(session.recorder._thread.is_alive())
+
+    def test_recording_runs_at_60_hz_without_flips_in_exact_experiment_block_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            block_dir = Path(tmp).resolve() / "experiment" / "blocks" / "1_active_foraging"
+            with patch.dict(os.environ, {EXACT_SESSION_DIR_ENV: str(block_dir)}):
+                logs = SessionLogBundle(
+                    output_root=block_dir, task_name="active_foraging", config_name="static",
+                    eye_tracking_config=EyeTrackingSettings(
+                        uart=UARTEyeTrackerConfig(simulate=True), show_preview=False
+                    ),
+                )
+            session = logs.eye_tracking
+            try:
+                logs.set_eye_tracking_screen((800, 600), 90)
+                self.assertEqual(session.recorder.path, block_dir / "eye_tracking.csv")
+                # No task loop, window flips, or preview process runs here.
+                # Wait across a periodic flush to verify on-disk streaming too.
+                time.sleep(1.15)
+                with session.recorder.path.open(newline="") as handle:
+                    live_rows = list(csv.DictReader(handle))
+                self.assertGreater(len(live_rows), 35)
+            finally:
+                logs.close()
+            with session.recorder.path.open(newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            timestamps = [float(row["timestamp_ms"]) for row in rows]
+            self.assertEqual(timestamps, sorted(timestamps))
+            self.assertGreaterEqual(timestamps[0], 0)
+            self.assertGreater(timestamps[-1] - timestamps[0], 900)
+            actual_hz = (len(rows) - 1) * 1000 / (timestamps[-1] - timestamps[0])
+            self.assertGreater(actual_hz, 45)
+            self.assertLess(actual_hz, 70)
+            self.assertTrue(any(
+                row["screen_ready"] == "1" and not math.isnan(float(row["x_screen_px"]))
+                for row in rows
+            ))
+            self.assertFalse(session.recorder._thread.is_alive())
+            self.assertFalse(session.tracker._thread.is_alive())
+
+    def test_disabled_tracking_creates_no_eye_csv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = SessionLogBundle(
+                output_root=tmp, task_name="active_foraging", config_name="disabled"
+            )
+            logs.set_eye_tracking_screen((800, 600), 90)
+            logs.close()
+            self.assertFalse((logs.session_dir / "eye_tracking.csv").exists())
+
+    def test_recording_failure_surfaces_and_tracker_is_stopped_on_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = SessionLogBundle(
+                output_root=tmp, task_name="active_foraging", config_name="disk-error",
+                eye_tracking_config=EyeTrackingSettings(
+                    uart=UARTEyeTrackerConfig(simulate=True), show_preview=False
+                ),
+            )
+            session = logs.eye_tracking
+            session.recorder._error = OSError("disk full")
+            with self.assertRaisesRegex(RuntimeError, "disk full"):
+                logs.flush()
+            with self.assertRaisesRegex(RuntimeError, "disk full"):
+                logs.close()
+            self.assertFalse(session.tracker._thread.is_alive())
+            self.assertTrue(session.recorder._file.closed)
 
     def test_startup_error_remains_available_after_worker_exits(self):
         tracker = UARTEyeTracker()

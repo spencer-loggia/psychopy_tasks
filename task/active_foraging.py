@@ -676,6 +676,7 @@ def run_task(
         main_scene_size,
         stimulus_rotation_degrees,
     )
+    session_logs.set_eye_tracking_screen(main_scene_size, stimulus_rotation_degrees)
     fix = utils.make_fixation_cross(
         win,
         size=fixation_size,

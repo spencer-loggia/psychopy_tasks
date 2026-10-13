@@ -98,6 +98,18 @@ class EyeTrackingConfigTests(unittest.TestCase):
                     load_eye_tracking_settings(config).calibration, calibration
                 )
 
+    def test_recording_rate_defaults_to_60_and_can_be_set_independently_of_uart(self):
+        cfg = {**asdict(EyeCalibration()), "eye_tracking": {"enabled": True}}
+        self.assertEqual(load_eye_tracking_settings(cfg).record_rate_hz, 60)
+        cfg["eye_tracking"]["record_rate_hz"] = 50
+        settings = load_eye_tracking_settings(cfg)
+        self.assertEqual(settings.record_rate_hz, 50)
+        self.assertEqual(settings.uart.poll_rate_hz, 100)
+        for value in (0, -1, float("nan"), float("inf"), True, "bad"):
+            cfg["eye_tracking"]["record_rate_hz"] = value
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                load_eye_tracking_settings(cfg)
+
     def test_invalid_units_eye_coefficients_and_boolean_flags_rejected(self):
         for override in (
             {"input_units": "volts"},

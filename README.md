@@ -739,6 +739,35 @@ it returns an unclamped `(x, y)` pair in centered subject-scene fractions, or `N
 state without serial I/O on the presentation thread. `"show_preview": false` disables the marker while keeping
 that API available. The session owns tracker startup/shutdown; gaze updates do not alter stimulus commands.
 
+Every enabled presentation block also writes **`eye_tracking.csv` directly in that block's directory**,
+alongside `event_log.tsv` and `behavior_log.tsv`, for example:
+`logs/exp_Y_20260813_001/blocks/1_active_foraging/eye_tracking.csv`.
+Standalone runs put it in their usual session directory. Disabled eye tracking creates no eye CSV.
+
+Recording runs at **60 Hz** on its own worker, independently of stimulus changes, screen flips, reward waits,
+or whether the experimenter preview is enabled. Set `eye_tracking.record_rate_hz` to change that cadence
+(for example, `50`). UART acquisition keeps its separate `uart.poll_rate_hz` schedule. Each recording tick
+observes the reader's latest state; a camera slower than the recording rate produces repeated source frames.
+Missed recording deadlines leave actual timestamp gaps, without backfilled rows or invented measurements.
+
+The CSV columns are:
+
+| Column | Meaning |
+| --- | --- |
+| `timestamp_ms` | Observation time in milliseconds since the block's session clock started; same origin as `event_log.tsv` (which uses seconds). Independent of file-flush time and flips. |
+| `x_screen_px`, `y_screen_px` | Calibrated, filtered position in centered native task-window pixels, right/up positive. Gain, offset, current scene size and display rotation are applied, matching the coordinates used to place stimuli. Offscreen positions are retained without clamping. |
+| `pupil_diameter_px` | Eye 0 pupil diameter in camera pixels, as supplied by the tracker. |
+| `eye_valid`, `rejection_reason` | Eye validity (`1`/`0`) and reason such as `blink`, `lost`, `stale`, or `uart_error`. Invalid samples write `nan` for both position coordinates and pupil diameter. |
+| `screen_ready` | `1` once the task has supplied its screen geometry. During setup, `0` means screen coordinates are still `nan`; a valid pupil measurement can already be recorded. |
+| `sample_timestamp_ms` | Estimated source-sample time on the same block clock, accounting for reported age and UART round-trip time; `nan` before a source timestamp is available. This is not the unsynchronized remote camera clock. |
+| `sample_index`, `frame_sequence` | Source sample/frame identifiers, allowing repeated camera measurements to be distinguished from new ones. |
+
+Thus, after accurate calibration, looking at a stimulus positioned at `(x, y)` should record that same
+centered pixel position. The existing main-thread `get_position()` API continues returning subject-scene
+fractions. Applied calibration, UART/filter settings, recording rate and screen geometry are recorded in
+the block's message log. CSV storage uses a fixed-size buffer, flushes about once per second, and closes
+before UART shutdown; writer failures are reported by task log flushing/cleanup instead of silently losing data.
+
 CPU Affinity for Timing-Critical Tasks
 --------------------------------------
 The `active_foraging` and `play_video` tasks treat CPU core `0` as the timing-critical presentation core.

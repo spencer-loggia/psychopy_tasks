@@ -45,6 +45,7 @@ from bin.screen import (
     describe_screen,
     load_screen_config,
     resolve_scene_size,
+    software_stimulus_rotation,
 )
 
 
@@ -172,6 +173,15 @@ def run_task(
         config_name=resolved_config_name,
         behavior_fieldnames=behavior_fieldnames,
     )
+    effective_win_size = resolve_scene_size(
+        main_screen,
+        fullscreen=bool(fullscreen),
+        requested_size=win_size,
+        realized_size=tuple(win.size),
+    )
+    session_logs.set_eye_tracking_screen(
+        effective_win_size, software_stimulus_rotation(main_screen.rotation)
+    )
     logger = session_logs.event_logger
     msg_logger = session_logs.message_logger
     behavior_logger = session_logs.behavior_logger
@@ -260,13 +270,6 @@ def run_task(
         first_p = trial_options[0]
         pil0 = preloaded[first_p]
         stim_size = pil0.size  # (W,H) in pixels
-
-        effective_win_size = resolve_scene_size(
-            main_screen,
-            fullscreen=bool(fullscreen),
-            requested_size=win_size,
-            realized_size=tuple(win.size),
-        )
 
         # Compute non-overlapping positions for all options in this trial.
         sampled_positions = utils.sample_non_overlapping_positions(

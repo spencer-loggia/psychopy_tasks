@@ -188,10 +188,50 @@ def run_task(
     )
     auto_reward_armed = True
     last_revision = last_zero_count = 0
+    last_attention_count = 0
+    attention_started_s = None
     last_error = None
     latest_state = None
     gain_anchor_px = initial_gain_anchor_px
     exit_requested = False
+    interrupted_error = None
+
+    def save_calibration(path, *, error=None):
+        # This is called only after setup has produced a sample, or on normal
+        # exit. Geometry and calibration both belong to the main process, so
+        # an aborted preview cannot prevent recovering the applied settings.
+        payload = calibration_payload(
+            calibration,
+            uart_config=uart_config,
+            filter_config=filter_config,
+            main_screen_size=subject_size,
+            fixation_fraction=fixation,
+            latest_state=latest_state,
+        )
+        payload["eye_tracker_calibration"].update(
+            {
+                "saved_at": datetime.now().isoformat(timespec="seconds"),
+                "main_native_size_px": list(main_size),
+                "main_rotation_deg": rotation,
+                "gain_anchor_px": gain_anchor_px,
+                "completion_status": "interrupted" if error else "complete",
+                "fixation_acceptance": {
+                    "fix_diameter": fix_diameter,
+                    "fix_accept_percent": accept_fraction,
+                    "fix_accept_time": fix_accept_time,
+                    "diameter_units": "fraction_of_shorter_subject_scene_dimension",
+                },
+            }
+        )
+        if error:
+            payload["eye_tracker_calibration"]["interruption_error"] = error
+        temporary = path.with_name(f".{path.name}.tmp")
+        temporary.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        temporary.replace(path)
+        msg_logger.log("INFO", f"eye_calibration_saved path={path}")
+
     try:
         outputs.open()
         output_opened = True
@@ -295,20 +335,34 @@ def run_task(
                 )
                 last_error = latest_state.error
             controls = preview.get_calibration_controls()
-            if controls["revision"] != last_revision:
-                if gain_anchor_px is not None:
-                    calibration.set_gains(
-                        x_scale=controls["x_scale"],
-                        y_scale=controls["y_scale"],
-                        anchor_px=gain_anchor_px,
-                    )
-                else:
-                    # No observed position exists to anchor yet. This only
-                    # initializes sensitivity; invalid data never sets offsets.
-                    calibration.x_scale = controls["x_scale"]
-                    calibration.y_scale = controls["y_scale"]
-                fixation = (controls["fix_x"], controls["fix_y"])
-                if controls["zero_count"] != last_zero_count:
+            # Each window owns its keyboard events. Merge subject-window keys
+            # with the preview's requests before applying any action, so both
+            # focus paths share zeroing, attention and reward behavior.
+            main_keys = set(event.getKeys(["f", "z", "r"]))
+            attention_count = controls.get("attention_count", 0)
+            attention_requested = (
+                "f" in main_keys or attention_count != last_attention_count
+            )
+            last_attention_count = attention_count
+            controls_changed = controls["revision"] != last_revision
+            zero_requested = (
+                "z" in main_keys or controls["zero_count"] != last_zero_count
+            )
+            if controls_changed or zero_requested:
+                if controls_changed:
+                    if gain_anchor_px is not None:
+                        calibration.set_gains(
+                            x_scale=controls["x_scale"],
+                            y_scale=controls["y_scale"],
+                            anchor_px=gain_anchor_px,
+                        )
+                    else:
+                        # No observed position exists to anchor yet. This only
+                        # initializes sensitivity; invalid data never sets offsets.
+                        calibration.x_scale = controls["x_scale"]
+                        calibration.y_scale = controls["y_scale"]
+                    fixation = (controls["fix_x"], controls["fix_y"])
+                if zero_requested:
                     if latest_state.valid:
                         gain_anchor_px = latest_state.smoothed_position
                         calibration.set_offsets_for_fixation(
@@ -338,9 +392,9 @@ def run_task(
                 screen_size=subject_size,
             )
             accepted = window.update(latest_state, in_window)
-            manual_reward = preview.consume_manual_reward_request() or bool(
-                event.getKeys(["r"])
-            )
+            # Drain both sources every frame; simultaneous requests produce
+            # one pulse rather than leaving a second queued keyboard reward.
+            manual_reward = preview.consume_manual_reward_request() or "r" in main_keys
             if manual_reward or (accepted and auto_reward_armed):
                 msg_logger.log(
                     "INFO",
@@ -350,6 +404,13 @@ def run_task(
                 auto_reward_armed = False
             elif not in_window:
                 auto_reward_armed = True
+            if attention_requested:
+                # Start with the next draw (after any reward pulse). A fresh F
+                # request restarts the one-second cue rather than queuing it.
+                attention_started_s = time.perf_counter()
+                msg_logger.log(
+                    "INFO", "fixation_attention duration_s=1 frequency_hz=5 scale=2"
+                )
             status = (
                 f"Eye 0 ({latest_state.x_smooth_px:.2f}, {latest_state.y_smooth_px:.2f}) px  "
                 f"fix {window.acceptance * 100:.1f}%"
@@ -360,6 +421,7 @@ def run_task(
                 eye_fraction=eye_fraction,
                 eye_valid=latest_state.valid,
                 status_text=status,
+                attention_started_s=attention_started_s,
             )
             main_bg.draw()
             _draw_fixation_cross(
@@ -367,38 +429,15 @@ def run_task(
                 rotate_centered_point(
                     fraction_to_pixels(fixation, subject_size), rotation
                 ),
+                attention_started_s=attention_started_s,
             )
             main_win.flip()
 
-        payload = calibration_payload(
-            calibration,
-            uart_config=uart_config,
-            filter_config=filter_config,
-            main_screen_size=subject_size,
-            fixation_fraction=fixation,
-            latest_state=latest_state,
-        )
-        payload["eye_tracker_calibration"].update(
-            {
-                "saved_at": datetime.now().isoformat(timespec="seconds"),
-                "main_native_size_px": list(main_size),
-                "main_rotation_deg": rotation,
-                "gain_anchor_px": gain_anchor_px,
-                "fixation_acceptance": {
-                    "fix_diameter": fix_diameter,
-                    "fix_accept_percent": accept_fraction,
-                    "fix_accept_time": fix_accept_time,
-                    "diameter_units": "fraction_of_shorter_subject_scene_dimension",
-                },
-            }
-        )
-        session_logs.calibration_path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
-        msg_logger.log(
-            "INFO", f"eye_calibration_saved path={session_logs.calibration_path}"
-        )
+        save_calibration(session_logs.calibration_path)
         return session_logs.calibration_path
+    except Exception as exc:
+        interrupted_error = f"{type(exc).__name__}: {exc}"
+        raise
     finally:
         # Reward is off before potentially slow camera/recording shutdown. Each
         # cleanup is independent so a UART failure cannot strand either window.
@@ -407,6 +446,16 @@ def run_task(
                 outputs.write(pump_pin, False)
             except Exception as exc:
                 msg_logger.log("ERROR", f"pump_cleanup_failed: {exc}")
+        if interrupted_error is not None and latest_state is not None:
+            # Preserve work without importing an interrupted run as a completed
+            # calibration. It can be explicitly reloaded via calibration_file.
+            try:
+                recovery_path = session_logs.calibration_path.with_name(
+                    "calibration_recovery.json"
+                )
+                save_calibration(recovery_path, error=interrupted_error)
+            except Exception as exc:
+                msg_logger.log("ERROR", f"eye_calibration_recovery_failed: {exc}")
         if tracker is not None:
             try:
                 tracker.stop()

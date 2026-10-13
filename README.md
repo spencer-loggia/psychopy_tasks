@@ -658,10 +658,14 @@ Eye data and calibration:
 
 Click the preview to move the fixation target. The bottom and left sliders adjust x/y gain around the last
 zeroed eye position, keeping that position fixed while changing sensitivity to movement. Before the first zero,
-the first valid sample provides the anchor. Moving the target does not change this anchor; `zero` (or `z` on
-the experimenter display) maps the current valid, smoothed eye position to that target and replaces the anchor.
+the first valid sample provides the anchor. Moving the target does not change this anchor; `zero` (or `z`)
+maps the current valid, smoothed eye position to that target and replaces the anchor.
 The anchor survives saving/reloading, including a gain of zero or a change of sign. Invalid gaze is hidden
 and its status is displayed. The green reward button or `r` delivers a manual pulse; Exit or Escape ends the task.
+The `f`, `z`, and `r` shortcuts work with either the subject or experimenter calibration window focused.
+Press `f` with either calibration window focused to double the fixation cross (including stroke width) and
+flash it at 5 Hz for one second. It then returns to its normal size and steady display. Pressing `f` again
+restarts the cue; the target position, calibration and fixation acceptance area stay unchanged.
 
 Reward and fixation settings:
 
@@ -681,6 +685,15 @@ On normal exit, `calibration.json` retains the existing top-level `eye_tracker_c
 scale/offset keys used by the experiment manager. Additional metadata records pixel input units, `eye_id: 0`,
 UART/filter settings, gain anchor, oriented/native screen dimensions, rotation and latest sample validity. The session
 also contains message and pump event logs.
+
+Calibration and task previews reuse their text layouts for changing readouts and disable automatic per-frame
+stimulus logging. This avoids the label-allocation leak documented in PsychoPy 2025.1.1's `TextStim` setter;
+the calibration gaze marker and controls still update at 20 Hz.
+If calibration fails after receiving a sample (including a preview-process crash), the main process turns
+the pump off and saves its applied settings to `calibration_recovery.json` before shutting down.
+This file is marked interrupted and is not automatically imported by the experiment manager. To resume from
+it, explicitly set `eye_tracking.calibration_file` to its path in the calibration task config, check the
+mapping on the rig, and exit normally to write a completed `calibration.json`.
 
 Eye tracking in presentation tasks
 ---------------------------------

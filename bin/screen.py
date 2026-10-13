@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, Optional, Sequence, Union
 
 import numpy as np
 from PIL import Image
+from .preview_text import set_preview_text
 
 try:
     from screeninfo import get_monitors
@@ -1819,6 +1820,7 @@ def _experimenter_preview_process(
             fillColorSpace="rgb",
             lineColor=None,
             units="pix",
+            autoLog=False,
         )
 
     def _release_movie() -> None:
@@ -1858,6 +1860,7 @@ def _experimenter_preview_process(
             fillColorSpace="rgb",
             lineColor=None,
             units="pix",
+            autoLog=False,
         )
         preview_outline_rect = visual.Rect(
             win,
@@ -1869,6 +1872,7 @@ def _experimenter_preview_process(
             lineColorSpace="rgb",
             lineWidth=2,
             units="pix",
+            autoLog=False,
         )
 
         def _map_pos(pos: Sequence[float]) -> tuple[float, float]:
@@ -1916,6 +1920,7 @@ def _experimenter_preview_process(
                 lineColor=None,
                 units="pix",
                 pos=_map_pos(item.get("pos", (0, 0))),
+                autoLog=False,
             )
             dots.append(dot)
 
@@ -1941,6 +1946,7 @@ def _experimenter_preview_process(
                     fillColor=None,
                     units="pix",
                     ori=_map_ori(item),
+                    autoLog=False,
                 )
             )
 
@@ -1962,6 +1968,7 @@ def _experimenter_preview_process(
                 color=_preview_rgb255_to_psychopy(payload.get("fixation_color", (0, 0, 0))),
                 colorSpace="rgb",
                 pos=_map_pos((0, 0)),
+                autoLog=False,
             )
 
         highlight_box = None
@@ -1990,6 +1997,7 @@ def _experimenter_preview_process(
                 fillColor=None,
                 units="pix",
                 ori=_map_ori(highlight_payload),
+                autoLog=False,
             )
 
         return {
@@ -2110,38 +2118,43 @@ def _experimenter_preview_process(
     def _draw_overlay(layout: Optional[Dict[str, Any]] = None) -> None:
         _place_overlay_controls(layout or static_scene.get("layout"))
         elapsed = time.perf_counter() - float(start_perf_s)
-        system_time_text.text = time.strftime("%H:%M:%S")
+        set_preview_text(system_time_text, time.strftime("%H:%M:%S"))
         system_time_text.draw()
-        timer_text.text = format_elapsed_hms(elapsed)
+        set_preview_text(timer_text, format_elapsed_hms(elapsed))
         timer_text.draw()
         video_start_perf_s = float(video_start_perf_shared.value)
         if shared_movie_active and np.isfinite(video_start_perf_s):
-            video_timer_text.text = (
-                f"Video: "
-                f"{format_elapsed_hms(time.perf_counter() - video_start_perf_s)}"
+            set_preview_text(
+                video_timer_text,
+                f"Video: {format_elapsed_hms(time.perf_counter() - video_start_perf_s)}",
             )
             video_timer_text.draw()
         status_counts = static_scene.get("status_counts")
         reward_counts = static_scene.get("reward_counts")
         if status_counts is not None:
-            reward_counts_text.text = "\n".join(
-                f"{label}: {count}" for label, count in status_counts.items()
+            set_preview_text(
+                reward_counts_text,
+                "\n".join(f"{label}: {count}" for label, count in status_counts.items()),
             )
             reward_counts_text.draw()
         elif reward_counts is not None:
-            reward_counts_text.text = (
+            set_preview_text(
+                reward_counts_text,
                 f"R0: {reward_counts.get(0, 0)}\n"
                 f"R1: {reward_counts.get(1, 0)}\n"
                 f"R2: {reward_counts.get(2, 0)}\n"
-                f"R3: {reward_counts.get(3, 0)}"
+                f"R3: {reward_counts.get(3, 0)}",
             )
             reward_counts_text.draw()
         if task_label_text is not None:
-            task_label_text.text = format_experimenter_label(
-                task_label,
-                subject=static_scene.get("subject"),
-                current_trial_num=static_scene.get("current_trial_num"),
-                total_trials=static_scene.get("total_trials"),
+            set_preview_text(
+                task_label_text,
+                format_experimenter_label(
+                    task_label,
+                    subject=static_scene.get("subject"),
+                    current_trial_num=static_scene.get("current_trial_num"),
+                    total_trials=static_scene.get("total_trials"),
+                ),
             )
             task_label_text.draw()
         reward_button_rect.draw()
@@ -2284,6 +2297,7 @@ def _experimenter_preview_process(
                 pos=(0.0, -float(preview_canvas_size[1]) * 0.44),
                 color=_preview_rgb255_to_psychopy((230, 230, 230)),
                 colorSpace="rgb",
+                autoLog=False,
             )
 
         task_label_height = max(18.0, min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.032)
@@ -2304,6 +2318,7 @@ def _experimenter_preview_process(
             anchorHoriz="left",
             color=_preview_rgb255_to_psychopy((210, 210, 210)),
             colorSpace="rgb",
+            autoLog=False,
         )
         timer_text = visual.TextStim(
             win,
@@ -2315,6 +2330,7 @@ def _experimenter_preview_process(
             anchorHoriz="left",
             color=_preview_rgb255_to_psychopy((255, 255, 255)),
             colorSpace="rgb",
+            autoLog=False,
         )
         video_timer_text = visual.TextStim(
             win,
@@ -2326,6 +2342,7 @@ def _experimenter_preview_process(
             anchorHoriz="left",
             color=_preview_rgb255_to_psychopy((255, 224, 128)),
             colorSpace="rgb",
+            autoLog=False,
         )
         reward_counts_text = visual.TextStim(
             win,
@@ -2337,6 +2354,7 @@ def _experimenter_preview_process(
             anchorHoriz="left",
             color=_preview_rgb255_to_psychopy((255, 255, 255)),
             colorSpace="rgb",
+            autoLog=False,
         )
         reward_button_width = max(84.0, min(140.0, float(preview_canvas_size[0]) * 0.08))
         reward_button_height = max(44.0, min(64.0, float(preview_canvas_size[1]) * 0.065))
@@ -2354,6 +2372,7 @@ def _experimenter_preview_process(
             fillColorSpace="rgb",
             lineColor=None,
             units="pix",
+            autoLog=False,
         )
         reward_button_text = visual.TextStim(
             win,
@@ -2363,6 +2382,7 @@ def _experimenter_preview_process(
             pos=reward_button_rect.pos,
             color=_preview_rgb255_to_psychopy((255, 255, 255)),
             colorSpace="rgb",
+            autoLog=False,
         )
         exit_button_rect = visual.Rect(
             win,
@@ -2373,6 +2393,7 @@ def _experimenter_preview_process(
             fillColorSpace="rgb",
             lineColor=None,
             units="pix",
+            autoLog=False,
         )
         exit_button_text = visual.TextStim(
             win,
@@ -2382,6 +2403,7 @@ def _experimenter_preview_process(
             pos=exit_button_rect.pos,
             color=_preview_rgb255_to_psychopy((255, 255, 255)),
             colorSpace="rgb",
+            autoLog=False,
         )
 
         # The parent may begin timing immediately after construction returns.
@@ -2478,6 +2500,7 @@ def _experimenter_preview_process(
                             fillColorSpace="rgb",
                             lineColor=None,
                             units="pix",
+                            autoLog=False,
                         )
                         movie_outline_rect = visual.Rect(
                             win,
@@ -2489,6 +2512,7 @@ def _experimenter_preview_process(
                             lineColorSpace="rgb",
                             lineWidth=2,
                             units="pix",
+                            autoLog=False,
                         )
                         descriptor = dict(payload["shared_frame_buffer"])
                         if (
@@ -2732,7 +2756,7 @@ class ExperimenterPreview:
             initial = calibration_config["calibration"]
             self._calibration_controls = self._ctx.Array(
                 "d",
-                [initial["x_scale"], initial["y_scale"], 0, 0, 0, 0],
+                [initial["x_scale"], initial["y_scale"], 0, 0, 0, 0, 0],
                 lock=True,
             )
         self._video_start_perf_shared = self._ctx.Value(
@@ -2847,20 +2871,26 @@ class ExperimenterPreview:
         return True
 
     def get_calibration_controls(self) -> dict:
-        """Read scale/target values and the zero-button counter atomically."""
+        """Read calibration values and zero/attention request counters atomically."""
         if self._calibration_controls is None:
             raise RuntimeError("Preview was not opened with calibration controls")
         with self._calibration_controls.get_lock():
             values = list(self._calibration_controls[:])
-        fields = ("x_scale", "y_scale", "fix_x", "fix_y", "revision", "zero_count")
+        fields = (
+            "x_scale", "y_scale", "fix_x", "fix_y", "revision", "zero_count",
+            "attention_count",
+        )
         return dict(zip(fields, values))
 
-    def show_calibration_state(self, *, eye_fraction, eye_valid, status_text) -> None:
+    def show_calibration_state(
+        self, *, eye_fraction, eye_valid, status_text, attention_started_s=None
+    ) -> None:
         self._send({
             "type": "calibration",
             "eye_fraction": list(eye_fraction),
             "eye_valid": bool(eye_valid),
             "status_text": str(status_text),
+            "attention_started_s": attention_started_s,
         })
 
     def set_trial_progress(self, current_trial_num: int, total_trials: Optional[int]) -> None:

@@ -79,5 +79,7 @@
   "sequential": true,
   "is_memory": true,
   "raspi": true,
-  "touchscreen": true
+  "touchscreen": true,
+
+  "eye_tracking": {"enabled": true}
 }

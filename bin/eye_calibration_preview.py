@@ -7,10 +7,12 @@ mailbox. There is no UART or reward hardware access in this component.
 
 from __future__ import annotations
 
+import time
 from typing import Sequence, Tuple
 from psychopy import event, visual
 from bin import utils
 from bin.eye_tracking import clamp_fraction
+from bin.preview_text import set_preview_text
 from bin.screen import compute_centered_aspect_fit
 
 
@@ -45,6 +47,7 @@ class Slider:
             lineColor=utils.rgb255_to_psychopy((210, 210, 210)),
             lineColorSpace="rgb",
             units="pix",
+            autoLog=False,
         )
         self.knob = visual.Rect(
             win,
@@ -56,6 +59,7 @@ class Slider:
             lineColor=utils.rgb255_to_psychopy((30, 30, 30)),
             lineColorSpace="rgb",
             units="pix",
+            autoLog=False,
         )
         self.text = visual.TextStim(
             win,
@@ -65,6 +69,7 @@ class Slider:
             color=utils.rgb255_to_psychopy((245, 245, 245)),
             colorSpace="rgb",
             pos=(0, 0),
+            autoLog=False,
         )
 
     def _fraction(self) -> float:
@@ -108,12 +113,15 @@ class Slider:
         self.knob.pos = self._knob_pos()
         self.track.draw()
         self.knob.draw()
-        self.text.text = f"{self.label} {self.value:.4f}"
         if self.orientation == "horizontal":
+            label_text = f"{self.label} {self.value:.4f}"
             self.text.pos = (self.pos[0], self.pos[1] + 30.0)
         else:
-            self.text.text = f"{self.label}\n{self.value:.4f}"
+            label_text = f"{self.label}\n{self.value:.4f}"
             self.text.pos = (self.pos[0], self.pos[1] + self.length / 2 + 35)
+        # Assign only the final string: the vertical slider previously toggled
+        # single/multiline text every frame even when the value was unchanged.
+        set_preview_text(self.text, label_text)
         self.text.draw()
 
 
@@ -129,6 +137,7 @@ def _make_fixation_cross(win, *, size: float, weight: float, color_rgb: Sequence
         fillColorSpace="rgb",
         lineColor=None,
         units="pix",
+        autoLog=False,
     )
     vertical = visual.Rect(
         win,
@@ -138,14 +147,38 @@ def _make_fixation_cross(win, *, size: float, weight: float, color_rgb: Sequence
         fillColorSpace="rgb",
         lineColor=None,
         units="pix",
+        autoLog=False,
     )
+    for part in (horizontal, vertical):
+        # Keep the original dimensions so repeated attention requests never
+        # compound the scale or allocate new graphics objects.
+        part._calibration_base_size = (part.width, part.height)
+        part._calibration_scale = 1.0
     return (horizontal, vertical)
 
 
-def _draw_fixation_cross(parts, pos: Sequence[float]) -> None:
+def _draw_fixation_cross(
+    parts, pos: Sequence[float], *, attention_started_s=None, now_s=None
+) -> None:
+    """Draw a normal cross, or a doubled 5 Hz on/off cue for one second.
+
+    Both displays use the main task's monotonic start timestamp. Rendering
+    follows elapsed time without sleeps, frame counters or new stimuli.
+    """
+    scale, visible = 1.0, True
+    if attention_started_s is not None:
+        now_s = time.perf_counter() if now_s is None else now_s
+        elapsed = now_s - attention_started_s
+        if 0 <= elapsed < 1.0:
+            scale = 2.0
+            visible = int(elapsed * 10) % 2 == 0  # 100 ms on, 100 ms off.
     for part in parts:
+        if part._calibration_scale != scale:
+            part.size = tuple(value * scale for value in part._calibration_base_size)
+            part._calibration_scale = scale
         part.pos = (float(pos[0]), float(pos[1]))
-        part.draw()
+        if visible:
+            part.draw()
 
 
 def _make_button(
@@ -161,6 +194,7 @@ def _make_button(
         lineColor=utils.rgb255_to_psychopy((20, 20, 20)),
         lineColorSpace="rgb",
         units="pix",
+        autoLog=False,
     )
     label = visual.TextStim(
         win,
@@ -170,6 +204,7 @@ def _make_button(
         pos=pos,
         color=utils.rgb255_to_psychopy((255, 255, 255)),
         colorSpace="rgb",
+        autoLog=False,
     )
     return rect, label
 
@@ -274,6 +309,7 @@ class EyeCalibrationControls:
             lineColorSpace="rgb",
             lineWidth=2,
             units="pix",
+            autoLog=False,
         )
         exp_cross = _make_fixation_cross(
             exp_win,
@@ -297,6 +333,7 @@ class EyeCalibrationControls:
             lineColor=utils.rgb255_to_psychopy((255, 255, 255)),
             lineColorSpace="rgb",
             units="pix",
+            autoLog=False,
         )
 
         # Fixed gutters keep the preview and controls disjoint even when the
@@ -362,6 +399,7 @@ class EyeCalibrationControls:
             wrapWidth=max(150, exp_w - 320),
             color=utils.rgb255_to_psychopy((245, 245, 245)),
             colorSpace="rgb",
+            autoLog=False,
         )
 
         self.bg, self.preview_box = exp_bg, preview_box
@@ -379,10 +417,12 @@ class EyeCalibrationControls:
         self.dragging = None
         self.fixation = (0.0, 0.0)
         self.zero_count = 0
+        self.attention_count = 0
         self.revision = 0
 
-    def _publish_controls(self):
-        self.revision += 1
+    def _publish_controls(self, *, calibration_changed=True):
+        if calibration_changed:
+            self.revision += 1
         with self.controls_shared.get_lock():
             self.controls_shared[:] = [
                 self.x_slider.value,
@@ -390,10 +430,11 @@ class EyeCalibrationControls:
                 *self.fixation,
                 self.revision,
                 self.zero_count,
+                self.attention_count,
             ]
 
     def poll_controls(self):
-        keys = event.getKeys(keyList=["escape", "r", "z"])
+        keys = event.getKeys(keyList=["escape", "r", "z", "f"])
         if "escape" in keys:
             self.exit_event.set()
         if "r" in keys:
@@ -401,6 +442,11 @@ class EyeCalibrationControls:
         if "z" in keys:
             self.zero_count += 1
             self._publish_controls()
+        if "f" in keys:
+            self.attention_count += 1
+            # A visual cue must not reset fixation acceptance or change gain,
+            # offset, or target position. Keep the calibration revision intact.
+            self._publish_controls(calibration_changed=False)
         down = bool(self.mouse.getPressed()[0])
         pos = self.mouse.getPos()
         if down and not self.last_down:
@@ -435,6 +481,7 @@ class EyeCalibrationControls:
             _fraction_to_preview(
                 self.fixation, box_center=self.box_center, box_size=self.box_size
             ),
+            attention_started_s=payload.get("attention_started_s"),
         )
         # Hide invalid gaze instead of displaying last reliable coordinates as
         # a live sample. The status text explains blink/loss/staleness/errors.
@@ -449,7 +496,7 @@ class EyeCalibrationControls:
         self.y_slider.draw()
         for button in (self.reward_button, self.exit_button, self.zero_button):
             _draw_button(button)
-        self.status_text.text = payload.get(
-            "status_text", "Waiting for Eye 0 UART data"
+        set_preview_text(
+            self.status_text, payload.get("status_text", "Waiting for Eye 0 UART data")
         )
         self.status_text.draw()

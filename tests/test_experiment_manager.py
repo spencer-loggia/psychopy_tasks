@@ -28,6 +28,26 @@ class FakeClock:
 
 
 class ExperimentManagerTests(unittest.TestCase):
+    def test_lifecycle_uses_full_subject_start_time_and_exports_uart_handoff(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config, config_path = self._project(root)
+            started = dt.datetime(2026, 10, 14, 10, 30)
+            with patch("interface.experiment_manager.ExperimentEyeTracker") as tracker:
+                manager = ExperimentManager(
+                    working_dir=root, launch_config_path=config_path, launch_config=config,
+                    subject_name="Yuri", subject_code="Y", now=started,
+                )
+                tracker.assert_called_once_with(
+                    config, subject="Yuri", started_at=started, directory=manager.experiment_dir,
+                )
+                tracker.return_value.pending_path = manager.experiment_dir / ".pending"
+                block = manager.prepare_block(task_name="demo", launch_value="task/demo.py", config_value="configs/demo.json")
+                env = manager.subprocess_environment(block)
+                self.assertEqual(env["NEURO_EYE_TRACKER_EXPERIMENT_PENDING"], str(tracker.return_value.pending_path))
+                manager.finish()
+                tracker.return_value.finish.assert_called_once()
+
     def _project(self, root: Path):
         (root / "task").mkdir()
         (root / "configs").mkdir()

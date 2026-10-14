@@ -21,6 +21,7 @@ from .protocol import (
     decode_command,
     decode_status,
     encode_command,
+    validate_subject_name,
 )
 from .uart import configure_raw_uart, open_exclusive_uart
 
@@ -164,14 +165,36 @@ class EyeTrackerController:
     def send_state_command(self, code: CommandCode) -> DecodedStatus:
         if code is CommandCode.POLL:
             raise ValueError("Use poll() for POLL commands")
-        sequence = self._take_sequence()
-        command_packet = encode_command(
+        if code is CommandCode.START_EXPERIMENT:
+            raise ValueError("Use start_experiment() with a subject for START_EXPERIMENT")
+        return self._send_state_packet(
             CommandPacket(
                 code=code,
-                sequence=sequence,
+                sequence=self._take_sequence(),
                 controller_timestamp_ns=time.monotonic_ns(),
             )
         )
+
+    def start_experiment(
+        self, subject: str, *, timestamp_ns: int | None = None
+    ) -> DecodedStatus:
+        """Open a Pi Tracker experiment using Unix UTC nanoseconds."""
+        validate_subject_name(subject)
+        return self._send_state_packet(
+            CommandPacket(
+                code=CommandCode.START_EXPERIMENT,
+                sequence=self._take_sequence(),
+                controller_timestamp_ns=time.time_ns() if timestamp_ns is None else timestamp_ns,
+                subject=subject,
+            )
+        )
+
+    def stop_experiment(self) -> DecodedStatus:
+        return self.send_state_command(CommandCode.STOP_EXPERIMENT)
+
+    def _send_state_packet(self, command: CommandPacket) -> DecodedStatus:
+        sequence = command.sequence
+        command_packet = encode_command(command)
         attempts = self.retries + 1
         for attempt in range(attempts):
             try:

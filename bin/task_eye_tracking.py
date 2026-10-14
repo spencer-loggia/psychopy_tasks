@@ -16,6 +16,7 @@ import time
 
 from .eye_tracking import UARTEyeTracker
 from .eye_tracking_log import EYE_DATA_FILENAME, EyeDataRecorder
+from .eye_tracker_warnings import EyeTrackerWarnings
 
 
 def read_preview_gaze(shared, *, now_s=None):
@@ -51,6 +52,7 @@ class TaskEyeTrackingSession:
         self._last_state = None
         self._closed = False
         self._preview_lock = threading.Lock()
+        self.warnings = EyeTrackerWarnings()
         self.tracker = UARTEyeTracker(
             uart_config=settings.uart,
             filter_config=settings.filter,
@@ -69,9 +71,8 @@ class TaskEyeTrackingSession:
                     ),
                     rate_hz=settings.record_rate_hz,
                 )
-        except Exception:
-            self.tracker.stop()
-            raise
+        except Exception as exc:
+            self.warnings.warn("recording", f"Could not start eye data acquisition/CSV recording: {exc}")
         # Normal cleanup goes through SessionLogBundle. Also stop tracking if a
         # legacy task exits before its main loop's finally block is established.
         atexit.register(self.close)
@@ -106,7 +107,10 @@ class TaskEyeTrackingSession:
 
     def check_recording_error(self):
         if self.recorder is not None:
-            self.recorder.check_error()
+            try:
+                self.recorder.check_error()
+            except Exception as exc:
+                self.warnings.warn("recording", str(exc))
 
     def get_position(self):
         """Return calibrated, unclamped subject-scene fractions or None.
@@ -132,8 +136,13 @@ class TaskEyeTrackingSession:
             try:
                 if self.recorder is not None:
                     self.recorder.close()
+            except Exception as exc:
+                self.warnings.warn("recording", str(exc))
             finally:
-                self.tracker.stop()
+                try:
+                    self.tracker.stop()
+                except Exception as exc:
+                    self.warnings.warn("stop", f"Eye tracker cleanup failed: {exc}")
         finally:
             with self._preview_lock:
                 self._closed = True

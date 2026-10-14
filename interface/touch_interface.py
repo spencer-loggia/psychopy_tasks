@@ -1233,6 +1233,8 @@ class TouchInterfaceApp:
             self.status_var.set("Could not restore main touchscreen")
             messagebox.showerror("Desktop Error", str(exc))
             return
+        if self.experiment is not None:
+            self.experiment.finish()
         self.root.destroy()
 
     def _create_shutdown_button(self, row_idx: int) -> None:
@@ -1292,6 +1294,8 @@ class TouchInterfaceApp:
             messagebox.showerror("Experiment Cleanup Error", str(exc))
             self.status_var.set("Could not restore quiet mode")
             return
+        if self.experiment is not None:
+            self.experiment.finish()
         self.experiment = None
         self.cleanup()
         self._render_root_menu()
@@ -1568,6 +1572,8 @@ def main() -> None:
         )
         root.mainloop()
     finally:
+        if app is not None and app.experiment is not None:
+            app.experiment.finish()
         if app is not None and app.quiet_mode is not None:
             try:
                 app.quiet_mode.exit()

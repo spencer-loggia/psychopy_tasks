@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import enum
+import re
 import struct
 from dataclasses import dataclass
 
@@ -42,6 +43,8 @@ class CommandCode(enum.IntEnum):
     START_RECORDING = 3
     STOP_RECORDING = 4
     CLEAR_ERROR = 5
+    START_EXPERIMENT = 6
+    STOP_EXPERIMENT = 7
 
 
 class StatusCode(enum.IntEnum):
@@ -62,6 +65,8 @@ class StatusFlag(enum.IntFlag):
     CONFIGURED = 1 << 2
     ERROR = 1 << 3
     RESULT_STALE = 1 << 4
+    EXPERIMENT_ACTIVE = 1 << 5
+    CALIBRATING = 1 << 6
 
 
 class EyeFlag(enum.IntFlag):
@@ -76,6 +81,7 @@ class CommandPacket:
     sequence: int
     controller_timestamp_ns: int = 0
     flags: int = 0
+    subject: str | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +115,19 @@ def _checked_u32(value: int, name: str) -> int:
     return value
 
 
+def validate_subject_name(subject: str) -> str:
+    """Use the tracker's subject identifier unchanged on the wire."""
+    if (
+        not isinstance(subject, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}", subject, flags=re.ASCII) is None
+    ):
+        raise ValueError(
+            "Subject must be 1–32 ASCII letters, digits, underscores, dots, or "
+            "hyphens, starting with a letter or digit"
+        )
+    return subject
+
+
 def encode_command(command: CommandPacket) -> bytes:
     sequence = _checked_u32(command.sequence, "command sequence")
     if sequence == 0:
@@ -117,6 +136,13 @@ def encode_command(command: CommandPacket) -> bytes:
         raise ValueError("command flags must fit in uint16")
     if not 0 <= command.controller_timestamp_ns <= 0xFFFFFFFFFFFFFFFF:
         raise ValueError("controller_timestamp_ns must fit in uint64")
+    subject_bytes = b""
+    if command.code == CommandCode.START_EXPERIMENT:
+        if command.controller_timestamp_ns == 0:
+            raise ValueError("START_EXPERIMENT requires a nonzero Unix UTC timestamp")
+        subject_bytes = validate_subject_name(command.subject).encode("ascii")
+    elif command.subject is not None:
+        raise ValueError("Only START_EXPERIMENT accepts a subject")
     packet = bytearray(TRANSACTION_SIZE)
     _HEADER.pack_into(
         packet,
@@ -130,6 +156,9 @@ def encode_command(command: CommandPacket) -> bytes:
         0,
         command.controller_timestamp_ns,
     )
+    if subject_bytes:
+        packet[24] = len(subject_bytes)
+        packet[25 : 25 + len(subject_bytes)] = subject_bytes
     _CRC.pack_into(packet, TRANSACTION_SIZE - _CRC.size, crc32c(packet[:-4]))
     return bytes(packet)
 
@@ -153,17 +182,33 @@ def decode_command(packet: bytes) -> CommandPacket:
         raise ProtocolError("BAD_PACKET_TYPE")
     if sequence == 0:
         raise ProtocolError("BAD_SEQUENCE")
-    if related != 0 or any(packet[_HEADER.size : TRANSACTION_SIZE - _CRC.size]):
+    if related != 0:
         raise ProtocolError("BAD_RESERVED")
     try:
         command_code = CommandCode(code)
     except ValueError as exc:
         raise ProtocolError("UNKNOWN_COMMAND") from exc
+    subject = None
+    if command_code is CommandCode.START_EXPERIMENT:
+        if timestamp_ns == 0:
+            raise ProtocolError("BAD_TIMESTAMP")
+        subject_length = packet[24]
+        if not 1 <= subject_length <= 32:
+            raise ProtocolError("BAD_SUBJECT")
+        try:
+            subject = validate_subject_name(packet[25 : 25 + subject_length].decode("ascii"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ProtocolError("BAD_SUBJECT") from exc
+        if any(packet[25 + subject_length : TRANSACTION_SIZE - _CRC.size]):
+            raise ProtocolError("BAD_RESERVED")
+    elif any(packet[_HEADER.size : TRANSACTION_SIZE - _CRC.size]):
+        raise ProtocolError("BAD_RESERVED")
     return CommandPacket(
         code=command_code,
         sequence=sequence,
         controller_timestamp_ns=timestamp_ns,
         flags=flags,
+        subject=subject,
     )
 
 
@@ -194,6 +239,8 @@ def decode_status(packet: bytes) -> DecodedStatus:
         | StatusFlag.CONFIGURED
         | StatusFlag.ERROR
         | StatusFlag.RESULT_STALE
+        | StatusFlag.EXPERIMENT_ACTIVE
+        | StatusFlag.CALIBRATING
     )
     if raw_flags & ~known_status_flags:
         raise ProtocolError("Status contains unknown flag bits")

@@ -123,7 +123,7 @@ def load_eye_tracking_settings(cfg, *, for_calibration=False):
     uart = dict(_object(saved.get("uart"), "saved uart"))
     uart.update(_object(cfg.get("uart"), "uart"))
     uart.update(_object(section.get("uart"), "eye_tracking.uart"))
-    for key in ("simulate", "manage_tracking"):
+    for key in ("simulate", "manage_tracking", "expect_recording"):
         if key in uart:
             _boolean(uart[key], f"uart.{key}")
     filter_values = dict(_object(saved.get("filter"), "saved filter"))

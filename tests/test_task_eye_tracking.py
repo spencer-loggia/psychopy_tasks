@@ -27,6 +27,11 @@ from bin.task_eye_tracking import TaskEyeTrackingSession, read_preview_gaze
 
 
 class TaskEyeTrackingTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch("bin.eye_tracker_warnings.show_eye_tracker_warning")
+        self.warning = patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_main_thread_and_preview_share_calibration_and_reject_invalid_data(self):
         settings = EyeTrackingSettings(
             calibration=EyeCalibration(
@@ -180,7 +185,7 @@ class TaskEyeTrackingTests(unittest.TestCase):
             logs.close()
             self.assertFalse((logs.session_dir / "eye_tracking.csv").exists())
 
-    def test_recording_failure_surfaces_and_tracker_is_stopped_on_cleanup(self):
+    def test_recording_failure_warns_and_task_continues_through_cleanup(self):
         with tempfile.TemporaryDirectory() as tmp:
             logs = SessionLogBundle(
                 output_root=tmp, task_name="active_foraging", config_name="disk-error",
@@ -190,10 +195,11 @@ class TaskEyeTrackingTests(unittest.TestCase):
             )
             session = logs.eye_tracking
             session.recorder._error = OSError("disk full")
-            with self.assertRaisesRegex(RuntimeError, "disk full"):
-                logs.flush()
-            with self.assertRaisesRegex(RuntimeError, "disk full"):
-                logs.close()
+            logs.flush()
+            logs.flush()
+            logs.close()
+            self.warning.assert_called_once()
+            self.assertIn("disk full", self.warning.call_args.args[0])
             self.assertFalse(session.tracker._thread.is_alive())
             self.assertTrue(session.recorder._file.closed)
 
@@ -206,6 +212,19 @@ class TaskEyeTrackingTests(unittest.TestCase):
             tracker.stop()
         self.assertFalse(tracker.get_state().valid)
         self.assertEqual(tracker.get_state().error, "no UART")
+        self.warning.assert_called_once()
+
+    def test_csv_start_failure_does_not_abort_task_or_eye_acquisition(self):
+        tracker = Mock()
+        tracker.get_state.return_value = EyeTrackerState(valid=True)
+        with patch("bin.task_eye_tracking.UARTEyeTracker", return_value=tracker), patch(
+            "bin.task_eye_tracking.EyeDataRecorder", side_effect=OSError("disk full")
+        ):
+            session = TaskEyeTrackingSession(EyeTrackingSettings(show_preview=False), output_dir="unused")
+            self.assertEqual(session.get_position(), (0, 0))
+            session.close()
+        self.warning.assert_called_once()
+        tracker.stop.assert_called_once()
 
     def test_static_and_frozen_movie_preview_draw_and_expire_oriented_gaze(self):
         for command_type in ("static_scene", "play_shared_video"):

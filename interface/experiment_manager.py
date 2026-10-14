@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Optional
 
 from bin.config import load_config
+from bin.eye_tracking import EXPERIMENT_UART_PENDING_ENV
 from bin.eye_tracking_config import resolve_eye_tracking_paths
 from bin.logger import (
     CALIBRATION_FILENAME,
@@ -26,6 +27,7 @@ from bin.screen import (
     SCREEN_ENV_OVERRIDE_ENV,
     SECONDARY_SCREEN_ENV,
 )
+from interface.experiment_eye_tracker import ExperimentEyeTracker
 
 
 BLOCKS_FILENAME = "blocks.tsv"
@@ -180,6 +182,14 @@ class ExperimentManager:
         shutil.copy2(source_event_library, self.event_library_path)
         self._write_state()
         self._write_blocks()
+        self.eye_tracker = ExperimentEyeTracker(
+            self.launch_config, subject=self.subject_name,
+            started_at=self.started_at, directory=self.experiment_dir,
+        )
+
+    def finish(self) -> None:
+        """Request remote recording flush/closure without delaying the launcher."""
+        self.eye_tracker.finish()
 
     def _create_experiment_dir(self) -> Path:
         safe_code = sanitize_filename_component(self.subject_code)
@@ -319,6 +329,8 @@ class ExperimentManager:
         environment = os.environ.copy()
         environment[EXACT_SESSION_DIR_ENV] = str(block.output_dir)
         environment[EVENT_LIBRARY_ENV] = str(self.event_library_path)
+        if self.eye_tracker.start_future is not None:
+            environment[EXPERIMENT_UART_PENDING_ENV] = str(self.eye_tracker.pending_path)
         return environment
 
     def finish_block(self, block: PreparedBlock) -> None:

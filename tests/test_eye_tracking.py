@@ -36,6 +36,43 @@ def sample(frame=1, **kwargs):
 
 
 class EyeTrackingTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch("bin.eye_tracker_warnings.show_eye_tracker_warning")
+        self.warning = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_missing_recording_flag_warns_once_and_preserves_valid_gaze(self):
+        tracker = UARTEyeTracker()
+        status = sample(flags=StatusFlag.TRACKING | StatusFlag.CONFIGURED | StatusFlag.EXPERIMENT_ACTIVE)
+        tracker.filter.consume(status, now_s=time.perf_counter())
+        for _ in range(5):
+            tracker._check_status(status)
+        self.warning.assert_called_once()
+        self.assertIn("recording did not start", self.warning.call_args.args[0])
+        self.assertTrue(tracker.get_state().valid)
+
+    def test_intentionally_disabled_recording_does_not_warn(self):
+        tracker = UARTEyeTracker(uart_config=UARTEyeTrackerConfig(expect_recording=False))
+        tracker._check_status(sample())
+        self.warning.assert_not_called()
+
+    def test_error_and_calibration_flags_warn_without_accepting_gaze(self):
+        tracker = UARTEyeTracker()
+        status = sample(flags=StatusFlag.CALIBRATING | StatusFlag.EXPERIMENT_ACTIVE | StatusFlag.ERROR)
+        tracker.filter.consume(status, now_s=time.perf_counter())
+        tracker._check_status(status)
+        self.assertFalse(tracker.get_state().valid)
+        self.warning.assert_called_once()
+        self.assertIn("calibration mode", self.warning.call_args.args[0])
+
+    def test_stop_failure_warns_without_raising(self):
+        tracker = UARTEyeTracker()
+        tracker._cleanup_error = "lost STOP acknowledgement"
+        tracker.stop()
+        tracker.stop()
+        self.warning.assert_called_once()
+        self.assertIn("lost STOP acknowledgement", self.warning.call_args.args[0])
+
     def test_calibration_payload_uses_pixel_units_and_eye_zero(self):
         payload = calibration_payload(
             EyeCalibration(x_scale=0.1, y_scale=-0.2, x_offset=0.3, y_offset=-0.4),

@@ -37,6 +37,40 @@ contains:
 source config. A row is written with a blank `end_time` before the subprocess starts and is updated when it exits,
 so an interrupted or failed block remains visible in the experiment record.
 
+Both Raspberry Pi launch configs also synchronize experiment boundaries with the tracker Pi:
+
+```json
+"eye_tracker_experiment": {
+  "enabled": true,
+  "uart": {"device": "/dev/ttyAMA10", "baud": 460800}
+}
+```
+
+Selecting a subject queues UART `START_EXPERIMENT` (code 6) with the selected full name
+(for example, `Yuri`, not its directory code `Y`) and the experiment start datetime converted
+to Unix UTC nanoseconds. End Experiment or closing the launcher queues `STOP_EXPERIMENT`
+(code 7), which asks the tracker to flush recording and close its experiment. The tracker
+must run its `pi_tracker.py CONFIG` interface with permission to set its system clock;
+standalone `run`/`preview` services do not implement these experiment commands. Subject
+names must match `[A-Za-z0-9][A-Za-z0-9_.-]{0,31}`; unsupported names produce a warning
+and are never silently rewritten.
+
+These commands run in order on a background worker, with the existing 10-second state
+timeout and one identical-packet retry by default (`uart.state_timeout_s` / `state_retries`).
+The UART is closed after each command. Task eye acquisition waits for the experiment-start
+handoff in its own worker, so the launcher and task rendering remain responsive.
+Missing hardware, rejected commands, unexpected status flags, or recording failures show
+nonmodal warning dialogs and write warnings to stderr; experiments and tasks continue.
+Repeated warnings of the same kind are suppressed within each session. Missing recording
+does not invalidate otherwise valid gaze, but stopped, unconfigured, calibrating, stale,
+or error telemetry is unusable. Local eye CSV failures also warn without aborting the task.
+
+Experiment synchronization defaults to disabled when this launcher section is absent;
+set `enabled` to `false` (or `uart.simulate` to `true`) for hardware-free operation.
+The launcher UART device/baud must match the task's UART settings and physical wiring.
+Experiment start opens the tracker session; each eye-enabled task still controls tracking
+through `START_TRACKING` / `STOP_TRACKING`.
+
 ### `config_name` convention
 
 `config_name` is a stable analysis-family identifier, not a unique name for one configuration or run. Assign the
@@ -626,7 +660,8 @@ as other tasks. `experimenter_win_size` is no longer used; the secondary window 
 Connection and protocol:
 
 - `uart.device` defaults to `/dev/ttyAMA10`, the Pi 5 dedicated **3-pin UART connector**. This differs from
-  `/dev/ttyAMA0` in the tracker's sample config, which selects UART0 on the 40-pin GPIO header.
+  `/dev/ttyAMA0`, which selects UART0 on the 40-pin GPIO header. The current tracker profiles
+  also default to `/dev/ttyAMA10`.
   `/dev/serial0` normally aliases the dedicated connector on Pi 5; an explicit device avoids alias ambiguity.
   See [Raspberry Pi UART documentation](https://github.com/raspberrypi/documentation/blob/master/documentation/asciidoc/computers/configuration/interfaces.adoc).
 - Both ends must select the UART actually wired: cross TX to RX and share ground, using 3.3 V logic.
@@ -640,6 +675,10 @@ Connection and protocol:
   Set this option to `false` to poll an already-running tracker without changing its state.
   State commands wait up to `uart.state_timeout_s` (10 s) and retry the identical command
   `uart.state_retries` times (default 1). Close may wait for these acknowledgements.
+- `uart.expect_recording` defaults to `true`: a missing `RECORDING` status flag shows a
+  warning while allowing the task and valid gaze acquisition to continue. Set it to `false`
+  when recording on the tracker Pi is intentionally disabled. Error, stopped/unconfigured,
+  calibration, and restarted-service states also produce warnings without aborting tasks.
 
 Eye data and calibration:
 

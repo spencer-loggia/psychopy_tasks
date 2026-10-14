@@ -8,7 +8,7 @@ import struct
 import threading
 import time
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from bin.eye_tracker_wire.controller import (
     EyeTrackerController,
@@ -23,6 +23,7 @@ from bin.eye_tracker_wire.protocol import (
     CommandPacket,
     ProtocolError,
     StatusCode,
+    StatusFlag,
     crc32c,
     encode_command,
     decode_command,
@@ -44,6 +45,44 @@ def status_bytes(*, sequence=42, code=0, edits=()):
 
 
 class UARTProtocolTests(unittest.TestCase):
+    def test_experiment_commands_match_upstream_packets_and_new_status_flags(self):
+        start = CommandPacket(CommandCode.START_EXPERIMENT, 42, 1791988200123456000, subject="Yuri")
+        self.assertEqual(encode_command(start).hex(), FIXTURE["start_experiment"])
+        self.assertEqual(decode_command(bytes.fromhex(FIXTURE["start_experiment"])), start)
+        stop = CommandPacket(CommandCode.STOP_EXPERIMENT, 43, 111222333)
+        self.assertEqual(encode_command(stop).hex(), FIXTURE["stop_experiment"])
+        status = decode_status(bytes.fromhex(FIXTURE["experiment_status"]))
+        self.assertEqual(status.flags, StatusFlag.EXPERIMENT_ACTIVE | StatusFlag.CALIBRATING)
+
+    def test_experiment_start_validation_and_padding(self):
+        for subject in (None, "", "Subject One", "../x", "café", "A" * 33):
+            with self.subTest(subject=subject), self.assertRaises(ValueError):
+                encode_command(CommandPacket(CommandCode.START_EXPERIMENT, 1, 1, subject=subject))
+        for timestamp in (0, -1, 1 << 64):
+            with self.subTest(timestamp=timestamp), self.assertRaises(ValueError):
+                encode_command(CommandPacket(CommandCode.START_EXPERIMENT, 1, timestamp, subject="A"))
+        packet = encode_command(CommandPacket(CommandCode.START_EXPERIMENT, 1, 1, subject="A"))
+        for offset, value in ((24, 0), (24, 33), (25, 255), (26, 1), (59, 1), (12, 1), (16, 0)):
+            malformed = bytearray(packet)
+            malformed[offset] = value
+            struct.pack_into("<I", malformed, 60, crc32c(malformed[:60]))
+            with self.subTest(offset=offset), self.assertRaises(ProtocolError):
+                decode_command(bytes(malformed))
+
+    def test_experiment_start_retries_original_utc_timestamp_and_subject(self):
+        channel = Mock()
+        channel.exchange.side_effect = [ResponseTimeout("lost ACK"), status_bytes(), status_bytes(sequence=43)]
+        controller = EyeTrackerController(channel, initial_sequence=42, retries=1, retry_delay_s=0)
+        with patch("bin.eye_tracker_wire.controller.time.time_ns", return_value=1791988200123456000) as clock:
+            controller.start_experiment("Yuri")
+            clock.assert_called_once_with()
+        controller.stop_experiment()
+        calls = channel.exchange.call_args_list
+        self.assertEqual(calls[0].args[0], bytes.fromhex(FIXTURE["start_experiment"]))
+        self.assertEqual(calls[0].args[0], calls[1].args[0])
+        self.assertEqual(decode_command(calls[2].args[0]).code, CommandCode.STOP_EXPERIMENT)
+        self.assertEqual(calls[2].args[0][24:60], bytes(36))
+
     def test_codec_matches_upstream_golden_packets(self):
         self.assertEqual(crc32c(b"123456789"), 0xE3069283)
         self.assertEqual(

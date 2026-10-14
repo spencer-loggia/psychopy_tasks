@@ -68,13 +68,14 @@ class TouchInterfaceNavigationTests(unittest.TestCase):
 
     def test_end_experiment_returns_to_root_and_allows_another_experiment(self):
         app = self._app()
-        app.experiment = Mock()
+        experiment = app.experiment = Mock()
         app.page_stack = [("Tasks", {})]
         app._render_root_menu = Mock()
 
         app._end_experiment()
 
         self.assertIsNone(app.experiment)
+        experiment.finish.assert_called_once_with()
         app.quiet_mode.exit.assert_called_once_with()
         app.cleanup.assert_called_once_with()
         app._render_root_menu.assert_called_once_with()
@@ -89,10 +90,20 @@ class TouchInterfaceNavigationTests(unittest.TestCase):
         app._end_experiment()
 
         self.assertIs(app.experiment, experiment)
+        experiment.finish.assert_not_called()
         app._render_root_menu.assert_not_called()
         app.status_var.set.assert_called_once_with(
             "Cannot end experiment while a task is running"
         )
+
+    def test_closing_launcher_also_ends_active_tracker_experiment(self):
+        app = self._app()
+        app.experiment = Mock()
+        app.root = Mock()
+        app.idle_guard = Mock()
+        app._exit_to_desktop()
+        app.experiment.finish.assert_called_once_with()
+        app.root.destroy.assert_called_once_with()
 
     def test_process_launch_hides_the_interface(self):
         app = self._app()

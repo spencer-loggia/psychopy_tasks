@@ -11,17 +11,22 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import asdict, dataclass, replace
 import math
+import os
+from pathlib import Path
 import threading
 import time
 from typing import Optional, Sequence, Tuple
 
 from .eye_tracker_wire.controller import EyeTrackerController, SerialPacketChannel
+from .eye_tracker_warnings import EyeTrackerWarnings
 from .eye_tracker_wire.protocol import (
     CommandCode,
     DecodedStatus,
     StatusCode,
     StatusFlag,
 )
+
+EXPERIMENT_UART_PENDING_ENV = "NEURO_EYE_TRACKER_EXPERIMENT_PENDING"
 
 
 @dataclass(frozen=True)
@@ -34,9 +39,13 @@ class UARTEyeTrackerConfig:
     state_timeout_s: float = 10.0
     state_retries: int = 1
     manage_tracking: bool = True
+    expect_recording: bool = True
     simulate: bool = False
 
     def __post_init__(self):
+        for name in ("manage_tracking", "expect_recording", "simulate"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"uart.{name} must be true or false")
         for name in (
             "poll_rate_hz",
             "max_sample_age_s",
@@ -177,7 +186,11 @@ class EyePositionFilter:
                 "tracker_error", error=f"Tracker status: {status.status.name}"
             )
         required = StatusFlag.TRACKING | StatusFlag.CONFIGURED
-        if status.flags & required != required or status.configured_eye_count < 1:
+        if (
+            status.flags & required != required
+            or status.configured_eye_count < 1
+            or status.flags & StatusFlag.CALIBRATING
+        ):
             return self.invalidate("not_tracking_or_configured")
         age_s = status.result_age_ms / 1000.0 + max(0.0, round_trip_s)
         if (
@@ -258,6 +271,7 @@ class UARTEyeTracker:
         self._thread = None
         self._on_state = on_state
         self._callback_error = None
+        self.warnings = EyeTrackerWarnings()
 
     def start(self):
         if self._thread is not None:
@@ -279,13 +293,39 @@ class UARTEyeTracker:
             )
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():
-                raise RuntimeError("Eye UART worker did not stop")
+                self.warnings.warn("stop", "Eye UART worker did not stop; tracker shutdown is unconfirmed.")
         if getattr(self, "_cleanup_error", None):
-            raise RuntimeError(
-                f"Eye tracker STOP_TRACKING failed: {self._cleanup_error}"
+            self.warnings.warn(
+                "stop", f"Eye tracker STOP_TRACKING failed: {self._cleanup_error}"
             )
         if self._callback_error is not None:
-            raise RuntimeError(f"Eye sample consumer failed: {self._callback_error}")
+            self.warnings.warn("consumer", f"Eye sample consumer failed: {self._callback_error}")
+
+    def _check_status(self, status):
+        problems = {}
+        if status.status != StatusCode.OK or status.flags & StatusFlag.ERROR:
+            problems["status"] = f"Eye tracker reported an error ({status.status.name}); gaze may be unavailable."
+        if status.flags & StatusFlag.CALIBRATING:
+            problems["calibrating"] = "Eye tracker is in calibration mode; tracking/recording may not have started."
+        if not status.flags & StatusFlag.TRACKING:
+            problems["tracking"] = "Eye tracker did not start tracking, or tracking has stopped."
+        if not status.flags & StatusFlag.CONFIGURED or status.configured_eye_count < 1:
+            problems["configuration"] = "Eye tracker is not configured; eye measurements are unavailable."
+        if self.config.expect_recording and not status.flags & StatusFlag.RECORDING:
+            problems["recording"] = "Eye tracker recording did not start, or has stopped. Check the tracker Pi's recording settings and storage."
+        if self.get_state().rejection_reason == "service_restarted":
+            problems["restart"] = "Eye tracker restarted; gaze will remain unavailable for this task. Check calibration before the next task."
+        self.warnings.warn_many(problems)
+
+    def _wait_for_experiment_start(self):
+        pending = os.environ.get(EXPERIMENT_UART_PENDING_ENV)
+        if not pending:
+            return
+        deadline = time.monotonic() + 2 * self.config.state_timeout_s * (self.config.state_retries + 1) + 2
+        while Path(pending).exists() and not self._stop.is_set():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Experiment START_EXPERIMENT is still pending; task continues without eye tracking")
+            self._stop.wait(0.05)
 
     def _publish_state(self):
         """Optional worker-side consumer; never perform serial/file I/O on flip."""
@@ -295,6 +335,7 @@ class UARTEyeTracker:
             self._on_state(self.get_state())
         except Exception as exc:
             self._callback_error = str(exc)
+            self.warnings.warn("consumer", f"Eye sample consumer failed: {exc}")
             with self._lock:
                 self.filter.invalidate("consumer_error", error=str(exc))
             self._stop.set()
@@ -305,6 +346,9 @@ class UARTEyeTracker:
         start_attempted = False
         try:
             if not self.config.simulate:
+                self._wait_for_experiment_start()
+                if self._stop.is_set():
+                    return
                 channel = SerialPacketChannel(self.config.device, baud=self.config.baud)
                 controller = EyeTrackerController(
                     channel,
@@ -317,6 +361,7 @@ class UARTEyeTracker:
                     status = controller.send_state_command(CommandCode.START_TRACKING)
                     with self._lock:
                         self.filter.consume(status, now_s=time.perf_counter())
+                    self._check_status(status)
                     self._publish_state()
             next_poll = time.perf_counter()
             while not self._stop.is_set():
@@ -340,9 +385,11 @@ class UARTEyeTracker:
                             self.filter.consume(
                                 status, now_s=now_s, round_trip_s=now_s - sent_s
                             )
+                        self._check_status(status)
                 except Exception as exc:
                     with self._lock:
                         self.filter.invalidate("uart_error", error=str(exc))
+                    self.warnings.warn("link", f"Eye tracker communication failed: {exc}")
                 self._publish_state()
                 next_poll = max(
                     next_poll + 1 / self.config.poll_rate_hz, time.perf_counter()
@@ -351,11 +398,14 @@ class UARTEyeTracker:
         except Exception as exc:
             with self._lock:
                 self.filter.invalidate("uart_error", error=str(exc))
+            self.warnings.warn("link", f"Eye tracker is unavailable or could not start tracking/recording: {exc}")
             self._publish_state()
         finally:
             try:
                 if start_attempted and controller is not None:
-                    controller.send_state_command(CommandCode.STOP_TRACKING)
+                    status = controller.send_state_command(CommandCode.STOP_TRACKING)
+                    if status.flags & (StatusFlag.TRACKING | StatusFlag.RECORDING | StatusFlag.ERROR):
+                        self.warnings.warn("stop", "Eye tracker did not confirm tracking/recording stopped cleanly.")
             except Exception as exc:
                 self._cleanup_error = str(exc)
             finally:
@@ -373,6 +423,8 @@ class UARTEyeTracker:
                     error=getattr(self, "_cleanup_error", None) or previous.error,
                 )
             self._publish_state()
+            if getattr(self, "_cleanup_error", None):
+                self.warnings.warn("stop", f"Eye tracker shutdown failed: {self._cleanup_error}")
 
 
 class FixationWindow:

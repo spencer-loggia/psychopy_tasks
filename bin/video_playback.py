@@ -31,6 +31,70 @@ def _slot_metadata_offset(slot_index: int) -> int:
     return _SEQUENCE.size + (int(slot_index) * _SLOT_METADATA.size)
 
 
+def resolve_video_files(video_files: Sequence[str]) -> list[Path]:
+    if isinstance(video_files, (str, bytes)) or not isinstance(video_files, Sequence):
+        raise ValueError("video_files must be a JSON list of video file paths")
+    if not video_files:
+        raise ValueError("video_files must contain at least one video file path")
+
+    resolved: list[Path] = []
+    for index, value in enumerate(video_files):
+        if not isinstance(value, (str, Path)) or not str(value).strip():
+            raise ValueError(f"video_files[{index}] must be a non-empty path")
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = path.absolute()
+        if not path.is_file():
+            raise FileNotFoundError(f"Video file not found: {path}")
+        resolved.append(path)
+    return resolved
+
+
+def validate_video_source(
+    video_path: Path, stream: dict[str, Any], *, clip_duration_seconds: float,
+    frame_rate: float, require_pi5_compatible: bool = False,
+) -> None:
+    """Apply the same source/clip/codec checks to task and calibration videos."""
+    validate_hevc_stream(
+        video_path,
+        stream,
+        require_pi5_compatible=require_pi5_compatible,
+    )
+    source_duration_s = video_duration_seconds(stream)
+    source_time_origin_s = video_time_origin_seconds(stream)
+    if source_duration_s <= 0.0:
+        raise ValueError(f"Video duration is missing or invalid: {video_path}")
+    if source_duration_s + 1e-9 < clip_duration_seconds:
+        raise ValueError(
+            f"Video is shorter than clip_duration_seconds: {video_path} "
+            f"({source_duration_s:.6f}s < {clip_duration_seconds:.6f}s)"
+        )
+    stream["start_time"] = source_time_origin_s
+    probed_rate = parse_frame_rate(
+        stream.get("avg_frame_rate") or stream.get("r_frame_rate")
+    )
+    if probed_rate <= 0.0:
+        raise ValueError(f"Video frame rate is missing or invalid: {video_path}")
+    if abs(probed_rate - frame_rate) > 0.001:
+        raise ValueError(
+            f"Video frame rate {probed_rate:.6f} does not match configured "
+            f"frame_rate {frame_rate:.6f}: {video_path}. Normalize the "
+            "source offline or use its exact configured rate."
+        )
+    average_rate = parse_frame_rate(stream.get("avg_frame_rate"))
+    nominal_rate = parse_frame_rate(stream.get("r_frame_rate"))
+    if (
+        average_rate > 0.0
+        and nominal_rate > 0.0
+        and abs(average_rate - nominal_rate) > 0.001
+    ):
+        raise ValueError(
+            f"Video reports inconsistent average/nominal frame rates "
+            f"({average_rate:.6f}/{nominal_rate:.6f}): {video_path}. "
+            "Normalize it to exact CFR during preprocessing."
+        )
+
+
 def parse_frame_rate(value: Any) -> float:
     """Parse an ffprobe frame-rate value such as ``30000/1001``."""
     text = str(value or "").strip()
@@ -73,6 +137,7 @@ def video_time_origin_seconds(stream: dict[str, Any]) -> float:
 def probe_video_stream(
     video_path: str | Path,
     ffprobe_bin: str = "ffprobe",
+    *, timeout_s: Optional[float] = None,
 ) -> dict[str, Any]:
     """Return first-video-stream ffprobe metadata, or an empty mapping."""
     ffprobe_path = shutil.which(ffprobe_bin) or ffprobe_bin
@@ -97,6 +162,7 @@ def probe_video_stream(
             check=True,
             capture_output=True,
             text=True,
+            timeout=timeout_s,
         )
         payload = json.loads(result.stdout)
     except Exception:
@@ -702,6 +768,20 @@ def center_crop_bounds(
         left -= left % alignment
         top -= top % alignment
     return left, top, left + crop_w, top + crop_h
+
+
+def make_rgb_video_stim(
+    win, frame_size, *, size=None, rotation=0.0, visual_module=None,
+):
+    """Allocate one RGB texture for repeated uploads in either display."""
+    from PIL import Image
+    if visual_module is None:
+        from psychopy import visual as visual_module
+    return visual_module.ImageStim(
+        win, image=Image.new("RGB", tuple(frame_size), (0, 0, 0)), units="pix",
+        size=frame_size if size is None else size, pos=(0.0, 0.0), ori=rotation,
+        interpolate=True, flipVert=True, autoLog=False,
+    )
 
 
 def upload_rgb_texture(stim: Any, rgb: np.ndarray) -> None:

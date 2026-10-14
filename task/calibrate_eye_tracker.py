@@ -22,6 +22,9 @@ from bin.daqc2_outputs import DAQC2DigitalOutputs
 from bin.eye_calibration_keys import CALIBRATION_KEYS, fixation_key_steps
 from bin.eye_calibration_preview import _make_fixation_cross, _draw_fixation_cross
 from bin.eye_calibration_reward import CalibrationAutoReward
+from bin.eye_calibration_video import CalibrationVideoClips
+from bin.buffered_video import DEFAULT_BUFFER_BYTES
+from bin.video_playback import SharedVideoFrameBuffer, make_rgb_video_stim, upload_rgb_texture
 from bin.eye_tracking_config import load_eye_tracking_settings
 from bin.eye_tracking import (
     UARTEyeTracker,
@@ -54,6 +57,14 @@ def parse_args():
     parser.add_argument("--win_size", type=int, nargs=2, default=None)
     parser.add_argument("--main_screen", default=None)
     parser.add_argument("--experimenter_screen", default=None)
+    parser.add_argument("--video_files", nargs="+", default=None)
+    parser.add_argument("--video_size", type=int, nargs=2, default=None)
+    parser.add_argument("--clip_duration_seconds", type=float, default=None)
+    parser.add_argument("--frame_rate", type=float, default=None)
+    parser.add_argument("--seek_timeout_seconds", type=float, default=None)
+    parser.add_argument("--video_buffer_megabytes", type=float, default=None)
+    parser.add_argument("--ffprobe", default=None)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
         "--uart_device", default=None, help="Pi 5 3-pin UART: /dev/ttyAMA10"
     )
@@ -70,7 +81,8 @@ def parse_args():
 
 
 def _deliver_reward_pulse(
-    *, outputs, pump_pin, pulse_duration_s, logger, should_exit=lambda: False
+    *, outputs, pump_pin, pulse_duration_s, logger, should_exit=lambda: False,
+    on_wait=None,
 ):
     """Use DAQC2 logical on/off semantics and log actual software-timed edges.
 
@@ -97,6 +109,8 @@ def _deliver_reward_pulse(
         while time.perf_counter() < deadline:
             if should_exit():
                 break
+            if on_wait is not None:
+                on_wait()
             core.wait(min(0.01, max(0, deadline - time.perf_counter())))
     finally:
         requested_off_s = time.perf_counter()
@@ -134,6 +148,14 @@ def run_task(
     daq_module_name="piplates.DAQC2plate",
     pump_pin=0,
     pump_pulse_time_seconds=0.25,
+    video_files=(),
+    video_size=(100, 100),
+    clip_duration_seconds=5.0,
+    frame_rate=30.0,
+    seek_timeout_seconds=30.0,
+    video_buffer_megabytes=DEFAULT_BUFFER_BYTES / (1024 * 1024),
+    ffprobe_bin="ffprobe",
+    seed=None,
 ) -> Path:
     uart_config = uart_config or UARTEyeTrackerConfig()
     filter_config = filter_config or EyeFilterConfig()
@@ -164,6 +186,12 @@ def run_task(
             raise ValueError("Initial scale is outside its slider limits")
     if not all(math.isfinite(value) for value in asdict(calibration).values()):
         raise ValueError("Calibration values must be finite")
+    videos = CalibrationVideoClips(
+        video_files=video_files, video_size=video_size,
+        clip_duration_seconds=clip_duration_seconds, frame_rate=frame_rate,
+        seek_timeout_seconds=seek_timeout_seconds, video_buffer_megabytes=video_buffer_megabytes,
+        ffprobe_bin=ffprobe_bin, seed=seed, raspi=raspi,
+    )
 
     # Validate DOUT addressing even in simulation, so a legacy GPIO pin (17)
     # cannot silently become an invalid plate output when the rig is enabled.
@@ -185,6 +213,11 @@ def run_task(
     last_revision = last_zero_count = 0
     last_attention_count = 0
     last_auto_reward_count = 0
+    last_video_toggle_count = 0
+    video_publisher = video_stim = None
+    video_sequence = video_clip_number = 0
+    last_video_error = None
+    status = ""
     attention_started_s = None
     last_error = None
     latest_state = None
@@ -279,6 +312,7 @@ def run_task(
                 "calibration": asdict(calibration),
                 "x_scale_limits": x_scale_limits,
                 "y_scale_limits": y_scale_limits,
+                "video_size": video_size,
             },
         )
         utils.verify_task_window_vblank(main_win)
@@ -318,6 +352,41 @@ def run_task(
             )
             return exit_requested
 
+        def draw_scene():
+            nonlocal video_stim, video_publisher, video_sequence, video_clip_number
+            position = rotate_centered_point(fraction_to_pixels(fixation, subject_size), rotation)
+            frame = videos.frame()
+            main_bg.draw()
+            if videos.enabled:
+                if video_stim is None:
+                    video_stim = make_rgb_video_stim(main_win, video_size, rotation=rotation)
+                    video_publisher = SharedVideoFrameBuffer(video_size[0] * video_size[1] * 3)
+                if frame is not None and frame.sequence != video_sequence:
+                    upload_rgb_texture(video_stim, frame.rgb)
+                    video_publisher.publish_rgb(
+                        frame.rgb, source_frame_index=frame.source_frame_index,
+                        source_media_time_s=frame.source_pts_s,
+                    )
+                    video_sequence = frame.sequence
+                    if frame.clip_number != video_clip_number:
+                        video_clip_number = frame.clip_number
+                        msg_logger.log(
+                            "INFO", f"calibration_video clip={frame.clip_number} file={frame.path} "
+                            f"source_pts_s={frame.source_pts_s:.6f} duration_s={clip_duration_seconds}",
+                        )
+                video_stim.pos = position
+                video_stim.draw()
+            else:
+                _draw_fixation_cross(cross, position, attention_started_s=attention_started_s)
+            main_win.flip()
+            preview.show_calibration_state(
+                eye_fraction=eye_fraction, eye_valid=latest_state.valid,
+                status_text=status, attention_started_s=attention_started_s,
+                video_visible=videos.enabled,
+                video_descriptor=video_publisher.descriptor() if video_publisher else None,
+                video_sequence=video_publisher.sequence if video_publisher else 0,
+            )
+
         def reward():
             auto_reward.reward_delivered(now_s=time.perf_counter())
             _deliver_reward_pulse(
@@ -326,6 +395,9 @@ def run_task(
                 pulse_duration_s=pump_pulse_time_seconds,
                 logger=logger,
                 should_exit=should_exit,
+                # Keep the attention movie moving during the software-timed
+                # pulse; the UART observation worker is already independent.
+                on_wait=draw_scene if videos.enabled else None,
             )
             # The UART callback continues both observation windows during the
             # pulse. Do not discard that history or require a fixation break.
@@ -359,6 +431,12 @@ def run_task(
                 preview.request_calibration_fixation_steps(
                     x_steps=fix_x_steps, y_steps=fix_y_steps
                 )
+            video_count = int(controls.get("video_toggle_count", 0))
+            toggles = max(main_keys.count("v"), video_count - last_video_toggle_count)
+            last_video_toggle_count = video_count
+            if toggles % 2:
+                enabled = videos.toggle()
+                msg_logger.log("INFO", f"calibration_video enabled={int(enabled)}")
             attention_count = controls.get("attention_count", 0)
             attention_requested = (
                 "f" in main_keys or attention_count != last_attention_count
@@ -447,21 +525,14 @@ def run_task(
                 status += f"\n{latest_state.error or latest_state.rejection_reason}"
             if not raspi:
                 status += "\nReward output disabled (raspi: false)"
-            preview.show_calibration_state(
-                eye_fraction=eye_fraction,
-                eye_valid=latest_state.valid,
-                status_text=status,
-                attention_started_s=attention_started_s,
-            )
-            main_bg.draw()
-            _draw_fixation_cross(
-                cross,
-                rotate_centered_point(
-                    fraction_to_pixels(fixation, subject_size), rotation
-                ),
-                attention_started_s=attention_started_s,
-            )
-            main_win.flip()
+            status += f"\nVideo {'ON' if videos.enabled else 'OFF'} (V)"
+            if videos.error:
+                status += f": {videos.error}"
+            if videos.error != last_video_error:
+                last_video_error = videos.error
+                if last_video_error:
+                    msg_logger.log("WARN", f"calibration_video_error: {last_video_error}")
+            draw_scene()
 
         save_calibration(session_logs.calibration_path)
         return session_logs.calibration_path
@@ -492,12 +563,20 @@ def run_task(
             except Exception as exc:
                 msg_logger.log("ERROR", f"eye_uart_cleanup_failed: {exc}")
         try:
+            videos.close()
+        except Exception as exc:
+            msg_logger.log("ERROR", f"calibration_video_cleanup_failed: {exc}")
+        try:
             if preview is not None:
                 preview.close()
         finally:
             try:
-                if main_win is not None:
-                    utils.close_task_window(main_win)
+                try:
+                    if video_publisher is not None:
+                        video_publisher.close()
+                finally:
+                    if main_win is not None:
+                        utils.close_task_window(main_win)
             finally:
                 session_logs.close()
 
@@ -527,6 +606,17 @@ def main():
     if args.simulate_eye is not None:
         overrides["simulate"] = args.simulate_eye
     uart_config = replace(settings.uart, **overrides)
+    video_options = {}
+    for name, default in (
+        ("video_files", ()), ("video_size", (100, 100)), ("clip_duration_seconds", 5.0),
+        ("frame_rate", 30.0), ("seek_timeout_seconds", 30.0),
+        ("video_buffer_megabytes", DEFAULT_BUFFER_BYTES / (1024 * 1024)),
+        ("ffprobe", "ffprobe"), ("seed", None),
+    ):
+        value = getattr(args, name, None)
+        video_options["ffprobe_bin" if name == "ffprobe" else name] = (
+            value if value is not None else cfg.get(name, default)
+        )
     path = run_task(
         output_dir=args.output_dir or cfg.get("output_dir", "logs"),
         config_name=cfg.get("config_name", "calibrate_eye_tracker"),
@@ -560,6 +650,7 @@ def main():
         ),
         pump_pin=int(cfg.get("pump_pin", 0)),
         pump_pulse_time_seconds=float(cfg.get("pump_pulse_time_seconds", 0.25)),
+        **video_options,
     )
     print(f"Saved eye calibration to {path}")
     sys.exit(USER_EXIT_CODE)

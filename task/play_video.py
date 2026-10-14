@@ -31,13 +31,11 @@ from bin.video_playback import (
     SharedVideoFrameBuffer,
     center_crop_bounds,
     is_raspberry_pi,
-    parse_frame_rate,
     plan_video_refresh_cadence,
     probe_video_stream,
     select_random_video_clip,
-    validate_hevc_stream,
-    video_duration_seconds,
-    video_time_origin_seconds,
+    resolve_video_files as _resolve_video_files,
+    validate_video_source,
 )
 from bin.screen import (
     ExperimenterPreview,
@@ -47,25 +45,6 @@ from bin.screen import (
     resolve_scene_size,
     software_stimulus_rotation,
 )
-
-
-def _resolve_video_files(video_files: Sequence[str]) -> list[Path]:
-    if isinstance(video_files, (str, bytes)) or not isinstance(video_files, Sequence):
-        raise ValueError("video_files must be a JSON list of video file paths")
-    if not video_files:
-        raise ValueError("video_files must contain at least one video file path")
-
-    resolved: list[Path] = []
-    for index, value in enumerate(video_files):
-        if not isinstance(value, (str, Path)) or not str(value).strip():
-            raise ValueError(f"video_files[{index}] must be a non-empty path")
-        path = Path(value).expanduser()
-        if not path.is_absolute():
-            path = path.absolute()
-        if not path.is_file():
-            raise FileNotFoundError(f"Video file not found: {path}")
-        resolved.append(path)
-    return resolved
 
 
 def parse_args():
@@ -178,44 +157,10 @@ def run_task(
         stream = probe_video_stream(video_path, ffprobe_bin=ffprobe_bin)
         if not stream:
             raise RuntimeError(f"Could not probe video stream: {video_path}")
-        validate_hevc_stream(
-            video_path,
-            stream,
-            require_pi5_compatible=bool(raspi),
+        validate_video_source(
+            video_path, stream, clip_duration_seconds=clip_duration_seconds,
+            frame_rate=frame_rate, require_pi5_compatible=bool(raspi),
         )
-        source_duration_s = video_duration_seconds(stream)
-        source_time_origin_s = video_time_origin_seconds(stream)
-        if source_duration_s <= 0.0:
-            raise ValueError(f"Video duration is missing or invalid: {video_path}")
-        if source_duration_s + 1e-9 < clip_duration_seconds:
-            raise ValueError(
-                f"Video is shorter than clip_duration_seconds: {video_path} "
-                f"({source_duration_s:.6f}s < {clip_duration_seconds:.6f}s)"
-            )
-        stream["start_time"] = source_time_origin_s
-        probed_rate = parse_frame_rate(
-            stream.get("avg_frame_rate") or stream.get("r_frame_rate")
-        )
-        if probed_rate <= 0.0:
-            raise ValueError(f"Video frame rate is missing or invalid: {video_path}")
-        if abs(probed_rate - frame_rate) > 0.001:
-            raise ValueError(
-                f"Video frame rate {probed_rate:.6f} does not match configured "
-                f"frame_rate {frame_rate:.6f}: {video_path}. Normalize the "
-                "source offline or use its exact configured rate."
-            )
-        average_rate = parse_frame_rate(stream.get("avg_frame_rate"))
-        nominal_rate = parse_frame_rate(stream.get("r_frame_rate"))
-        if (
-            average_rate > 0.0
-            and nominal_rate > 0.0
-            and abs(average_rate - nominal_rate) > 0.001
-        ):
-            raise ValueError(
-                f"Video reports inconsistent average/nominal frame rates "
-                f"({average_rate:.6f}/{nominal_rate:.6f}): {video_path}. "
-                "Normalize it to exact CFR during preprocessing."
-            )
         video_streams[video_path] = stream
 
     win, main_screen, experimenter_screen = utils.setup_task_window(

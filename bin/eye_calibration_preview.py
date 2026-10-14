@@ -19,6 +19,9 @@ from bin.eye_calibration_keys import (
 from bin.eye_tracking import clamp_fraction
 from bin.preview_text import set_preview_text
 from bin.screen import compute_centered_aspect_fit
+from bin.video_playback import (
+    SharedVideoFrameReader, make_rgb_video_stim, upload_rgb_texture,
+)
 
 
 class Slider:
@@ -431,7 +434,34 @@ class EyeCalibrationControls:
         self.zero_count = 0
         self.attention_count = 0
         self.auto_reward_count = 0
+        self.video_toggle_count = 0
         self.revision = 0
+        self.video_size = tuple(config.get("video_size", (100, 100)))
+        self.video_preview_size = tuple(
+            pixels * preview_pixels / subject_pixels
+            for pixels, preview_pixels, subject_pixels in zip(
+                self.video_size, box_size, main_size,
+            )
+        )
+        self.video_reader = self.video_stim = None
+        self.video_sequence = 0
+        # Mask pixels outside the subject scene when the fixation reaches an
+        # edge. Controls are drawn later, on top of these fixed border masks.
+        w, h = exp_size
+        bw, bh = box_size
+        self.video_masks = tuple(
+            visual.Rect(
+                win, width=mw, height=mh, pos=pos, units="pix",
+                fillColor=utils.rgb255_to_psychopy((30, 30, 30)), lineColor=None,
+                autoLog=False,
+            )
+            for mw, mh, pos in (
+                ((w - bw) / 2, h, (-(w + bw) / 4, 0)),
+                ((w - bw) / 2, h, ((w + bw) / 4, 0)),
+                (bw, (h - bh) / 2, (0, -(h + bh) / 4)),
+                (bw, (h - bh) / 2, (0, (h + bh) / 4)),
+            )
+        )
 
     def _publish_controls(self, *, calibration_changed=True):
         if calibration_changed:
@@ -448,6 +478,7 @@ class EyeCalibrationControls:
                 self.attention_count,
             ]
             self.controls_shared[9] = self.auto_reward_count
+            self.controls_shared[12] = self.video_toggle_count
 
     def _set_fixation(self, position):
         """Share click/key bounds and notify the task to reset fixation history."""
@@ -495,6 +526,9 @@ class EyeCalibrationControls:
         if "a" in keys:
             self.auto_reward_count += keys.count("a")
             self._publish_controls(calibration_changed=False)
+        if "v" in keys:
+            self.video_toggle_count += keys.count("v")
+            self._publish_controls(calibration_changed=False)
         down = bool(self.mouse.getPressed()[0])
         pos = self.mouse.getPos()
         if down and not self.last_down:
@@ -523,13 +557,34 @@ class EyeCalibrationControls:
     def draw(self, payload):
         self.bg.draw()
         self.preview_box.draw()
-        _draw_fixation_cross(
-            self.cross,
-            _fraction_to_preview(
-                self.fixation, box_center=self.box_center, box_size=self.box_size
-            ),
-            attention_started_s=payload.get("attention_started_s"),
+        fixation_pos = _fraction_to_preview(
+            self.fixation, box_center=self.box_center, box_size=self.box_size,
         )
+        descriptor = payload.get("video_descriptor")
+        if descriptor is not None and self.video_reader is None:
+            self.video_reader = SharedVideoFrameReader(**descriptor)
+            self.video_stim = make_rgb_video_stim(
+                self.win, self.video_size, size=self.video_preview_size, visual_module=visual,
+            )
+        video_visible = bool(payload.get("video_visible")) and self.video_reader is not None
+        if video_visible:
+            frame = self.video_reader.read_latest(
+                self.video_sequence, minimum_sequence=payload.get("video_sequence", 1),
+            )
+            if frame is not None:
+                upload_rgb_texture(self.video_stim, frame.rgb)
+                self.video_sequence = frame.sequence
+            # Before the first decoded frame the texture is black. Retain the
+            # last video frame during a delayed seek; only V restores the cross.
+        if video_visible:
+            self.video_stim.pos = fixation_pos
+            self.video_stim.draw()
+            for mask in self.video_masks:
+                mask.draw()
+        else:
+            _draw_fixation_cross(
+                self.cross, fixation_pos, attention_started_s=payload.get("attention_started_s"),
+            )
         # Hide invalid gaze instead of displaying last reliable coordinates as
         # a live sample. The status text explains blink/loss/staleness/errors.
         if payload.get("eye_valid", False):
@@ -547,3 +602,7 @@ class EyeCalibrationControls:
             self.status_text, payload.get("status_text", "Waiting for Eye 0 UART data")
         )
         self.status_text.draw()
+
+    def close(self):
+        if self.video_reader is not None:
+            self.video_reader.close()

@@ -344,6 +344,12 @@ class VideoPlaybackTests(unittest.TestCase):
         )
 
     def test_decode_worker_seeks_before_consuming_and_discards_stale_pts(self):
+        self._exercise_decode_worker((0, 0, 2, 2), "crop=2:2:0:0")
+
+    def test_decode_worker_scales_calibration_frames_before_shared_memory(self):
+        self._exercise_decode_worker((0, 0, 4, 4), "crop=4:4:0:0,scale=2:2")
+
+    def _exercise_decode_worker(self, crop_bounds, expected_filter):
         layout = plan_video_chunks(
             (2, 2),
             frame_count=3,
@@ -439,7 +445,7 @@ class VideoPlaybackTests(unittest.TestCase):
                     video_path="unused.mp4",
                     shared_memory_name=owner.name,
                     layout=layout,
-                    crop_bounds=(0, 0, 2, 2),
+                    crop_bounds=crop_bounds,
                     clip_start_s=10.0,
                     seek_timeout_s=1.0,
                     free_slots=free_slots,
@@ -479,7 +485,7 @@ class VideoPlaybackTests(unittest.TestCase):
             player_options = media_player_factory.call_args.kwargs["ff_opts"]
             self.assertEqual(
                 player_options["vf"],
-                ["crop=2:2:0:0"],
+                [expected_filter],
             )
             self.assertEqual(
                 messages,
@@ -487,7 +493,7 @@ class VideoPlaybackTests(unittest.TestCase):
                     (
                         "info",
                         {
-                            "video_filter": "crop=2:2:0:0",
+                            "video_filter": expected_filter,
                             "pixel_format": "rgb24",
                         },
                     ),

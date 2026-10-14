@@ -2194,6 +2194,7 @@ def _experimenter_preview_process(
         # Calibration needs interactive scale/target controls, but uses exactly
         # the same verified, non-vsync secondary window and process lifecycle
         # as task previews. Keep its renderer out of the general scene code.
+        controls = None
         try:
             from .eye_calibration_preview import EyeCalibrationControls
 
@@ -2226,7 +2227,11 @@ def _experimenter_preview_process(
             _report_startup({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
             raise
         finally:
-            win.close()
+            try:
+                if controls is not None:
+                    controls.close()
+            finally:
+                win.close()
         return
     mouse = event.Mouse(win=win)
     gaze_dot = None
@@ -2756,10 +2761,10 @@ class ExperimenterPreview:
             initial = calibration_config["calibration"]
             self._calibration_controls = self._ctx.Array(
                 "d",
-                # Slots 0:7 and 9 are preview-published controls/counters.
+                # Slots 0:7, 9 and 12 are preview-published controls/counters.
                 # Slots 7:9 (gain) and 10:12 (target) accumulate subject-window
                 # steps until consumed; scene mailbox drops cannot lose keys.
-                [initial["x_scale"], initial["y_scale"]] + [0] * 10,
+                [initial["x_scale"], initial["y_scale"]] + [0] * 11,
                 lock=True,
             )
         self._video_start_perf_shared = self._ctx.Value(
@@ -2883,7 +2888,10 @@ class ExperimenterPreview:
             "x_scale", "y_scale", "fix_x", "fix_y", "revision", "zero_count",
             "attention_count",
         )
-        return {**dict(zip(fields, values)), "auto_reward_count": values[9]}
+        return {
+            **dict(zip(fields, values)), "auto_reward_count": values[9],
+            "video_toggle_count": values[12],
+        }
 
     def request_calibration_scale_steps(self, *, x_steps: int = 0, y_steps: int = 0) -> None:
         """Queue arrow steps for the process that owns the calibration sliders."""
@@ -2901,7 +2909,8 @@ class ExperimenterPreview:
             self._calibration_controls[slot + 1] += y_steps
 
     def show_calibration_state(
-        self, *, eye_fraction, eye_valid, status_text, attention_started_s=None
+        self, *, eye_fraction, eye_valid, status_text, attention_started_s=None,
+        video_visible=False, video_descriptor=None, video_sequence=0,
     ) -> None:
         self._send({
             "type": "calibration",
@@ -2909,6 +2918,9 @@ class ExperimenterPreview:
             "eye_valid": bool(eye_valid),
             "status_text": str(status_text),
             "attention_started_s": attention_started_s,
+            "video_visible": bool(video_visible),
+            "video_descriptor": video_descriptor,
+            "video_sequence": int(video_sequence),
         })
 
     def set_trial_progress(self, current_trial_num: int, total_trials: Optional[int]) -> None:

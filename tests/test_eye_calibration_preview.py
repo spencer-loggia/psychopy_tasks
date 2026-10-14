@@ -76,7 +76,7 @@ def load_renderer():
         Mouse=Mock(return_value=mouse), getKeys=Mock(return_value=[])
     )
     psychopy.visual = types.SimpleNamespace(
-        Rect=Stimulus, Circle=Stimulus, TextStim=TextStim
+        Rect=Stimulus, Circle=Stimulus, TextStim=TextStim, ImageStim=Stimulus
     )
     utils = types.ModuleType("bin.utils")
     utils.rgb255_to_psychopy = lambda value: [2 * v / 255 - 1 for v in value]
@@ -97,7 +97,7 @@ class EyeCalibrationPreviewTests(unittest.TestCase):
     def make_controls(self, canvas=(1280, 1024), subject=(1080, 1920)):
         module, mouse = load_renderer()
         self.renderer = module
-        shared = SharedControls([0.005, -0.005] + [0] * 10)
+        shared = SharedControls([0.005, -0.005] + [0] * 11)
         controls = module.EyeCalibrationControls(
             Mock(),
             canvas,
@@ -207,6 +207,48 @@ class EyeCalibrationPreviewTests(unittest.TestCase):
         controls._publish_controls(calibration_changed=False)
         self.assertEqual(shared[7:9], [1, 0])
         self.assertEqual(shared[:7], original)
+
+    def test_v_toggle_preserves_mapping_and_pending_target_and_gain_steps(self):
+        controls, shared, _ = self.make_controls()
+        preview = object.__new__(ExperimenterPreview)
+        preview._calibration_controls = shared
+        original = shared[:7]
+        self.renderer.event.getKeys.return_value = ["v", "v", "v"]
+        controls.poll_controls()
+        self.assertEqual(preview.get_calibration_controls()["video_toggle_count"], 3)
+        self.assertEqual(shared[:7], original)
+        preview.request_calibration_fixation_steps(x_steps=1)
+        preview.request_calibration_scale_steps(y_steps=2)
+        controls._publish_controls(calibration_changed=False)
+        self.assertEqual(shared[7:9], [0, 2])
+        self.assertEqual(shared[10:12], [1, 0])
+
+    def test_video_mirror_follows_target_and_replaces_cross_until_disabled(self):
+        controls, _, mouse = self.make_controls()
+        self.click(controls, mouse, (0.2 * controls.box_size[0], -0.1 * controls.box_size[1]))
+        reader = Mock()
+        reader.read_latest.return_value = types.SimpleNamespace(sequence=5, rgb=object())
+        payload = {"video_visible": True, "video_descriptor": {}, "video_sequence": 5}
+        with patch.object(self.renderer, "SharedVideoFrameReader", return_value=reader), patch.object(
+            self.renderer, "upload_rgb_texture",
+        ) as upload:
+            controls.draw(payload)
+            video_stim = controls.video_stim
+            self.assertEqual(video_stim.pos, mouse.getPos.return_value)
+            self.assertAlmostEqual(video_stim.size[0], 100 * controls.box_size[0] / 1080)
+            self.assertAlmostEqual(video_stim.size[1], 100 * controls.box_size[1] / 1920)
+            for part in controls.cross:
+                part.draw.assert_not_called()
+            reader.read_latest.return_value = None
+            controls.draw(payload)
+            self.assertIs(controls.video_stim, video_stim)
+            upload.assert_called_once()
+            controls.draw({"video_visible": False})
+            for part in controls.cross:
+                part.draw.assert_called_once()
+            self.assertEqual(video_stim.draw.call_count, 2)
+            controls.close()
+            reader.close.assert_called_once()
 
     def test_arrows_update_values_readouts_and_knobs_from_either_window(self):
         for source in ("main", "preview"):

@@ -52,6 +52,7 @@ from .video_playback import (
     SharedVideoFrameBuffer,
     VideoRefreshCadence,
     center_crop_bounds,
+    make_rgb_video_stim,
     plan_video_refresh_cadence,
     probe_video_stream,
     upload_rgb_texture,
@@ -736,17 +737,9 @@ def play_video_fill_screen(
         if not aborted:
             if decoder_ready_callback is not None:
                 decoder_ready_callback()
-            blank_image = Image.new("RGB", prepared_size, (0, 0, 0))
-            video_stim = visual.ImageStim(
-                win,
-                image=blank_image,
-                units="pix",
-                size=draw_size,
-                pos=(0.0, 0.0),
-                ori=rotation_degrees,
-                interpolate=True,
-                flipVert=True,
-                autoLog=False,
+            video_stim = make_rgb_video_stim(
+                win, prepared_size, size=draw_size, rotation=rotation_degrees,
+                visual_module=visual,
             )
             # Exercise the exact texture-upload/draw/swap path while the
             # stimulus is still black. This moves lazy GL allocation and the

@@ -670,13 +670,35 @@ the first valid sample provides the anchor. Moving the target does not change th
 maps the current valid, smoothed eye position to that target and replaces the anchor.
 The anchor survives saving/reloading, including a gain of zero or a change of sign. Invalid gaze is hidden
 and its status is displayed. The green reward button or `r` delivers a manual pulse; Exit or Escape ends the task.
-The `f`, `z`, `r`, and `a` shortcuts work with either the subject or experimenter calibration window focused.
+The `f`, `z`, `r`, `a`, and `v` shortcuts work with either the subject or experimenter calibration window focused.
 Arrow keys also work in either window: Right/Left increase/decrease x scale, and Up/Down increase/decrease
 y scale by 0.0001 per keypress, within the slider limits. The corresponding slider and its readout update
 together. These are signed adjustments: Up moves a negative y scale toward zero. The zeroed position stays fixed.
 Press `f` with either calibration window focused to double the fixation cross (including stroke width) and
 flash it at 5 Hz for one second. It then returns to its normal size and steady display. Pressing `f` again
 restarts the cue; the target position, calibration and fixation acceptance area stay unchanged.
+
+Press **V** to toggle attention videos (initially off). Video replaces the fixation cross in a
+**100×100 subject-screen-pixel box**, centered on the current fixation location. Clicking or using
+the number pad moves the video with the target, including on rotated displays. The experimenter
+preview mirrors the video and retains the gaze marker. V off restores the cross; F animates the
+cross when it is visible. Video toggles do not change calibration or reset auto-reward fixation history.
+
+Calibration accepts the same media settings as `play_video.py`: `video_files`, `clip_duration_seconds`,
+`frame_rate`, `seek_timeout_seconds`, `video_buffer_megabytes`, `ffprobe`, and `seed`. Set `video_size`
+to `[width, height]` in pixels to change the box. The supplied calibration configs use the same
+`monkey_kingdom.mp4` path as `test_configs/play_video_config.json`, with 5-second clips at 24 fps;
+edit the paths and rate for your preprocessed HEVC files. Without a config, clip duration defaults to
+5 seconds and `frame_rate` to 30 Hz. Sources must match the configured rate, as in `play_video`.
+
+Random files and start points are selected repeatedly until V is toggled off; no `num_clips` limit
+applies. Clips are center-cropped to the box without stretching. The shared decoder prepares the next
+clip while the current clip plays and scales pixels before transfer to the display. The decoder budget
+is split between these two clips. A delayed seek holds the last video frame; initial loading shows a
+black box. File/decoder errors switch video off and appear in the status readout without aborting
+calibration. Attention clips follow elapsed time, and a slow display uses the latest frame; the full-screen
+task retains its exact-frame presentation policy. UART acquisition and calibration controls continue
+during playback, and the movie continues updating during reward pulses.
 
 Reward and fixation settings:
 

@@ -12,5 +12,18 @@
   "uart": {
     "device": "/dev/ttyAMA10",
     "baud": 460800
-  }
+  },
+  "video_files": [
+    "/mnt/data/stim_videos/preproc/monkey_kingdom.mp4"
+  ],
+  "video_size": [
+    100,
+    100
+  ],
+  "clip_duration_seconds": 5.0,
+  "frame_rate": 24,
+  "seek_timeout_seconds": 30.0,
+  "video_buffer_megabytes": 16,
+  "ffprobe": "ffprobe",
+  "seed": null
 }

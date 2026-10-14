@@ -227,6 +227,7 @@ def _queue_get_until_stopped(input_queue, stop_event) -> Optional[int]:
 
 def _build_video_filter(
     crop_bounds: Sequence[int],
+    output_size: Optional[Sequence[int]] = None,
 ) -> str:
     left, top, right, bottom = (int(value) for value in crop_bounds)
     width = right - left
@@ -238,7 +239,15 @@ def _build_video_filter(
             f"yuv420p crop bounds must have even offsets and dimensions: "
             f"{tuple(crop_bounds)}"
         )
-    return f"crop={width}:{height}:{left}:{top}"
+    video_filter = f"crop={width}:{height}:{left}:{top}"
+    if output_size is not None and tuple(output_size) != (width, height):
+        # Resize in the decoder process, before RGB crosses shared memory.
+        # Small calibration movies should not upload full-resolution textures.
+        out_w, out_h = (int(value) for value in output_size)
+        if out_w <= 0 or out_h <= 0:
+            raise ValueError("video output dimensions must be positive")
+        video_filter += f",scale={out_w}:{out_h}"
+    return video_filter
 
 
 def _decode_worker(
@@ -260,7 +269,7 @@ def _decode_worker(
         from ffpyplayer.player import MediaPlayer
 
         shm = shared_memory.SharedMemory(name=shared_memory_name, create=False)
-        video_filter = _build_video_filter(crop_bounds)
+        video_filter = _build_video_filter(crop_bounds, (layout.width, layout.height))
         ff_opts = {
             "an": True,
             "sn": True,
@@ -316,6 +325,9 @@ def _decode_worker(
             slot_index = _queue_get_until_stopped(free_slots, stop_event)
             if slot_index is None:
                 return
+            # A preloaded next clip may wait here for the current clip to end.
+            # Consumer backpressure is not a decoder timeout.
+            frame_deadline = time.monotonic() + float(seek_timeout_s)
             slot = _shared_slot_view(shm, layout, slot_index)
             first_frame_index = produced
             pts_values: list[float] = []
@@ -445,6 +457,7 @@ class BufferedVideoFrameStream:
         seek_timeout_s: float,
         memory_budget_bytes: int = DEFAULT_BUFFER_BYTES,
         context_name: str = "spawn",
+        output_size: Optional[Sequence[int]] = None,
     ):
         self.video_path = Path(video_path)
         self.source_size = (int(source_size[0]), int(source_size[1]))
@@ -469,7 +482,7 @@ class BufferedVideoFrameStream:
             raise ValueError("seek_timeout_s must be positive and finite")
 
         self.layout = plan_video_chunks(
-            (right - left, bottom - top),
+            output_size if output_size is not None else (right - left, bottom - top),
             frame_count,
             frame_rate,
             memory_budget_bytes=memory_budget_bytes,

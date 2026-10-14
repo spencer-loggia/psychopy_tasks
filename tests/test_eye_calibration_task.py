@@ -88,6 +88,30 @@ class EyeCalibrationTaskTests(unittest.TestCase):
         )
         outputs.write.assert_not_called()
 
+    def test_reward_keeps_drawing_video_and_clears_output_at_pulse_end(self):
+        task = self.task
+        now = [0.0]
+        frames = []
+        outputs, logger = Mock(), Mock()
+
+        def draw():
+            frames.append(now[0])
+            now[0] += 0.02
+
+        def wait(duration):
+            now[0] += duration
+
+        with patch.object(task.time, "perf_counter", side_effect=lambda: now[0]), patch.object(
+            task.core, "wait", side_effect=wait,
+        ):
+            task._deliver_reward_pulse(
+                outputs=outputs, pump_pin=0, pulse_duration_s=0.09,
+                logger=logger, on_wait=draw,
+            )
+        self.assertEqual(len(frames), 3)
+        self.assertAlmostEqual(now[0], 0.09)
+        self.assertEqual([call.args for call in outputs.write.call_args_list], [(0, True), (0, False)])
+
     def test_task_uses_shared_preview_windowed_rotation_and_uart_metadata(self):
         task = self.task
         win = Mock(size=(800, 600))
@@ -517,6 +541,73 @@ class EyeCalibrationTaskTests(unittest.TestCase):
         preview.close.assert_called_once()
         task.utils.close_task_window.assert_called_once_with(win)
 
+    def test_v_from_either_window_moves_rotated_video_and_restores_cross(self):
+        for source in ("main", "preview", "both"):
+            with self.subTest(source=source):
+                task = load_task()
+                win = Mock(size=(800, 600))
+                main = ScreenGeometry(index=0, name="main", width=800, height=600, x=0, y=0, rotation="normal")
+                secondary = ScreenGeometry(index=1, name="exp", width=1280, height=1024, x=800, y=0)
+                task.utils.setup_task_window.return_value = win, main, secondary
+                preview, tracker = Mock(), Mock()
+                preview.poll.side_effect = lambda: win.flip.call_count >= 4
+                preview.consume_manual_reward_request.return_value = False
+                tracker.get_state.return_value = EyeTrackerState(
+                    timestamp_perf_s=1, sample_index=1, valid=True,
+                    x_smooth_px=100, y_smooth_px=50,
+                )
+                control_frames = [
+                    {
+                        "x_scale": 0.005, "y_scale": -0.005, "zero_count": 0,
+                        "revision": 1 if frame == 0 else 2,
+                        "fix_x": 0 if frame == 0 else 0.25,
+                        "fix_y": 0 if frame == 0 else -0.1,
+                        "video_toggle_count": (1 if frame < 2 else 2) if source != "main" else 0,
+                    }
+                    for frame in range(4)
+                ]
+                preview.get_calibration_controls.side_effect = control_frames
+                key_frames = iter([
+                    ["v"] if frame in (0, 2) and source != "preview" else []
+                    for frame in range(4)
+                ])
+                videos = Mock(enabled=False, error=None)
+
+                def toggle():
+                    videos.enabled = not videos.enabled
+                    return videos.enabled
+
+                videos.toggle.side_effect = toggle
+                videos.frame.side_effect = lambda: types.SimpleNamespace(
+                    sequence=1, rgb=object(), source_frame_index=0, source_pts_s=2.0,
+                    clip_number=1, path="attention.mp4",
+                ) if videos.enabled and win.flip.call_count > 0 else None
+                stim, publisher = Mock(), Mock(sequence=1)
+                publisher.descriptor.return_value = {"name": "video", "maximum_frame_bytes": 30000}
+                positions = []
+                stim.draw.side_effect = lambda: positions.append(stim.pos)
+                with tempfile.TemporaryDirectory() as tmp, patch.object(
+                    task, "ExperimenterPreview", return_value=preview
+                ), patch.object(task, "UARTEyeTracker", return_value=tracker), patch.object(
+                    task, "CalibrationVideoClips", return_value=videos
+                ), patch.object(task, "make_rgb_video_stim", return_value=stim) as make_stim, patch.object(
+                    task, "SharedVideoFrameBuffer", return_value=publisher
+                ), patch.object(task, "upload_rgb_texture") as upload, patch.object(
+                    task.event, "getKeys", side_effect=lambda keys: next(key_frames) if "v" in keys else []
+                ):
+                    task.run_task(output_dir=tmp, fullscreen=False, video_files=["attention.mp4"])
+                self.assertEqual(videos.toggle.call_count, 2)
+                self.assertEqual(positions, [(0, 0), (-80, -150)])
+                self.assertEqual(make_stim.call_args.args[1], (100, 100))
+                self.assertEqual(make_stim.call_args.kwargs["rotation"], 90)
+                upload.assert_called_once()
+                self.assertEqual(task._draw_fixation_cross.call_count, 2)
+                self.assertEqual([
+                    call.kwargs["video_visible"] for call in preview.show_calibration_state.call_args_list
+                ], [True, True, False, False])
+                videos.close.assert_called_once()
+                publisher.close.assert_called_once()
+
     def test_main_accepts_null_calibration_values_from_experiment_manager(self):
         task = self.task
         args = types.SimpleNamespace(
@@ -538,12 +629,20 @@ class EyeCalibrationTaskTests(unittest.TestCase):
             "initial_x_scale": 0.003,
             "initial_y_scale": -0.004,
             "reward_interval": 1.5,
+            "video_files": ["attention.mp4"],
+            "video_size": [120, 80],
+            "clip_duration_seconds": 3.5,
+            "frame_rate": 24,
         }
         with patch.object(task, "parse_args", return_value=args), patch.object(
             task, "load_config", return_value=config
         ), patch.object(task, "run_task") as run, patch("builtins.print"):
             with self.assertRaises(SystemExit):
                 task.main()
+        self.assertEqual(run.call_args.kwargs["video_files"], ["attention.mp4"])
+        self.assertEqual(run.call_args.kwargs["video_size"], [120, 80])
+        self.assertEqual(run.call_args.kwargs["clip_duration_seconds"], 3.5)
+        self.assertEqual(run.call_args.kwargs["frame_rate"], 24)
         initial = run.call_args.kwargs["initial_calibration"]
         self.assertEqual(run.call_args.kwargs["reward_interval"], 1.5)
         self.assertEqual(

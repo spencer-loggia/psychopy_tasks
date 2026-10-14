@@ -97,7 +97,7 @@ class EyeCalibrationPreviewTests(unittest.TestCase):
     def make_controls(self, canvas=(1280, 1024), subject=(1080, 1920)):
         module, mouse = load_renderer()
         self.renderer = module
-        shared = SharedControls([0.005, -0.005, 0, 0, 0, 0, 0, 0, 0, 0])
+        shared = SharedControls([0.005, -0.005] + [0] * 10)
         controls = module.EyeCalibrationControls(
             Mock(),
             canvas,
@@ -259,6 +259,73 @@ class EyeCalibrationPreviewTests(unittest.TestCase):
             self.assertEqual(shared[:2], [expected, expected])
             revision = shared[4]
             preview.request_calibration_scale_steps(x_steps=steps, y_steps=steps)
+            controls.poll_controls()
+            self.assertEqual(shared[4], revision)
+
+    def test_keypad_moves_clicked_target_from_either_window_without_changing_gain(self):
+        from bin.eye_calibration_keys import fixation_key_steps
+
+        # Num Lock on/off, pygame names, and normalized digits share directions.
+        for up, right, down, left in (
+            ("num_8", "num_6", "num_2", "num_4"),
+            ("num_up", "num_right", "num_down", "num_left"),
+            ("[8]", "[6]", "[2]", "[4]"),
+            ("8", "6", "2", "4"),
+        ):
+            for source in ("main", "preview"):
+                with self.subTest(source=source, up=up):
+                    controls, shared, mouse = self.make_controls()
+                    preview = object.__new__(ExperimenterPreview)
+                    preview._calibration_controls = shared
+                    self.click(controls, mouse, (
+                        0.2 * controls.box_size[0], -0.1 * controls.box_size[1]
+                    ))
+                    for keys, expected in (
+                        ([up, up, right], (0.225, -0.05)),
+                        ([down, left], (0.2, -0.075)),
+                    ):
+                        revision = shared[4]
+                        if source == "main":
+                            for key in keys:
+                                x_steps, y_steps = fixation_key_steps([key])
+                                preview.request_calibration_fixation_steps(
+                                    x_steps=x_steps, y_steps=y_steps
+                                )
+                            # UI updates must not overwrite queued target steps.
+                            controls._publish_controls(calibration_changed=False)
+                        else:
+                            self.renderer.event.getKeys.return_value = keys
+                        controls.poll_controls()
+                        controls.draw({})
+                        self.assertTrue(all(
+                            key in self.renderer.event.getKeys.call_args.kwargs["keyList"]
+                            for key in keys
+                        ))
+                        snapshot = preview.get_calibration_controls()
+                        for axis, fraction, size, center, pixel in zip(
+                            ("x", "y"), expected, controls.box_size,
+                            controls.box_center, controls.cross[0].pos,
+                        ):
+                            self.assertAlmostEqual(snapshot[f"fix_{axis}"], fraction)
+                            self.assertAlmostEqual(pixel, center + fraction * size)
+                        self.assertGreater(snapshot["revision"], revision)
+                        self.assertEqual(shared[:2], [0.005, -0.005])
+                        self.assertEqual(shared[5:7], [0, 0])
+                        self.assertEqual(shared[10:12], [0, 0])
+                        self.renderer.event.getKeys.return_value = []
+                        controls.poll_controls()
+                        self.assertEqual(preview.get_calibration_controls(), snapshot)
+
+    def test_keypad_stops_at_screen_edges_without_resetting_history_again(self):
+        controls, shared, _ = self.make_controls()
+        preview = object.__new__(ExperimenterPreview)
+        preview._calibration_controls = shared
+        for steps, expected in ((100, 0.5), (-100, -0.5)):
+            preview.request_calibration_fixation_steps(x_steps=steps, y_steps=steps)
+            controls.poll_controls()
+            self.assertEqual(shared[2:4], [expected, expected])
+            revision = shared[4]
+            preview.request_calibration_fixation_steps(x_steps=steps, y_steps=steps)
             controls.poll_controls()
             self.assertEqual(shared[4], revision)
 

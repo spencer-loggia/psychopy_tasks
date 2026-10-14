@@ -2757,9 +2757,9 @@ class ExperimenterPreview:
             self._calibration_controls = self._ctx.Array(
                 "d",
                 # Slots 0:7 and 9 are preview-published controls/counters.
-                # Slots 7:9 accumulate subject-window arrow steps until the
-                # preview consumes them; scene mailbox drops cannot lose keys.
-                [initial["x_scale"], initial["y_scale"], 0, 0, 0, 0, 0, 0, 0, 0],
+                # Slots 7:9 (gain) and 10:12 (target) accumulate subject-window
+                # steps until consumed; scene mailbox drops cannot lose keys.
+                [initial["x_scale"], initial["y_scale"]] + [0] * 10,
                 lock=True,
             )
         self._video_start_perf_shared = self._ctx.Value(
@@ -2887,11 +2887,18 @@ class ExperimenterPreview:
 
     def request_calibration_scale_steps(self, *, x_steps: int = 0, y_steps: int = 0) -> None:
         """Queue arrow steps for the process that owns the calibration sliders."""
+        self._request_calibration_steps(7, x_steps, y_steps)
+
+    def request_calibration_fixation_steps(self, *, x_steps: int = 0, y_steps: int = 0) -> None:
+        """Queue keypad steps for the process that owns the fixation target."""
+        self._request_calibration_steps(10, x_steps, y_steps)
+
+    def _request_calibration_steps(self, slot: int, x_steps: int, y_steps: int) -> None:
         if self._calibration_controls is None:
             raise RuntimeError("Preview was not opened with calibration controls")
         with self._calibration_controls.get_lock():
-            self._calibration_controls[7] += x_steps
-            self._calibration_controls[8] += y_steps
+            self._calibration_controls[slot] += x_steps
+            self._calibration_controls[slot + 1] += y_steps
 
     def show_calibration_state(
         self, *, eye_fraction, eye_valid, status_text, attention_started_s=None

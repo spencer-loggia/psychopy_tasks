@@ -19,6 +19,7 @@ from psychopy import core, event, logging as pylogging
 from bin import utils
 from bin.config import load_config
 from bin.daqc2_outputs import DAQC2DigitalOutputs
+from bin.eye_calibration_keys import CALIBRATION_KEYS, fixation_key_steps
 from bin.eye_calibration_preview import _make_fixation_cross, _draw_fixation_cross
 from bin.eye_calibration_reward import CalibrationAutoReward
 from bin.eye_tracking_config import load_eye_tracking_settings
@@ -344,14 +345,19 @@ def run_task(
             controls = preview.get_calibration_controls()
             # Each window owns its keyboard events. Merge subject-window keys
             # with the preview's requests before applying any action, so both
-            # focus paths share zeroing, attention and reward behavior. Arrow
-            # requests go to the slider owner and return as a normal revision.
-            main_keys = event.getKeys(["f", "z", "r", "a", "up", "down", "right", "left"])
+            # focus paths share zeroing, attention and reward behavior. Gain and
+            # target steps go to the UI owner and return as a normal revision.
+            main_keys = event.getKeys(CALIBRATION_KEYS)
             x_steps = main_keys.count("right") - main_keys.count("left")
             y_steps = main_keys.count("up") - main_keys.count("down")
             if x_steps or y_steps:
                 preview.request_calibration_scale_steps(
                     x_steps=x_steps, y_steps=y_steps
+                )
+            fix_x_steps, fix_y_steps = fixation_key_steps(main_keys)
+            if fix_x_steps or fix_y_steps:
+                preview.request_calibration_fixation_steps(
+                    x_steps=fix_x_steps, y_steps=fix_y_steps
                 )
             attention_count = controls.get("attention_count", 0)
             attention_requested = (

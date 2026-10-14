@@ -11,6 +11,11 @@ import time
 from typing import Sequence, Tuple
 from psychopy import event, visual
 from bin import utils
+from bin.eye_calibration_keys import (
+    CALIBRATION_KEYS,
+    FIXATION_STEP_FRACTION,
+    fixation_key_steps,
+)
 from bin.eye_tracking import clamp_fraction
 from bin.preview_text import set_preview_text
 from bin.screen import compute_centered_aspect_fit
@@ -432,8 +437,8 @@ class EyeCalibrationControls:
         if calibration_changed:
             self.revision += 1
         with self.controls_shared.get_lock():
-            # Leave pending main-window arrow steps untouched. Only this
-            # process writes slider values, avoiding stale UI overwrites.
+            # Leave pending main-window gain/target steps untouched. Only this
+            # process writes control values, avoiding stale UI overwrites.
             self.controls_shared[:7] = [
                 self.x_slider.value,
                 self.y_slider.value,
@@ -444,13 +449,20 @@ class EyeCalibrationControls:
             ]
             self.controls_shared[9] = self.auto_reward_count
 
+    def _set_fixation(self, position):
+        """Share click/key bounds and notify the task to reset fixation history."""
+        position = tuple(clamp_fraction(value) for value in position)
+        if position != self.fixation:
+            self.fixation = position
+            self._publish_controls()
+
     def poll_controls(self):
-        keys = event.getKeys(
-            keyList=["escape", "r", "z", "f", "a", "up", "down", "right", "left"]
-        )
+        keys = event.getKeys(keyList=("escape", *CALIBRATION_KEYS))
         with self.controls_shared.get_lock():
             x_steps, y_steps = self.controls_shared[7:9]
             self.controls_shared[7:9] = [0, 0]
+            fix_x_steps, fix_y_steps = self.controls_shared[10:12]
+            self.controls_shared[10:12] = [0, 0]
         # Use the same sliders for both focus paths and retain repeated keys
         # between preview frames. Signed scales change numerically, even below 0.
         x_changed = self.x_slider.nudge(
@@ -461,6 +473,13 @@ class EyeCalibrationControls:
         )
         if x_changed or y_changed:
             self._publish_controls()
+        local_x, local_y = fixation_key_steps(keys)
+        # Work in subject-scene fractions, as clicks do; the main task applies
+        # display rotation when drawing. Preview resizing never changes a step.
+        self._set_fixation((
+            self.fixation[0] + (fix_x_steps + local_x) * FIXATION_STEP_FRACTION,
+            self.fixation[1] + (fix_y_steps + local_y) * FIXATION_STEP_FRACTION,
+        ))
         if "escape" in keys:
             self.exit_event.set()
         if "r" in keys:
@@ -491,10 +510,9 @@ class EyeCalibrationControls:
             elif self.y_slider.contains(pos):
                 self.dragging = self.y_slider
             elif self.preview_box.contains(pos):
-                self.fixation = _preview_to_fraction(
+                self._set_fixation(_preview_to_fraction(
                     pos, box_center=self.box_center, box_size=self.box_size
-                )
-                self._publish_controls()
+                ))
         if down and self.dragging is not None:
             self.dragging.set_from_pos(pos)
             self._publish_controls()

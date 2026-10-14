@@ -397,11 +397,13 @@ class EyeCalibrationTaskTests(unittest.TestCase):
             ),
         ]
         key_frames = iter([
-            [], ["f", "z", "r", "right", "right", "up"] if main_request else [], []
+            [], ["f", "z", "r", "right", "right", "up",
+                 "num_8", "num_8", "num_6", "num_2", "num_4", "num_6"]
+            if main_request else [], []
         ])
 
         def get_keys(keys):
-            return next(key_frames) if "f" in keys else []
+            return [key for key in next(key_frames) if key in keys] if "f" in keys else []
 
         def wait(duration):
             clock[0] += duration
@@ -447,8 +449,10 @@ class EyeCalibrationTaskTests(unittest.TestCase):
         self.assertAlmostEqual(off_times[1] - on_times[0], 0.25)
         if main_request:
             preview.request_calibration_scale_steps.assert_called_once_with(x_steps=2, y_steps=1)
+            preview.request_calibration_fixation_steps.assert_called_once_with(x_steps=1, y_steps=1)
         else:
             preview.request_calibration_scale_steps.assert_not_called()
+            preview.request_calibration_fixation_steps.assert_not_called()
         starts = [
             call.kwargs["attention_started_s"]
             for call in preview.show_calibration_state.call_args_list

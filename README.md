@@ -661,7 +661,10 @@ Eye data and calibration:
 - Output fractions refer to the oriented subject scene, including the actual window size in windowed mode:
   x=-0.5 is left, x=0.5 right, y=-0.5 bottom and y=0.5 top. The preview preserves that scene's aspect ratio.
 
-Click the preview to move the fixation target. The bottom and left sliders adjust x/y gain around the last
+Click the preview to move the fixation target, or use **number-pad 8/6/2/4** for up/right/down/left
+with either calibration window focused. Each keypress moves it by 2.5% of the subject-scene width or
+height, stopping at the screen edges. Plain 8/6/2/4 also work. Moving the target resets auto-reward
+fixation history just as clicking does. The bottom and left sliders adjust x/y gain around the last
 zeroed eye position, keeping that position fixed while changing sensitivity to movement. Before the first zero,
 the first valid sample provides the anchor. Moving the target does not change this anchor; `zero` (or `z`)
 maps the current valid, smoothed eye position to that target and replaces the anchor.

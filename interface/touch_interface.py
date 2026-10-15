@@ -52,6 +52,8 @@ from interface.experiment_manager import (
     task_run_sequence,
 )
 from interface.experiment_quiet_mode import create_experiment_quiet_mode
+from interface.experiment_eye_tracker import request_eye_tracker_shutdown
+from bin.eye_tracker_warnings import show_eye_tracker_warning
 from bin.task_lifecycle import (
     TASK_WINDOW_READY_ENV,
     TASK_WINDOW_RELEASE_ENV,
@@ -1120,6 +1122,8 @@ class TouchInterfaceApp:
             messagebox.showerror("System Diagnostic", report)
 
     def _render_subject_selection(self) -> None:
+        if getattr(self, "cleanup_active", False):
+            return
         self._clear_buttons()
         self.page_title_var.set("Select Subject")
         self.status_var.set("Choose the subject to start a new experiment")
@@ -1215,6 +1219,8 @@ class TouchInterfaceApp:
         self._place_button(button, row_idx)
 
     def _exit_to_desktop(self) -> None:
+        if getattr(self, "cleanup_active", False):
+            return
         if self.task_active:
             self.status_var.set("Cannot exit to desktop while a task is running")
             return
@@ -1386,6 +1392,28 @@ class TouchInterfaceApp:
                 if not self._ask_retry_data_network():
                     break
 
+            self.cleanup_active = True
+            future = request_eye_tracker_shutdown(self.cfg)
+        except Exception as exc:
+            self.cleanup_active = False
+            self.status_var.set("Shutdown failed")
+            messagebox.showerror("Shutdown Error", str(exc))
+            return
+        self._finish_shutdown(future)
+
+    def _finish_shutdown(self, tracker_future) -> None:
+        if tracker_future is not None:
+            if not tracker_future.done():
+                self.status_var.set("Waiting for eye tracker shutdown acknowledgement...")
+                self.root.after(100, lambda: self._finish_shutdown(tracker_future))
+                return
+            try:
+                tracker_future.result()
+            except Exception as exc:
+                show_eye_tracker_warning(
+                    f"Eye tracker shutdown failed: {exc}. Local shutdown will continue."
+                )
+        try:
             subprocess.run(
                 self._shutdown_command(),
                 check=True,
@@ -1394,11 +1422,13 @@ class TouchInterfaceApp:
                 text=True,
             )
         except subprocess.CalledProcessError as exc:
+            self.cleanup_active = False
             detail = (exc.stderr or exc.stdout or str(exc)).strip()
             self.status_var.set("Shutdown failed")
             messagebox.showerror("Shutdown Error", detail)
             return
         except Exception as exc:
+            self.cleanup_active = False
             self.status_var.set("Shutdown failed")
             messagebox.showerror("Shutdown Error", str(exc))
             return

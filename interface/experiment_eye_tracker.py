@@ -16,6 +16,58 @@ from bin.eye_tracker_wire.protocol import StatusFlag
 _COMMANDS = ThreadPoolExecutor(max_workers=1, thread_name_prefix="experiment-uart")
 
 
+def _experiment_uart(config):
+    options = config.get("eye_tracker_experiment", {})
+    if not isinstance(options, dict):
+        raise ValueError("eye_tracker_experiment must be a JSON object")
+    enabled = options.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("eye_tracker_experiment.enabled must be true or false")
+    if not enabled:
+        return None
+    uart = options.get("uart", {})
+    if not isinstance(uart, dict):
+        raise ValueError("eye_tracker_experiment.uart must be a JSON object")
+    return UARTEyeTrackerConfig(**uart)
+
+
+def request_eye_tracker_shutdown(config):
+    """Queue power-off after prior experiment commands, even from the root menu.
+
+    The caller waits asynchronously for the returned future before local power-off.
+    Tracker failures warn but never veto local shutdown.
+    """
+    warnings = EyeTrackerWarnings()
+    try:
+        uart = _experiment_uart(config)
+        if uart is None or uart.simulate:
+            return None
+        return _COMMANDS.submit(_shutdown_eye_tracker, uart, warnings)
+    except Exception as exc:
+        warnings.warn("shutdown", f"Could not request eye tracker shutdown: {exc}")
+        return None
+
+
+def _shutdown_eye_tracker(uart, warnings):
+    try:
+        with SerialPacketChannel(uart.device, baud=uart.baud) as channel:
+            controller = EyeTrackerController(
+                channel,
+                response_timeout_s=uart.response_timeout_s,
+                state_timeout_s=uart.state_timeout_s,
+                retries=uart.state_retries,
+            )
+            status = controller.shutdown()
+            if status.flags & StatusFlag.ERROR or not status.flags & StatusFlag.SHUTTING_DOWN:
+                warnings.warn(
+                    "shutdown", "The eye tracker did not confirm SHUTTING_DOWN. Local shutdown will continue."
+                )
+    except Exception as exc:
+        warnings.warn(
+            "shutdown", f"Eye tracker shutdown could not be confirmed: {exc}. Local shutdown will continue."
+        )
+
+
 class ExperimentEyeTracker:
     def __init__(self, config, *, subject: str, started_at: dt.datetime, directory: Path):
         self.warnings = EyeTrackerWarnings()
@@ -31,19 +83,8 @@ class ExperimentEyeTracker:
         self.start_future = None
         self.stop_future = None
         try:
-            options = config.get("eye_tracker_experiment", {})
-            if not isinstance(options, dict):
-                raise ValueError("eye_tracker_experiment must be a JSON object")
-            enabled = options.get("enabled", False)
-            if not isinstance(enabled, bool):
-                raise ValueError("eye_tracker_experiment.enabled must be true or false")
-            if not enabled:
-                return
-            uart = options.get("uart", {})
-            if not isinstance(uart, dict):
-                raise ValueError("eye_tracker_experiment.uart must be a JSON object")
-            self.uart = UARTEyeTrackerConfig(**uart)
-            if self.uart.simulate:
+            self.uart = _experiment_uart(config)
+            if self.uart is None or self.uart.simulate:
                 return
             self.pending_path.touch()
             self.start_future = _COMMANDS.submit(self._send, start=True)

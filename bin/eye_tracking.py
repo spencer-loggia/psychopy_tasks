@@ -189,7 +189,7 @@ class EyePositionFilter:
         if (
             status.flags & required != required
             or status.configured_eye_count < 1
-            or status.flags & StatusFlag.CALIBRATING
+            or status.flags & (StatusFlag.CALIBRATING | StatusFlag.SHUTTING_DOWN)
         ):
             return self.invalidate("not_tracking_or_configured")
         age_s = status.result_age_ms / 1000.0 + max(0.0, round_trip_s)
@@ -307,6 +307,8 @@ class UARTEyeTracker:
             problems["status"] = f"Eye tracker reported an error ({status.status.name}); gaze may be unavailable."
         if status.flags & StatusFlag.CALIBRATING:
             problems["calibrating"] = "Eye tracker is in calibration mode; tracking/recording may not have started."
+        if status.flags & StatusFlag.SHUTTING_DOWN:
+            problems["shutdown"] = "Eye tracker is shutting down; eye measurements are unavailable."
         if not status.flags & StatusFlag.TRACKING:
             problems["tracking"] = "Eye tracker did not start tracking, or tracking has stopped."
         if not status.flags & StatusFlag.CONFIGURED or status.configured_eye_count < 1:

@@ -67,6 +67,15 @@ or error telemetry is unusable. Local eye CSV failures also warn without abortin
 
 Experiment synchronization defaults to disabled when this launcher section is absent;
 set `enabled` to `false` (or `uart.simulate` to `true`) for hardware-free operation.
+With synchronization enabled, the interface's **Shutdown** button also sends binary UART
+`SHUTDOWN` (code 8), even after End Experiment has returned to the root menu. It runs
+after data cleanup is accepted and after any queued experiment commands. The interface
+stays responsive while awaiting the matching `SHUTTING_DOWN` acknowledgement or the
+configured timeout/retries, then requests local power-off. Tracker failures show a warning
+and still allow local shutdown; cancelling data cleanup sends no shutdown command.
+The tracker acknowledgement confirms application cleanup and acceptance of the request,
+not that its operating system has finished powering off. The tracker process must have
+permission to request system power-off.
 The launcher UART device/baud must match the task's UART settings and physical wiring.
 Experiment start opens the tracker session; each eye-enabled task still controls tracking
 through `START_TRACKING` / `STOP_TRACKING`.

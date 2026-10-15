@@ -530,6 +530,7 @@ class TouchInterfaceShutdownTests(unittest.TestCase):
         app = object.__new__(TouchInterfaceApp)
         app.task_active = False
         app.cleanup_active = False
+        app.cfg = {}
         app.status_var = Mock()
         app.root = Mock()
         app.cleanup = Mock()
@@ -584,12 +585,65 @@ class TouchInterfaceShutdownTests(unittest.TestCase):
         app = self._app()
         app.cleanup.return_value = CleanupResult.CANCELLED
 
-        with patch("interface.touch_interface.subprocess.run") as run:
+        with patch("interface.touch_interface.subprocess.run") as run, patch(
+            "interface.touch_interface.request_eye_tracker_shutdown"
+        ) as tracker_shutdown:
             app._shutdown_system()
 
         run.assert_not_called()
+        tracker_shutdown.assert_not_called()
         app._ask_retry_data_network.assert_not_called()
         app.status_var.set.assert_called_with("Shutdown cancelled")
+
+    def test_tracker_shutdown_finishes_before_local_shutdown_without_blocking_ui(self):
+        from concurrent.futures import Future
+
+        app = self._app()
+        app.cfg = {"eye_tracker_experiment": {"enabled": True}}
+        app.experiment = None  # End Experiment has already returned to the root menu.
+        app.cleanup.return_value = CleanupResult.SUCCESS
+        future = Future()
+        with patch("interface.touch_interface.request_eye_tracker_shutdown", return_value=future) as shutdown, patch(
+            "interface.touch_interface.subprocess.run"
+        ) as run:
+            app._shutdown_system()
+            shutdown.assert_called_once_with(app.cfg)
+            run.assert_not_called()
+            self.assertTrue(app.cleanup_active)
+            delay, resume = app.root.after.call_args.args
+            self.assertEqual(delay, 100)
+            # Another click cannot enqueue a duplicate command or start a task.
+            app._shutdown_system()
+            shutdown.assert_called_once()
+            future.set_result(None)
+            resume()
+            run.assert_called_once()
+            app.status_var.set.assert_called_with("Shutdown requested")
+
+    def test_tracker_failure_warns_and_still_powers_off_locally(self):
+        from concurrent.futures import Future
+
+        app = self._app()
+        app.cleanup.return_value = CleanupResult.SUCCESS
+        future = Future()
+        future.set_exception(RuntimeError("no UART"))
+        with patch("interface.touch_interface.request_eye_tracker_shutdown", return_value=future), patch(
+            "interface.touch_interface.subprocess.run"
+        ) as run, patch("interface.touch_interface.show_eye_tracker_warning") as warning:
+            app._shutdown_system()
+        run.assert_called_once()
+        warning.assert_called_once()
+        self.assertIn("no UART", warning.call_args.args[0])
+
+    def test_failed_local_shutdown_releases_ui_for_retry(self):
+        app = self._app()
+        app.cleanup.return_value = CleanupResult.SUCCESS
+        with patch("interface.touch_interface.subprocess.run", side_effect=OSError("poweroff denied")), patch(
+            "interface.touch_interface.messagebox.showerror"
+        ):
+            app._shutdown_system()
+        self.assertFalse(app.cleanup_active)
+        app.status_var.set.assert_called_with("Shutdown failed")
 
     def test_repeated_failure_prompts_until_no_then_proceeds(self):
         app = self._app()

@@ -45,6 +45,22 @@ def status_bytes(*, sequence=42, code=0, edits=()):
 
 
 class UARTProtocolTests(unittest.TestCase):
+    def test_shutdown_matches_upstream_and_retries_identical_command(self):
+        channel = Mock()
+        channel.exchange.side_effect = [ResponseTimeout("lost ACK"), bytes.fromhex(FIXTURE["shutdown_status"])]
+        controller = EyeTrackerController(channel, initial_sequence=42, retries=1, retry_delay_s=0)
+        with patch("bin.eye_tracker_wire.controller.time.monotonic_ns", return_value=111222333):
+            status = controller.shutdown()
+        self.assertEqual(status.flags, StatusFlag.SHUTTING_DOWN)
+        calls = channel.exchange.call_args_list
+        self.assertEqual(calls[0].args[0].hex(), FIXTURE["shutdown_command"])
+        self.assertEqual(calls[0].args[0], calls[1].args[0])
+        packet = decode_command(calls[0].args[0])
+        self.assertEqual(packet.code, CommandCode.SHUTDOWN)
+        self.assertEqual(packet.flags, 0)
+        self.assertIsNone(packet.subject)
+        self.assertEqual(calls[0].args[0][24:60], bytes(36))
+
     def test_experiment_commands_match_upstream_packets_and_new_status_flags(self):
         start = CommandPacket(CommandCode.START_EXPERIMENT, 42, 1791988200123456000, subject="Yuri")
         self.assertEqual(encode_command(start).hex(), FIXTURE["start_experiment"])
@@ -101,7 +117,7 @@ class UARTProtocolTests(unittest.TestCase):
         for edits in (
             ((2, 2),),
             ((3, 1),),
-            ((4, 128),),
+            ((5, 1),),
             ((35, 3),),
             ((35, 0),),
             ((32, 0), (33, 0)),

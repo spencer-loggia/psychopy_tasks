@@ -56,6 +56,15 @@ class EyeTrackingTests(unittest.TestCase):
         tracker._check_status(sample())
         self.warning.assert_not_called()
 
+    def test_shutting_down_flag_warns_and_invalidates_gaze(self):
+        tracker = UARTEyeTracker()
+        status = sample(flags=StatusFlag.TRACKING | StatusFlag.CONFIGURED | StatusFlag.RECORDING | StatusFlag.SHUTTING_DOWN)
+        tracker.filter.consume(status, now_s=time.perf_counter())
+        tracker._check_status(status)
+        self.assertFalse(tracker.get_state().valid)
+        self.warning.assert_called_once()
+        self.assertIn("shutting down", self.warning.call_args.args[0])
+
     def test_error_and_calibration_flags_warn_without_accepting_gaze(self):
         tracker = UARTEyeTracker()
         status = sample(flags=StatusFlag.CALIBRATING | StatusFlag.EXPERIMENT_ACTIVE | StatusFlag.ERROR)

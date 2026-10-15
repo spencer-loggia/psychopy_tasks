@@ -17,3 +17,8 @@ checkout's staged Pi Tracker changes on HEAD
 `de4b8ca753f25d4da21cd98253d01ff2a63c76ae`. These changes were not yet committed
 upstream. `tests/fixtures/eye_uart_v1.json` includes experiment packets generated
 by that checkout's codec, as well as the original telemetry fixtures.
+
+SHUTDOWN (command 8), SHUTTING_DOWN (status bit 7), and the controller shutdown
+helper were synchronized on 2026-10-15 from companion commit
+`44ac5f50ee27c6a2a6896cf0efe472b20130cf9c`. The fixture file also includes its
+codec-generated shutdown command and acknowledgement.

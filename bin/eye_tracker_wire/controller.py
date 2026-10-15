@@ -192,6 +192,10 @@ class EyeTrackerController:
     def stop_experiment(self) -> DecodedStatus:
         return self.send_state_command(CommandCode.STOP_EXPERIMENT)
 
+    def shutdown(self) -> DecodedStatus:
+        """Finalize the tracker experiment and request clean system power-off."""
+        return self.send_state_command(CommandCode.SHUTDOWN)
+
     def _send_state_packet(self, command: CommandPacket) -> DecodedStatus:
         sequence = command.sequence
         command_packet = encode_command(command)

@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 from bin.eye_tracking import EXPERIMENT_UART_PENDING_ENV, UARTEyeTracker, UARTEyeTrackerConfig
 from bin.eye_tracker_wire.protocol import StatusFlag
-from interface.experiment_eye_tracker import ExperimentEyeTracker
+from interface.experiment_eye_tracker import ExperimentEyeTracker, request_eye_tracker_shutdown
 
 
 class ExperimentEyeTrackerTests(unittest.TestCase):
@@ -28,6 +28,57 @@ class ExperimentEyeTrackerTests(unittest.TestCase):
         self.addCleanup(controller.stop)
         self.controller.start_experiment.return_value = Mock(flags=StatusFlag.EXPERIMENT_ACTIVE)
         self.controller.stop_experiment.return_value = Mock(flags=StatusFlag(0))
+        self.controller.shutdown.return_value = Mock(flags=StatusFlag.SHUTTING_DOWN)
+
+    def test_shutdown_uses_configured_uart_without_an_active_experiment(self):
+        request_eye_tracker_shutdown(self.config).result(timeout=2)
+        self.channel.assert_called_once_with("/dev/test", baud=460800)
+        self.controller.shutdown.assert_called_once_with()
+        self.controller.start_experiment.assert_not_called()
+        self.channel.return_value.__exit__.assert_called_once()
+        self.warning.assert_not_called()
+
+    def test_shutdown_waits_behind_pending_experiment_stop(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def slow_stop():
+            entered.set()
+            release.wait(2)
+            return Mock(flags=StatusFlag(0))
+
+        tracker = self.create()
+        tracker.start_future.result(timeout=2)
+        self.controller.stop_experiment.side_effect = slow_stop
+        tracker.finish()
+        future = request_eye_tracker_shutdown(self.config)
+        try:
+            self.assertTrue(entered.wait(1))
+            self.assertFalse(future.done())
+            self.controller.shutdown.assert_not_called()
+        finally:
+            release.set()
+            future.result(timeout=2)
+        self.controller.shutdown.assert_called_once()
+
+    def test_shutdown_failures_warn_without_failing_future(self):
+        self.controller.shutdown.side_effect = RuntimeError("no acknowledgement")
+        request_eye_tracker_shutdown(self.config).result(timeout=2)
+        self.warning.assert_called_once()
+        self.assertIn("Local shutdown will continue", self.warning.call_args.args[0])
+
+    def test_shutdown_requires_shutting_down_flag_without_error(self):
+        for flags in (StatusFlag(0), StatusFlag.SHUTTING_DOWN | StatusFlag.ERROR):
+            with self.subTest(flags=flags):
+                self.warning.reset_mock()
+                self.controller.shutdown.return_value = Mock(flags=flags)
+                request_eye_tracker_shutdown(self.config).result(timeout=2)
+                self.warning.assert_called_once()
+
+    def test_shutdown_disabled_and_simulation_never_send_uart(self):
+        for config in ({}, {"eye_tracker_experiment": {"enabled": False}},
+                       {"eye_tracker_experiment": {"enabled": True, "uart": {"simulate": True}}}):
+            self.assertIsNone(request_eye_tracker_shutdown(config))
+        self.channel.assert_not_called()
 
     def create(self, **kwargs):
         return ExperimentEyeTracker(

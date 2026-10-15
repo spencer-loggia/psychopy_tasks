@@ -7,6 +7,7 @@ import atexit
 from contextlib import contextmanager
 from dataclasses import dataclass
 import io
+import math
 import multiprocessing as mp
 import os
 import queue
@@ -1778,6 +1779,7 @@ def _experimenter_preview_process(
     calibration_config=None,
     calibration_controls_shared=None,
     eye_tracking_shared=None,
+    calibration_actions_queue=None,
 ) -> None:
     startup_reported = False
 
@@ -2205,6 +2207,7 @@ def _experimenter_preview_process(
                 calibration_controls_shared,
                 reward_event,
                 exit_event,
+                actions_queue=calibration_actions_queue,
             )
             payload = {}
             controls.draw(payload)
@@ -2757,16 +2760,22 @@ class ExperimenterPreview:
         self._exit_event = self._ctx.Event()
         self._stop_event = self._ctx.Event()
         self._calibration_controls = None
+        self._calibration_actions = None
         if calibration_config is not None:
-            initial = calibration_config["calibration"]
+            from .eye_tracking import EyeCalibration
+
+            initial = EyeCalibration(**calibration_config["calibration"])
             self._calibration_controls = self._ctx.Array(
                 "d",
-                # Slots 0:7, 9 and 12 are preview-published controls/counters.
+                # Slots 0:7, 9, 12 and 13 are preview controls/counters.
                 # Slots 7:9 (gain) and 10:12 (target) accumulate subject-window
                 # steps until consumed; scene mailbox drops cannot lose keys.
-                [initial["x_scale"], initial["y_scale"]] + [0] * 11,
+                # Slots 14:18 hold fitted gains, request token, applied token.
+                [initial.x_gain, initial.y_gain] + [0] * 16,
                 lock=True,
             )
+            # Point edits are ordered events, not latest-only scene state.
+            self._calibration_actions = self._ctx.Queue()
         self._video_start_perf_shared = self._ctx.Value(
             "d",
             float("nan"),
@@ -2794,6 +2803,7 @@ class ExperimenterPreview:
                 calibration_config,
                 self._calibration_controls,
                 eye_tracking_shared,
+                self._calibration_actions,
             ),
             daemon=True,
         )
@@ -2803,6 +2813,7 @@ class ExperimenterPreview:
             startup_sender.close()
             startup_receiver.close()
             self._queue.close()
+            self._close_calibration_actions()
             self._closed = True
             raise RuntimeError(
                 f"Experimenter preview process could not start: "
@@ -2831,6 +2842,7 @@ class ExperimenterPreview:
                 self._process.terminate()
             self._process.join(timeout=1.0)
             self._queue.close()
+            self._close_calibration_actions()
             self._closed = True
             raise RuntimeError(
                 f"Experimenter preview failed to realize on "
@@ -2884,14 +2896,47 @@ class ExperimenterPreview:
             raise RuntimeError("Preview was not opened with calibration controls")
         with self._calibration_controls.get_lock():
             values = list(self._calibration_controls[:])
+        if values[16] != values[17]:
+            # The task may poll again before the UI consumes a fitted gain.
+            # Never let that stale UI snapshot revert the fitted transform.
+            values[:2] = values[14:16]
         fields = (
             "x_scale", "y_scale", "fix_x", "fix_y", "revision", "zero_count",
             "attention_count",
         )
-        return {
+        snapshot = {
             **dict(zip(fields, values)), "auto_reward_count": values[9],
             "video_toggle_count": values[12],
+            "delete_count": values[13],
         }
+        actions_queue = getattr(self, "_calibration_actions", None)
+        if actions_queue is not None:
+            # Always expose the list, even while the Queue feeder is pending:
+            # consumers must not replay legacy counters during that delay.
+            snapshot["point_actions"] = []
+            while True:
+                try:
+                    snapshot["point_actions"].append(actions_queue.get_nowait())
+                except queue.Empty:
+                    break
+        return snapshot
+
+    def _close_calibration_actions(self) -> None:
+        actions_queue = getattr(self, "_calibration_actions", None)
+        if actions_queue is not None:
+            actions_queue.cancel_join_thread()
+            actions_queue.close()
+
+    def set_calibration_gains(self, *, x_scale: float, y_scale: float) -> None:
+        """Synchronize fitted gains without moving the target or losing UI keys."""
+        if self._calibration_controls is None:
+            raise RuntimeError("Preview was not opened with calibration controls")
+        gains = (float(x_scale), float(y_scale))
+        if not all(math.isfinite(value) for value in gains):
+            raise ValueError("Calibration gains must be finite")
+        with self._calibration_controls.get_lock():
+            self._calibration_controls[14:16] = gains
+            self._calibration_controls[16] += 1
 
     def request_calibration_scale_steps(self, *, x_steps: int = 0, y_steps: int = 0) -> None:
         """Queue arrow steps for the process that owns the calibration sliders."""
@@ -2911,6 +2956,7 @@ class ExperimenterPreview:
     def show_calibration_state(
         self, *, eye_fraction, eye_valid, status_text, attention_started_s=None,
         video_visible=False, video_descriptor=None, video_sequence=0,
+        calibration_points=(),
     ) -> None:
         self._send({
             "type": "calibration",
@@ -2921,6 +2967,7 @@ class ExperimenterPreview:
             "video_visible": bool(video_visible),
             "video_descriptor": video_descriptor,
             "video_sequence": int(video_sequence),
+            "calibration_points": [list(point) for point in calibration_points],
         })
 
     def set_trial_progress(self, current_trial_num: int, total_trials: Optional[int]) -> None:
@@ -3187,5 +3234,9 @@ class ExperimenterPreview:
         try:
             self._queue.cancel_join_thread()
             self._queue.close()
+        except Exception:
+            pass
+        try:
+            self._close_calibration_actions()
         except Exception:
             pass

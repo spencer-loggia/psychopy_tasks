@@ -28,8 +28,11 @@ EYE_DATA_FIELDS = (
 class EyeDataRecorder:
     """Record at an independent fixed cadence using the event log's time origin.
 
-    Screen pixels are centered native-window coordinates (right/up positive),
-    matching task stimulus positions. Pupil diameter stays in camera pixels;
+    Screen pixels are native PsychoPy coordinates (centered, right/up positive),
+    matching task stimulus positions: x = screen_x - W/2, y = H/2 - screen_y
+    for top-left-origin screen pixels. Calibration axes remain relative to the
+    subject; X11 normal requires a 90-degree clockwise turn, so subject up is
+    native right and subject left is native up. Pupil diameter stays in camera pixels;
     screen calibration cannot convert a pupil measurement to physical units.
     """
 

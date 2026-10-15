@@ -75,7 +75,9 @@ class EyeTrackingConfigTests(unittest.TestCase):
         self.assertEqual(settings.gain_anchor_px, (80, 40))
 
     def test_latest_embedded_history_or_flat_calibration(self):
-        calibration = EyeCalibration(x_offset=-0.5, y_offset=0.3)
+        calibration = EyeCalibration(
+            x_offset=-0.5, y_offset=0.3, x_cross=0.001, y_cross=-0.002
+        )
         for fields in (
             asdict(calibration),
             {"eye_tracker_calibration": calibration.to_json_dict()},
@@ -98,6 +100,97 @@ class EyeTrackingConfigTests(unittest.TestCase):
                     load_eye_tracking_settings(config).calibration, calibration
                 )
 
+    def test_legacy_four_coefficient_calibration_defaults_cross_terms_to_zero(self):
+        legacy = {"x_scale": 0.001, "y_scale": -0.002, "x_offset": -0.4, "y_offset": 0.2}
+        settings = load_eye_tracking_settings(
+            {"eye_tracking": {"enabled": True}, "eye_tracker_calibration": legacy}
+        )
+        self.assertEqual(settings.calibration, EyeCalibration(**legacy))
+        self.assertEqual(settings.calibration.x_cross, 0)
+        self.assertEqual(settings.calibration.y_cross, 0)
+
+    def test_affine_cross_terms_round_trip_file_and_flat_overrides(self):
+        calibration = EyeCalibration(x_cross=0.003, y_cross=-0.004)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "calibration.json"
+            path.write_text(json.dumps({"eye_tracker_calibration": calibration.to_json_dict()}))
+            config = {"eye_tracking": {"enabled": True, "calibration_file": str(path)}}
+            self.assertEqual(load_eye_tracking_settings(config).calibration, calibration)
+            config.update(x_cross=-0.002, y_cross=None)
+            loaded = load_eye_tracking_settings(config).calibration
+            self.assertEqual(loaded.x_cross, -0.002)
+            self.assertEqual(loaded.y_cross, -0.004)
+
+    def test_calibration_initial_cross_terms_are_supported(self):
+        settings = load_eye_tracking_settings(
+            {"initial_x_cross": 0.003, "initial_y_cross": -0.002},
+            for_calibration=True,
+        )
+        self.assertEqual(settings.calibration.x_cross, 0.003)
+        self.assertEqual(settings.calibration.y_cross, -0.002)
+
+    def test_zero_gain_directions_survive_saved_file_and_history_round_trip(self):
+        for initial, zero_gains in (
+            (EyeCalibration(x_scale=0, y_scale=0, x_cross=0.01, y_cross=-0.02), (0, 0)),
+            (EyeCalibration(x_scale=0.003, x_cross=-0.004, y_cross=0.006, y_scale=0.008), (0, 0)),
+            (EyeCalibration(x_scale=0.003, x_cross=0.004, y_cross=-0.006, y_scale=0.008), (0, 0.01)),
+        ):
+            with self.subTest(initial=initial, zero_gains=zero_gains):
+                anchor = (100, 50)
+                anchor_position = initial.map_position(*anchor)
+                initial.set_gains(x_scale=zero_gains[0], y_scale=zero_gains[1], anchor_px=anchor)
+                saved = initial.to_json_dict()
+                # Runtime direction caches must not change the coefficient API.
+                self.assertEqual(
+                    set(asdict(initial)),
+                    {"x_scale", "y_scale", "x_offset", "y_offset", "x_cross", "y_cross"},
+                )
+                initial.set_gains(x_scale=-0.025, y_scale=0.012, anchor_px=anchor)
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = Path(tmp) / "calibration.json"
+                    path.write_text(json.dumps({"eye_tracker_calibration": saved}))
+                    configurations = (
+                        {"eye_tracking": {"enabled": True, "calibration_file": str(path)}},
+                        {"eye_tracking": {"enabled": True}, "eye_tracker_calibration": [saved]},
+                        {"eye_tracking": {"enabled": True}, **saved},
+                    )
+                    for cfg in configurations:
+                        loaded = load_eye_tracking_settings(cfg).calibration
+                        loaded.set_gains(x_scale=-0.025, y_scale=0.012, anchor_px=anchor)
+                        for key, value in asdict(initial).items():
+                            self.assertAlmostEqual(getattr(loaded, key), value)
+                        for actual, expected in zip(loaded.map_position(*anchor), anchor_position):
+                            self.assertAlmostEqual(actual, expected)
+
+    def test_nonzero_coefficients_override_saved_zero_gain_direction(self):
+        calibration = EyeCalibration(x_scale=0, y_scale=0, x_cross=0.01, y_cross=-0.02)
+        calibration.set_gains(x_scale=0, y_scale=0, anchor_px=(100, 50))
+        loaded = load_eye_tracking_settings({
+            "eye_tracking": {"enabled": True},
+            "eye_tracker_calibration": calibration.to_json_dict(),
+            "x_scale": 0.005, "y_scale": -0.005,
+        }).calibration
+        loaded.set_gains(x_scale=0.01, y_scale=-0.01, anchor_px=(100, 50))
+        self.assertEqual((loaded.x_scale, loaded.y_scale), (0.01, -0.01))
+        self.assertEqual((loaded.x_cross, loaded.y_cross), (0, 0))
+
+    def test_invalid_saved_gain_directions_are_rejected(self):
+        for directions in (
+            [], {}, {"x": [1, 0]}, {"x": [1, 0], "y": [0, 1], "z": [1, 0]},
+            {"x": [1], "y": [0, 1]}, {"x": [0, 0], "y": [0, 1]},
+            {"x": [2, 0], "y": [0, 1]}, {"x": [-1, 0], "y": [0, 1]},
+            {"x": [1, 0], "y": [0, -1]}, {"x": [float("nan"), 0], "y": [0, 1]},
+            {"x": [1, 0], "y": [float("inf"), 0]}, {"x": [True, 0], "y": [0, 1]},
+            {"x": [None, 0], "y": [0, 1]},
+        ):
+            with self.subTest(directions=directions), self.assertRaisesRegex(ValueError, "gain_directions"):
+                load_eye_tracking_settings({
+                    "eye_tracking": {"enabled": True},
+                    "eye_tracker_calibration": {
+                        **EyeCalibration().to_json_dict(), "gain_directions": directions,
+                    },
+                })
+
     def test_recording_rate_defaults_to_60_and_can_be_set_independently_of_uart(self):
         cfg = {**asdict(EyeCalibration()), "eye_tracking": {"enabled": True}}
         self.assertEqual(load_eye_tracking_settings(cfg).record_rate_hz, 60)
@@ -116,6 +209,8 @@ class EyeTrackingConfigTests(unittest.TestCase):
             {"eye_id": 1},
             {"coordinate_units": "pixels"},
             {"x_scale": float("nan")},
+            {"x_cross": float("inf")},
+            {"y_cross": float("nan")},
             {"gain_anchor_px": [1]},
             {"gain_anchor_px": [1, float("inf")]},
             {"uart": {"simulate": "false"}},

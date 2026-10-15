@@ -3,6 +3,7 @@
 from contextlib import nullcontext
 import importlib.util
 from pathlib import Path
+import queue
 import sys
 import threading
 import types
@@ -94,10 +95,17 @@ def load_renderer():
 
 
 class EyeCalibrationPreviewTests(unittest.TestCase):
-    def make_controls(self, canvas=(1280, 1024), subject=(1080, 1920)):
+    def make_controls(
+        self, canvas=(1280, 1024), subject=(1080, 1920), calibration=None,
+        actions_queue=None,
+    ):
+        from bin.eye_tracking import EyeCalibration
+
         module, mouse = load_renderer()
         self.renderer = module
-        shared = SharedControls([0.005, -0.005] + [0] * 11)
+        calibration = calibration or {"x_scale": 0.005, "y_scale": -0.005}
+        mapping = EyeCalibration(**calibration)
+        shared = SharedControls([mapping.x_gain, mapping.y_gain] + [0] * 16)
         controls = module.EyeCalibrationControls(
             Mock(),
             canvas,
@@ -107,13 +115,14 @@ class EyeCalibrationPreviewTests(unittest.TestCase):
                 "fixation_color": (0, 0, 0),
                 "fixation_cross_size": 40,
                 "fixation_cross_weight": 6,
-                "calibration": {"x_scale": 0.005, "y_scale": -0.005},
+                "calibration": calibration,
                 "x_scale_limits": (-0.02, 0.02),
                 "y_scale_limits": (-0.02, 0.02),
             },
             shared,
             threading.Event(),
             threading.Event(),
+            actions_queue=actions_queue,
         )
         return controls, shared, mouse
 
@@ -180,6 +189,178 @@ class EyeCalibrationPreviewTests(unittest.TestCase):
         controls.poll_controls()
         self.assertEqual(preview.get_calibration_controls()["attention_count"], 2)
         self.assertEqual(shared[:6], calibration_before)
+
+    def test_delete_and_backspace_publish_removal_count_without_moving_target(self):
+        controls, shared, _ = self.make_controls()
+        preview = object.__new__(ExperimenterPreview)
+        preview._calibration_controls = shared
+        self.renderer.event.getKeys.return_value = ["delete", "backspace", "delete"]
+        controls.poll_controls()
+        snapshot = preview.get_calibration_controls()
+        self.assertEqual(snapshot["delete_count"], 3)
+        self.assertEqual(snapshot["zero_count"], 0)
+        self.assertEqual(shared[:4], [0.005, -0.005, 0, 0])
+        self.assertIn("delete", self.renderer.event.getKeys.call_args.kwargs["keyList"])
+
+    def test_point_action_queue_preserves_delete_add_and_add_delete_order(self):
+        for keys, expected in (
+            (["delete", "z"], ["delete", "add"]),
+            (["z", "delete"], ["add", "delete"]),
+            (["backspace", "z", "z"], ["delete", "add", "add"]),
+        ):
+            with self.subTest(keys=keys):
+                actions_queue = queue.Queue()
+                controls, shared, _ = self.make_controls(actions_queue=actions_queue)
+                preview = object.__new__(ExperimenterPreview)
+                preview._calibration_controls = shared
+                preview._calibration_actions = actions_queue
+                self.renderer.event.getKeys.return_value = keys
+                controls.poll_controls()
+                snapshot = preview.get_calibration_controls()
+                self.assertEqual(
+                    [item["action"] for item in snapshot["point_actions"]], expected,
+                )
+                self.assertEqual(snapshot["zero_count"], keys.count("z"))
+                self.assertEqual(snapshot["delete_count"], 1)
+                self.assertEqual(preview.get_calibration_controls()["point_actions"], [])
+
+    def test_point_actions_capture_target_before_subsequent_keypad_movement(self):
+        actions_queue = queue.Queue()
+        controls, shared, _ = self.make_controls(actions_queue=actions_queue)
+        preview = object.__new__(ExperimenterPreview)
+        preview._calibration_controls = shared
+        preview._calibration_actions = actions_queue
+        self.renderer.event.getKeys.return_value = ["z", "num_6", "z", "num_8"]
+        controls.poll_controls()
+        snapshot = preview.get_calibration_controls()
+        self.assertEqual(snapshot["point_actions"], [
+            {"action": "add", "target_fraction": [0.0, 0.0]},
+            {"action": "add", "target_fraction": [0.025, 0.0]},
+        ])
+        self.assertEqual((snapshot["fix_x"], snapshot["fix_y"]), (0.025, 0.025))
+
+    def test_add_button_enqueues_target_after_keyboard_point_actions(self):
+        actions_queue = queue.Queue()
+        controls, shared, mouse = self.make_controls(actions_queue=actions_queue)
+        preview = object.__new__(ExperimenterPreview)
+        preview._calibration_controls = shared
+        preview._calibration_actions = actions_queue
+        controls._set_fixation((0.1, -0.2))
+        self.renderer.event.getKeys.return_value = ["delete"]
+        mouse.getPos.return_value = controls.zero_button[0].pos
+        mouse.getPressed.return_value = (True, False, False)
+        controls.poll_controls()
+        self.assertEqual(preview.get_calibration_controls()["point_actions"], [
+            {"action": "delete"},
+            {"action": "add", "target_fraction": [0.1, -0.2]},
+        ])
+
+    def test_delayed_queue_feeder_still_exposes_empty_point_actions(self):
+        controls, shared, _ = self.make_controls()
+        preview = object.__new__(ExperimenterPreview)
+        preview._calibration_controls = shared
+        preview._calibration_actions = Mock()
+        action = {"action": "add", "target_fraction": [0, 0]}
+        preview._calibration_actions.get_nowait.side_effect = [queue.Empty, action, queue.Empty]
+        self.renderer.event.getKeys.return_value = ["z"]
+        controls.poll_controls()
+        delayed = preview.get_calibration_controls()
+        self.assertEqual(delayed["zero_count"], 1)
+        self.assertEqual(delayed["point_actions"], [])
+        received = preview.get_calibration_controls()
+        self.assertEqual(received["zero_count"], 1)
+        self.assertEqual(received["point_actions"], [action])
+
+    def test_retained_calibration_dots_use_subject_fraction_mapping(self):
+        controls, _, _ = self.make_controls()
+        points = [(0.2, -0.1), (-0.3, 0.4)]
+        drawn = []
+        marker = controls.calibration_dot
+        marker.draw.side_effect = lambda: drawn.append(marker.pos)
+        payload = {"calibration_points": points}
+        controls.draw(payload)
+        controls.draw(payload)
+        expected = [
+            (controls.box_center[0] + x * controls.box_size[0],
+             controls.box_center[1] + y * controls.box_size[1])
+            for x, y in points
+        ]
+        self.assertEqual(drawn, expected * 2)
+        self.assertIs(controls.calibration_dot, marker)
+        self.assertEqual(marker.fillColor, [1, -1, -1])
+        controls.draw({"calibration_points": points[:1]})
+        self.assertEqual(drawn[-1], expected[0])
+        self.assertEqual(len(drawn), 5)
+
+    def test_fitted_gains_sync_without_stale_values_or_target_revision_changes(self):
+        controls, shared, _ = self.make_controls()
+        preview = object.__new__(ExperimenterPreview)
+        preview._calibration_controls = shared
+        controls._set_fixation((0.2, -0.1))
+        revision = shared[4]
+        preview.set_calibration_gains(x_scale=0.04, y_scale=-0.08)
+        # Main process sees the fit before the renderer receives it.
+        snapshot = preview.get_calibration_controls()
+        self.assertEqual((snapshot["x_scale"], snapshot["y_scale"]), (0.04, -0.08))
+        self.assertEqual(shared[:2], [0.005, -0.005])
+        # Publishing another action during that delay cannot restore old gains.
+        controls._publish_controls(calibration_changed=False)
+        self.assertEqual(shared[:2], [0.04, -0.08])
+        self.assertEqual(shared[4], revision)
+        controls.poll_controls()
+        controls.draw({})
+        self.assertEqual(preview.get_calibration_controls(), snapshot)
+        self.assertEqual(controls.fixation, (0.2, -0.1))
+        self.assertEqual(controls.x_slider.value, 0.04)
+        self.assertEqual(controls.y_slider.value, -0.08)
+        self.assertGreater(controls.x_slider.value_max, 0.04)
+        self.assertLess(controls.y_slider.value_min, -0.08)
+        self.assertIn("0.0400", controls.x_slider.text.text)
+        # Changing the target after acknowledgement preserves the fitted gains.
+        controls._set_fixation((-0.1, 0.3))
+        self.assertEqual(shared[:2], [0.04, -0.08])
+
+    def test_initial_sliders_show_signed_affine_row_gains(self):
+        controls, shared, _ = self.make_controls(calibration={
+            "x_scale": 0.003, "x_cross": 0.004,
+            "y_cross": -0.04, "y_scale": 0.03,
+        })
+        self.assertAlmostEqual(controls.x_slider.value, 0.005)
+        self.assertAlmostEqual(controls.y_slider.value, -0.05)
+        self.assertEqual(shared[:2], [controls.x_slider.value, controls.y_slider.value])
+        self.assertLess(controls.y_slider.value_min, -0.05)
+
+    def test_manual_gain_changes_follow_fit_and_next_fit_replaces_manual_values(self):
+        controls, shared, _ = self.make_controls()
+        preview = object.__new__(ExperimenterPreview)
+        preview._calibration_controls = shared
+        preview.set_calibration_gains(x_scale=0.01, y_scale=-0.015)
+        preview.request_calibration_scale_steps(x_steps=2, y_steps=-1)
+        controls.poll_controls()
+        self.assertAlmostEqual(shared[0], 0.0102)
+        self.assertAlmostEqual(shared[1], -0.0151)
+        self.renderer.event.getKeys.return_value = ["left", "up"]
+        controls.poll_controls()
+        self.assertAlmostEqual(shared[0], 0.0101)
+        self.assertAlmostEqual(shared[1], -0.0150)
+        self.renderer.event.getKeys.return_value = []
+        preview.set_calibration_gains(x_scale=0.03, y_scale=0.04)
+        preview.set_calibration_gains(x_scale=-0.06, y_scale=0.07)
+        controls.poll_controls()
+        self.assertEqual(shared[:2], [-0.06, 0.07])
+        self.assertEqual(shared[7:9], [0, 0])
+
+    def test_calibration_state_payload_carries_all_retained_points(self):
+        preview = object.__new__(ExperimenterPreview)
+        preview._send = Mock()
+        preview.show_calibration_state(
+            eye_fraction=(0, 0), eye_valid=False, status_text="waiting",
+            calibration_points=[(0.1, 0.2), (-0.2, -0.3)],
+        )
+        self.assertEqual(
+            preview._send.call_args.args[0]["calibration_points"],
+            [[0.1, 0.2], [-0.2, -0.3]],
+        )
 
     def test_r_key_requests_one_manual_reward(self):
         controls, shared, _ = self.make_controls()
@@ -371,27 +552,32 @@ class EyeCalibrationPreviewTests(unittest.TestCase):
             controls.poll_controls()
             self.assertEqual(shared[4], revision)
 
-    def test_attention_cross_doubles_flashes_and_restores_after_one_second(self):
+    def test_attention_cross_flashes_all_rainbow_colors_and_restores_after_one_second(self):
         controls, _, _ = self.make_controls()
         sizes = [(part.width, part.height) for part in controls.cross]
         payload = {"attention_started_s": 100.0}
-        # The actual renderer is shared with the subject window. Sample both
-        # phases and the end boundary; dimensions must never compound.
-        for now, scale, draws in (
-            (100.0, 2, 1),
-            (100.15, 2, 1),
-            (100.25, 2, 2),
-            (100.95, 2, 2),
-            (101.0, 1, 3),
-        ):
+        base_colors = [part.fillColor for part in controls.cross]
+        # Sample the middle of each on/off phase, avoiding float boundaries.
+        for phase in range(14):
+            now = 100 + (phase + 0.5) / 14
             with self.subTest(now=now), patch.object(
                 self.renderer.time, "perf_counter", return_value=now
             ):
                 controls.draw(payload)
+                color = self.renderer.utils.rgb255_to_psychopy(
+                    self.renderer._RAINBOW_COLORS[phase // 2]
+                )
                 for part, base_size in zip(controls.cross, sizes):
-                    self.assertEqual(part.size, tuple(v * scale for v in base_size))
-                    self.assertEqual(part.draw.call_count, draws)
+                    self.assertEqual(part.size, tuple(v * 2 for v in base_size))
+                    self.assertEqual(part.draw.call_count, phase // 2 + 1)
+                    self.assertEqual(part.fillColor, color)
                     self.assertEqual(part.pos, (0, 0))
+        with patch.object(self.renderer.time, "perf_counter", return_value=101.0):
+            controls.draw(payload)
+        for part, base_size, base_color in zip(controls.cross, sizes, base_colors):
+            self.assertEqual(part.size, base_size)
+            self.assertEqual(part.fillColor, base_color)
+            self.assertEqual(part.draw.call_count, 8)
 
     def test_changing_readouts_do_not_allocate_layouts_over_long_run(self):
         controls, _, _ = self.make_controls()
@@ -423,7 +609,7 @@ class EyeCalibrationPreviewTests(unittest.TestCase):
             self.assertEqual(label.text, stim.text)
             self.assertEqual(stim.text_assignments, 0)
             self.assertFalse(stim.autoLog)
-        self.assertEqual(controls.y_slider.text.text, "y scale\n-0.0050")
+        self.assertEqual(controls.y_slider.text.text, "subject Y gain\n-0.0050")
         self.assertIn("999.99", controls.status_text.text)
 
     def test_preview_text_releases_layout_when_styling_requires_replacement(self):

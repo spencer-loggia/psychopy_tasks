@@ -15,11 +15,12 @@ _project_root = Path(__file__).resolve().parents[1]
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from psychopy import core, event, logging as pylogging
+from psychopy import core, event, visual, logging as pylogging
 from bin import utils
 from bin.config import load_config
 from bin.daqc2_outputs import DAQC2DigitalOutputs
 from bin.eye_calibration_keys import CALIBRATION_KEYS, fixation_key_steps
+from bin.eye_calibration_fit import AffineCalibrationFit
 from bin.eye_calibration_preview import _make_fixation_cross, _draw_fixation_cross
 from bin.eye_calibration_reward import CalibrationAutoReward
 from bin.eye_calibration_video import CalibrationVideoClips
@@ -170,10 +171,7 @@ def run_task(
         raise ValueError("reward_interval must be positive and finite")
     if reward_interval <= pump_pulse_time_seconds:
         raise ValueError("reward_interval must be longer than pump_pulse_time_seconds")
-    for limits, value in (
-        (x_scale_limits, calibration.x_scale),
-        (y_scale_limits, calibration.y_scale),
-    ):
+    for limits in (x_scale_limits, y_scale_limits):
         if (
             len(limits) != 2
             or not all(math.isfinite(v) for v in limits)
@@ -182,10 +180,14 @@ def run_task(
             raise ValueError(
                 "Scale limits must contain two finite numbers in increasing order"
             )
-        if not limits[0] <= value <= limits[1]:
-            raise ValueError("Initial scale is outside its slider limits")
     if not all(math.isfinite(value) for value in asdict(calibration).values()):
         raise ValueError("Calibration values must be finite")
+    # An automatic fit may exceed the original manual slider range. Reopening
+    # that calibration must preserve it and keep both gains reachable.
+    x_scale_limits = (min(x_scale_limits[0], calibration.x_gain), max(x_scale_limits[1], calibration.x_gain))
+    y_scale_limits = (min(y_scale_limits[0], calibration.y_gain), max(y_scale_limits[1], calibration.y_gain))
+    point_fit = AffineCalibrationFit(calibration)
+    point_anchors = []
     videos = CalibrationVideoClips(
         video_files=video_files, video_size=video_size,
         clip_duration_seconds=clip_duration_seconds, frame_rate=frame_rate,
@@ -211,6 +213,8 @@ def run_task(
     fixation = (0.0, 0.0)
     auto_reward = None
     last_revision = last_zero_count = 0
+    last_delete_count = 0
+    last_control_gains = (calibration.x_gain, calibration.y_gain)
     last_attention_count = 0
     last_auto_reward_count = 0
     last_video_toggle_count = 0
@@ -243,6 +247,7 @@ def run_task(
                 "main_native_size_px": list(main_size),
                 "main_rotation_deg": rotation,
                 "gain_anchor_px": gain_anchor_px,
+                "calibration_points": [asdict(point) for point in point_fit.points],
                 "completion_status": "interrupted" if error else "complete",
                 "fixation_acceptance": {
                     "fix_diameter": fix_diameter,
@@ -344,6 +349,10 @@ def run_task(
         )
         for part in cross:
             part.ori = rotation
+        calibration_dot = visual.Circle(
+            main_win, radius=5, fillColor=(1, -1, -1), lineColor=None,
+            units="pix", autoLog=False,
+        )
 
         def should_exit():
             nonlocal exit_requested
@@ -378,6 +387,11 @@ def run_task(
                 video_stim.draw()
             else:
                 _draw_fixation_cross(cross, position, attention_started_s=attention_started_s)
+            for point in point_fit.points:
+                calibration_dot.pos = rotate_centered_point(
+                    fraction_to_pixels(point.target_fraction, subject_size), rotation,
+                )
+                calibration_dot.draw()
             main_win.flip()
             preview.show_calibration_state(
                 eye_fraction=eye_fraction, eye_valid=latest_state.valid,
@@ -385,6 +399,7 @@ def run_task(
                 video_visible=videos.enabled,
                 video_descriptor=video_publisher.descriptor() if video_publisher else None,
                 video_sequence=video_publisher.sequence if video_publisher else 0,
+                calibration_points=[point.target_fraction for point in point_fit.points],
             )
 
         def reward():
@@ -405,7 +420,7 @@ def run_task(
         while not should_exit():
             latest_state = tracker.get_state()
             if gain_anchor_px is None and latest_state.valid:
-                # Hold one reference throughout slider drags. Zero explicitly
+                # Hold one reference throughout slider drags. Capturing a point
                 # replaces it; moving the fixation target must not replace it.
                 gain_anchor_px = latest_state.smoothed_position
             if latest_state.error != last_error:
@@ -417,7 +432,7 @@ def run_task(
             controls = preview.get_calibration_controls()
             # Each window owns its keyboard events. Merge subject-window keys
             # with the preview's requests before applying any action, so both
-            # focus paths share zeroing, attention and reward behavior. Gain and
+            # focus paths share point capture, attention and reward behavior. Gain and
             # target steps go to the UI owner and return as a normal revision.
             main_keys = event.getKeys(CALIBRATION_KEYS)
             x_steps = main_keys.count("right") - main_keys.count("left")
@@ -443,39 +458,64 @@ def run_task(
             )
             last_attention_count = attention_count
             controls_changed = controls["revision"] != last_revision
-            zero_requested = (
-                "z" in main_keys or controls["zero_count"] != last_zero_count
-            )
-            if controls_changed or zero_requested:
+            delete_count = int(controls.get("delete_count", 0))
+            main_point_actions = [
+                {"action": "add" if key == "z" else "delete"}
+                for key in main_keys if key in ("z", "delete", "backspace")
+            ]
+            if "point_actions" in controls:
+                # Preview events carry the target at keypress time. The queue
+                # preserves Delete/Z ordering even when several keys arrive
+                # between polls, or the live target has since moved.
+                point_actions = [*controls["point_actions"], *main_point_actions]
+            else:
+                # Accept older control snapshots without double-counting a key
+                # reported by both focus paths. Current previews use the queue.
+                extra_adds = max(0, int(controls["zero_count"]) - last_zero_count - main_keys.count("z"))
+                extra_deletes = max(0, delete_count - last_delete_count - main_keys.count("delete") - main_keys.count("backspace"))
+                point_actions = (
+                    [{"action": "add"}] * extra_adds
+                    + [{"action": "delete"}] * extra_deletes
+                    + main_point_actions
+                )
+            if controls_changed or point_actions:
                 if controls_changed:
-                    if gain_anchor_px is not None:
+                    gains = (controls["x_scale"], controls["y_scale"])
+                    if gains != last_control_gains:
                         calibration.set_gains(
-                            x_scale=controls["x_scale"],
-                            y_scale=controls["y_scale"],
-                            anchor_px=gain_anchor_px,
+                            x_scale=gains[0], y_scale=gains[1],
+                            anchor_px=gain_anchor_px or (0.0, 0.0),
                         )
-                    else:
-                        # No observed position exists to anchor yet. This only
-                        # initializes sensitivity; invalid data never sets offsets.
-                        calibration.x_scale = controls["x_scale"]
-                        calibration.y_scale = controls["y_scale"]
+                    last_control_gains = gains
                     fixation = (controls["fix_x"], controls["fix_y"])
-                if zero_requested:
-                    if latest_state.valid:
-                        gain_anchor_px = latest_state.smoothed_position
-                        calibration.set_offsets_for_fixation(
-                            fixation_fraction=fixation,
-                            x_px=latest_state.x_smooth_px,
-                            y_px=latest_state.y_smooth_px,
-                        )
-                    else:
-                        msg_logger.log(
-                            "WARN", "offset_set_ignored: Eye 0 sample is invalid"
-                        )
+                points_changed = False
+                for action in point_actions:
+                    if action["action"] == "add":
+                        if latest_state.valid:
+                            point_anchors.append(gain_anchor_px)
+                            point_fit.add_point(
+                                raw_px=latest_state.smoothed_position,
+                                target_fraction=action.get("target_fraction", fixation),
+                            )
+                            gain_anchor_px = latest_state.smoothed_position
+                            points_changed = True
+                        else:
+                            msg_logger.log(
+                                "WARN", "calibration_point_ignored: Eye 0 sample is invalid"
+                            )
+                    elif action["action"] == "delete" and point_fit.remove_last_point() is not None:
+                        gain_anchor_px = point_anchors.pop()
+                        points_changed = True
+                if points_changed:
+                    last_control_gains = (calibration.x_gain, calibration.y_gain)
+                    preview.set_calibration_gains(
+                        x_scale=calibration.x_gain, y_scale=calibration.y_gain,
+                    )
                 last_revision, last_zero_count = (
                     controls["revision"],
                     controls["zero_count"],
                 )
+                last_delete_count = delete_count
                 auto_reward.set_mapping(calibration, fixation, now_s=time.perf_counter())
                 msg_logger.log(
                     "INFO",
@@ -513,7 +553,7 @@ def run_task(
                 # request restarts the one-second cue rather than queuing it.
                 attention_started_s = time.perf_counter()
                 msg_logger.log(
-                    "INFO", "fixation_attention duration_s=1 frequency_hz=5 scale=2"
+                    "INFO", "fixation_attention duration_s=1 frequency_hz=7 scale=2 colors=rainbow"
                 )
             status = (
                 f"Eye 0 ({latest_state.x_smooth_px:.2f}, {latest_state.y_smooth_px:.2f}) px  "
@@ -526,6 +566,7 @@ def run_task(
             if not raspi:
                 status += "\nReward output disabled (raspi: false)"
             status += f"\nVideo {'ON' if videos.enabled else 'OFF'} (V)"
+            status += f"\nCalibration points: {len(point_fit.points)} (Z add, Delete undo)"
             if videos.error:
                 status += f": {videos.error}"
             if videos.error != last_video_error:

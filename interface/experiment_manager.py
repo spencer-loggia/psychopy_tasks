@@ -33,6 +33,9 @@ from interface.experiment_eye_tracker import ExperimentEyeTracker
 BLOCKS_FILENAME = "blocks.tsv"
 STATE_FILENAME = "state.json"
 BLOCK_CONFIG_FILENAME = "config.json"
+_EYE_CALIBRATION_COEFFICIENTS = (
+    "x_scale", "y_scale", "x_offset", "y_offset", "x_cross", "y_cross",
+)
 BLOCK_FIELDS = (
     "block_name",
     "block_num",
@@ -276,7 +279,7 @@ class ExperimentManager:
         block_config["subject"] = self.subject_name
         block_config.update(injected)
         resolve_eye_tracking_paths(block_config, self.launch_config_path.parent)
-        # History intentionally retains only declared scalar state fields.
+        # History retains declared scalar fields and all affine eye coefficients.
         # Also reference the accepted source artifact so enabled eye tracking
         # inherits UART/filter settings, units and the gain anchor losslessly.
         if self._eye_calibration_path is not None:
@@ -355,6 +358,16 @@ class ExperimentManager:
             if not isinstance(candidate, dict):
                 continue
             required_fields = [key for key in history[-1] if key != "set_time"]
+            if state_name == "eye_tracker_calibration":
+                # Older launch configs declare only diagonal gains and offsets.
+                # Keep fitted cross terms in state so block-level overrides do
+                # not silently reduce a full affine calibration to that schema.
+                # A later legacy calibration must explicitly clear cross terms
+                # from the previous fit, rather than inheriting stale values.
+                candidate = {"x_cross": 0.0, "y_cross": 0.0, **candidate}
+                required_fields = list(dict.fromkeys(
+                    [*required_fields, *_EYE_CALIBRATION_COEFFICIENTS]
+                ))
             if not all(field in candidate for field in required_fields):
                 continue
             entry = {field: copy.deepcopy(candidate[field]) for field in required_fields}

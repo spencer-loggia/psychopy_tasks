@@ -3,6 +3,7 @@
 import importlib.util
 from dataclasses import replace
 import json
+import math
 from pathlib import Path
 import sys
 import tempfile
@@ -21,6 +22,7 @@ def load_task():
     psychopy = types.ModuleType("psychopy")
     psychopy.core = types.SimpleNamespace(wait=lambda _: None)
     psychopy.event = types.SimpleNamespace(getKeys=lambda *args, **kwargs: [])
+    psychopy.visual = types.SimpleNamespace(Circle=Mock())
     psychopy.logging = types.SimpleNamespace(console=Mock(), CRITICAL=50)
     utils = types.ModuleType("bin.utils")
     for name in (
@@ -51,6 +53,150 @@ def load_task():
 class EyeCalibrationTaskTests(unittest.TestCase):
     def setUp(self):
         self.task = load_task()
+
+    def test_points_fit_affine_sync_sliders_and_snap_back_after_manual_gain_edit(self):
+        task = self.task
+        win = Mock(size=(800, 600))
+        main = ScreenGeometry(0, 0, 0, 800, 600, rotation="normal")
+        secondary = ScreenGeometry(1, 800, 0, 800, 600)
+        task.utils.setup_task_window.return_value = win, main, secondary
+        preview, tracker = Mock(), Mock()
+        preview.poll.side_effect = lambda: win.flip.call_count >= 5
+        preview.consume_manual_reward_request.return_value = False
+        x_gain, y_gain = math.hypot(0.003, -0.001), math.hypot(0.004, 0.001)
+        frames = [
+            (0.005, -0.005, (0, 0), 1, (100, 100)),
+            (0.005, -0.005, (0.3, 0.1), 2, (200, 100)),
+            (0.003, -math.hypot(0.005, 0.001), (-0.1, 0.4), 3, (100, 200)),
+            (2 * x_gain, y_gain, (-0.1, 0.4), 3, (200, 200)),
+            (2 * x_gain, y_gain, (0.2, 0.5), 4, (200, 200)),
+        ]
+        preview.get_calibration_controls.side_effect = [
+            dict(x_scale=x, y_scale=y, fix_x=target[0], fix_y=target[1], revision=i + 1, zero_count=count)
+            for i, (x, y, target, count, raw) in enumerate(frames)
+        ]
+        tracker.get_state.side_effect = [
+            EyeTrackerState(valid=True, sample_index=i + 1, x_smooth_px=raw[0], y_smooth_px=raw[1])
+            for i, (_, _, _, _, raw) in enumerate(frames)
+        ]
+        marker_positions = []
+        marker = task.visual.Circle.return_value
+        marker.draw.side_effect = lambda: marker_positions.append(marker.pos)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            task, "ExperimenterPreview", return_value=preview
+        ), patch.object(task, "UARTEyeTracker", return_value=tracker):
+            path = task.run_task(output_dir=tmp, fullscreen=False)
+            saved = json.loads(path.read_text())["eye_tracker_calibration"]
+            calibration = load_eye_tracking_settings(
+                {"eye_tracking": {"enabled": True, "calibration_file": str(path)}}
+            ).calibration
+        for name, expected in dict(x_scale=0.003, x_cross=-0.001, y_cross=0.001, y_scale=0.004, x_offset=-0.2, y_offset=-0.5).items():
+            self.assertAlmostEqual(getattr(calibration, name), expected)
+        states = [call.kwargs for call in preview.show_calibration_state.call_args_list]
+        for actual, expected in zip(states[3]["eye_fraction"], (0.5, 0.5)):
+            self.assertAlmostEqual(actual, expected)
+        for actual, expected in zip(states[4]["eye_fraction"], (0.2, 0.5)):
+            self.assertAlmostEqual(actual, expected)
+        self.assertEqual([len(state["calibration_points"]) for state in states], [1, 2, 3, 3, 4])
+        self.assertEqual(len(saved["calibration_points"]), 4)
+        self.assertEqual(preview.set_calibration_gains.call_count, 4)
+        last = preview.set_calibration_gains.call_args.kwargs
+        self.assertAlmostEqual(last["x_scale"], x_gain)
+        self.assertAlmostEqual(last["y_scale"], y_gain)
+        self.assertEqual(task.visual.Circle.call_args.kwargs["fillColor"], (1, -1, -1))
+        self.assertEqual(marker_positions[-4:], [(0, 0), (80, -180), (320, 60), (400, -120)])
+
+    def test_delete_from_either_window_removes_point_and_restores_prior_mapping(self):
+        for source in ("main", "preview"):
+            with self.subTest(source=source):
+                task = load_task()
+                win = Mock(size=(800, 600))
+                task.utils.setup_task_window.return_value = (
+                    win, ScreenGeometry(0, 0, 0, 800, 600), ScreenGeometry(1, 800, 0, 800, 600),
+                )
+                preview, tracker = Mock(), Mock()
+                preview.poll.side_effect = lambda: win.flip.call_count >= 2
+                preview.consume_manual_reward_request.return_value = False
+                initial = dict(x_scale=0.005, y_scale=-0.005, fix_x=0.1, fix_y=0.2, revision=1, zero_count=1)
+                preview.get_calibration_controls.side_effect = [initial, {**initial, "delete_count": int(source == "preview")}]
+                tracker.get_state.return_value = EyeTrackerState(valid=True, x_smooth_px=100, y_smooth_px=50)
+                keys = iter([[], ["delete"] if source == "main" else []])
+                with tempfile.TemporaryDirectory() as tmp, patch.object(task, "ExperimenterPreview", return_value=preview), patch.object(
+                    task, "UARTEyeTracker", return_value=tracker
+                ), patch.object(task.event, "getKeys", side_effect=lambda names: next(keys) if "z" in names else []):
+                    path = task.run_task(output_dir=tmp, fullscreen=False)
+                    saved = json.loads(path.read_text())["eye_tracker_calibration"]
+                self.assertEqual(saved["calibration_points"], [])
+                self.assertEqual((saved["x_offset"], saved["y_offset"]), (0, 0))
+                self.assertEqual(task.visual.Circle.return_value.draw.call_count, 1)
+                self.assertEqual(preview.set_calibration_gains.call_count, 2)
+
+    def test_queued_point_edits_keep_order_and_capture_target_despite_delivery_delay(self):
+        task = self.task
+        win = Mock(size=(800, 600))
+        task.utils.setup_task_window.return_value = (
+            win, ScreenGeometry(0, 0, 0, 800, 600), ScreenGeometry(1, 800, 0, 800, 600),
+        )
+        preview, tracker = Mock(), Mock()
+        preview.poll.side_effect = lambda: win.flip.call_count >= 3
+        preview.consume_manual_reward_request.return_value = False
+        controls = dict(x_scale=0.005, y_scale=-0.005, fix_x=0.45, fix_y=0.4, revision=1, zero_count=1)
+        delayed = {**controls, "revision": 2, "zero_count": 2, "delete_count": 1}
+        preview.get_calibration_controls.side_effect = [
+            {**controls, "point_actions": [{"action": "add", "target_fraction": [0.1, 0.2]}]},
+            {**delayed, "point_actions": []},
+            {**delayed, "point_actions": [
+                {"action": "delete"}, {"action": "add", "target_fraction": [0.3, -0.1]},
+            ]},
+        ]
+        tracker.get_state.side_effect = [
+            EyeTrackerState(valid=True, x_smooth_px=x, y_smooth_px=y)
+            for x, y in [(100, 50), (200, 150), (200, 150)]
+        ]
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            task, "ExperimenterPreview", return_value=preview
+        ), patch.object(task, "UARTEyeTracker", return_value=tracker):
+            path = task.run_task(output_dir=tmp, fullscreen=False)
+            saved = json.loads(path.read_text())["eye_tracker_calibration"]
+        self.assertEqual(saved["calibration_points"], [
+            {"raw_px": [200, 150], "target_fraction": [0.3, -0.1]},
+        ])
+        states = [call.kwargs for call in preview.show_calibration_state.call_args_list]
+        self.assertEqual([len(state["calibration_points"]) for state in states], [1, 1, 1])
+        for actual, expected in zip(states[-1]["eye_fraction"], (0.3, -0.1)):
+            self.assertAlmostEqual(actual, expected)
+        self.assertEqual(preview.set_calibration_gains.call_count, 2)
+
+    def test_subject_window_delete_then_add_replaces_last_point(self):
+        task = self.task
+        win = Mock(size=(800, 600))
+        task.utils.setup_task_window.return_value = (
+            win, ScreenGeometry(0, 0, 0, 800, 600), ScreenGeometry(1, 800, 0, 800, 600),
+        )
+        preview, tracker = Mock(), Mock()
+        preview.poll.side_effect = lambda: win.flip.call_count >= 2
+        preview.consume_manual_reward_request.return_value = False
+        controls = dict(x_scale=0.005, y_scale=-0.005, fix_x=0.1, fix_y=0.2,
+                        revision=1, zero_count=0, point_actions=[])
+        preview.get_calibration_controls.side_effect = [
+            controls, {**controls, "revision": 2, "fix_x": 0.3, "fix_y": -0.1},
+        ]
+        tracker.get_state.side_effect = [
+            EyeTrackerState(valid=True, x_smooth_px=x, y_smooth_px=y)
+            for x, y in [(100, 50), (200, 150)]
+        ]
+        keys = iter([["z"], ["delete", "z"]])
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            task, "ExperimenterPreview", return_value=preview
+        ), patch.object(task, "UARTEyeTracker", return_value=tracker), patch.object(
+            task.event, "getKeys", side_effect=lambda names: next(keys) if "z" in names else [],
+        ):
+            path = task.run_task(output_dir=tmp, fullscreen=False)
+            saved = json.loads(path.read_text())["eye_tracker_calibration"]
+        self.assertEqual(saved["calibration_points"], [
+            {"raw_px": [200, 150], "target_fraction": [0.3, -0.1]},
+        ])
+        self.assertEqual((saved["x_scale"], saved["y_scale"]), (0.005, -0.005))
 
     def test_reward_clears_dout_even_if_logger_raises(self):
         outputs = Mock()

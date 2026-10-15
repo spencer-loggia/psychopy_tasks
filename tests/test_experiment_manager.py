@@ -171,6 +171,7 @@ class ExperimentManagerTests(unittest.TestCase):
                 {"x_scale": 0.1, "y_scale": -0.2, "x_offset": 0.3, "y_offset": -0.4},
             )
             self.assertEqual(latest["set_time"], 500.0)
+            self.assertEqual((latest["x_cross"], latest["y_cross"]), (0.0, 0.0))
             self.assertNotIn("ignored_metadata", latest)
 
             with manager.blocks_path.open(encoding="utf-8") as handle:
@@ -199,6 +200,72 @@ class ExperimentManagerTests(unittest.TestCase):
             self.assertEqual(settings.filter.ema_gamma, 0.2)
             self.assertEqual(settings.gain_anchor_px, (100, 50))
             self.assertEqual(settings.calibration.x_scale, 0.1)
+
+    def test_affine_calibration_survives_legacy_state_schema_and_block_injection(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            launch_config, launch_path = self._project(root)
+            manager = ExperimentManager(
+                working_dir=root, launch_config_path=launch_path,
+                launch_config=launch_config, subject_name="Subject One",
+                subject_code="S1", now=dt.datetime(2026, 8, 13),
+            )
+            # The launch history intentionally declares only the old four
+            # coefficients; the completed calibration adds both cross terms.
+            coefficients = {
+                "x_scale": 0.002, "y_scale": -0.004,
+                "x_offset": -0.2, "y_offset": 0.5,
+                "x_cross": 0.003, "y_cross": -0.001,
+            }
+            first = manager.prepare_block(
+                task_name="demo", launch_value="task/demo.py", config_value="configs/demo.json",
+            )
+            calibration_path = first.output_dir / "calibration.json"
+            calibration_path.write_text(json.dumps({"eye_tracker_calibration": {
+                **coefficients,
+                "input_units": "crop_local_pixels",
+                "uart": {"device": "/dev/affine-uart", "simulate": True},
+                "gain_anchor_px": [100, 50],
+            }}), encoding="utf-8")
+            manager.finish_block(first)
+            state = json.loads(manager.state_path.read_text(encoding="utf-8"))
+            latest = state["eye_tracker_calibration"][-1]
+            self.assertEqual({key: latest[key] for key in coefficients}, coefficients)
+
+            (root / "configs" / "demo.json").write_text(json.dumps({
+                "eye_tracking": {"enabled": True, "calibration_file": "obsolete.json"},
+                "x_cross": 99, "y_cross": 99,
+            }), encoding="utf-8")
+            second = manager.prepare_block(
+                task_name="demo", launch_value="task/demo.py", config_value="configs/demo.json",
+            )
+            generated = json.loads(second.config_path.read_text(encoding="utf-8"))
+            self.assertEqual({key: generated[key] for key in coefficients}, coefficients)
+            self.assertEqual(generated["eye_tracking"]["calibration_file"], str(calibration_path.resolve()))
+            settings = load_eye_tracking_settings(generated)
+            self.assertEqual(settings.uart.device, "/dev/affine-uart")
+            self.assertEqual(settings.gain_anchor_px, (100, 50))
+            self.assertAlmostEqual(settings.calibration.map_position(120, 60)[0], 0.22)
+            self.assertAlmostEqual(settings.calibration.map_position(120, 60)[1], 0.14)
+
+            # A later four-coefficient artifact must still import after the
+            # history gained cross fields, and clear the old affine cross terms.
+            legacy = {key: value for key, value in coefficients.items() if "cross" not in key}
+            legacy_path = second.output_dir / "calibration.json"
+            legacy_path.write_text(json.dumps({"eye_tracker_calibration": legacy}), encoding="utf-8")
+            manager.finish_block(second)
+            state = json.loads(manager.state_path.read_text(encoding="utf-8"))
+            latest = state["eye_tracker_calibration"][-1]
+            self.assertEqual(len(state["eye_tracker_calibration"]), 3)
+            self.assertEqual((latest["x_cross"], latest["y_cross"]), (0.0, 0.0))
+            third = manager.prepare_block(
+                task_name="demo", launch_value="task/demo.py", config_value="configs/demo.json",
+            )
+            generated = json.loads(third.config_path.read_text(encoding="utf-8"))
+            self.assertEqual((generated["x_cross"], generated["y_cross"]), (0.0, 0.0))
+            self.assertEqual(generated["eye_tracking"]["calibration_file"], str(legacy_path.resolve()))
+            settings = load_eye_tracking_settings(generated)
+            self.assertEqual((settings.calibration.x_cross, settings.calibration.y_cross), (0.0, 0.0))
 
     def test_generated_block_persists_launcher_screen_selection(self):
         with tempfile.TemporaryDirectory() as tmpdir:

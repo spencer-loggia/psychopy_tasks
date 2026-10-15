@@ -10,7 +10,8 @@ from typing import Optional
 
 from .eye_tracking import EyeCalibration, EyeFilterConfig, UARTEyeTrackerConfig
 
-CALIBRATION_KEYS = ("x_scale", "y_scale", "x_offset", "y_offset")
+CALIBRATION_KEYS = ("x_scale", "y_scale", "x_offset", "y_offset", "x_cross", "y_cross")
+_OPTIONAL_CALIBRATION_KEYS = ("x_cross", "y_cross")
 
 
 @dataclass(frozen=True)
@@ -70,7 +71,8 @@ def load_eye_tracking_settings(cfg, *, for_calibration=False):
     Precedence: saved calibration file, embedded calibration/history, explicit
     task UART/filter settings, then non-null flattened runtime coefficients.
     Defaults are allowed for the calibration task, but presentation tasks require
-    all four measured coefficients. Merely having state fields never opens UART.
+    all four legacy measured coefficients; missing affine cross terms default
+    to zero. Merely having state fields never opens UART.
     """
     section = _object(cfg.get("eye_tracking"), "eye_tracking")
     enabled = _boolean(section.get("enabled", False), "eye_tracking.enabled")
@@ -111,6 +113,8 @@ def load_eye_tracking_settings(cfg, *, for_calibration=False):
             value = cfg.get(f"initial_{key}")
             if value is None:
                 value = getattr(defaults, key)
+        if value is None and key in _OPTIONAL_CALIBRATION_KEYS:
+            value = 0.0
         if value is None:
             raise ValueError(
                 f"Eye tracking is enabled but calibration {key} is missing; calibrate first"
@@ -136,11 +140,17 @@ def load_eye_tracking_settings(cfg, *, for_calibration=False):
         anchor = tuple(float(v) for v in anchor)
         if not all(math.isfinite(v) for v in anchor):
             raise ValueError("gain_anchor_px must be finite")
+    calibration = EyeCalibration(**values)
+    gain_directions = cfg.get("gain_directions")
+    if gain_directions is None:
+        gain_directions = saved.get("gain_directions")
+    if gain_directions is not None:
+        calibration.restore_gain_directions(gain_directions)
     try:
         return EyeTrackingSettings(
             uart=UARTEyeTrackerConfig(**uart),
             filter=EyeFilterConfig(**filter_values),
-            calibration=EyeCalibration(**values),
+            calibration=calibration,
             show_preview=_boolean(
                 section.get("show_preview", True), "eye_tracking.show_preview"
             ),

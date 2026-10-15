@@ -7,6 +7,7 @@ mailbox. There is no UART or reward hardware access in this component.
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Sequence, Tuple
 from psychopy import event, visual
@@ -43,7 +44,7 @@ class Slider:
         self.length = max(1.0, float(length))
         self.value_min = float(value_min)
         self.value_max = float(value_max)
-        self.value = float(value)
+        self.set_value(value)
         self.label = str(label)
         self.track = visual.Rect(
             win,
@@ -79,6 +80,15 @@ class Slider:
             pos=(0, 0),
             autoLog=False,
         )
+
+    def set_value(self, value: float) -> None:
+        """Display fitted gains exactly, extending the manual range if needed."""
+        value = float(value)
+        if not math.isfinite(value):
+            raise ValueError("Calibration gain must be finite")
+        self.value_min = min(self.value_min, value * 1.1 if value < 0 else value)
+        self.value_max = max(self.value_max, value * 1.1 if value > 0 else value)
+        self.value = value
 
     def _fraction(self) -> float:
         span = self.value_max - self.value_min
@@ -169,28 +179,45 @@ def _make_fixation_cross(win, *, size: float, weight: float, color_rgb: Sequence
         # compound the scale or allocate new graphics objects.
         part._calibration_base_size = (part.width, part.height)
         part._calibration_scale = 1.0
+        part._calibration_base_color = color
+        part._calibration_color = color
     return (horizontal, vertical)
+
+
+_RAINBOW_COLORS = (
+    (255, 0, 0), (255, 127, 0), (255, 255, 0), (0, 255, 0),
+    (0, 0, 255), (75, 0, 130), (148, 0, 211),
+)
 
 
 def _draw_fixation_cross(
     parts, pos: Sequence[float], *, attention_started_s=None, now_s=None
 ) -> None:
-    """Draw a normal cross, or a doubled 5 Hz on/off cue for one second.
+    """Draw a normal cross, or seven doubled rainbow flashes in one second.
 
     Both displays use the main task's monotonic start timestamp. Rendering
     follows elapsed time without sleeps, frame counters or new stimuli.
     """
-    scale, visible = 1.0, True
+    scale, visible, rainbow_index = 1.0, True, None
     if attention_started_s is not None:
         now_s = time.perf_counter() if now_s is None else now_s
         elapsed = now_s - attention_started_s
         if 0 <= elapsed < 1.0:
             scale = 2.0
-            visible = int(elapsed * 10) % 2 == 0  # 100 ms on, 100 ms off.
+            phase = int(elapsed * 14)  # Seven colors, each followed by darkness.
+            visible = phase % 2 == 0
+            rainbow_index = phase // 2
     for part in parts:
         if part._calibration_scale != scale:
             part.size = tuple(value * scale for value in part._calibration_base_size)
             part._calibration_scale = scale
+        color = (
+            part._calibration_base_color if rainbow_index is None else
+            utils.rgb255_to_psychopy(_RAINBOW_COLORS[rainbow_index])
+        )
+        if part._calibration_color != color:
+            part.fillColor = color
+            part._calibration_color = color
         part.pos = (float(pos[0]), float(pos[1]))
         if visible:
             part.draw()
@@ -293,12 +320,14 @@ def _preview_to_fraction(
 
 class EyeCalibrationControls:
     def __init__(
-        self, win, canvas_size, config, controls_shared, reward_event, exit_event
+        self, win, canvas_size, config, controls_shared, reward_event, exit_event,
+        actions_queue=None,
     ):
         from bin.eye_tracking import EyeCalibration
 
         self.win = exp_win = win
         self.controls_shared = controls_shared
+        self.actions_queue = actions_queue
         self.reward_event = reward_event
         self.exit_event = exit_event
         exp_size = canvas_size
@@ -350,6 +379,15 @@ class EyeCalibrationControls:
             units="pix",
             autoLog=False,
         )
+        calibration_dot = visual.Circle(
+            exp_win,
+            radius=max(3.0, min(float(exp_size[0]), float(exp_size[1])) * 0.006),
+            fillColor=utils.rgb255_to_psychopy((255, 0, 0)),
+            fillColorSpace="rgb",
+            lineColor=None,
+            units="pix",
+            autoLog=False,
+        )
 
         # Fixed gutters keep the preview and controls disjoint even when the
         # two displays have the same aspect ratio. The image itself remains an
@@ -379,7 +417,7 @@ class EyeCalibrationControls:
         )
         zero_button = _make_button(
             exp_win,
-            text="zero",
+            text="add (Z)",
             pos=zero_pos,
             size=(90.0, 48.0),
             color_rgb=(75, 75, 75),
@@ -392,8 +430,8 @@ class EyeCalibrationControls:
             length=box_size[0] * 0.85,
             value_min=x_scale_limits[0],
             value_max=x_scale_limits[1],
-            value=calibration.x_scale,
-            label="x scale",
+            value=calibration.x_gain,
+            label="subject X gain",
         )
         y_slider = Slider(
             exp_win,
@@ -402,8 +440,8 @@ class EyeCalibrationControls:
             length=box_size[1] * 0.85,
             value_min=y_scale_limits[0],
             value_max=y_scale_limits[1],
-            value=calibration.y_scale,
-            label="y scale",
+            value=calibration.y_gain,
+            label="subject Y gain",
         )
         status_text = visual.TextStim(
             exp_win,
@@ -419,6 +457,7 @@ class EyeCalibrationControls:
 
         self.bg, self.preview_box = exp_bg, preview_box
         self.cross, self.eye_dot = exp_cross, eye_dot
+        self.calibration_dot = calibration_dot
         self.x_slider, self.y_slider = x_slider, y_slider
         self.reward_button, self.exit_button, self.zero_button = (
             reward_button,
@@ -432,6 +471,7 @@ class EyeCalibrationControls:
         self.dragging = None
         self.fixation = (0.0, 0.0)
         self.zero_count = 0
+        self.delete_count = 0
         self.attention_count = 0
         self.auto_reward_count = 0
         self.video_toggle_count = 0
@@ -463,10 +503,23 @@ class EyeCalibrationControls:
             )
         )
 
+    def _apply_pending_gains_locked(self):
+        """Consume the reliable fit mailbox without moving the target or revision."""
+        shared = self.controls_shared
+        if shared[16] == shared[17]:
+            return
+        self.x_slider.set_value(shared[14])
+        self.y_slider.set_value(shared[15])
+        shared[:2] = [self.x_slider.value, self.y_slider.value]
+        shared[17] = shared[16]
+
     def _publish_controls(self, *, calibration_changed=True):
         if calibration_changed:
             self.revision += 1
         with self.controls_shared.get_lock():
+            # A fit may arrive between polling and publishing. Apply it before
+            # sending the UI snapshot so older slider values never undo a fit.
+            self._apply_pending_gains_locked()
             # Leave pending main-window gain/target steps untouched. Only this
             # process writes control values, avoiding stale UI overwrites.
             self.controls_shared[:7] = [
@@ -479,6 +532,7 @@ class EyeCalibrationControls:
             ]
             self.controls_shared[9] = self.auto_reward_count
             self.controls_shared[12] = self.video_toggle_count
+            self.controls_shared[13] = self.delete_count
 
     def _set_fixation(self, position):
         """Share click/key bounds and notify the task to reset fixation history."""
@@ -487,9 +541,23 @@ class EyeCalibrationControls:
             self.fixation = position
             self._publish_controls()
 
+    def _request_point_action(self, action):
+        """Retain input order and the target displayed when each point was added."""
+        if self.actions_queue is not None:
+            point_action = {"action": action}
+            if action == "add":
+                point_action["target_fraction"] = list(self.fixation)
+            self.actions_queue.put_nowait(point_action)
+        if action == "add":
+            self.zero_count += 1
+        else:
+            self.delete_count += 1
+        self._publish_controls()
+
     def poll_controls(self):
         keys = event.getKeys(keyList=("escape", *CALIBRATION_KEYS))
         with self.controls_shared.get_lock():
+            self._apply_pending_gains_locked()
             x_steps, y_steps = self.controls_shared[7:9]
             self.controls_shared[7:9] = [0, 0]
             fix_x_steps, fix_y_steps = self.controls_shared[10:12]
@@ -504,20 +572,29 @@ class EyeCalibrationControls:
         )
         if x_changed or y_changed:
             self._publish_controls()
-        local_x, local_y = fixation_key_steps(keys)
         # Work in subject-scene fractions, as clicks do; the main task applies
         # display rotation when drawing. Preview resizing never changes a step.
         self._set_fixation((
-            self.fixation[0] + (fix_x_steps + local_x) * FIXATION_STEP_FRACTION,
-            self.fixation[1] + (fix_y_steps + local_y) * FIXATION_STEP_FRACTION,
+            self.fixation[0] + fix_x_steps * FIXATION_STEP_FRACTION,
+            self.fixation[1] + fix_y_steps * FIXATION_STEP_FRACTION,
         ))
+        # Separate counters cannot distinguish Delete then Z from Z then
+        # Delete. Preserve point actions and target movement in keyboard order.
+        for key in keys:
+            local_x, local_y = fixation_key_steps((key,))
+            if local_x or local_y:
+                self._set_fixation((
+                    self.fixation[0] + local_x * FIXATION_STEP_FRACTION,
+                    self.fixation[1] + local_y * FIXATION_STEP_FRACTION,
+                ))
+            elif key == "z":
+                self._request_point_action("add")
+            elif key in ("delete", "backspace"):
+                self._request_point_action("delete")
         if "escape" in keys:
             self.exit_event.set()
         if "r" in keys:
             self.reward_event.set()
-        if "z" in keys:
-            self.zero_count += 1
-            self._publish_controls()
         if "f" in keys:
             self.attention_count += 1
             # A visual cue must not reset fixation acceptance or change gain,
@@ -537,8 +614,7 @@ class EyeCalibrationControls:
             elif self.reward_button[0].contains(pos):
                 self.reward_event.set()
             elif self.zero_button[0].contains(pos):
-                self.zero_count += 1
-                self._publish_controls()
+                self._request_point_action("add")
             elif self.x_slider.contains(pos):
                 self.dragging = self.x_slider
             elif self.y_slider.contains(pos):
@@ -594,6 +670,13 @@ class EyeCalibrationControls:
                 box_size=self.box_size,
             )
             self.eye_dot.draw()
+        # Draw retained targets above gaze so a correctly fixated point still
+        # shows its red center rather than being covered by the larger eye dot.
+        for point in payload.get("calibration_points", ()):
+            self.calibration_dot.pos = _fraction_to_preview(
+                point, box_center=self.box_center, box_size=self.box_size,
+            )
+            self.calibration_dot.draw()
         self.x_slider.draw()
         self.y_slider.draw()
         for button in (self.reward_button, self.exit_button, self.zero_button):

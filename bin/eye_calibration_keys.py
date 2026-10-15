@@ -13,7 +13,10 @@ _FIXATION_DIRECTIONS = {
     )
     for key in aliases
 }
-CALIBRATION_KEYS = ("f", "z", "r", "a", "v", "up", "down", "right", "left", *_FIXATION_DIRECTIONS)
+CALIBRATION_KEYS = (
+    "f", "z", "delete", "backspace", "r", "a", "v", "up", "down", "right", "left",
+    *_FIXATION_DIRECTIONS,
+)
 FIXATION_STEP_FRACTION = 0.025
 
 

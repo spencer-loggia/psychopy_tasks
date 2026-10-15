@@ -700,30 +700,49 @@ Eye data and calibration:
   invalidates the session and requires restarting calibration; its ROI coordinates may have changed.
 - `eye_filter.ema_gamma` defaults to 0 (no added smoothing); higher values below 1 retain more of the previous
   sample. Filtering occurs at the camera frame rate, not the UART poll rate.
-- `initial_x_scale`, `initial_y_scale`, `initial_x_offset`, `initial_y_offset` initialize the linear mapping
-  `fraction = scale * crop_pixel + offset`. Runtime `x_scale`, `y_scale`, `x_offset`, `y_offset` values supplied
-  by the experiment manager take precedence when non-null. Defaults are +0.005 for x and -0.005 for y.
+- The affine calibration maps camera crop pixels to subject-relative fractions:
+  `subject_x = x_scale * eye_x + x_cross * eye_y + x_offset` and
+  `subject_y = y_cross * eye_x + y_scale * eye_y + y_offset`.
+  The corresponding `initial_` coefficient settings initialize calibration; non-null runtime coefficients
+  supplied by the experiment manager take precedence. Defaults are +0.005 for `x_scale`, -0.005 for
+  `y_scale`, and zero for cross terms and offsets. Existing four-coefficient files load with zero cross terms.
   These are starting values to calibrate, not a measured mapping. **Old analog-voltage calibration values must
   be cleared/replaced in the experiment state before use.** Changing camera ROI or analysis resolution also
   requires recalibration. Analog DAQ input configuration is rejected rather than silently reused.
 - Output fractions refer to the oriented subject scene, including the actual window size in windowed mode:
   x=-0.5 is left, x=0.5 right, y=-0.5 bottom and y=0.5 top. The preview preserves that scene's aspect ratio.
+  With X11 `normal`, the mounted screen is compensated by 90° clockwise stimulus rotation. Subject up
+  therefore maps to native-screen right, and subject left maps to native-screen up. Camera/UART pixels
+  remain in their original coordinates; the display rotation is applied once, after calibration.
 
 Click the preview to move the fixation target, or use **number-pad 8/6/2/4** for up/right/down/left
 with either calibration window focused. Each keypress moves it by 2.5% of the subject-scene width or
 height, stopping at the screen edges. Plain 8/6/2/4 also work. Moving the target resets auto-reward
-fixation history just as clicking does. The bottom and left sliders adjust x/y gain around the last
-zeroed eye position, keeping that position fixed while changing sensitivity to movement. Before the first zero,
-the first valid sample provides the anchor. Moving the target does not change this anchor; `zero` (or `z`)
-maps the current valid, smoothed eye position to that target and replaces the anchor.
-The anchor survives saving/reloading, including a gain of zero or a change of sign. Invalid gaze is hidden
+fixation history just as clicking does. When the subject looks at the target, **Z** (or **Add point**)
+captures the current valid, smoothed eye position and refits the affine transform using all points collected
+in this calibration session. A persistent red dot marks each captured target on both displays. One point
+changes only offsets; two points adjust the constrained direction while preserving the remaining sensitivity.
+Three noncollinear points determine a full affine transform. Additional points use a least-squares fit;
+collinear or repeated points preserve directions that the observations cannot determine.
+**Delete** (or Backspace) removes the last point and restores the transform and anchor from before that capture.
+Removing every point restores the pre-collection mapping. Invalid/stale eye samples cannot add points.
+
+The bottom and left sliders show signed subject-X/Y gains from the latest fit and update automatically
+after capture or undo. Each gain is the signed length of its affine row (the largest-magnitude coefficient
+sets its sign; the diagonal wins ties), so it controls that subject axis even when the camera axes are mixed.
+Manual changes scale the entire row around the last captured eye position, keeping that position fixed.
+Adding another point refits the collected data and snaps the sliders to the resulting gains. Slider ranges
+expand when necessary to display an automatic fit. Before the first capture, the first valid sample provides
+the gain anchor; moving the target does not change it. The anchor and axis directions are saved with the
+calibration, including when a gain is zero. Invalid gaze is hidden
 and its status is displayed. The green reward button or `r` delivers a manual pulse; Exit or Escape ends the task.
-The `f`, `z`, `r`, `a`, and `v` shortcuts work with either the subject or experimenter calibration window focused.
-Arrow keys also work in either window: Right/Left increase/decrease x scale, and Up/Down increase/decrease
-y scale by 0.0001 per keypress, within the slider limits. The corresponding slider and its readout update
-together. These are signed adjustments: Up moves a negative y scale toward zero. The zeroed position stays fixed.
+The `f`, `z`, Delete, `r`, `a`, and `v` shortcuts work with either calibration window focused.
+Arrow keys also work in either window: Right/Left increase/decrease subject-X gain, and Up/Down increase/decrease
+subject-Y gain by 0.0001 per keypress, within the slider limits. The corresponding slider and its readout update
+together. These are signed adjustments: Up moves a negative Y gain toward zero. The gain anchor stays fixed.
 Press `f` with either calibration window focused to double the fixation cross (including stroke width) and
-flash it at 5 Hz for one second. It then returns to its normal size and steady display. Pressing `f` again
+flash red, orange, yellow, green, blue, indigo, and violet at 7 Hz over one second.
+It then returns to its original color, normal size and steady display. Pressing `f` again
 restarts the cue; the target position, calibration and fixation acceptance area stay unchanged.
 
 Press **V** to toggle attention videos (initially off). Video replaces the fixation cross in a
@@ -773,8 +792,10 @@ Reward and fixation settings:
   `fix_accept_percent` is superseded by the two fixed thresholds; an older positive `fix_accept_time` is
   used as the interval only when `reward_interval` is absent.
 
-On normal exit, `calibration.json` retains the existing top-level `eye_tracker_calibration` object and four
-scale/offset keys used by the experiment manager. Additional metadata records pixel input units, `eye_id: 0`,
+On normal exit, `calibration.json` retains the top-level `eye_tracker_calibration` object with all six
+affine coefficients and the collected `calibration_points` (smoothed camera pixels and subject-fraction targets).
+The experiment manager preserves all six coefficients in state and later block configs, including when its
+initial state declared only the older four coefficients. Additional metadata records pixel input units, `eye_id: 0`,
 UART/filter settings, gain anchor, oriented/native screen dimensions, rotation and latest sample validity. The session
 also contains message and pump event logs.
 
@@ -838,7 +859,7 @@ The CSV columns are:
 | Column | Meaning |
 | --- | --- |
 | `timestamp_ms` | Observation time in milliseconds since the block's session clock started; same origin as `event_log.tsv` (which uses seconds). Independent of file-flush time and flips. |
-| `x_screen_px`, `y_screen_px` | Calibrated, filtered position in centered native task-window pixels, right/up positive. Gain, offset, current scene size and display rotation are applied, matching the coordinates used to place stimuli. Offscreen positions are retained without clamping. |
+| `x_screen_px`, `y_screen_px` | Calibrated, filtered position in native PsychoPy pixel coordinates: `x = screen_x - W/2`, `y = H/2 - screen_y`, where screen coordinates start at the top left. The full affine transform, scene size and display rotation are applied, matching stimulus positions. Offscreen positions are retained without clamping. |
 | `pupil_diameter_px` | Eye 0 pupil diameter in camera pixels, as supplied by the tracker. |
 | `eye_valid`, `rejection_reason` | Eye validity (`1`/`0`) and reason such as `blink`, `lost`, `stale`, or `uart_error`. Invalid samples write `nan` for both position coordinates and pupil diameter. |
 | `screen_ready` | `1` once the task has supplied its screen geometry. During setup, `0` means screen coordinates are still `nan`; a valid pupil measurement can already be recorded. |

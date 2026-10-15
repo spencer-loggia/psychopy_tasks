@@ -80,32 +80,111 @@ class EyeCalibration:
     y_scale: float = -0.005
     x_offset: float = 0.0
     y_offset: float = 0.0
+    x_cross: float = 0.0
+    y_cross: float = 0.0
 
     def map_position(self, x_px: float, y_px: float) -> Tuple[float, float]:
         return (
-            self.x_scale * x_px + self.x_offset,
-            self.y_scale * y_px + self.y_offset,
+            self.x_scale * x_px + self.x_cross * y_px + self.x_offset,
+            self.y_cross * x_px + self.y_scale * y_px + self.y_offset,
         )
 
     def set_offsets_for_fixation(self, *, fixation_fraction, x_px, y_px) -> None:
-        self.x_offset = float(fixation_fraction[0]) - self.x_scale * x_px
-        self.y_offset = float(fixation_fraction[1]) - self.y_scale * y_px
+        self.x_offset = (
+            float(fixation_fraction[0]) - self.x_scale * x_px - self.x_cross * y_px
+        )
+        self.y_offset = (
+            float(fixation_fraction[1]) - self.y_cross * x_px - self.y_scale * y_px
+        )
+
+    @staticmethod
+    def _signed_row_gain(diagonal, cross):
+        """Signed row length, with the diagonal breaking equal-size ties."""
+        dominant = diagonal if abs(diagonal) >= abs(cross) else cross
+        return math.copysign(math.hypot(diagonal, cross), dominant)
+
+    @property
+    def x_gain(self) -> float:
+        """Sensitivity along subject x, including a rotated camera's cross term."""
+        return self._signed_row_gain(self.x_scale, self.x_cross)
+
+    @property
+    def y_gain(self) -> float:
+        """Sensitivity along subject y, including a rotated camera's cross term."""
+        return self._signed_row_gain(self.y_scale, self.y_cross)
+
+    def _gain_direction(self, axis):
+        diagonal = getattr(self, f"{axis}_scale")
+        cross = getattr(self, f"{axis}_cross")
+        gain = self._signed_row_gain(diagonal, cross)
+        if gain:
+            return (diagonal / gain, cross / gain)
+        return getattr(self, f"_{axis}_gain_direction", (1.0, 0.0))
+
+    def restore_gain_directions(self, directions) -> None:
+        """Restore optional zero-gain directions from saved calibration metadata.
+
+        Serialized vectors use raw-input order ``[raw_x, raw_y]`` for each
+        subject axis. Their unit length and canonical positive dominant entry
+        keep slider gain values consistent after reloading a zero-gain row.
+        Nonzero rows always derive their direction from the actual coefficients.
+        """
+        if not isinstance(directions, dict) or set(directions) != {"x", "y"}:
+            raise ValueError("gain_directions must contain x and y direction vectors")
+        validated = {}
+        for axis in ("x", "y"):
+            vector = directions[axis]
+            if not isinstance(vector, (list, tuple)) or len(vector) != 2:
+                raise ValueError(f"gain_directions.{axis} must contain two coordinates")
+            try:
+                if any(isinstance(value, bool) for value in vector):
+                    raise ValueError
+                raw_x, raw_y = map(float, vector)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"gain_directions.{axis} must be a finite unit vector") from exc
+            norm = math.hypot(raw_x, raw_y)
+            if not math.isfinite(norm) or not math.isclose(norm, 1.0, rel_tol=1e-9, abs_tol=1e-9):
+                raise ValueError(f"gain_directions.{axis} must be a finite unit vector")
+            diagonal, cross = (raw_x, raw_y) if axis == "x" else (raw_y, raw_x)
+            if self._signed_row_gain(diagonal, cross) < 0:
+                raise ValueError(f"gain_directions.{axis} must have a positive dominant component")
+            validated[axis] = (diagonal / norm, cross / norm)
+        for axis, direction in validated.items():
+            setattr(self, f"_{axis}_gain_direction", direction)
 
     def set_gains(self, *, x_scale: float, y_scale: float, anchor_px) -> None:
-        """Change sensitivity around a fixed eye position, preserving its mapping.
+        """Set signed subject-axis row gains, preserving a fixed eye mapping.
 
-        Crop coordinates have a large DC component. Merely changing the slope
-        of ``scale * pixel + offset`` shifts the calibrated zero. Compensating
-        the affine intercept makes gain act on displacement from the anchor.
-        Keep the anchor fixed throughout a drag, including crossing gain zero.
+        The argument names preserve the original diagonal-calibration API. For
+        affine maps, use ``x_gain`` / ``y_gain`` as the slider readout: each gain
+        scales its entire affine row, preserving its direction. Keep that row's
+        direction through zero so dragging back out of zero still works, even
+        when a row consists entirely of a cross term. These direction caches
+        are separate metadata, excluded from the six calibration coefficients.
         """
-        self.x_offset += (self.x_scale - x_scale) * anchor_px[0]
-        self.y_offset += (self.y_scale - y_scale) * anchor_px[1]
-        self.x_scale, self.y_scale = float(x_scale), float(y_scale)
+        target = self.map_position(*anchor_px)
+        for axis, diagonal_name, cross_name, gain in (
+            ("x", "x_scale", "x_cross", float(x_scale)),
+            ("y", "y_scale", "y_cross", float(y_scale)),
+        ):
+            direction = self._gain_direction(axis)
+            cache_name = f"_{axis}_gain_direction"
+            setattr(self, cache_name, direction)
+            setattr(self, diagonal_name, gain * direction[0])
+            setattr(self, cross_name, gain * direction[1])
+        self.set_offsets_for_fixation(
+            fixation_fraction=target, x_px=anchor_px[0], y_px=anchor_px[1]
+        )
 
     def to_json_dict(self) -> dict:
+        x_direction = self._gain_direction("x")
+        y_direction = self._gain_direction("y")
         return {
             **asdict(self),
+            "gain_directions": {
+                "x": list(x_direction),
+                "y": [y_direction[1], y_direction[0]],
+            },
             "input_units": "crop_local_pixels",
             "eye_id": 0,
             "coordinate_units": "screen_fraction_centered",

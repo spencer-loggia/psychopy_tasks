@@ -42,6 +42,7 @@ Both Raspberry Pi launch configs also synchronize experiment boundaries with the
 ```json
 "eye_tracker_experiment": {
   "enabled": true,
+  "start_timeout_s": 15.0,
   "uart": {"device": "/dev/ttyAMA10", "baud": 460800}
 }
 ```
@@ -55,8 +56,11 @@ standalone `run`/`preview` services do not implement these experiment commands. 
 names must match `[A-Za-z0-9][A-Za-z0-9_.-]{0,31}`; unsupported names produce a warning
 and are never silently rewritten.
 
-These commands run in order on a background worker, with the existing 10-second state
-timeout and one identical-packet retry by default (`uart.state_timeout_s` / `state_retries`).
+These commands run in order on a background worker. Experiment start allows 15 seconds per
+attempt (`eye_tracker_experiment.start_timeout_s`), with one identical-packet retry by default,
+giving a slow startup about 30 seconds to acknowledge before a timeout warning. When omitted,
+the start timeout is the greater of 15 seconds and `uart.state_timeout_s`. Stop and shutdown retain
+the 10-second state timeout (`uart.state_timeout_s`); `uart.state_retries` controls retries for all three.
 The UART is closed after each command. Task eye acquisition waits for the experiment-start
 handoff in its own worker, so the launcher and task rendering remain responsive.
 Missing hardware, rejected commands, unexpected status flags, or recording failures show

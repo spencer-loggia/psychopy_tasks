@@ -11,6 +11,7 @@
     "experiment_quiet_mode": true,
     "eye_tracker_experiment": {
         "enabled": true,
+        "start_timeout_s": 15.0,
         "uart": {"device": "/dev/ttyAMA10", "baud": 460800}
     },
     "subjects": {

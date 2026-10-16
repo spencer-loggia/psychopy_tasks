@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
+import math
 from pathlib import Path
 
 from bin.eye_tracking import UARTEyeTrackerConfig
@@ -86,6 +87,16 @@ class ExperimentEyeTracker:
             self.uart = _experiment_uart(config)
             if self.uart is None or self.uart.simulate:
                 return
+            self.start_timeout_s = config["eye_tracker_experiment"].get(
+                "start_timeout_s", max(15.0, self.uart.state_timeout_s)
+            )
+            if (
+                isinstance(self.start_timeout_s, bool)
+                or not isinstance(self.start_timeout_s, (int, float))
+                or not math.isfinite(self.start_timeout_s)
+                or self.start_timeout_s <= 0
+            ):
+                raise ValueError("eye_tracker_experiment.start_timeout_s must be positive and finite")
             self.pending_path.touch()
             self.start_future = _COMMANDS.submit(self._send, start=True)
         except Exception as exc:
@@ -109,7 +120,7 @@ class ExperimentEyeTracker:
                 controller = EyeTrackerController(
                     channel,
                     response_timeout_s=self.uart.response_timeout_s,
-                    state_timeout_s=self.uart.state_timeout_s,
+                    state_timeout_s=self.start_timeout_s if start else self.uart.state_timeout_s,
                     retries=self.uart.state_retries,
                 )
                 status = (

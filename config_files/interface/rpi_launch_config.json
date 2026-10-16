@@ -7,6 +7,7 @@
         "main": null,
         "experimenter": null
     },
+    "screen_mask_rgb": [174, 165, 163],
     "record_experiment_video": false,
     "video_config": "config_files/video/config.json",
     "mask_main_inputs": true,

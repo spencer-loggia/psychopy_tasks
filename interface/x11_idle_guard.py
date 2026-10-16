@@ -1,4 +1,4 @@
-"""X11 input and blackout lifecycle for the experiment manager."""
+"""X11 input and screen-mask lifecycle for the experiment manager."""
 from __future__ import annotations
 
 import os
@@ -122,9 +122,22 @@ class XInputTouchscreen:
 
 
 class MainScreenCurtain:
-    """Borderless black Tk window covering the main subject display."""
+    """Borderless Tk window covering the main subject display with a solid color."""
 
-    def __init__(self, root, screen_info: ScreenGeometry, *, tk_module) -> None:
+    def __init__(
+        self, root, screen_info: ScreenGeometry, *, tk_module,
+        screen_mask_rgb=(0, 0, 0),
+    ) -> None:
+        if (
+            not isinstance(screen_mask_rgb, (list, tuple))
+            or len(screen_mask_rgb) != 3
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 255
+                for value in screen_mask_rgb
+            )
+        ):
+            raise ValueError("Config field 'screen_mask_rgb' must contain three integers in [0, 255]")
+        background = "#{:02x}{:02x}{:02x}".format(*screen_mask_rgb)
         self.root = root
         self.screen_info = screen_info
         self.window = tk_module.Toplevel(root)
@@ -133,7 +146,7 @@ class MainScreenCurtain:
         # on the experimenter window until it is withdrawn leaves the window
         # manager's active monitor undefined and can send a new managed
         # fullscreen window to either output.
-        self.window.configure(bg="black", cursor="none", takefocus=True)
+        self.window.configure(bg=background, cursor="none", takefocus=True)
         set_tk_window_fullscreen(self.window, self.screen_info)
         try:
             self.window.attributes("-topmost", True)
@@ -178,7 +191,7 @@ class MainScreenCurtain:
 
 
 class ExperimentIdleGuard:
-    """Coordinate the main touchscreen and blackout window around tasks."""
+    """Coordinate the main touchscreen and screen-mask window around tasks."""
 
     def __init__(self, root, touchscreen: XInputTouchscreen, curtain: MainScreenCurtain):
         self.root = root
@@ -282,7 +295,10 @@ def create_experiment_idle_guard(
         output_name=output_name,
     )
     touchscreen.validate()
-    curtain = MainScreenCurtain(root, main_screen, tk_module=tk_module)
+    curtain = MainScreenCurtain(
+        root, main_screen, tk_module=tk_module,
+        screen_mask_rgb=cfg.get("screen_mask_rgb", (0, 0, 0)),
+    )
     return ExperimentIdleGuard(root, touchscreen, curtain)
 
 

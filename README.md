@@ -257,12 +257,15 @@ fields:
     "experimenter": "DSI-1"
   },
   "mask_main_inputs": true,
+  "screen_mask_rgb": [174, 165, 163],
   "main_touchscreen_xinput": "Exact XInput Touchscreen Name"
 }
 ```
 
 - `mask_main_inputs` defaults to `false` and must be a JSON boolean.
-- When it is `true` and the resolved main and experimenter displays differ, `main_touchscreen_xinput` is required.
+- `screen_mask_rgb` sets the idle main-screen mask color using three integer RGB channels in 0–255;
+  it defaults to `[0, 0, 0]` (black).
+- When `mask_main_inputs` is `true` and the resolved main and experimenter displays differ, `main_touchscreen_xinput` is required.
   It must be the exact stable device name reported by `xinput list --name-only`; numeric XInput IDs are rejected
   because they can change after reboot.
 - When both screen selectors resolve to the same display, masking is skipped completely for debugging and
@@ -270,8 +273,8 @@ fields:
 - Masking requires Linux with a real X11 `DISPLAY`. It intentionally does not support Xwayland.
 
 While the interface is idle, the manager runs `xinput disable` only for that named touchscreen and covers the main
-display with a fullscreen black window. The experimenter touchscreen and physical mouse are not modified. A task
-subprocess creates its main window, then emits a private readiness marker. The manager removes the black window,
+display with a fullscreen window colored by `screen_mask_rgb`. The experimenter touchscreen and physical mouse are not modified. A task
+subprocess creates its main window, then emits a private readiness marker. The manager removes the mask window,
 maps the touchscreen to the resolved main RandR output with `xinput map-to-output`, enables it, and acknowledges
 release. The task waits for that acknowledgment and then activates its window before beginning timing-sensitive
 work.

@@ -3,6 +3,8 @@
 Touch-friendly Tk launcher for experiment tasks and simple utilities.
 """
 import argparse
+from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 import os
 import subprocess
@@ -13,7 +15,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional
 import tkinter as tk
-from tkinter import messagebox
 import urllib.request
 from email.utils import parsedate_to_datetime
 
@@ -21,6 +22,7 @@ _project_root = Path(__file__).resolve().parents[1]
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
+from bin import tk_dialogs as messagebox
 from bin.screen import (
     MAIN_SCREEN_ENV,
     SCREEN_ENV_OVERRIDE_ENV,
@@ -46,6 +48,7 @@ from interface.data_sync import (
     run_command_bounded,
     terminate_process,
 )
+from bin.tk_dialogs import bind_dialog_keys, choose_dialog
 from interface.experiment_manager import (
     ExperimentManager,
     PreparedBlock,
@@ -94,6 +97,27 @@ class SyncDialogResult(Enum):
     COMPLETED = "completed"
     CANCELLED = "cancelled"
     TIMED_OUT = "timed_out"
+
+
+@dataclass(frozen=True)
+class CleanupReport:
+    code_ok: bool
+    data_result: CleanupResult
+    code_detail: str
+    data_detail: str
+
+    @property
+    def summary(self) -> str:
+        data = {
+            CleanupResult.SUCCESS: "Data sync completed",
+            CleanupResult.UNAVAILABLE: "Data sync failed; local data retained",
+            CleanupResult.CANCELLED: "Data sync cancelled; local data retained",
+        }[self.data_result]
+        return f"{data}. Code update {'completed' if self.code_ok else 'failed'}."
+
+    @property
+    def details(self) -> str:
+        return f"{self.summary}\n\nData sync: {self.data_detail}\n\nCode update: {self.code_detail}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -512,13 +536,11 @@ class TouchInterfaceApp:
             print(f"Could not sync time: {e}")
 
     def pull_latest_code(self) -> bool:
-        """Pull from the configured mirror, returning whether it was reachable."""
+        """Pull from the mirror, recording operation errors separately from data sync."""
         remote_git_url = str(self.cfg.get("remote_git_url", "")).strip()
         if not remote_git_url:
-            print(
-                "Code update error: remote_git_url is not configured",
-                file=sys.stderr,
-            )
+            self._code_update_detail = "remote_git_url is not configured"
+            print(f"Code update error: {self._code_update_detail}", file=sys.stderr)
             return False
         try:
             for command in (
@@ -532,24 +554,49 @@ class TouchInterfaceApp:
                     timeout_s=REMOTE_GIT_TIMEOUT_SECONDS,
                 )
         except subprocess.TimeoutExpired as exc:
-            print(
-                f"Code update error: command timed out after "
-                f"{exc.timeout} second(s): {' '.join(exc.cmd)}",
-                file=sys.stderr,
+            self._code_update_detail = (
+                f"Command timed out after {exc.timeout} seconds: {' '.join(exc.cmd)}"
             )
+            if exc.stderr:
+                detail = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr
+                self._code_update_detail += f"\n{detail.strip()}"
+            print(f"Code update error: {self._code_update_detail}", file=sys.stderr)
             return False
         except subprocess.CalledProcessError as exc:
             detail = (exc.stderr or exc.stdout or str(exc)).strip()
-            print(f"Code update error: {detail}", file=sys.stderr)
+            self._code_update_detail = f"{' '.join(exc.cmd)} (exit {exc.returncode}):\n{detail}"
+            print(f"Code update error: {self._code_update_detail}", file=sys.stderr)
             return False
         except Exception as exc:
-            print(f"Code update error: {exc}", file=sys.stderr)
+            self._code_update_detail = f"{remote_git_url}: {exc}"
+            print(f"Code update error: {self._code_update_detail}", file=sys.stderr)
             return False
+        self._code_update_detail = f"Updated from {remote_git_url}"
         return True
+
+    def _write_sync_log(self, message: str) -> bool:
+        """Keep diagnostics locally even when the remote drive cannot be used."""
+        try:
+            path = self.working_dir / "logs" / "interface_sync.log"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(f"{datetime.now(timezone.utc).isoformat()}\n{message}\n\n")
+            return True
+        except OSError as exc:
+            print(f"Could not save sync diagnostics: {exc}", file=sys.stderr)
+            return False
+
+    def _data_sync_failed(self, detail: str) -> CleanupResult:
+        self._data_sync_detail = detail
+        print(f"Data sync error: {detail}", file=sys.stderr)
+        self.status_var.set("Data sync failed; local data retained")
+        return CleanupResult.UNAVAILABLE
 
     def startup(self) -> None:
         os.chdir(self.working_dir)
-        self.pull_latest_code()
+        if not self.pull_latest_code():
+            self.status_var.set("Code update failed; using local code. See logs/interface_sync.log")
+            self._write_sync_log(f"Startup code update failed:\n{getattr(self, '_code_update_detail', 'No details available')}")
 
     def cleanup(self) -> CleanupResult:
         """Attempt both remotes and distinguish success, failure, and cancel."""
@@ -557,12 +604,18 @@ class TouchInterfaceApp:
             return CleanupResult.UNAVAILABLE
         self.cleanup_active = True
         try:
+            self._code_update_detail = "No code-update details available"
+            self._data_sync_detail = "No data-sync details available"
             code_available = self.pull_latest_code()
             try:
                 data_result = self.sync_data()
             except Exception as exc:
-                print(f"Data sync error: {exc}", file=sys.stderr)
-                data_result = CleanupResult.UNAVAILABLE
+                data_result = self._data_sync_failed(str(exc))
+            self.cleanup_report = CleanupReport(
+                code_available, data_result, self._code_update_detail, self._data_sync_detail,
+            )
+            self._sync_log_saved = self._write_sync_log(self.cleanup_report.details)
+            self.status_var.set(self.cleanup_report.summary)
             if data_result is CleanupResult.CANCELLED:
                 return CleanupResult.CANCELLED
             if code_available and data_result is CleanupResult.SUCCESS:
@@ -581,12 +634,11 @@ class TouchInterfaceApp:
         try:
             preparation = data_sync.prepare()
         except Exception as exc:
-            print(f"Data sync error: {exc}", file=sys.stderr)
-            return CleanupResult.UNAVAILABLE
+            return self._data_sync_failed(f"Could not prepare sync to {remote_value}: {exc}")
         if preparation.warning:
-            print(f"Data sync error: {preparation.warning}", file=sys.stderr)
-            return CleanupResult.UNAVAILABLE
+            return self._data_sync_failed(preparation.warning)
         if preparation.plan is None:
+            self._data_sync_detail = "No local experiments to copy"
             return CleanupResult.SUCCESS
 
         plan = preparation.plan
@@ -607,50 +659,53 @@ class TouchInterfaceApp:
                     start_new_session=os.name == "posix",
                 )
             except OSError as exc:
-                print(
-                    f"Data sync error: could not start rsync: {exc}",
-                    file=sys.stderr,
-                )
-                return CleanupResult.UNAVAILABLE
+                return self._data_sync_failed(f"Could not start rsync to {plan.destination}: {exc}")
 
             dialog_result = self._show_sync_dialog(process, plan, progress_file)
+            # Read stderr before every exit path, including a stalled transfer.
+            error_file.seek(0)
+            error_detail = error_file.read().strip()
             if dialog_result is SyncDialogResult.CANCELLED:
+                self._data_sync_detail = f"Copy to {plan.destination} cancelled; no local data was removed"
+                if error_detail:
+                    self._data_sync_detail += f"\n{error_detail}"
                 print("Data sync cancelled; no local data was removed")
                 self.status_var.set("Data sync cancelled")
                 return CleanupResult.CANCELLED
             if dialog_result is SyncDialogResult.TIMED_OUT:
-                print(
-                    f"Data sync error: rsync made no progress for "
-                    f"{DATA_SYNC_STALL_TIMEOUT_SECONDS} seconds",
-                    file=sys.stderr,
+                return self._data_sync_failed(
+                    f"rsync to {plan.destination} produced no progress output for "
+                    f"{DATA_SYNC_STALL_TIMEOUT_SECONDS} seconds and was stopped."
+                    + (f"\n{error_detail}" if error_detail else "")
                 )
-                self.status_var.set("Data sync timed out; local data retained")
-                return CleanupResult.UNAVAILABLE
 
             returncode = process.poll()
             if returncode is None:
-                print(
-                    "Data sync error: rsync did not exit after its dialog closed",
-                    file=sys.stderr,
+                terminate_process(process, process_group=os.name == "posix")
+                return self._data_sync_failed(
+                    f"rsync to {plan.destination} did not exit after its dialog closed"
+                    + (f"\n{error_detail}" if error_detail else "")
                 )
-                self.status_var.set("Data sync failed; local data retained")
-                return CleanupResult.UNAVAILABLE
-            error_file.seek(0)
-            error_detail = error_file.read().strip()
 
         if returncode != 0:
-            detail = error_detail or f"rsync exited with status {returncode}"
-            print(f"Data sync error: {detail}", file=sys.stderr)
-            self.status_var.set("Data sync failed; local data retained")
-            return CleanupResult.UNAVAILABLE
+            return self._data_sync_failed(
+                f"rsync to {plan.destination} exited with status {returncode}. "
+                "The copy was not confirmed complete; local data was retained."
+                + (f"\n{error_detail}" if error_detail else "")
+            )
 
+        self._data_sync_detail = f"Copied {plan.source} to {plan.destination} successfully"
         try:
             removed = data_sync.prune(plan)
         except OSError as exc:
+            self._data_sync_detail += f"\nSome old local data could not be removed: {exc}"
             print(f"Data prune warning: {exc}")
             self.status_var.set("Data synced; some old local data could not be removed")
             return CleanupResult.SUCCESS
 
+        self._data_sync_detail += (
+            f"\nRetained {plan.retained_experiment.name} locally; removed {len(removed)} older experiments"
+        )
         self.status_var.set(
             f"Data synced; retained {plan.retained_experiment.name} locally "
             f"and removed {len(removed)} older experiment(s)"
@@ -734,7 +789,7 @@ class TouchInterfaceApp:
             activeforeground="white",
         )
         cancel_button.pack(fill="x", padx=28, pady=(0, 24))
-        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        bind_dialog_keys(dialog, [cancel_button], cancel=cancel)
 
         def poll_process() -> None:
             nonlocal last_progress_at, last_progress_size, poll_after_id
@@ -1305,72 +1360,30 @@ class TouchInterfaceApp:
         self.experiment = None
         self.cleanup()
         self._render_root_menu()
+        report = getattr(self, "cleanup_report", None)
+        if report is not None:
+            self.status_var.set(report.summary)
+            if not report.code_ok or report.data_result is not CleanupResult.SUCCESS:
+                messagebox.showwarning("Experiment Cleanup", report.details, parent=self.root)
 
     def _shutdown_command(self) -> list[str]:
         if hasattr(os, "geteuid") and os.geteuid() == 0:
             return ["shutdown", "-h", "now"]
         return ["sudo", "-n", "shutdown", "-h", "now"]
 
-    def _ask_retry_data_network(self) -> bool:
-        """Show a blocking, touch-sized retry choice for shutdown cleanup."""
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Data Network")
-        dialog.transient(self.root)
-        dialog.resizable(False, False)
-        dialog.grab_set()
-        retry = False
-
-        tk.Label(
-            dialog,
-            text="Data network not available. Try again?",
-            font=("Helvetica", 20, "bold"),
-            padx=36,
-            pady=30,
-            justify="center",
-        ).pack(fill="both", expand=True)
-
-        button_frame = tk.Frame(dialog)
-        button_frame.pack(fill="x", padx=28, pady=(0, 28))
-        button_frame.grid_columnconfigure(0, weight=1)
-        button_frame.grid_columnconfigure(1, weight=1)
-
-        def choose(should_retry: bool) -> None:
-            nonlocal retry
-            retry = should_retry
-            dialog.destroy()
-
-        yes_button = tk.Button(
-            button_frame,
-            text="Yes",
-            command=lambda: choose(True),
-            font=("Helvetica", 20, "bold"),
-            height=2,
-            padx=24,
-            pady=16,
-            bg=BUTTON_BG,
-            activebackground=BUTTON_ACTIVE_BG,
+    def _ask_retry_data_network(self) -> Optional[bool]:
+        """Report each cleanup outcome; closing this dialog cancels shutdown."""
+        report = getattr(self, "cleanup_report", None)
+        detail = report.details if report is not None else "Cleanup did not complete."
+        log_note = (
+            "Details saved to logs/interface_sync.log" if getattr(self, "_sync_log_saved", False)
+            else "Could not save diagnostics to logs/interface_sync.log; see the details above."
         )
-        yes_button.grid(row=0, column=0, sticky="ew", padx=(0, 10))
-
-        no_button = tk.Button(
-            button_frame,
-            text="No",
-            command=lambda: choose(False),
-            font=("Helvetica", 20, "bold"),
-            height=2,
-            padx=24,
-            pady=16,
-            bg=SHUTDOWN_BUTTON_BG,
-            fg="white",
-            activebackground=SHUTDOWN_BUTTON_ACTIVE_BG,
-            activeforeground="white",
+        return choose_dialog(
+            self.root, "Shutdown Cleanup", detail + f"\n\n{log_note}",
+            [("Retry", True), ("Shut down anyway", False), ("Cancel shutdown", None)],
+            cancel_value=None,
         )
-        no_button.grid(row=0, column=1, sticky="ew", padx=(10, 0))
-
-        dialog.protocol("WM_DELETE_WINDOW", lambda: None)
-        yes_button.focus_set()
-        self.root.wait_window(dialog)
-        return retry
 
     def _shutdown_system(self) -> None:
         if self.task_active or getattr(self, "cleanup_active", False):
@@ -1388,8 +1401,13 @@ class TouchInterfaceApp:
                     self.status_var.set("Shutdown cancelled")
                     return
 
-                self.status_var.set("Data network not available")
-                if not self._ask_retry_data_network():
+                report = getattr(self, "cleanup_report", None)
+                self.status_var.set(report.summary if report is not None else "Cleanup did not complete")
+                retry = self._ask_retry_data_network()
+                if retry is None:
+                    self.status_var.set("Shutdown cancelled")
+                    return
+                if not retry:
                     break
 
             self.cleanup_active = True

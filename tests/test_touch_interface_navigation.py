@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from bin.screen import ScreenGeometry
-from interface.touch_interface import ScrollableButtonFrame, TouchInterfaceApp
+from interface.touch_interface import CleanupReport, CleanupResult, ScrollableButtonFrame, TouchInterfaceApp
 
 
 class TouchInterfaceNavigationTests(unittest.TestCase):
@@ -95,6 +95,16 @@ class TouchInterfaceNavigationTests(unittest.TestCase):
         app.status_var.set.assert_called_once_with(
             "Cannot end experiment while a task is running"
         )
+
+    def test_end_experiment_keeps_cleanup_status_and_displays_failure_details(self):
+        app = self._app()
+        app.root = Mock()
+        app.cleanup_report = CleanupReport(False, CleanupResult.SUCCESS, "Git permission denied", "Data copied")
+        app._render_root_menu = Mock(side_effect=lambda: app.status_var.set("Choose an action"))
+        with patch("interface.touch_interface.messagebox.showwarning") as warning:
+            app._end_experiment()
+        app.status_var.set.assert_called_with("Data sync completed. Code update failed.")
+        warning.assert_called_once_with("Experiment Cleanup", app.cleanup_report.details, parent=app.root)
 
     def test_closing_launcher_also_ends_active_tracker_experiment(self):
         app = self._app()

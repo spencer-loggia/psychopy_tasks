@@ -190,8 +190,17 @@ startup the launcher makes a bounded update attempt; a failure or timeout is log
 from opening. Each later cleanup also runs `git reset --hard` and pulls from that explicit URL before data
 synchronization starts.
 
-Only shutdown turns a network-cleanup failure into a blocking prompt: **Data network not available. Try again?**
-**Yes** retries cleanup, while **No** proceeds with shutdown.
+Cleanup reports data copying and code updating separately. A failed Git update can therefore report
+**Data sync completed. Code update failed.** without implying that the data drive is unavailable.
+The report includes the destination and actual command/probe errors, including rsync errors captured before
+a timeout. Reports are appended locally to `logs/interface_sync.log`, so they remain available when the
+remote is unavailable. Startup code-update failures are also recorded there and shown in the status bar.
+
+End Experiment keeps the cleanup summary visible on the root menu and shows details if either operation
+fails. Before shutdown, the details dialog offers **Retry**, **Shut down anyway**, and **Cancel shutdown**.
+Escape or closing this dialog cancels shutdown. Interface error/warning dialogs support arrow keys to select
+a button, Enter or keypad Enter to activate it, and Escape to dismiss. The same keys work in the sync-cancel
+dialog and the separate nonmodal eye-tracker warnings; tracker warnings never block task execution.
 
 Run System Diagnostic uses the configured `environment.python` interpreter and does not create an experiment or
 block. It checks that PsychoPy can import, `lgpio` can open GPIO chip 0, and the Pi-Plates DAQC2 driver can read the

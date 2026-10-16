@@ -103,15 +103,20 @@ def run_command_bounded(
 
 
 def mounted_filesystem_type(path: Path) -> Optional[str]:
-    """Return the filesystem type containing *path*, or ``None`` on failure."""
+    """Return the containing filesystem type, preserving probe failure details."""
     try:
         result = run_command_bounded(
             ["findmnt", "--target", str(path), "--noheadings", "--output", "FSTYPE"],
             check=True,
             timeout_s=FILESYSTEM_TYPE_PROBE_TIMEOUT_S,
         )
-    except (OSError, subprocess.SubprocessError):
-        return None
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"findmnt timed out after {exc.timeout:g} seconds") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or str(exc)).strip()
+        raise RuntimeError(f"findmnt failed: {detail}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"Could not run findmnt: {exc}") from exc
     filesystem_type = result.stdout.strip().splitlines()
     return filesystem_type[-1].strip().lower() if filesystem_type else None
 
@@ -258,7 +263,10 @@ class ExperimentDataSync:
                 None,
                 "remote_data_url is not configured; data was not synced",
             )
-        filesystem_type = self._filesystem_type(remote_root)
+        try:
+            filesystem_type = self._filesystem_type(remote_root)
+        except (OSError, RuntimeError) as exc:
+            return SyncPreparation(None, f"Could not verify the data mount at {remote_root}: {exc}")
         if filesystem_type not in NFS_FILESYSTEM_TYPES:
             detail = filesystem_type or "unknown"
             return SyncPreparation(

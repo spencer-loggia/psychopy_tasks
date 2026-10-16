@@ -14,6 +14,7 @@ from interface.data_sync import (
     probe_remote_directory,
     run_command_bounded,
     terminate_process,
+    mounted_filesystem_type,
 )
 from interface.touch_interface import (
     DATA_SYNC_STALL_TIMEOUT_SECONDS,
@@ -21,10 +22,28 @@ from interface.touch_interface import (
     CleanupResult,
     SyncDialogResult,
     TouchInterfaceApp,
+    CleanupReport,
 )
 
 
 class ExperimentDataSyncTests(unittest.TestCase):
+    def test_mount_probe_errors_are_not_misreported_as_unsupported_filesystems(self):
+        for error in (
+            FileNotFoundError("findmnt missing"),
+            subprocess.TimeoutExpired(["findmnt"], 5),
+            subprocess.CalledProcessError(1, ["findmnt"], stderr="Permission denied"),
+        ):
+            with self.subTest(error=error), patch(
+                "interface.data_sync.run_command_bounded", side_effect=error,
+            ):
+                preparation = ExperimentDataSync(
+                    Path("/work/logs"), Path("/mnt/data"), filesystem_type=mounted_filesystem_type,
+                ).prepare()
+            self.assertIsNone(preparation.plan)
+            self.assertIn("Could not verify the data mount", preparation.warning)
+            self.assertIn("findmnt", preparation.warning)
+            self.assertNotIn("type=unknown", preparation.warning)
+
     def test_prepare_requires_nonempty_nfs_destination(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -225,6 +244,7 @@ class TouchInterfaceCleanupTests(unittest.TestCase):
         app.cleanup_active = False
         app.status_var = Mock()
         app.root = Mock()
+        app._write_sync_log = Mock(return_value=True)
         return app
 
     def test_pull_resets_hard_then_pulls_configured_url(self):
@@ -302,6 +322,65 @@ class TouchInterfaceCleanupTests(unittest.TestCase):
         self.assertIs(result, CleanupResult.UNAVAILABLE)
         app.pull_latest_code.assert_called_once_with()
         self.assertFalse(app.cleanup_active)
+
+    def test_cleanup_keeps_operation_details_and_resets_them_on_retry(self):
+        app = self._app()
+
+        def failed_pull():
+            app._code_update_detail = "git pull timed out"
+            return False
+
+        def successful_copy():
+            app._data_sync_detail = "Copied logs successfully"
+            return CleanupResult.SUCCESS
+
+        app.pull_latest_code = Mock(side_effect=failed_pull)
+        app.sync_data = Mock(side_effect=successful_copy)
+        self.assertIs(app.cleanup(), CleanupResult.UNAVAILABLE)
+        report = app.cleanup_report
+        self.assertEqual(report.summary, "Data sync completed. Code update failed.")
+        self.assertIn("git pull timed out", report.details)
+        self.assertIn("Copied logs successfully", report.details)
+        app._write_sync_log.assert_called_with(report.details)
+        app.pull_latest_code.side_effect = None
+        app.pull_latest_code.return_value = True
+        app.cleanup()
+        self.assertNotIn("git pull timed out", app.cleanup_report.details)
+
+    def test_sync_diagnostic_log_is_local_and_append_only(self):
+        app = self._app()
+        with tempfile.TemporaryDirectory() as tmp:
+            app.working_dir = Path(tmp)
+            for detail in ("Git failed; data copied", "Data copy failed: Permission denied"):
+                self.assertTrue(TouchInterfaceApp._write_sync_log(app, detail))
+            text = (Path(tmp) / "logs/interface_sync.log").read_text()
+        self.assertIn("Git failed; data copied", text)
+        self.assertIn("Data copy failed: Permission denied", text)
+
+    def test_rsync_stderr_survives_stall_timeout_and_nonzero_exit(self):
+        for outcome in (SyncDialogResult.TIMED_OUT, SyncDialogResult.COMPLETED):
+            with self.subTest(outcome=outcome):
+                app = self._app()
+                plan = SyncPlan(Path("/work/logs"), (Path("/work/logs/exp"),),
+                                Path("/work/logs/exp"), Path("/mnt/data/experiments"))
+                sync = Mock()
+                sync.prepare.return_value = SyncPreparation(plan)
+                process = Mock()
+                process.poll.return_value = 23
+
+                def spawn(*args, **kwargs):
+                    kwargs["stderr"].write("rsync: failed to set times: Operation not permitted\n")
+                    kwargs["stderr"].flush()
+                    return process
+
+                app._show_sync_dialog = Mock(return_value=outcome)
+                with patch("interface.touch_interface.ExperimentDataSync", return_value=sync), patch(
+                    "interface.touch_interface.subprocess.Popen", side_effect=spawn,
+                ):
+                    self.assertIs(app.sync_data(), CleanupResult.UNAVAILABLE)
+                self.assertIn("Operation not permitted", app._data_sync_detail)
+                self.assertIn("/mnt/data/experiments", app._data_sync_detail)
+                sync.prune.assert_not_called()
 
     def test_cleanup_attempts_both_remotes_and_combines_their_status(self):
         for code_available, data_result, expected in (
@@ -657,50 +736,35 @@ class TouchInterfaceShutdownTests(unittest.TestCase):
         self.assertEqual(app._ask_retry_data_network.call_count, 2)
         run.assert_called_once()
 
-    def test_network_retry_dialog_uses_exact_message_and_touch_buttons(self):
+    def test_retry_dialog_reports_data_success_separately_from_git_failure(self):
         app = self._app()
-        dialog = Mock()
-        frame = Mock()
-        buttons = {}
-        close_kept_dialog_open = []
-
-        def create_button(_parent, **kwargs):
-            button = Mock()
-            buttons[kwargs["text"]] = (button, kwargs)
-            return button
-
-        def close_then_choose_yes(_dialog):
-            close_callback = dialog.protocol.call_args.args[1]
-            close_callback()
-            close_kept_dialog_open.append(not dialog.destroy.called)
-            buttons["Yes"][1]["command"]()
-
-        app.root.wait_window.side_effect = close_then_choose_yes
-
-        with patch(
-            "interface.touch_interface.tk.Toplevel",
-            return_value=dialog,
-        ), patch("interface.touch_interface.tk.Label") as label, patch(
-            "interface.touch_interface.tk.Frame",
-            return_value=frame,
-        ), patch(
-            "interface.touch_interface.tk.Button",
-            side_effect=create_button,
-        ):
-            retry = TouchInterfaceApp._ask_retry_data_network(app)
-
-        self.assertTrue(retry)
-        self.assertEqual(
-            label.call_args.kwargs["text"],
-            "Data network not available. Try again?",
+        app.cleanup_report = CleanupReport(
+            False, CleanupResult.SUCCESS, "git pull failed: repository permissions",
+            "Copied logs to /mnt/data/experiments successfully",
         )
-        self.assertEqual(set(buttons), {"Yes", "No"})
-        self.assertEqual(close_kept_dialog_open, [True])
-        for _button, kwargs in buttons.values():
-            self.assertGreaterEqual(kwargs["height"], 2)
-            self.assertGreaterEqual(kwargs["pady"], 16)
-        dialog.grab_set.assert_called_once_with()
-        app.root.wait_window.assert_called_once_with(dialog)
+        app._sync_log_saved = True
+        with patch("interface.touch_interface.choose_dialog", return_value=True) as choose:
+            self.assertTrue(TouchInterfaceApp._ask_retry_data_network(app))
+        title, message, choices = choose.call_args.args[1:]
+        self.assertEqual(title, "Shutdown Cleanup")
+        self.assertIn("Data sync completed. Code update failed.", message)
+        self.assertIn("repository permissions", message)
+        self.assertIn("interface_sync.log", message)
+        self.assertNotIn("network not available", message)
+        self.assertEqual(choices, [("Retry", True), ("Shut down anyway", False), ("Cancel shutdown", None)])
+        self.assertIsNone(choose.call_args.kwargs["cancel_value"])
+
+    def test_dismissing_cleanup_dialog_cancels_shutdown(self):
+        app = self._app()
+        app.cleanup.return_value = CleanupResult.UNAVAILABLE
+        app._ask_retry_data_network.return_value = None
+        with patch("interface.touch_interface.subprocess.run") as run, patch(
+            "interface.touch_interface.request_eye_tracker_shutdown"
+        ) as tracker_shutdown:
+            app._shutdown_system()
+        run.assert_not_called()
+        tracker_shutdown.assert_not_called()
+        app.status_var.set.assert_called_with("Shutdown cancelled")
 
 
 if __name__ == "__main__":

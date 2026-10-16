@@ -1,4 +1,5 @@
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -46,6 +47,21 @@ class EyeTrackerWarningTests(unittest.TestCase):
         root.grab_set.assert_not_called()
         root.wait_window.assert_not_called()
         root.mainloop.assert_called_once_with()
+
+    def test_warning_can_be_dismissed_by_enter_or_escape_without_blocking(self):
+        for key in ("Return", "KP_Enter", "Escape"):
+            with self.subTest(key=key):
+                root, button = Mock(), Mock()
+                button.invoke.side_effect = root.destroy
+                with patch("tkinter.Tk", return_value=root), patch("tkinter.Label"), patch(
+                    "tkinter.Button", return_value=button
+                ), patch("bin.screen.resolve_task_screens", side_effect=RuntimeError("no display")):
+                    _main("No recording")
+                bindings = {call.args[0]: call.args[1] for call in button.bind.call_args_list}
+                self.assertEqual(bindings[f"<{key}>"](SimpleNamespace(keysym=key)), "break")
+                root.destroy.assert_called_once_with()
+                root.grab_set.assert_not_called()
+                root.wait_window.assert_not_called()
 
 
 if __name__ == "__main__":

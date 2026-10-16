@@ -47,6 +47,8 @@ class EyeTrackerWarnings:
 
 def _main(message: str) -> None:
     import tkinter as tk
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from bin.tk_dialogs import bind_dialog_keys
 
     root = tk.Tk()
     root.title("Eye Tracker Warning")
@@ -56,13 +58,14 @@ def _main(message: str) -> None:
         root, text=message + "\n\nThe experiment and task can continue.",
         wraplength=500, justify="left", padx=24, pady=24, font=("Helvetica", 16),
     ).pack()
-    tk.Button(
+    dismiss = tk.Button(
         root, text="Dismiss", command=root.destroy,
         padx=24, pady=12, font=("Helvetica", 16),
-    ).pack(pady=(0, 20))
+    )
+    dismiss.pack(pady=(0, 20))
+    bind_dialog_keys(root, [dismiss], cancel=root.destroy)
     # Place the dialog on the launcher's experimenter display when available.
     try:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
         from bin.screen import load_screen_config, resolve_task_screens
 
         main, secondary = resolve_task_screens(load_screen_config({}), allow_same_screen=True)

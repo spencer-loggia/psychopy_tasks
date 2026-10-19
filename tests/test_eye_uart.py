@@ -78,7 +78,7 @@ class UARTProtocolTests(unittest.TestCase):
             with self.subTest(timestamp=timestamp), self.assertRaises(ValueError):
                 encode_command(CommandPacket(CommandCode.START_EXPERIMENT, 1, timestamp, subject="A"))
         packet = encode_command(CommandPacket(CommandCode.START_EXPERIMENT, 1, 1, subject="A"))
-        for offset, value in ((24, 0), (24, 33), (25, 255), (26, 1), (59, 1), (12, 1), (16, 0)):
+        for offset, value in ((24, 0), (24, 33), (25, 255), (26, 1), (59, 1), (16, 0)):
             malformed = bytearray(packet)
             malformed[offset] = value
             struct.pack_into("<I", malformed, 60, crc32c(malformed[:60]))
@@ -90,14 +90,63 @@ class UARTProtocolTests(unittest.TestCase):
         channel.exchange.side_effect = [ResponseTimeout("lost ACK"), status_bytes(), status_bytes(sequence=43)]
         controller = EyeTrackerController(channel, initial_sequence=42, retries=1, retry_delay_s=0)
         with patch("bin.eye_tracker_wire.controller.time.time_ns", return_value=1791988200123456000) as clock:
-            controller.start_experiment("Yuri")
+            controller.start_experiment("Yuri", experiment_number=7)
             clock.assert_called_once_with()
         controller.stop_experiment()
         calls = channel.exchange.call_args_list
-        self.assertEqual(calls[0].args[0], bytes.fromhex(FIXTURE["start_experiment"]))
+        self.assertEqual(calls[0].args[0], bytes.fromhex(FIXTURE["numbered_experiment"]))
         self.assertEqual(calls[0].args[0], calls[1].args[0])
         self.assertEqual(decode_command(calls[2].args[0]).code, CommandCode.STOP_EXPERIMENT)
         self.assertEqual(calls[2].args[0][24:60], bytes(36))
+
+    def test_numbered_starts_match_upstream_and_retry_identically(self):
+        for method, key, code in (
+            ("start_tracking", "numbered_tracking", CommandCode.START_TRACKING),
+            ("start_recording", "numbered_recording", CommandCode.START_RECORDING),
+        ):
+            with self.subTest(method=method):
+                channel = Mock()
+                channel.exchange.side_effect = [ResponseTimeout("lost ACK"), status_bytes()]
+                controller = EyeTrackerController(channel, initial_sequence=42, retries=1, retry_delay_s=0)
+                with patch("bin.eye_tracker_wire.controller.time.monotonic_ns", return_value=111222333) as clock:
+                    getattr(controller, method)(block_number=0x01020304)
+                clock.assert_called_once_with()
+                packets = [call.args[0] for call in channel.exchange.call_args_list]
+                self.assertEqual(packets, [bytes.fromhex(FIXTURE[key])] * 2)
+                self.assertEqual(decode_command(packets[0]), CommandPacket(code, 42, 111222333, block_number=0x01020304))
+                self.assertEqual(len(packets[0]), 64)
+                self.assertEqual(packets[0][12:16], b"\x04\x03\x02\x01")
+                self.assertEqual(packets[0][24:60], bytes(36))
+
+    def test_start_numbers_validate_uint32_and_round_trip(self):
+        for code in (CommandCode.START_EXPERIMENT, CommandCode.START_TRACKING, CommandCode.START_RECORDING):
+            field = "experiment_number" if code == CommandCode.START_EXPERIMENT else "block_number"
+            payload = {"subject": "Yuri"} if code == CommandCode.START_EXPERIMENT else {}
+            for number in (None, 1, 0xFFFFFFFF):
+                command = CommandPacket(code, 42, 1, **payload, **{field: number})
+                with self.subTest(code=code, number=number):
+                    packet = encode_command(command)
+                    self.assertEqual(struct.unpack_from("<I", packet, 12)[0], number or 0)
+                    self.assertEqual(decode_command(packet), command)
+            for number in (0, -1, True, 1.5, "2", 1 << 32):
+                with self.subTest(code=code, number=number), self.assertRaises(ValueError):
+                    encode_command(CommandPacket(code, 42, 1, **payload, **{field: number}))
+
+    def test_numbers_are_rejected_on_other_commands(self):
+        for code in CommandCode:
+            for field, allowed in (
+                ("experiment_number", (CommandCode.START_EXPERIMENT,)),
+                ("block_number", (CommandCode.START_TRACKING, CommandCode.START_RECORDING)),
+            ):
+                if code not in allowed:
+                    with self.subTest(code=code, field=field), self.assertRaises(ValueError):
+                        encode_command(CommandPacket(code, 42, 1, **{field: 7}))
+            if code not in (CommandCode.START_EXPERIMENT, CommandCode.START_TRACKING, CommandCode.START_RECORDING):
+                packet = bytearray(encode_command(CommandPacket(code, 42)))
+                struct.pack_into("<I", packet, 12, 7)
+                struct.pack_into("<I", packet, 60, crc32c(packet[:60]))
+                with self.subTest(code=code), self.assertRaisesRegex(ProtocolError, "BAD_RESERVED"):
+                    decode_command(bytes(packet))
 
     def test_codec_matches_upstream_golden_packets(self):
         self.assertEqual(crc32c(b"123456789"), 0xE3069283)

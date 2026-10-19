@@ -5,7 +5,13 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
-from bin.eye_tracking import EXPERIMENT_UART_PENDING_ENV, UARTEyeTracker, UARTEyeTrackerConfig
+from bin.eye_tracking import (
+    EXPERIMENT_BLOCK_NUMBER_ENV,
+    EXPERIMENT_UART_PENDING_ENV,
+    EXPERIMENT_UART_READY_ENV,
+    UARTEyeTracker,
+    UARTEyeTrackerConfig,
+)
 from bin.eye_tracker_wire.protocol import StatusFlag
 from interface.experiment_eye_tracker import ExperimentEyeTracker, request_eye_tracker_shutdown
 
@@ -84,13 +90,17 @@ class ExperimentEyeTrackerTests(unittest.TestCase):
         return ExperimentEyeTracker(
             kwargs.get("config", self.config), subject=kwargs.get("subject", "Yuri"),
             started_at=self.started_at, directory=self.directory,
+            experiment_number=kwargs.get("experiment_number", 7),
         )
 
     def test_subject_utc_date_and_stop_share_configured_uart_and_release_it(self):
         tracker = self.create()
         tracker.start_future.result(timeout=2)
-        self.controller.start_experiment.assert_called_once_with("Yuri", timestamp_ns=1791988200123456000)
+        self.controller.start_experiment.assert_called_once_with(
+            "Yuri", timestamp_ns=1791988200123456000, experiment_number=7,
+        )
         self.assertFalse(tracker.pending_path.exists())
+        self.assertTrue(tracker.ready_path.is_file())
         tracker.finish()
         tracker.finish()
         tracker.stop_future.result(timeout=2)
@@ -126,6 +136,7 @@ class ExperimentEyeTrackerTests(unittest.TestCase):
         tracker = self.create()
         tracker.start_future.result(timeout=2)
         self.assertFalse(tracker.pending_path.exists())
+        self.assertFalse(tracker.ready_path.exists())
         tracker.finish()
         tracker.stop_future.result(timeout=2)
         self.assertEqual(self.warning.call_count, 2)
@@ -135,6 +146,7 @@ class ExperimentEyeTrackerTests(unittest.TestCase):
         self.controller.start_experiment.side_effect = RuntimeError("lost acknowledgement")
         tracker = self.create()
         tracker.start_future.result(timeout=2)
+        self.assertFalse(tracker.ready_path.exists())
         tracker.finish()
         tracker.stop_future.result(timeout=2)
         self.controller.stop_experiment.assert_called_once()
@@ -149,6 +161,23 @@ class ExperimentEyeTrackerTests(unittest.TestCase):
         tracker.stop_future.result(timeout=2)
         self.assertEqual(self.warning.call_count, 2)
         self.assertIn("recording may not have been flushed", self.warning.call_args.args[0])
+        self.assertFalse(tracker.ready_path.exists())
+
+    def test_unconfirmed_experiment_prevents_numbered_tracking_in_previous_experiment(self):
+        for flags in (StatusFlag(0), StatusFlag.ERROR | StatusFlag.EXPERIMENT_ACTIVE):
+            with self.subTest(flags=flags):
+                self.controller.start_experiment.return_value = Mock(flags=flags)
+                tracker = self.create()
+                tracker.start_future.result(timeout=2)
+                with patch.dict("os.environ", {
+                    EXPERIMENT_UART_PENDING_ENV: str(tracker.pending_path),
+                    EXPERIMENT_UART_READY_ENV: str(tracker.ready_path),
+                    EXPERIMENT_BLOCK_NUMBER_ENV: "3",
+                }), patch("bin.eye_tracking.SerialPacketChannel") as channel:
+                    task_tracker = UARTEyeTracker()
+                    task_tracker._run()
+                channel.assert_not_called()
+                self.assertIn("experiment start was not confirmed", task_tracker.get_state().error)
 
     def test_disabled_simulated_and_invalid_settings_do_not_open_uart(self):
         for config in ({}, {"eye_tracker_experiment": {"enabled": True, "uart": {"simulate": True}}}, {"eye_tracker_experiment": {"enabled": "yes"}}):

@@ -84,6 +84,8 @@ class CommandPacket:
     controller_timestamp_ns: int = 0
     flags: int = 0
     subject: str | None = None
+    experiment_number: int | None = None
+    block_number: int | None = None
 
 
 @dataclass(frozen=True)
@@ -130,6 +132,15 @@ def validate_subject_name(subject: str) -> str:
     return subject
 
 
+def validate_run_number(value: int | None) -> int | None:
+    """Accept automatic numbering (None) or a positive uint32 experiment/block ID."""
+    if value is not None and (
+        isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 0xFFFFFFFF
+    ):
+        raise ValueError("Experiment/block number must be an integer in [1, 2^32-1]")
+    return value
+
+
 def encode_command(command: CommandPacket) -> bytes:
     sequence = _checked_u32(command.sequence, "command sequence")
     if sequence == 0:
@@ -139,6 +150,14 @@ def encode_command(command: CommandPacket) -> bytes:
     if not 0 <= command.controller_timestamp_ns <= 0xFFFFFFFFFFFFFFFF:
         raise ValueError("controller_timestamp_ns must fit in uint64")
     subject_bytes = b""
+    experiment_number = validate_run_number(command.experiment_number)
+    block_number = validate_run_number(command.block_number)
+    if experiment_number is not None and command.code != CommandCode.START_EXPERIMENT:
+        raise ValueError("Only START_EXPERIMENT accepts an experiment number")
+    if block_number is not None and command.code not in (
+        CommandCode.START_TRACKING, CommandCode.START_RECORDING,
+    ):
+        raise ValueError("Only START_TRACKING/START_RECORDING accept a block number")
     if command.code == CommandCode.START_EXPERIMENT:
         if command.controller_timestamp_ns == 0:
             raise ValueError("START_EXPERIMENT requires a nonzero Unix UTC timestamp")
@@ -155,7 +174,7 @@ def encode_command(command: CommandPacket) -> bytes:
         command.flags,
         int(command.code),
         sequence,
-        0,
+        experiment_number or block_number or 0,
         command.controller_timestamp_ns,
     )
     if subject_bytes:
@@ -184,12 +203,14 @@ def decode_command(packet: bytes) -> CommandPacket:
         raise ProtocolError("BAD_PACKET_TYPE")
     if sequence == 0:
         raise ProtocolError("BAD_SEQUENCE")
-    if related != 0:
-        raise ProtocolError("BAD_RESERVED")
     try:
         command_code = CommandCode(code)
     except ValueError as exc:
         raise ProtocolError("UNKNOWN_COMMAND") from exc
+    if related and command_code not in (
+        CommandCode.START_EXPERIMENT, CommandCode.START_TRACKING, CommandCode.START_RECORDING,
+    ):
+        raise ProtocolError("BAD_RESERVED")
     subject = None
     if command_code is CommandCode.START_EXPERIMENT:
         if timestamp_ns == 0:
@@ -211,6 +232,10 @@ def decode_command(packet: bytes) -> CommandPacket:
         controller_timestamp_ns=timestamp_ns,
         flags=flags,
         subject=subject,
+        experiment_number=(related or None)
+        if command_code is CommandCode.START_EXPERIMENT else None,
+        block_number=(related or None)
+        if command_code in (CommandCode.START_TRACKING, CommandCode.START_RECORDING) else None,
     )
 
 

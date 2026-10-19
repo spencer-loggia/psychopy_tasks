@@ -24,9 +24,12 @@ from .eye_tracker_wire.protocol import (
     DecodedStatus,
     StatusCode,
     StatusFlag,
+    validate_run_number,
 )
 
 EXPERIMENT_UART_PENDING_ENV = "NEURO_EYE_TRACKER_EXPERIMENT_PENDING"
+EXPERIMENT_UART_READY_ENV = "NEURO_EYE_TRACKER_EXPERIMENT_READY"
+EXPERIMENT_BLOCK_NUMBER_ENV = "NEURO_EYE_TRACKER_BLOCK_NUMBER"
 
 
 @dataclass(frozen=True)
@@ -407,6 +410,11 @@ class UARTEyeTracker:
             if time.monotonic() >= deadline:
                 raise TimeoutError("Experiment START_EXPERIMENT is still pending; task continues without eye tracking")
             self._stop.wait(0.05)
+        ready = os.environ.get(EXPERIMENT_UART_READY_ENV)
+        if ready and not self._stop.is_set() and not Path(ready).is_file():
+            raise RuntimeError(
+                "Eye tracker experiment start was not confirmed; task continues without eye tracking"
+            )
 
     def _publish_state(self):
         """Optional worker-side consumer; never perform serial/file I/O on flip."""
@@ -438,8 +446,12 @@ class UARTEyeTracker:
                     retries=self.config.state_retries,
                 )
                 if self.config.manage_tracking:
+                    # The launcher supplies the actual task block, including
+                    # gaps from tasks that did not start eye tracking.
+                    number = os.environ.get(EXPERIMENT_BLOCK_NUMBER_ENV)
+                    block_number = validate_run_number(int(number)) if number is not None else None
                     start_attempted = True
-                    status = controller.send_state_command(CommandCode.START_TRACKING)
+                    status = controller.start_tracking(block_number=block_number)
                     with self._lock:
                         self.filter.consume(status, now_s=time.perf_counter())
                     self._check_status(status)

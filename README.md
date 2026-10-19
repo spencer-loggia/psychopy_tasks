@@ -48,13 +48,27 @@ Both Raspberry Pi launch configs also synchronize experiment boundaries with the
 ```
 
 Selecting a subject queues UART `START_EXPERIMENT` (code 6) with the selected full name
-(for example, `Yuri`, not its directory code `Y`) and the experiment start datetime converted
-to Unix UTC nanoseconds. End Experiment or closing the launcher queues `STOP_EXPERIMENT`
+(for example, `Yuri`, not its directory code `Y`), the numeric ID allocated for the local
+experiment directory (`007` sends number `7`), and the experiment start datetime converted
+to Unix UTC nanoseconds. When a task block starts eye tracking, its `START_TRACKING`
+command carries the local `block_num`, including calibration tasks and gaps from blocks
+without eye tracking. For example, local `blocks/3_fixation/` corresponds to tracker
+`blocks/3/`. Directory names retain each device's format; the tracker uses the full subject
+name, UTC date and an additional start time in its experiment name.
+End Experiment or closing the launcher queues `STOP_EXPERIMENT`
 (code 7), which asks the tracker to flush recording and close its experiment. The tracker
 must run its `pi_tracker.py CONFIG` interface with permission to set its system clock;
 standalone `run`/`preview` services do not implement these experiment commands. Subject
 names must match `[A-Za-z0-9][A-Za-z0-9_.-]{0,31}`; unsupported names produce a warning
 and are never silently rewritten.
+
+Use a tracker version supporting numbered starts: the number occupies little-endian
+uint32 header bytes 12–15 of the existing 64-byte protocol v1 packet. Older trackers reject
+this field. An existing experiment number for the same subject and UTC day is rejected;
+a numbered tracking start replaces that block's directory on the tracker. Retries reuse
+the identical packet and sequence so a lost acknowledgement does not restart or replace
+the block again. Standalone task launches and launches with experiment synchronization
+disabled retain automatic tracker numbering. `uart.manage_tracking: false` remains poll-only.
 
 These commands run in order on a background worker. Experiment start allows 15 seconds per
 attempt (`eye_tracker_experiment.start_timeout_s`), with one identical-packet retry by default,
@@ -63,6 +77,8 @@ the start timeout is the greater of 15 seconds and `uart.state_timeout_s`. Stop 
 the 10-second state timeout (`uart.state_timeout_s`); `uart.state_retries` controls retries for all three.
 The UART is closed after each command. Task eye acquisition waits for the experiment-start
 handoff in its own worker, so the launcher and task rendering remain responsive.
+If experiment start is not confirmed, task eye acquisition stays off for that experiment
+to avoid writing numbered blocks into a previously active tracker experiment.
 Missing hardware, rejected commands, unexpected status flags, or recording failures show
 nonmodal warning dialogs and write warnings to stderr; experiments and tasks continue.
 Repeated warnings of the same kind are suppressed within each session. Missing recording

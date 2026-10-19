@@ -14,7 +14,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Optional
 
 from bin.config import load_config
-from bin.eye_tracking import EXPERIMENT_UART_PENDING_ENV
+from bin.eye_tracking import (
+    EXPERIMENT_BLOCK_NUMBER_ENV,
+    EXPERIMENT_UART_PENDING_ENV,
+    EXPERIMENT_UART_READY_ENV,
+)
 from bin.eye_tracking_config import resolve_eye_tracking_paths
 from bin.logger import (
     CALIBRATION_FILENAME,
@@ -188,6 +192,7 @@ class ExperimentManager:
         self.eye_tracker = ExperimentEyeTracker(
             self.launch_config, subject=self.subject_name,
             started_at=self.started_at, directory=self.experiment_dir,
+            experiment_number=self.experiment_number,
         )
 
     def finish(self) -> None:
@@ -207,6 +212,7 @@ class ExperimentManager:
             experiment_id += 1
         experiment_dir = self.logs_dir / f"{prefix}{experiment_id:03d}"
         experiment_dir.mkdir(exist_ok=False)
+        self.experiment_number = experiment_id
         return experiment_dir
 
     def milliseconds_since_start(self) -> float:
@@ -332,8 +338,12 @@ class ExperimentManager:
         environment = os.environ.copy()
         environment[EXACT_SESSION_DIR_ENV] = str(block.output_dir)
         environment[EVENT_LIBRARY_ENV] = str(self.event_library_path)
+        for key in (EXPERIMENT_UART_PENDING_ENV, EXPERIMENT_UART_READY_ENV, EXPERIMENT_BLOCK_NUMBER_ENV):
+            environment.pop(key, None)
         if self.eye_tracker.start_future is not None:
             environment[EXPERIMENT_UART_PENDING_ENV] = str(self.eye_tracker.pending_path)
+            environment[EXPERIMENT_UART_READY_ENV] = str(self.eye_tracker.ready_path)
+            environment[EXPERIMENT_BLOCK_NUMBER_ENV] = str(block.block_num)
         return environment
 
     def finish_block(self, block: PreparedBlock) -> None:

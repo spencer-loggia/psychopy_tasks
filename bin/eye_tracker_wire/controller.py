@@ -162,7 +162,9 @@ class EyeTrackerController:
         packet = encode_command(CommandPacket(CommandCode.POLL, self._take_sequence()))
         return self._exchange(packet, timeout_s)
 
-    def send_state_command(self, code: CommandCode) -> DecodedStatus:
+    def send_state_command(
+        self, code: CommandCode, *, block_number: int | None = None,
+    ) -> DecodedStatus:
         if code is CommandCode.POLL:
             raise ValueError("Use poll() for POLL commands")
         if code is CommandCode.START_EXPERIMENT:
@@ -172,11 +174,13 @@ class EyeTrackerController:
                 code=code,
                 sequence=self._take_sequence(),
                 controller_timestamp_ns=time.monotonic_ns(),
+                block_number=block_number,
             )
         )
 
     def start_experiment(
-        self, subject: str, *, timestamp_ns: int | None = None
+        self, subject: str, *, timestamp_ns: int | None = None,
+        experiment_number: int | None = None,
     ) -> DecodedStatus:
         """Open a Pi Tracker experiment using Unix UTC nanoseconds."""
         validate_subject_name(subject)
@@ -186,8 +190,17 @@ class EyeTrackerController:
                 sequence=self._take_sequence(),
                 controller_timestamp_ns=time.time_ns() if timestamp_ns is None else timestamp_ns,
                 subject=subject,
+                experiment_number=experiment_number,
             )
         )
+
+    def start_tracking(self, *, block_number: int | None = None) -> DecodedStatus:
+        """Start tracking, optionally replacing a numbered Pi Tracker block."""
+        return self.send_state_command(CommandCode.START_TRACKING, block_number=block_number)
+
+    def start_recording(self, *, block_number: int | None = None) -> DecodedStatus:
+        """Start a saved run while tracking, optionally replacing a numbered block."""
+        return self.send_state_command(CommandCode.START_RECORDING, block_number=block_number)
 
     def stop_experiment(self) -> DecodedStatus:
         return self.send_state_command(CommandCode.STOP_EXPERIMENT)

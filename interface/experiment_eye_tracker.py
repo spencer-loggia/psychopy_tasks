@@ -70,10 +70,15 @@ def _shutdown_eye_tracker(uart, warnings):
 
 
 class ExperimentEyeTracker:
-    def __init__(self, config, *, subject: str, started_at: dt.datetime, directory: Path):
+    def __init__(
+        self, config, *, subject: str, started_at: dt.datetime,
+        directory: Path, experiment_number: int,
+    ):
         self.warnings = EyeTrackerWarnings()
         self.pending_path = directory / ".eye_tracker_start_pending"
+        self.ready_path = directory / ".eye_tracker_experiment_ready"
         self.subject = subject
+        self.experiment_number = experiment_number
         stamp = started_at.astimezone(dt.timezone.utc)
         delta = stamp - dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
         self.timestamp_ns = (
@@ -124,13 +129,20 @@ class ExperimentEyeTracker:
                     retries=self.uart.state_retries,
                 )
                 status = (
-                    controller.start_experiment(self.subject, timestamp_ns=self.timestamp_ns)
+                    controller.start_experiment(
+                        self.subject, timestamp_ns=self.timestamp_ns,
+                        experiment_number=self.experiment_number,
+                    )
                     if start else controller.stop_experiment()
                 )
                 if status.flags & StatusFlag.ERROR:
                     self.warnings.warn(action, f"The eye tracker reported an error while trying to {action} the experiment.")
                 elif start and not status.flags & StatusFlag.EXPERIMENT_ACTIVE:
                     self.warnings.warn(action, "The eye tracker did not report an active experiment after START_EXPERIMENT.")
+                elif start:
+                    # Numbered starts can replace remote blocks. Release them
+                    # only after the intended experiment was acknowledged.
+                    self.ready_path.touch()
                 elif not start and status.flags & (
                     StatusFlag.EXPERIMENT_ACTIVE | StatusFlag.TRACKING
                     | StatusFlag.RECORDING | StatusFlag.CALIBRATING

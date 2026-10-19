@@ -3,12 +3,21 @@ import datetime as dt
 import json
 import os
 import random
+import struct
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from bin.logger import SessionLogBundle
+from bin.eye_tracking import (
+    EXPERIMENT_BLOCK_NUMBER_ENV,
+    EXPERIMENT_UART_PENDING_ENV,
+    EXPERIMENT_UART_READY_ENV,
+    UARTEyeTracker,
+)
+from bin.eye_tracker_wire.controller import ResponseTimeout
+from bin.eye_tracker_wire.protocol import CommandCode, StatusFlag, crc32c, decode_command
 from bin.eye_tracking_config import load_eye_tracking_settings
 from interface.experiment_manager import (
     EVENT_LIBRARY_ENV,
@@ -28,6 +37,74 @@ class FakeClock:
 
 
 class ExperimentManagerTests(unittest.TestCase):
+    def test_numbered_experiment_and_skipped_block_reach_uart_with_identical_retries(self):
+        fixture = json.loads((Path(__file__).parent / "fixtures/eye_uart_v1.json").read_text())
+        packets = []
+        channel = Mock()
+        channel.__enter__ = Mock(return_value=channel)
+        channel.__exit__ = Mock(return_value=False)
+        task_tracker = UARTEyeTracker()
+
+        def exchange(packet, timeout_s):
+            packets.append(packet)
+            command = decode_command(packet)
+            # Lose the first ACK of both starts, then acknowledge identical retries.
+            if command.code in (CommandCode.START_EXPERIMENT, CommandCode.START_TRACKING):
+                if packets.count(packet) == 1:
+                    raise ResponseTimeout("lost ACK")
+            flags = StatusFlag.EXPERIMENT_ACTIVE
+            if command.code == CommandCode.START_TRACKING:
+                flags |= StatusFlag.TRACKING | StatusFlag.CONFIGURED | StatusFlag.RECORDING
+                task_tracker._stop.set()
+            elif command.code == CommandCode.STOP_EXPERIMENT:
+                flags = StatusFlag(0)
+            response = bytearray.fromhex(fixture["status"])
+            struct.pack_into("<H", response, 4, flags)
+            struct.pack_into("<I", response, 12, command.sequence)
+            struct.pack_into("<I", response, 60, crc32c(response[:60]))
+            return bytes(response)
+
+        channel.exchange.side_effect = exchange
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "interface.experiment_eye_tracker.SerialPacketChannel", return_value=channel
+        ), patch("bin.eye_tracking.SerialPacketChannel", return_value=channel), patch(
+            "bin.eye_tracker_warnings.show_eye_tracker_warning"
+        ) as warning:
+            root = Path(tmpdir)
+            config, path = self._project(root)
+            config["eye_tracker_experiment"] = {"enabled": True}
+            (root / "logs" / "exp_Y_20261019_001").mkdir(parents=True)
+            manager = ExperimentManager(
+                working_dir=root, launch_config_path=path, launch_config=config,
+                subject_name="Yuri", subject_code="Y",
+                now=dt.datetime(2026, 10, 19, 14, 30, tzinfo=dt.timezone.utc),
+            )
+            try:
+                manager.eye_tracker.start_future.result(timeout=2)
+                self.assertEqual(manager.experiment_dir.name, "exp_Y_20261019_002")
+                manager.prepare_block(task_name="no_tracking", launch_value="task/demo.py", config_value=None)
+                block = manager.prepare_block(task_name="tracking", launch_value="task/demo.py", config_value=None)
+                with patch.dict(os.environ, manager.subprocess_environment(block)):
+                    task_tracker._run()
+            finally:
+                manager.finish()
+                manager.eye_tracker.stop_future.result(timeout=2)
+            warning.assert_not_called()
+        commands = [decode_command(packet) for packet in packets]
+        self.assertEqual([command.code for command in commands], [
+            CommandCode.START_EXPERIMENT, CommandCode.START_EXPERIMENT,
+            CommandCode.START_TRACKING, CommandCode.START_TRACKING,
+            CommandCode.STOP_TRACKING, CommandCode.STOP_EXPERIMENT,
+        ])
+        self.assertEqual(commands[0].experiment_number, 2)
+        self.assertEqual(commands[0].subject, "Yuri")
+        self.assertEqual(commands[2].block_number, 2)
+        self.assertEqual(packets[0], packets[1])
+        self.assertEqual(packets[2], packets[3])
+        for command in commands[4:]:
+            self.assertIsNone(command.experiment_number)
+            self.assertIsNone(command.block_number)
+
     def test_lifecycle_uses_full_subject_start_time_and_exports_uart_handoff(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -40,11 +117,18 @@ class ExperimentManagerTests(unittest.TestCase):
                 )
                 tracker.assert_called_once_with(
                     config, subject="Yuri", started_at=started, directory=manager.experiment_dir,
+                    experiment_number=1,
                 )
                 tracker.return_value.pending_path = manager.experiment_dir / ".pending"
+                tracker.return_value.ready_path = manager.experiment_dir / ".ready"
                 block = manager.prepare_block(task_name="demo", launch_value="task/demo.py", config_value="configs/demo.json")
                 env = manager.subprocess_environment(block)
                 self.assertEqual(env["NEURO_EYE_TRACKER_EXPERIMENT_PENDING"], str(tracker.return_value.pending_path))
+                self.assertEqual(env[EXPERIMENT_UART_READY_ENV], str(tracker.return_value.ready_path))
+                self.assertEqual(env[EXPERIMENT_BLOCK_NUMBER_ENV], "1")
+                # Blocks with no tracking still consume their local number.
+                block = manager.prepare_block(task_name="demo", launch_value="task/demo.py", config_value="configs/demo.json")
+                self.assertEqual(manager.subprocess_environment(block)[EXPERIMENT_BLOCK_NUMBER_ENV], "2")
                 manager.finish()
                 tracker.return_value.finish.assert_called_once()
 
@@ -330,6 +414,29 @@ class ExperimentManagerTests(unittest.TestCase):
             second = ExperimentManager(**kwargs)
             self.assertEqual(first.experiment_dir.name, "exp_S1_20260813_001")
             self.assertEqual(second.experiment_dir.name, "exp_S1_20260813_002")
+            self.assertEqual(first.experiment_number, 1)
+            self.assertEqual(second.experiment_number, 2)
+
+    def test_disabled_and_simulated_sync_clear_inherited_uart_context(self):
+        for options in ({}, {"enabled": False}, {"enabled": True, "uart": {"simulate": True}}):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                config, path = self._project(root)
+                config["eye_tracker_experiment"] = options
+                manager = ExperimentManager(
+                    working_dir=root, launch_config_path=path, launch_config=config,
+                    subject_name="Yuri", subject_code="Y",
+                )
+                block = manager.prepare_block(task_name="demo", launch_value="task/demo.py", config_value=None)
+                inherited = {
+                    EXPERIMENT_UART_PENDING_ENV: "/old/pending",
+                    EXPERIMENT_UART_READY_ENV: "/old/ready",
+                    EXPERIMENT_BLOCK_NUMBER_ENV: "99",
+                }
+                with patch.dict(os.environ, inherited):
+                    env = manager.subprocess_environment(block)
+                for key in inherited:
+                    self.assertNotIn(key, env)
 
     def test_loop_sequences_validate_and_obey_iteration_policy(self):
         loop = {

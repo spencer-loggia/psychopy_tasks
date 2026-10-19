@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from bin.eye_tracking import (
+    EXPERIMENT_BLOCK_NUMBER_ENV,
     UARTEyeTracker,
     UARTEyeTrackerConfig,
     EyeCalibration,
@@ -230,6 +231,7 @@ class EyeTrackingTests(unittest.TestCase):
 
     def test_worker_starts_polls_and_stops_with_matching_state_commands(self):
         controller = Mock()
+        controller.start_tracking.return_value = sample()
         controller.send_state_command.return_value = sample()
         controller.poll.return_value = sample(2)
         with patch("bin.eye_tracking.SerialPacketChannel") as channel_class, patch(
@@ -241,9 +243,10 @@ class EyeTrackingTests(unittest.TestCase):
             while not tracker.get_state().valid and time.monotonic() < deadline:
                 time.sleep(0.001)
             tracker.stop()
+            controller.start_tracking.assert_called_once_with(block_number=None)
             self.assertEqual(
                 [c.args[0] for c in controller.send_state_command.call_args_list],
-                [CommandCode.START_TRACKING, CommandCode.STOP_TRACKING],
+                [CommandCode.STOP_TRACKING],
             )
             channel_class.return_value.close.assert_called_once()
 
@@ -258,6 +261,37 @@ class EyeTrackingTests(unittest.TestCase):
             tracker.start()
             tracker.stop()
             cls.return_value.send_state_command.assert_not_called()
+            cls.return_value.start_tracking.assert_not_called()
+
+    def test_worker_starts_the_launcher_block_number(self):
+        controller = Mock()
+        controller.send_state_command.return_value = sample(flags=StatusFlag(0))
+        tracker = UARTEyeTracker()
+
+        def started(**kwargs):
+            tracker._stop.set()
+            return sample()
+
+        controller.start_tracking.side_effect = started
+        with patch.dict("os.environ", {EXPERIMENT_BLOCK_NUMBER_ENV: "7"}), patch(
+            "bin.eye_tracking.SerialPacketChannel"
+        ), patch("bin.eye_tracking.EyeTrackerController", return_value=controller):
+            tracker._run()
+        controller.start_tracking.assert_called_once_with(block_number=7)
+        controller.send_state_command.assert_called_once_with(CommandCode.STOP_TRACKING)
+
+    def test_invalid_block_context_does_not_fall_back_to_auto_numbering(self):
+        for number in ("0", "-1", "1.5", "bad", str(1 << 32)):
+            with self.subTest(number=number), patch.dict("os.environ", {
+                EXPERIMENT_BLOCK_NUMBER_ENV: number,
+            }), patch("bin.eye_tracking.SerialPacketChannel"), patch(
+                "bin.eye_tracking.EyeTrackerController"
+            ) as controller:
+                tracker = UARTEyeTracker()
+                tracker._run()
+                controller.return_value.start_tracking.assert_not_called()
+                controller.return_value.send_state_command.assert_not_called()
+                self.assertIsNotNone(tracker.get_state().error)
 
     def test_invalid_config_rejected(self):
         for values in (

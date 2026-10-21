@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
+from interface.experiment_history import ExperimentHistory, HISTORY_SYNC_EXCLUDES
+
 
 NFS_FILESYSTEM_TYPES = frozenset({"nfs", "nfs4"})
 FILESYSTEM_TYPE_PROBE_TIMEOUT_S = 5.0
@@ -223,6 +225,7 @@ class SyncPlan:
             "--progress",
             "--no-owner",
             "--no-group",
+            *(f"--exclude={pattern}" for pattern in HISTORY_SYNC_EXCLUDES),
             "--",
             f"{self.source}/",
             f"{self.destination}/",
@@ -319,6 +322,9 @@ class ExperimentDataSync:
 
     def prune(self, plan: SyncPlan) -> tuple[Path, ...]:
         """Delete synced experiments except the most recently modified one."""
+        # This also covers upgrades followed by shutdown/sync before any new
+        # experiment has been opened. A history write failure prevents pruning.
+        ExperimentHistory(self.logs_dir).import_existing(plan.experiments)
         removed = []
         for experiment_dir in plan.experiments:
             if experiment_dir == plan.retained_experiment:

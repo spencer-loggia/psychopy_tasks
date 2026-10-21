@@ -4,6 +4,7 @@ import json
 import os
 import platform
 import random
+import signal
 import socket
 import struct
 import subprocess
@@ -33,6 +34,8 @@ from interface.experiment_manager import (
     task_run_sequence,
     task_variants,
 )
+from interface.experiment_history import HISTORY_FILENAME
+from interface.data_sync import ExperimentDataSync, SyncPlan
 
 
 class FakeClock:
@@ -546,6 +549,108 @@ class ExperimentManagerTests(unittest.TestCase):
             self.assertEqual(second.experiment_dir.name, "exp_S1_20260813_002")
             self.assertEqual(first.experiment_number, 1)
             self.assertEqual(second.experiment_number, 2)
+
+    def test_experiment_ids_keep_increasing_after_sync_prunes_earlier_runs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config, path = self._project(root)
+            kwargs = dict(
+                working_dir=root, launch_config_path=path, launch_config=config,
+                subject_name="Subject One", subject_code="S1", now=dt.datetime(2026, 10, 21),
+            )
+            first = ExperimentManager(**kwargs)
+            first.finish()  # No blocks.
+            second = ExperimentManager(**kwargs)
+            second.finish()
+            sync = ExperimentDataSync(root / "logs", None)
+            sync.prune(SyncPlan(
+                root / "logs", (first.experiment_dir, second.experiment_dir),
+                second.experiment_dir, root / "unused-remote",
+            ))
+            self.assertFalse(first.experiment_dir.exists())
+            third = ExperimentManager(**kwargs)
+            self.assertEqual(third.experiment_number, 3)
+            with (root / "logs" / HISTORY_FILENAME).open() as handle:
+                rows = list(csv.DictReader(handle, delimiter="\t"))
+            self.assertEqual([row["experiment_number"] for row in rows], ["1", "2", "3"])
+            self.assertEqual([row["block_count"] for row in rows], ["0", "0", "0"])
+
+    def test_history_tracks_blocks_runtime_and_idempotent_experiment_end(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config, path = self._project(root)
+            clock = FakeClock()
+            manager = ExperimentManager(
+                working_dir=root, launch_config_path=path, launch_config=config,
+                subject_name="Subject One", subject_code="S1", now=dt.datetime(2026, 10, 21, 9),
+                perf_counter_ns=lambda: round(clock() * 1_000_000_000),
+            )
+
+            def summary():
+                with manager.history.path.open() as handle:
+                    return next(csv.DictReader(handle, delimiter="\t"))
+
+            self.assertEqual(summary()["runtime_seconds"], "0.000000")
+            clock.value = 102.5
+            block = manager.prepare_block(task_name="demo", launch_value="task/demo.py", config_value=None)
+            row = summary()
+            self.assertEqual(row["block_count"], "1")
+            self.assertEqual(row["completed_block_count"], "0")
+            self.assertEqual(row["runtime_seconds"], "2.500000")
+            self.assertEqual(row["end_time"], "")
+            clock.value = 110
+            manager.finish_block(block)
+            self.assertEqual(summary()["completed_block_count"], "1")
+            self.assertEqual(summary()["runtime_seconds"], "10.000000")
+            clock.value = 115
+            manager.finish()
+            row = summary()
+            self.assertEqual(row["runtime_seconds"], "15.000000")
+            self.assertEqual(row["status"], "ended")
+            self.assertEqual(row["end_time"], "2026-10-21T09:00:15.000000")
+            clock.value = 130
+            manager.finish()
+            self.assertEqual(summary(), row)
+
+    def test_killed_experiments_keep_numbers_and_unfinished_summaries(self):
+        script = """
+import datetime as dt
+import json
+import os
+import signal
+import sys
+from pathlib import Path
+from interface.experiment_manager import ExperimentManager
+root = Path(sys.argv[1])
+manager = ExperimentManager(
+    working_dir=root, launch_config_path=root / 'launch.json',
+    launch_config=json.loads((root / 'launch.json').read_text()),
+    subject_name='Subject One', subject_code='S1', now=dt.datetime(2026, 10, 21))
+if sys.argv[2] == 'block':
+    manager.prepare_block(task_name='demo', launch_value='task/demo.py', config_value=None)
+os.kill(os.getpid(), signal.SIGKILL)
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config, path = self._project(root)
+            for phase in ("start", "block"):
+                result = subprocess.run(
+                    [sys.executable, "-c", script, str(root), phase],
+                    cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=15,
+                )
+                self.assertEqual(result.returncode, -signal.SIGKILL, result.stderr)
+            manager = ExperimentManager(
+                working_dir=root, launch_config_path=path, launch_config=config,
+                subject_name="Subject One", subject_code="S1", now=dt.datetime(2026, 10, 21),
+            )
+            self.assertEqual(manager.experiment_number, 3)
+            with manager.history.path.open() as handle:
+                rows = list(csv.DictReader(handle, delimiter="\t"))
+            self.assertEqual([row["block_count"] for row in rows], ["0", "1", "0"])
+            for row in rows:
+                self.assertEqual(row["status"], "open")
+                self.assertEqual(row["end_time"], "")
+                self.assertEqual(row["completed_block_count"], "0")
 
     def test_disabled_and_simulated_sync_clear_inherited_uart_context(self):
         for options in ({}, {"enabled": False}, {"enabled": True, "uart": {"simulate": True}}):

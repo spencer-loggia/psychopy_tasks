@@ -37,6 +37,7 @@ from bin.screen import (
     SECONDARY_SCREEN_ENV,
 )
 from interface.experiment_eye_tracker import ExperimentEyeTracker
+from interface.experiment_history import ExperimentHistory
 
 
 BLOCKS_FILENAME = "blocks.tsv"
@@ -236,7 +237,7 @@ class ExperimentManager:
         self.state.update(_runtime_metadata(self.working_dir, python_command))
 
         self.logs_dir = self.working_dir / "logs"
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.history = ExperimentHistory(self.logs_dir)
         self.experiment_dir = self._create_experiment_dir()
         self.blocks_dir = self.experiment_dir / "blocks"
         self.blocks_dir.mkdir()
@@ -262,24 +263,25 @@ class ExperimentManager:
         )
 
     def finish(self) -> None:
-        """Request remote recording flush/closure without delaying the launcher."""
-        self.eye_tracker.finish()
+        """Save the final local summary and request remote recording closure."""
+        try:
+            self._update_history(ended=True)
+        finally:
+            self.eye_tracker.finish()
 
     def _create_experiment_dir(self) -> Path:
-        safe_code = sanitize_filename_component(self.subject_code)
-        prefix = f"exp_{safe_code}_{self.started_at:%Y%m%d}_"
-        used_ids: set[int] = set()
-        for candidate in self.logs_dir.glob(f"{prefix}*"):
-            suffix = candidate.name[len(prefix):]
-            if suffix.isdigit():
-                used_ids.add(int(suffix))
-        experiment_id = 1
-        while experiment_id in used_ids:
-            experiment_id += 1
-        experiment_dir = self.logs_dir / f"{prefix}{experiment_id:03d}"
+        experiment_dir, self.experiment_number = self.history.reserve(
+            subject=self.subject_name, subject_code=self.subject_code, started_at=self.started_at,
+        )
         experiment_dir.mkdir(exist_ok=False)
-        self.experiment_number = experiment_id
         return experiment_dir
+
+    def _update_history(self, *, ended: bool = False) -> None:
+        self.history.update(
+            self.experiment_dir.name, block_count=len(self.blocks),
+            completed_block_count=sum(bool(block["end_time"]) for block in self.blocks),
+            elapsed_ns=self.task_time_ns(), ended=ended,
+        )
 
     def task_time_ns(self) -> int:
         return self.task_clock.task_time_ns(timestamp_perf_ns=self._perf_counter_ns())
@@ -300,6 +302,7 @@ class ExperimentManager:
             writer.writeheader()
             writer.writerows(self.blocks)
         os.replace(temp_path, self.blocks_path)
+        self._update_history()
 
     def prepare_block(
         self,

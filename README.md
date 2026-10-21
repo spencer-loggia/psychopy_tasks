@@ -33,6 +33,30 @@ contains:
 - `clock.json`: the experiment origin (`origin_perf_counter_ns`) and its local wall-clock datetime.
 - `blocks/[block_num]_[block_name]/`: the generated config and outputs for each block.
 
+The permanent local log `logs/experiment_history.tsv` sits alongside these experiment directories. It is
+excluded from data synchronization and is never removed by cache cleanup. Each row records the experiment
+directory name, subject, subject code, local date, experiment number, start/last-update/end times, block count,
+completed block count, runtime in seconds, and status. Numbers increase independently for each subject code
+and local start date, using one more than the highest recorded number rather than reusing gaps.
+
+Selecting a subject durably reserves its number in this log **before** creating the experiment directory or
+starting the tracker. Zero-block experiments, interrupted startup, and unexpected launcher exits therefore
+consume their numbers even if their experiment directories are later removed. Updates use a process lock,
+atomic file replacement, and file/directory `fsync`; an unreadable history or failed reservation stops startup
+instead of silently resetting the counter. Keep this file and its `.experiment_history.lock` sidecar locally.
+
+Summaries are saved at experiment creation, block preparation, block exit, and experiment end, outside the
+task's trial loop. Runtime includes time between blocks. `completed_block_count` counts blocks with a recorded
+exit, including failed or aborted blocks; `block_count` includes prepared/attempted blocks. `ended` means a
+clean experiment end was recorded. `open` means no clean end was recorded and may represent a running,
+interrupted, or partially initialized experiment. After an abrupt shutdown, its end time remains blank and
+runtime is only the elapsed time through the last saved update, not an inferred shutdown time.
+
+Existing local experiment directories are imported automatically before allocating a new number or pruning
+the cache. Their rows have status `imported`; missing summary fields remain blank and available block times
+provide only a lower bound on runtime. Experiments already removed locally before this log was introduced
+cannot be reconstructed from local files alone.
+
 `blocks.tsv` has the fields `block_name`, `block_num`, `subject`, `start_time`, `end_time`, and `out_dir`.
 `block_name` is the task config's `config_name`, falling back to the interface button name for a task with no
 source config. A row is written with a blank `end_time` before the subprocess starts and is updated when it exits,
@@ -205,20 +229,24 @@ Data synchronization
 --------------------
 
 The interface config's `remote_data_url` is the NFS-backed storage root. The contents of the local `logs`
-directory are copied into `remote_data_url/experiments/`, not directly into the storage root. Cleanup runs when
+directory, except the permanent experiment history and its sidecars, are copied into
+`remote_data_url/experiments/`, not directly into the storage root. Cleanup runs when
 **End Experiment** is pressed and before shutdown; it does not run at startup or after individual tasks or blocks.
 Cleanup checks both `remote_git_url` and `remote_data_url`, including that the data root is a mounted, non-empty NFS
 filesystem. An unavailable remote, failed operation, or timeout is logged and normal interface operation continues,
 with local experiment data left untouched unless synchronization completes successfully.
 
 When storage is available, the launcher uses `rsync --archive --timeout=30 --progress --no-owner --no-group`
-to copy the contents of `logs`. In addition to rsync's own I/O timeout, the launcher stops a transfer after 60 seconds
+with root exclusions for `experiment_history.tsv` and `.experiment_history.*` to copy the contents of `logs`.
+In addition to rsync's own I/O timeout, the launcher stops a transfer after 60 seconds
 without progress; active transfers have no total-duration limit. Owner and group metadata are intentionally not
 preserved because NFS root-squashing commonly rejects those changes; experiment contents, timestamps, permissions,
 directories, and symlinks are still preserved. A modal progress window prevents tasks from launching during the copy
 and offers **Cancel Sync**. Cancelling aborts the current operation without removing local data; during shutdown, it
 also cancels shutdown. Any rsync failure retains every local experiment. After a fully successful copy, all but the
-most recently modified experiment are removed from the local cache. Generated data directories are excluded by
+most recently modified experiment are removed from the local cache. Their names and numbers must first be saved
+in the permanent local history; a history read/write failure prevents pruning. The history remains in `logs`
+alongside the retained experiment. Generated data directories, including this local history, are excluded by
 `.gitignore`.
 
 Code updates use `remote_git_url` from the same interface config (normally an NFS-mounted repository path). At

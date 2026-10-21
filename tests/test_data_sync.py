@@ -1,4 +1,6 @@
 import os
+import csv
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -16,6 +18,7 @@ from interface.data_sync import (
     terminate_process,
     mounted_filesystem_type,
 )
+from interface.experiment_history import ExperimentHistory, HISTORY_FILENAME
 from interface.touch_interface import (
     DATA_SYNC_STALL_TIMEOUT_SECONDS,
     REMOTE_GIT_TIMEOUT_SECONDS,
@@ -104,6 +107,8 @@ class ExperimentDataSyncTests(unittest.TestCase):
                     "--progress",
                     "--no-owner",
                     "--no-group",
+                    "--exclude=/experiment_history.tsv",
+                    "--exclude=/.experiment_history.*",
                     "--",
                     f"{logs}/",
                     f"{remote / 'experiments'}/",
@@ -135,6 +140,47 @@ class ExperimentDataSyncTests(unittest.TestCase):
 
             self.assertEqual(removed, (older,))
             self.assertFalse(older.exists())
+            self.assertTrue(newest.exists())
+            with (logs / HISTORY_FILENAME).open() as handle:
+                rows = list(csv.DictReader(handle, delimiter="\t"))
+            self.assertEqual({row["experiment_name"] for row in rows}, {older.name, newest.name})
+
+    @unittest.skipUnless(shutil.which("rsync"), "rsync is not installed")
+    def test_real_sync_excludes_history_and_sidecars_and_prune_keeps_history(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            logs = root / "logs"
+            logs.mkdir()
+            experiment = logs / "exp_T_20261021_001"
+            experiment.mkdir()
+            (experiment / "state.json").write_text("{}")
+            history = ExperimentHistory(logs)
+            history.import_existing([experiment])
+            original = history.path.read_bytes()
+            (logs / ".experiment_history.tsv.tmp").write_text("interrupted update")
+            (logs / "interface_sync.log").write_text("diagnostics")
+            remote = root / "remote"
+            remote.mkdir()
+            plan = SyncPlan(logs, (experiment,), experiment, remote / "experiments")
+            copied = subprocess.run(plan.command, capture_output=True, text=True, timeout=15)
+            self.assertEqual(copied.returncode, 0, copied.stderr)
+            self.assertEqual(sorted(p.name for p in plan.destination.iterdir()), [experiment.name, "interface_sync.log"])
+            ExperimentDataSync(logs, remote).prune(plan)
+            self.assertEqual(history.path.read_bytes(), original)
+            self.assertTrue((logs / ".experiment_history.lock").exists())
+
+    def test_history_failure_prevents_pruning_any_experiments(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            logs = Path(tmpdir)
+            older = logs / "exp_T_20261021_001"
+            newest = logs / "exp_T_20261021_002"
+            older.mkdir()
+            newest.mkdir()
+            (logs / HISTORY_FILENAME).write_text("damaged history\n")
+            plan = SyncPlan(logs, (older, newest), newest, logs / "unused-remote")
+            with self.assertRaisesRegex(OSError, "Cannot read local experiment history"):
+                ExperimentDataSync(logs, None).prune(plan)
+            self.assertTrue(older.exists())
             self.assertTrue(newest.exists())
 
     def test_terminate_process_escalates_when_terminate_does_not_finish(self):

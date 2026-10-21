@@ -95,15 +95,16 @@ def _deliver_reward_pulse(
         raise ValueError("pump_pulse_time_seconds must be finite and nonnegative")
     if duration_s == 0:
         return time.perf_counter()
-    requested_s = time.perf_counter()
+    requested_ns = time.perf_counter_ns()
     try:
         outputs.write(pump_pin, True)
-        start_s = time.perf_counter()
+        start_ns = time.perf_counter_ns()
+        start_s = start_ns / 1_000_000_000
         logger.log_signal(
             trial_num=None,
             event="pump_on",
-            timestamp_perf_s=start_s,
-            requested_timestamp_perf_s=requested_s,
+            timestamp_perf_ns=start_ns,
+            requested_timestamp_perf_ns=requested_ns,
             requested_duration=duration_s,
         )
         deadline = start_s + duration_s
@@ -114,13 +115,14 @@ def _deliver_reward_pulse(
                 on_wait()
             core.wait(min(0.01, max(0, deadline - time.perf_counter())))
     finally:
-        requested_off_s = time.perf_counter()
+        requested_off_ns = time.perf_counter_ns()
         outputs.write(pump_pin, False)
+        off_ns = time.perf_counter_ns()
         logger.log_signal(
             trial_num=None,
             event="pump_off",
-            timestamp_perf_s=time.perf_counter(),
-            requested_timestamp_perf_s=requested_off_s,
+            timestamp_perf_ns=off_ns,
+            requested_timestamp_perf_ns=requested_off_ns,
         )
     return time.perf_counter()
 
@@ -334,6 +336,7 @@ def run_task(
         tracker = UARTEyeTracker(
             uart_config=uart_config, filter_config=filter_config,
             on_state=auto_reward.observe,
+            task_clock=session_logs.session_clock,
         )
         tracker.start()
         msg_logger.log(

@@ -206,8 +206,8 @@ def run_task(
         logger.log_frame_flip(
             trial_num=None,
             event="gray_pre_sequence",
-            timestamp_perf_s=isi_timing.actual_perf_s,
-            requested_timestamp_perf_s=isi_timing.requested_perf_s,
+            timestamp_perf_ns=isi_timing.actual_perf_ns,
+            requested_timestamp_perf_ns=isi_timing.requested_perf_ns,
             requested_duration=isi,
         )
         next_visual_target_perf_s = transition_scheduler.target_after(
@@ -244,8 +244,8 @@ def run_task(
         logger.log_frame_flip(
             trial_num=idx,
             event="stimulus_on",
-            timestamp_perf_s=stim_timing.actual_perf_s,
-            requested_timestamp_perf_s=stim_timing.requested_perf_s,
+            timestamp_perf_ns=stim_timing.actual_perf_ns,
+            requested_timestamp_perf_ns=stim_timing.requested_perf_ns,
             requested_duration=duration,
         )
         msg_logger.log(
@@ -276,8 +276,8 @@ def run_task(
                     if is_last_stimulus
                     else "gray_inter_stimulus"
                 ),
-                timestamp_perf_s=gray_timing.actual_perf_s,
-                requested_timestamp_perf_s=gray_timing.requested_perf_s,
+                timestamp_perf_ns=gray_timing.actual_perf_ns,
+                requested_timestamp_perf_ns=gray_timing.requested_perf_ns,
                 requested_duration=1.0 if is_last_stimulus else isi,
             )
             next_visual_target_perf_s = transition_scheduler.target_after(

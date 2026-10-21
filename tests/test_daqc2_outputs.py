@@ -7,6 +7,31 @@ from bin.daqc2_outputs import DAQC2DigitalOutputs, PeriodicDOUTPulseController
 
 
 class DAQC2DigitalOutputsTests(unittest.TestCase):
+    def test_queued_edges_keep_write_times_without_waiting_for_pulse_duration(self):
+        now = 9_007_199_254_740_993
+
+        def write(bit, active):
+            nonlocal now
+            now += 500
+
+        outputs = types.SimpleNamespace(validate_bit=int, write=write)
+        controller = PeriodicDOUTPulseController(
+            outputs, bit=0, interval_s=2, pulse_duration_s=0.25,
+        )
+        on_request = now
+        with patch("bin.daqc2_outputs.time.perf_counter_ns", side_effect=lambda: now):
+            controller._record_edge(active=True, pulse_index=1)
+            now += 250_000_000
+            off_request = now
+            controller._record_edge(active=False, pulse_index=1)
+            now += 1_000_000_000  # Log draining can happen much later.
+            on, off = controller.drain_edges()
+
+        self.assertEqual((on.requested_perf_ns, on.actual_perf_ns),
+                         (on_request, on_request + 500))
+        self.assertEqual((off.requested_perf_ns, off.actual_perf_ns),
+                         (off_request, off_request + 500))
+
     def test_write_maps_logical_on_to_set_and_off_to_clear(self):
         calls = []
 

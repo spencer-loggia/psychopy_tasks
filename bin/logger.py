@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import csv
 import datetime as dt
 from dataclasses import asdict, dataclass
@@ -11,6 +12,8 @@ import re
 import time
 from typing import Any, Iterable, Mapping, Optional
 
+from .task_clock import TaskClock
+
 
 EVENT_LOG_FILENAME = "event_log.tsv"
 MESSAGE_LOG_FILENAME = "message_log.tsv"
@@ -20,7 +23,7 @@ CALIBRATION_FILENAME = "calibration.json"
 EVENT_NAME_LIBRARY_FILENAME = "event_name_library.json"
 EXACT_SESSION_DIR_ENV = "NEURO_TASK_SESSION_DIR"
 EVENT_LIBRARY_ENV = "NEURO_EVENT_NAME_LIBRARY"
-ALLOWED_EVENT_TYPES = frozenset({"frame_flip", "interaction", "signal"})
+ALLOWED_EVENT_TYPES = frozenset({"frame_flip", "interaction", "signal", "lifecycle"})
 ALLOWED_MESSAGE_LEVELS = frozenset({"INFO", "WARN", "ERROR"})
 
 
@@ -193,14 +196,8 @@ def build_session_output_dir(
     return session_dir
 
 
-class SessionClock:
-    def __init__(self, started_at: Optional[dt.datetime] = None, start_perf_s: Optional[float] = None):
-        self.started_at = started_at or dt.datetime.now()
-        self.start_perf_s = float(start_perf_s) if start_perf_s is not None else time.perf_counter()
-
-    def seconds_since_start(self, timestamp_perf_s: Optional[float] = None) -> float:
-        now_perf = float(timestamp_perf_s) if timestamp_perf_s is not None else time.perf_counter()
-        return now_perf - self.start_perf_s
+# Kept as an import alias for existing callers; there is no block-local clock.
+SessionClock = TaskClock
 
 
 class EventCodeLibrary:
@@ -300,8 +297,8 @@ class EventLogger:
         self._writer.writerow(
             [
                 "trial_num",
-                "requested_time_since_session_start",
-                "time_since_session_start",
+                "requested_task_time_ns",
+                "task_time_ns",
                 "event",
                 "event_code",
                 "event_type",
@@ -309,8 +306,8 @@ class EventLogger:
             ]
         )
 
-    def seconds_since_session_start(self, timestamp_perf_s: Optional[float] = None) -> float:
-        return self._clock.seconds_since_start(timestamp_perf_s)
+    def task_time_ns(self, timestamp_perf_s=None, *, timestamp_perf_ns=None) -> int:
+        return self._clock.task_time_ns(timestamp_perf_s, timestamp_perf_ns=timestamp_perf_ns)
 
     def log_event(
         self,
@@ -320,9 +317,13 @@ class EventLogger:
         event_type: str,
         requested_duration: Optional[float] = None,
         timestamp_perf_s: Optional[float] = None,
+        timestamp_perf_ns: Optional[int] = None,
+        requested_timestamp_perf_ns: Optional[int] = None,
         requested_timestamp_perf_s: Optional[float] = None,
         description: Optional[str] = None,
     ) -> None:
+        if self._file.closed:
+            raise ValueError("Event log is closed")
         if requested_duration is not None:
             requested_duration = float(requested_duration)
             if not math.isfinite(requested_duration) or requested_duration < 0:
@@ -330,20 +331,19 @@ class EventLogger:
                     "requested_duration must be finite and non-negative when provided."
                 )
         definition = self._library.ensure(event, event_type=event_type, description=description)
-        timestamp_s = self.seconds_since_session_start(timestamp_perf_s)
-        requested_timestamp_s = (
-            None
-            if requested_timestamp_perf_s is None
-            else self.seconds_since_session_start(requested_timestamp_perf_s)
+        timestamp_ns = self.task_time_ns(timestamp_perf_s, timestamp_perf_ns=timestamp_perf_ns)
+        requested_ns = (
+            None if requested_timestamp_perf_s is None and requested_timestamp_perf_ns is None
+            else self.task_time_ns(requested_timestamp_perf_s, timestamp_perf_ns=requested_timestamp_perf_ns)
         )
         row = [
             "" if trial_num is None else str(int(trial_num)),
             (
                 ""
-                if requested_timestamp_s is None
-                else f"{requested_timestamp_s:.9f}"
+                if requested_ns is None
+                else str(requested_ns)
             ),
-            f"{timestamp_s:.9f}",
+            str(timestamp_ns),
             str(event).strip(),
             str(definition.code),
             definition.default_type,
@@ -360,8 +360,10 @@ class EventLogger:
         *,
         trial_num: Optional[int],
         event: str,
-        timestamp_perf_s: Optional[float],
+        timestamp_perf_s: Optional[float] = None,
+        timestamp_perf_ns: Optional[int] = None,
         requested_timestamp_perf_s: Optional[float] = None,
+        requested_timestamp_perf_ns: Optional[int] = None,
         requested_duration: Optional[float] = None,
         description: Optional[str] = None,
     ) -> None:
@@ -371,7 +373,9 @@ class EventLogger:
             event_type="frame_flip",
             requested_duration=requested_duration,
             timestamp_perf_s=timestamp_perf_s,
+            timestamp_perf_ns=timestamp_perf_ns,
             requested_timestamp_perf_s=requested_timestamp_perf_s,
+            requested_timestamp_perf_ns=requested_timestamp_perf_ns,
             description=description,
         )
 
@@ -380,7 +384,8 @@ class EventLogger:
         *,
         trial_num: Optional[int],
         event: str,
-        timestamp_perf_s: Optional[float],
+        timestamp_perf_s: Optional[float] = None,
+        timestamp_perf_ns: Optional[int] = None,
         description: Optional[str] = None,
     ) -> None:
         self.log_event(
@@ -388,6 +393,7 @@ class EventLogger:
             event=event,
             event_type="interaction",
             timestamp_perf_s=timestamp_perf_s,
+            timestamp_perf_ns=timestamp_perf_ns,
             description=description,
         )
 
@@ -396,8 +402,10 @@ class EventLogger:
         *,
         trial_num: Optional[int],
         event: str,
-        timestamp_perf_s: Optional[float],
+        timestamp_perf_s: Optional[float] = None,
+        timestamp_perf_ns: Optional[int] = None,
         requested_timestamp_perf_s: Optional[float] = None,
+        requested_timestamp_perf_ns: Optional[int] = None,
         requested_duration: Optional[float] = None,
         description: Optional[str] = None,
     ) -> None:
@@ -407,7 +415,9 @@ class EventLogger:
             event_type="signal",
             requested_duration=requested_duration,
             timestamp_perf_s=timestamp_perf_s,
+            timestamp_perf_ns=timestamp_perf_ns,
             requested_timestamp_perf_s=requested_timestamp_perf_s,
+            requested_timestamp_perf_ns=requested_timestamp_perf_ns,
             description=description,
         )
 
@@ -438,11 +448,11 @@ class MessageLogger:
         self.auto_flush = bool(auto_flush)
         self._pending_rows: list[list[str]] = []
         self._clock = session_clock
-        self._writer.writerow(["time_since_session_start", "level", "message"])
+        self._writer.writerow(["task_time_ns", "level", "message"])
 
-    def log(self, level: str, message: str, *, timestamp_perf_s: Optional[float] = None) -> None:
+    def log(self, level: str, message: str, *, timestamp_perf_s=None, timestamp_perf_ns=None) -> None:
         normalized_level = _normalize_message_level(level)
-        timestr = f"{self._clock.seconds_since_start(timestamp_perf_s):.9f}"
+        timestr = str(self._clock.task_time_ns(timestamp_perf_s, timestamp_perf_ns=timestamp_perf_ns))
         row = [timestr, normalized_level, str(message)]
         if self.auto_flush:
             self._writer.writerow(row)
@@ -513,7 +523,9 @@ class SessionLogBundle:
         event_name_library_path: Optional[str | Path] = None,
         eye_tracking_config=None,
     ):
-        self.session_clock = SessionClock(started_at=when)
+        self.session_clock = TaskClock(started_at=when)
+        block_start_perf_ns = time.perf_counter_ns()
+        self._closed = False
         exact_session_dir = os.environ.get(EXACT_SESSION_DIR_ENV)
         if exact_session_dir:
             self.session_dir = Path(exact_session_dir).expanduser().resolve()
@@ -543,6 +555,12 @@ class SessionLogBundle:
             event_library=self.event_library,
             auto_flush=auto_flush,
         )
+        self.event_logger.log_event(
+            trial_num=None, event="block_start", event_type="lifecycle",
+            timestamp_perf_ns=block_start_perf_ns,
+        )
+        # Persist the first row even when the task buffers its subsequent events.
+        self.event_logger.flush()
         self.message_logger = MessageLogger(
             self.session_dir,
             session_clock=self.session_clock,
@@ -565,6 +583,7 @@ class SessionLogBundle:
                 auto_flush=auto_flush,
             )
         self.eye_tracking = None
+        atexit.register(self.close)
         if eye_tracking_config is not None:
             from .task_eye_tracking import TaskEyeTrackingSession
 
@@ -572,7 +591,7 @@ class SessionLogBundle:
                 self.eye_tracking = TaskEyeTrackingSession(
                     eye_tracking_config,
                     output_dir=self.session_dir,
-                    start_perf_s=self.session_clock.start_perf_s,
+                    task_clock=self.session_clock,
                 )
                 self.message_logger.log(
                     "INFO", f"eye_tracking_started eye_id=0 settings={json.dumps(asdict(eye_tracking_config))}"
@@ -606,6 +625,17 @@ class SessionLogBundle:
             table_logger.flush()
 
     def close(self) -> None:
+        if self._closed:
+            return
+        if self.eye_tracking is not None and self.eye_tracking.recorder is not None:
+            self.eye_tracking.recorder.stop_accepting()
+        block_end_perf_ns = time.perf_counter_ns()
+        self._closed = True
+        atexit.unregister(self.close)
+        self.event_logger.log_event(
+            trial_num=None, event="block_end", event_type="lifecycle",
+            timestamp_perf_ns=block_end_perf_ns,
+        )
         eye_error = None
         if self.eye_tracking is not None:
             try:

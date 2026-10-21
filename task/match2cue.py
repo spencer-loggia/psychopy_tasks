@@ -144,7 +144,7 @@ def _meta_values(
 def _build_behavior_fieldnames(num_afc: int) -> List[str]:
     fields = [
         "trial_num",
-        "initiation_time",
+        "initiation_task_time_ns",
         "cue_shape",
         "cue_color",
         "cue_lum",
@@ -496,16 +496,16 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
 
     def deliver_reward(trial_num: Optional[int], *, context: str) -> bool:
         nonlocal task_end_status
-        start_requested_perf = time.perf_counter()
+        start_requested_perf = time.perf_counter_ns()
         aborted = False
         try:
             set_pump(True)
-            start_perf = time.perf_counter()
+            start_perf = time.perf_counter_ns()
             logger.log_signal(
                 trial_num=trial_num,
                 event="pump_on",
-                timestamp_perf_s=start_perf,
-                requested_timestamp_perf_s=start_requested_perf,
+                timestamp_perf_ns=start_perf,
+                requested_timestamp_perf_ns=start_requested_perf,
                 requested_duration=pump_pulse_time,
             )
             if context == "manual_reward":
@@ -516,16 +516,16 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                     allow_manual_reward=False,
                 )
         finally:
-            end_requested_perf = time.perf_counter()
+            end_requested_perf = time.perf_counter_ns()
             try:
                 set_pump(False)
             finally:
-                end_perf = time.perf_counter()
+                end_perf = time.perf_counter_ns()
                 logger.log_signal(
                     trial_num=trial_num,
                     event="pump_off",
-                    timestamp_perf_s=end_perf,
-                    requested_timestamp_perf_s=end_requested_perf,
+                    timestamp_perf_ns=end_perf,
+                    requested_timestamp_perf_ns=end_requested_perf,
                 )
         status_counts["Rewards delivered"] += 1
         update_preview_counts()
@@ -737,9 +737,9 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 logger.log_frame_flip(
                     trial_num=trial_num,
                     event="gray_inter_trial_interval",
-                    timestamp_perf_s=float(gray_start_perf),
-                    requested_timestamp_perf_s=trial_meta.get(
-                        "gray_flip_requested_perf_s"
+                    timestamp_perf_ns=trial_meta["gray_flip_perf_ns"],
+                    requested_timestamp_perf_ns=trial_meta.get(
+                        "gray_flip_requested_perf_ns"
                     ),
                     requested_duration=(gray_duration if gray_duration > 0.0 else None),
                 )
@@ -773,7 +773,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
             chosen_shape, chosen_color, chosen_lum = _meta_values(space, chosen_stimulus)
             behavior_row: Dict[str, Any] = {
                 "trial_num": trial_num,
-                "initiation_time": _optional_float(trial_meta.get("initiation_time_s")),
+                "initiation_task_time_ns": trial_meta.get("initiation_task_time_ns", ""),
                 "cue_shape": cue_shape,
                 "cue_color": cue_color,
                 "cue_lum": cue_lum,

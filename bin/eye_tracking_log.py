@@ -1,15 +1,11 @@
-"""Continuously sample calibrated gaze to CSV, independently of rendering/UART.
-
-Only this worker writes the file. It reads the UART reader's latest immutable
-state without serial I/O and retains repeated camera frames at the recording
-cadence. Source frame IDs/times distinguish those repeats from new measurements.
-"""
+"""Queue each received camera measurement once; write CSV off the UART thread."""
 
 from __future__ import annotations
 
 import csv
 import math
 from pathlib import Path
+import queue
 import threading
 import time
 
@@ -19,41 +15,29 @@ from .screen import oriented_size, rotate_centered_point
 
 EYE_DATA_FILENAME = "eye_tracking.csv"
 EYE_DATA_FIELDS = (
-    "timestamp_ms", "x_screen_px", "y_screen_px", "pupil_diameter_px",
-    "eye_valid", "screen_ready", "rejection_reason", "sample_timestamp_ms",
-    "sample_index", "frame_sequence",
+    "task_time_ns", "camera_time_ns", "x_screen_px", "y_screen_px",
+    "pupil_diameter_px", "eye_valid", "screen_ready", "rejection_reason",
+    "session_id", "frame_sequence",
 )
 
 
 class EyeDataRecorder:
-    """Record at an independent fixed cadence using the event log's time origin.
+    """Buffer acquisition snapshots without polling the latest state.
 
-    Screen pixels are native PsychoPy coordinates (centered, right/up positive),
-    matching task stimulus positions: x = screen_x - W/2, y = H/2 - screen_y
-    for top-left-origin screen pixels. Calibration axes remain relative to the
-    subject; X11 normal requires a 90-degree clockwise turn, so subject up is
-    native right and subject left is native up. Pupil diameter stays in camera pixels;
-    screen calibration cannot convert a pupil measurement to physical units.
+    Screen pixels use native PsychoPy coordinates, centered and right/up
+    positive. The camera clock is preserved verbatim and is not synchronized
+    with the experiment's task clock.
     """
 
-    def __init__(
-        self, path, *, get_state, calibration, start_perf_s, rate_hz=60.0,
-        clock=time.perf_counter,
-    ):
+    def __init__(self, path, *, calibration, queue_size=8192):
         self.path = Path(path)
-        self._get_state = get_state
         self._calibration = calibration
-        self._start_perf_s = start_perf_s
-        if not math.isfinite(rate_hz) or rate_hz <= 0:
-            raise ValueError("eye_tracking.record_rate_hz must be positive and finite")
-        self._period = 1.0 / rate_hz
-        self._clock = clock
         self._geometry = None
-        self._geometry_lock = threading.Lock()
+        self._lock = threading.Lock()
+        self._queue = queue.Queue(maxsize=queue_size)
         self._stop = threading.Event()
         self._error = None
-        # A fixed file buffer and periodic flush bound memory and preserve
-        # completed data during long blocks without per-sample disk flushes.
+        self._last_key = None
         self._file = self.path.open("w", newline="", encoding="utf-8", buffering=65536)
         try:
             self._writer = csv.writer(self._file)
@@ -72,55 +56,57 @@ class EyeDataRecorder:
             raise ValueError("Eye recording screen size must contain two positive dimensions")
         if not math.isfinite(rotation_degrees):
             raise ValueError("Eye recording screen rotation must be finite")
-        with self._geometry_lock:
+        with self._lock:
             self._geometry = (oriented_size(size, rotation_degrees), rotation_degrees)
 
-    def _write_sample(self):
-        state = self._get_state()
-        # Timestamp the observation, never the later buffer flush or a screen
-        # flip. The remote sensor clock is not synchronized to this task's clock.
-        observed_s = self._clock()
-        with self._geometry_lock:
-            geometry = self._geometry
+    def submit(self, state):
+        """Enqueue a measurement without waiting for disk or queue capacity.
+
+        Freeze the calibration and geometry in effect at acquisition, rather
+        than applying subsequent screen/calibration edits when draining CSV.
+        """
+        key = (state.session_id, state.frame_sequence, state.camera_time_ns)
+        with self._lock:
+            if self._stop.is_set() or self._error is not None or not state.camera_time_ns:
+                return
+            if key == self._last_key:
+                return
+            self._last_key = key
+            fraction = self._calibration.map_position(*state.smoothed_position) if state.valid else None
+            try:
+                self._queue.put_nowait((state, self._geometry, fraction))
+            except queue.Full:
+                self._error = RuntimeError("Eye CSV queue overflow; recording is incomplete")
+
+    def _write_sample(self, state, geometry, fraction):
         x = y = pupil = math.nan
         if state.valid:
             pupil = state.pupil_diameter_px
             if geometry is not None:
                 subject_size, rotation = geometry
-                fraction = self._calibration.map_position(*state.smoothed_position)
-                x, y = rotate_centered_point(
-                    fraction_to_pixels(fraction, subject_size), rotation
-                )
-        sample_ms = (
-            (state.timestamp_perf_s - self._start_perf_s) * 1000
-            if state.timestamp_perf_s > 0 else math.nan
-        )
+                x, y = rotate_centered_point(fraction_to_pixels(fraction, subject_size), rotation)
         self._writer.writerow((
-            f"{(observed_s - self._start_perf_s) * 1000:.6f}",
+            state.task_time_ns, state.camera_time_ns,
             f"{x:.6f}", f"{y:.6f}", f"{pupil:.6f}",
             int(state.valid), int(geometry is not None), state.rejection_reason or "",
-            f"{sample_ms:.6f}", state.sample_index, state.frame_sequence,
+            state.session_id, state.frame_sequence,
         ))
 
     def _run(self):
         try:
             with self._file:
-                next_sample = self._clock()
-                next_flush = next_sample + 1.0
-                while not self._stop.is_set():
-                    self._write_sample()
-                    now = self._clock()
+                next_flush = time.monotonic() + 1.0
+                while not self._stop.is_set() or not self._queue.empty():
+                    try:
+                        sample = self._queue.get(timeout=0.1)
+                    except queue.Empty:
+                        pass
+                    else:
+                        self._write_sample(*sample)
+                    now = time.monotonic()
                     if now >= next_flush:
                         self._file.flush()
                         next_flush = now + 1.0
-                    next_sample += self._period
-                    now = self._clock()
-                    if next_sample < now:
-                        # Slow scheduling/disk writes leave honest timestamp
-                        # gaps. Never backfill invented observations in a burst.
-                        missed = math.floor((now - next_sample) / self._period) + 1
-                        next_sample += missed * self._period
-                    self._stop.wait(max(0.0, next_sample - self._clock()))
         except Exception as exc:
             self._error = exc
 
@@ -128,8 +114,14 @@ class EyeDataRecorder:
         if self._error is not None:
             raise RuntimeError(f"Eye CSV recording failed: {self._error}") from self._error
 
+    def stop_accepting(self):
+        # Serialize against submit so a concurrent callback cannot enqueue after
+        # the writer has drained and exited. No serial I/O is performed here.
+        with self._lock:
+            self._stop.set()
+
     def close(self):
-        self._stop.set()
+        self.stop_accepting()
         self._thread.join(timeout=5.0)
         if self._thread.is_alive():
             raise RuntimeError("Eye CSV writer did not stop")

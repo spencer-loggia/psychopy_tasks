@@ -138,7 +138,7 @@ class TaskEyeTrackingTests(unittest.TestCase):
                     self.assertTrue(list(csv.DictReader(handle)))
                 self.assertFalse(session.recorder._thread.is_alive())
 
-    def test_recording_runs_at_60_hz_without_flips_in_exact_experiment_block_directory(self):
+    def test_recording_follows_acquisition_without_flips_in_exact_experiment_block_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             block_dir = Path(tmp).resolve() / "experiment" / "blocks" / "1_active_foraging"
             with patch.dict(os.environ, {EXACT_SESSION_DIR_ENV: str(block_dir)}):
@@ -162,13 +162,17 @@ class TaskEyeTrackingTests(unittest.TestCase):
                 logs.close()
             with session.recorder.path.open(newline="") as handle:
                 rows = list(csv.DictReader(handle))
-            timestamps = [float(row["timestamp_ms"]) for row in rows]
+            timestamps = [int(row["task_time_ns"]) for row in rows]
             self.assertEqual(timestamps, sorted(timestamps))
+            with (block_dir / "event_log.tsv").open() as handle:
+                events = list(csv.DictReader(handle, delimiter="\t"))
+            self.assertGreaterEqual(timestamps[0], int(events[0]["task_time_ns"]))
+            self.assertLessEqual(timestamps[-1], int(events[-1]["task_time_ns"]))
             self.assertGreaterEqual(timestamps[0], 0)
-            self.assertGreater(timestamps[-1] - timestamps[0], 900)
-            actual_hz = (len(rows) - 1) * 1000 / (timestamps[-1] - timestamps[0])
-            self.assertGreater(actual_hz, 45)
-            self.assertLess(actual_hz, 70)
+            self.assertGreater(timestamps[-1] - timestamps[0], 900_000_000)
+            actual_hz = (len(rows) - 1) * 1_000_000_000 / (timestamps[-1] - timestamps[0])
+            self.assertGreater(actual_hz, 75)
+            self.assertLess(actual_hz, 115)
             self.assertTrue(any(
                 row["screen_ready"] == "1" and not math.isnan(float(row["x_screen_px"]))
                 for row in rows

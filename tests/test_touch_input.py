@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from bin.touch_input import (
     MousePressTracker,
@@ -27,6 +28,46 @@ class FakeMouse:
 
 
 class MousePressTrackerTests(unittest.TestCase):
+    def test_buffered_press_preserves_event_time_despite_delayed_poll_and_position(self):
+        now = 9_007_199_254_740_993
+        origin = now
+
+        class DelayedMouse(FakeMouse):
+            def clickReset(self):
+                nonlocal now
+                now += 200  # Reset's midpoint anchors PsychoPy's elapsed times.
+                super().clickReset()
+
+            def getPos(self):
+                nonlocal now
+                now += 100_000_000
+                return super().getPos()
+
+        mouse = DelayedMouse([
+            ((0, 0, 0), (0, 0, 0), (0, 0)),
+            ((0, 0, 0), (0.012, 0, 0), (5, 6)),
+        ])
+        tracker = MousePressTracker(mouse)
+        with patch("bin.touch_input.time.perf_counter_ns", side_effect=lambda: now):
+            tracker.reset()
+            now = origin + 50_000_000
+            sample = tracker.poll()
+
+        self.assertEqual(sample.timestamp_perf_ns, origin + 100 + 12_000_000)
+        self.assertEqual(sample.observed_perf_ns, origin + 50_000_000)
+        self.assertTrue(sample.press_started)
+        self.assertGreater(now, sample.observed_perf_ns + 100_000_000)
+
+    def test_missing_or_invalid_event_time_uses_detection_before_position_lookup(self):
+        for press_time in (0, float("nan"), float("inf"), -1, 1000):
+            with self.subTest(press_time=press_time):
+                mouse = FakeMouse([((1, 0, 0), (press_time, 0, 0), (5, 6))])
+                tracker = MousePressTracker(mouse)
+                tracker._reset_perf_ns = 1_000_000_000
+                with patch("bin.touch_input.time.perf_counter_ns", return_value=2_000_000_003):
+                    sample = tracker.poll()
+                self.assertEqual(sample.timestamp_perf_ns, 2_000_000_003)
+
     def test_completed_tap_is_reported_from_buffered_press_time(self):
         mouse = FakeMouse(
             [
@@ -123,6 +164,15 @@ class MousePressTrackerTests(unittest.TestCase):
 
 
 class TouchHoldTrackerTests(unittest.TestCase):
+    def test_release_retains_first_detection_ns_across_grace_period(self):
+        tracker = TouchHoldTracker(0.5, max_break_s=0.1)
+        tracker.start(20.0)
+        tracker.update(False, 20.2, timestamp_perf_ns=20_200_000_003)
+        final = tracker.update(False, 20.31, timestamp_perf_ns=20_310_000_007)
+
+        self.assertTrue(final.released)
+        self.assertEqual(final.missing_since_perf_ns, 20_200_000_003)
+
     def test_short_registration_break_is_tolerated(self):
         tracker = TouchHoldTracker(0.2, max_break_s=0.1)
 

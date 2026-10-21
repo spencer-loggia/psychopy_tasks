@@ -155,6 +155,16 @@
       "code": 321,
       "event_type": "signal",
       "description": "Buzzer GPIO signal offset."
+    },
+    "block_start": {
+      "code": 1,
+      "event_type": "lifecycle",
+      "description": "Task block logging began."
+    },
+    "block_end": {
+      "code": 2,
+      "event_type": "lifecycle",
+      "description": "Task block ended and log finalization began."
     }
   },
   "task_event_sets": {
@@ -162,7 +172,9 @@
       "gray_pre_sequence",
       "stimulus_on",
       "gray_inter_stimulus",
-      "gray_final_fixation"
+      "gray_final_fixation",
+      "block_start",
+      "block_end"
     ],
     "afc_trial_sequence": [
       "trial_cue",
@@ -173,7 +185,9 @@
       "option_touch",
       "trial_start_signal_on",
       "trial_start_signal_off",
-      "inter_stimulus_interval"
+      "inter_stimulus_interval",
+      "block_start",
+      "block_end"
     ],
     "play_video": [
       "video_clip_start",
@@ -181,11 +195,15 @@
       "video_sync_signal_on",
       "video_sync_signal_off",
       "pump_on",
-      "pump_off"
+      "pump_off",
+      "block_start",
+      "block_end"
     ],
     "calibrate_eye_tracker": [
       "pump_on",
-      "pump_off"
+      "pump_off",
+      "block_start",
+      "block_end"
     ],
     "active_foraging": [
       "onset_cue_on",
@@ -202,7 +220,9 @@
       "buzzer_off",
       "options_dot",
       "options_on",
-      "inter_stimulus_interval"
+      "inter_stimulus_interval",
+      "block_start",
+      "block_end"
     ],
     "match2cue": [
       "onset_cue_on",
@@ -220,7 +240,9 @@
       "pump_off",
       "options_dot",
       "options_on",
-      "inter_stimulus_interval"
+      "inter_stimulus_interval",
+      "block_start",
+      "block_end"
     ],
     "afc_csc1": [
       "onset_cue_on",
@@ -235,7 +257,9 @@
       "options_dot",
       "options_on",
       "delay_start",
-      "feature_cue_on"
+      "feature_cue_on",
+      "block_start",
+      "block_end"
     ]
   },
   "event_templates": {

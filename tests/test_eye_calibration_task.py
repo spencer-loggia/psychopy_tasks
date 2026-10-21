@@ -76,7 +76,7 @@ class EyeCalibrationTaskTests(unittest.TestCase):
             for i, (x, y, target, count, raw) in enumerate(frames)
         ]
         tracker.get_state.side_effect = [
-            EyeTrackerState(valid=True, sample_index=i + 1, x_smooth_px=raw[0], y_smooth_px=raw[1])
+            EyeTrackerState(valid=True, frame_sequence=i + 1, x_smooth_px=raw[0], y_smooth_px=raw[1])
             for i, (_, _, _, _, raw) in enumerate(frames)
         ]
         marker_positions = []
@@ -247,7 +247,7 @@ class EyeCalibrationTaskTests(unittest.TestCase):
         def wait(duration):
             now[0] += duration
 
-        with patch.object(task.time, "perf_counter", side_effect=lambda: now[0]), patch.object(
+        with patch.object(task.time, "perf_counter_ns", side_effect=lambda: round(now[0] * 1_000_000_000)), patch.object(task.time, "perf_counter", side_effect=lambda: now[0]), patch.object(
             task.core, "wait", side_effect=wait,
         ):
             task._deliver_reward_pulse(
@@ -308,7 +308,7 @@ class EyeCalibrationTaskTests(unittest.TestCase):
         outputs.validate_bit.return_value = 0
         first_state = EyeTrackerState(
             timestamp_perf_s=1,
-            sample_index=1,
+            frame_sequence=1,
             valid=True,
             x_smooth_px=100,
             y_smooth_px=50,
@@ -318,7 +318,7 @@ class EyeCalibrationTaskTests(unittest.TestCase):
                 first_state,
                 x_smooth_px=110,
                 y_smooth_px=60,
-                sample_index=i,
+                frame_sequence=i,
                 timestamp_perf_s=1 + i * 0.01,
             )
             for i in (2, 3, 4)
@@ -342,7 +342,7 @@ class EyeCalibrationTaskTests(unittest.TestCase):
             task.event, "getKeys", side_effect=get_keys
         ), patch.object(
             task.time, "perf_counter", side_effect=lambda: clock[0]
-        ):
+        ), patch.object(task.time, "perf_counter_ns", side_effect=lambda: round(clock[0] * 1_000_000_000)):
             result = task.run_task(
                 output_dir=tmp,
                 fullscreen=False,
@@ -421,7 +421,7 @@ class EyeCalibrationTaskTests(unittest.TestCase):
         outputs.validate_bit.return_value = 0
         clock = [100.0]
         current = [EyeTrackerState(
-            timestamp_perf_s=100, sample_index=1, valid=True, rejection_reason=None
+            timestamp_perf_s=100, frame_sequence=1, valid=True, rejection_reason=None
         )]
         consumer = [None]
 
@@ -433,7 +433,7 @@ class EyeCalibrationTaskTests(unittest.TestCase):
                 clock[0] = min(target, clock[0] + 0.01)
                 current[0] = replace(
                     current[0], timestamp_perf_s=clock[0],
-                    sample_index=current[0].sample_index + 1,
+                    frame_sequence=current[0].frame_sequence + 1,
                 )
                 consumer[0](current[0])
 
@@ -472,7 +472,7 @@ class EyeCalibrationTaskTests(unittest.TestCase):
             task, "ExperimenterPreview", return_value=preview
         ), patch.object(task, "UARTEyeTracker", side_effect=make_tracker), patch.object(
             task, "DAQC2DigitalOutputs", return_value=outputs
-        ), patch.object(task.time, "perf_counter", side_effect=lambda: clock[0]), patch.object(
+        ), patch.object(task.time, "perf_counter_ns", side_effect=lambda: round(clock[0] * 1_000_000_000)), patch.object(task.time, "perf_counter", side_effect=lambda: clock[0]), patch.object(
             task.event, "getKeys", side_effect=get_keys
         ), patch.object(task.core, "wait", side_effect=advance):
             path = task.run_task(
@@ -543,7 +543,7 @@ class EyeCalibrationTaskTests(unittest.TestCase):
         ]
         first = EyeTrackerState(
             timestamp_perf_s=1,
-            sample_index=1,
+            frame_sequence=1,
             valid=True,
             x_smooth_px=100,
             y_smooth_px=50,
@@ -553,7 +553,7 @@ class EyeCalibrationTaskTests(unittest.TestCase):
             replace(
                 first,
                 timestamp_perf_s=1.02,
-                sample_index=2,
+                frame_sequence=2,
                 valid=valid,
                 x_smooth_px=120,
                 y_smooth_px=60,
@@ -561,7 +561,7 @@ class EyeCalibrationTaskTests(unittest.TestCase):
             replace(
                 first,
                 timestamp_perf_s=1.04,
-                sample_index=3,
+                frame_sequence=3,
                 x_smooth_px=130,
                 y_smooth_px=70,
             ),
@@ -584,7 +584,7 @@ class EyeCalibrationTaskTests(unittest.TestCase):
             sys.modules, {"_calibration_test_plate": plate}
         ), patch.object(
             task.event, "getKeys", side_effect=get_keys
-        ), patch.object(task.time, "perf_counter", side_effect=lambda: clock[0]), patch.object(
+        ), patch.object(task.time, "perf_counter_ns", side_effect=lambda: round(clock[0] * 1_000_000_000)), patch.object(task.time, "perf_counter", side_effect=lambda: clock[0]), patch.object(
             task.core, "wait", side_effect=wait
         ):
             result = task.run_task(
@@ -656,7 +656,7 @@ class EyeCalibrationTaskTests(unittest.TestCase):
         outputs.validate_bit.return_value = 0
         tracker.get_state.return_value = EyeTrackerState(
             timestamp_perf_s=1,
-            sample_index=1,
+            frame_sequence=1,
             valid=True,
             x_smooth_px=100,
             y_smooth_px=50,
@@ -699,7 +699,7 @@ class EyeCalibrationTaskTests(unittest.TestCase):
                 preview.poll.side_effect = lambda: win.flip.call_count >= 4
                 preview.consume_manual_reward_request.return_value = False
                 tracker.get_state.return_value = EyeTrackerState(
-                    timestamp_perf_s=1, sample_index=1, valid=True,
+                    timestamp_perf_s=1, frame_sequence=1, valid=True,
                     x_smooth_px=100, y_smooth_px=50,
                 )
                 control_frames = [

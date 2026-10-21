@@ -35,6 +35,7 @@ from .screen import (
 from .frame_timing import (
     FrameTransitionScheduler,
     capture_perf_counter_on_flip,
+    arm_flip_timestamp,
     flip_submission_time,
     flip_with_timestamps,
     plan_frame_duration,
@@ -412,11 +413,16 @@ def _summarize_video_frame_timing(
     }
 
 
-def _set_gpio_level_on_flip(lgpio_module, chip, pin: int, level: int) -> None:
+def _set_gpio_level_on_flip(lgpio_module, chip, pin: int, level: int, capture=None) -> None:
     """Set a GPIO level from PsychoPy's frame-flip callback queue."""
     if lgpio_module is None or chip is None:
         raise RuntimeError("Frame sync GPIO was not initialized")
-    result = lgpio_module.gpio_write(chip, int(pin), int(level))
+    pin, level = int(pin), int(level)
+    requested_ns = time.perf_counter_ns()
+    result = lgpio_module.gpio_write(chip, pin, level)
+    actual_ns = time.perf_counter_ns()
+    if capture is not None:
+        capture.update(requested_perf_ns=requested_ns, actual_perf_ns=actual_ns)
     if isinstance(result, int) and result < 0:
         raise RuntimeError(
             f"GPIO write failed with code {result} on pin {int(pin)}"
@@ -596,10 +602,12 @@ def play_video_fill_screen(
     first_flip_ps = None
     first_flip_perf = None
     first_flip_requested_perf = None
+    first_flip_perf_ns = first_flip_requested_perf_ns = None
     last_flip_perf = None
     previous_source_flip_perf = None
     end_perf = None
     end_requested_perf = None
+    end_perf_ns = end_requested_perf_ns = None
     dropped_frames = 0
     aborted = False
     abort_reason = ""
@@ -889,18 +897,22 @@ def play_video_fill_screen(
                     )
                     _wait_for_flip_submission(target_flip_perf)
 
-                flip_perf_capture: Dict[str, float] = {}
+                flip_perf_capture: Dict[str, int] = {}
                 win.callOnFlip(
                     capture_perf_counter_on_flip,
                     flip_perf_capture,
                 )
+                sync_captures = []
                 for edge in sync_edges:
+                    capture = {}
+                    sync_captures.append(capture)
                     win.callOnFlip(
                         _set_gpio_level_on_flip,
                         sync_gpio_module,
                         sync_gpio_chip,
                         int(sync_pin),
                         int(edge.level),
+                        capture,
                     )
 
                 frame_draw_started_s = time.perf_counter()
@@ -908,26 +920,20 @@ def play_video_fill_screen(
                 # main framebuffer. Drawing the full-screen background beneath
                 # it only doubles fill work on the Pi GPU.
                 video_stim.draw()
-                flip_requested_perf = time.perf_counter()
-                frame_draw_elapsed_s = (
-                    flip_requested_perf - frame_draw_started_s
-                )
+                frame_draw_elapsed_s = time.perf_counter() - frame_draw_started_s
+                flip_requested_perf_ns = time.perf_counter_ns()
+                flip_ps = win.flip()
+                flip_return_perf_ns = time.perf_counter_ns()
+                flip_perf_ns = flip_perf_capture.get("actual_perf_ns", flip_return_perf_ns)
+                flip_requested_perf = flip_requested_perf_ns / 1_000_000_000
+                flip_perf = flip_perf_ns / 1_000_000_000
                 frame_draw_total_s += frame_draw_elapsed_s
-                frame_draw_max_s = max(
-                    frame_draw_max_s,
-                    frame_draw_elapsed_s,
-                )
+                frame_draw_max_s = max(frame_draw_max_s, frame_draw_elapsed_s)
                 if target_flip_perf is not None:
                     minimum_flip_submission_headroom_s = min(
                         minimum_flip_submission_headroom_s,
                         target_flip_perf - flip_requested_perf,
                     )
-                flip_ps = win.flip()
-                flip_return_perf = time.perf_counter()
-                flip_perf = flip_perf_capture.get(
-                    "actual_perf_s",
-                    flip_return_perf,
-                )
 
                 if target_flip_perf is not None:
                     boundary_timing_error_s = (
@@ -975,16 +981,14 @@ def play_video_fill_screen(
                     ]
                 )
                 actual_source_last_frame_s = current_source_time_s
-                for edge in sync_edges:
+                for edge, capture in zip(sync_edges, sync_captures):
                     sync_records.append(
                         {
                             "level": int(edge.level),
                             "frame_index": int(edge.frame_index),
                             "interval_frames": edge.interval_frames,
-                            "timestamp_perf_s": flip_perf,
-                            "requested_timestamp_perf_s": (
-                                flip_requested_perf
-                            ),
+                            "timestamp_perf_ns": capture["actual_perf_ns"],
+                            "requested_timestamp_perf_ns": capture["requested_perf_ns"],
                         }
                     )
 
@@ -992,6 +996,8 @@ def play_video_fill_screen(
                     first_flip_ps = flip_ps
                     first_flip_perf = flip_perf
                     first_flip_requested_perf = flip_requested_perf
+                    first_flip_perf_ns = flip_perf_ns
+                    first_flip_requested_perf_ns = flip_requested_perf_ns
                     actual_source_start_s = current_source_time_s
                     glx_sync_start, glx_sync_start_detail = (
                         query_glx_sync_values()
@@ -1018,6 +1024,8 @@ def play_video_fill_screen(
                         ),
                         "flip_requested_perf_s": flip_requested_perf,
                         "actual_flip_perf_s": flip_perf,
+                        "flip_requested_perf_ns": flip_requested_perf_ns,
+                        "actual_flip_perf_ns": flip_perf_ns,
                     }
                 )
 
@@ -1063,7 +1071,8 @@ def play_video_fill_screen(
                         )
     finally:
         final_sync_edge = None
-        clear_flip_perf_capture: Dict[str, float] = {}
+        final_sync_capture = {}
+        clear_flip_perf_capture: Dict[str, int] = {}
         try:
             win.callOnFlip(
                 capture_perf_counter_on_flip,
@@ -1080,6 +1089,7 @@ def play_video_fill_screen(
                         sync_gpio_chip,
                         int(sync_pin),
                         0,
+                        final_sync_capture,
                     )
             if bg_rect is not None:
                 bg_rect.draw()
@@ -1096,18 +1106,17 @@ def play_video_fill_screen(
                 )
                 _wait_for_flip_submission(requested_clear_perf)
 
-            clear_flip_submitted_perf_s = time.perf_counter()
+            end_requested_perf_ns = time.perf_counter_ns()
             win.flip()
-            clear_flip_return_perf = time.perf_counter()
+            clear_flip_return_perf_ns = time.perf_counter_ns()
+            clear_flip_submitted_perf_s = end_requested_perf_ns / 1_000_000_000
             clear_flip_completed = True
             # The requested timestamp is when Python submitted the blocking
             # flip. Keep the predicted next-VBL target separate for timing
             # validation and the nominal scheduled endpoint.
             end_requested_perf = clear_flip_submitted_perf_s
-            end_perf = clear_flip_perf_capture.get(
-                "actual_perf_s",
-                clear_flip_return_perf,
-            )
+            end_perf_ns = clear_flip_perf_capture.get("actual_perf_ns", clear_flip_return_perf_ns)
+            end_perf = end_perf_ns / 1_000_000_000
             glx_sync_end, glx_sync_end_detail = query_glx_sync_values()
             if requested_clear_perf is not None:
                 clip_offset_timing_error_s = (
@@ -1131,8 +1140,8 @@ def play_video_fill_screen(
                         "level": 0,
                         "frame_index": int(final_sync_edge.frame_index),
                         "interval_frames": None,
-                        "timestamp_perf_s": end_perf,
-                        "requested_timestamp_perf_s": end_requested_perf,
+                        "timestamp_perf_ns": final_sync_capture["actual_perf_ns"],
+                        "requested_timestamp_perf_ns": final_sync_capture["requested_perf_ns"],
                     }
                 )
             if abs(clip_offset_timing_error_s) > timing_failure_threshold_s:
@@ -1230,16 +1239,16 @@ def play_video_fill_screen(
                 logger.log_frame_flip(
                     trial_num=trial_num,
                     event="video_clip_start",
-                    timestamp_perf_s=first_flip_perf,
-                    requested_timestamp_perf_s=first_flip_requested_perf,
+                    timestamp_perf_ns=first_flip_perf_ns,
+                    requested_timestamp_perf_ns=first_flip_requested_perf_ns,
                     requested_duration=expected_duration_s,
                 )
                 if end_perf is not None:
                     logger.log_frame_flip(
                         trial_num=trial_num,
                         event="video_clip_end",
-                        timestamp_perf_s=end_perf,
-                        requested_timestamp_perf_s=end_requested_perf,
+                        timestamp_perf_ns=end_perf_ns,
+                        requested_timestamp_perf_ns=end_requested_perf_ns,
                     )
             if first_flip_perf is not None:
                 _log_message(
@@ -1418,12 +1427,8 @@ def play_video_fill_screen(
                             if is_on
                             else "video_sync_signal_off"
                         ),
-                        timestamp_perf_s=float(
-                            record["timestamp_perf_s"]
-                        ),
-                        requested_timestamp_perf_s=record.get(
-                            "requested_timestamp_perf_s"
-                        ),
+                        timestamp_perf_ns=record["timestamp_perf_ns"],
+                        requested_timestamp_perf_ns=record["requested_timestamp_perf_ns"],
                         requested_duration=(
                             pulse_duration if is_on else None
                         ),
@@ -1489,6 +1494,7 @@ def play_video_fill_screen(
         "expected_duration_s": expected_duration_s,
         "start_flip_psychopy_s": first_flip_ps,
         "start_flip_perf_s": first_flip_perf,
+        "start_flip_perf_ns": first_flip_perf_ns,
         "start_flip_requested_perf_s": first_flip_requested_perf,
         "end_time_perf_s": end_perf,
         "clip_offset_perf_s": end_perf,
@@ -1501,6 +1507,9 @@ def play_video_fill_screen(
         ),
         "last_frame_end_perf_s": (
             end_perf if first_flip_perf is not None else None
+        ),
+        "last_frame_end_perf_ns": (
+            end_perf_ns if first_flip_perf is not None else None
         ),
         "last_frame_on_perf_s": last_flip_perf,
         "actual_source_start_s": actual_source_start_s,
@@ -2109,11 +2118,11 @@ def make_initiation_cue_stims(
     return idle_cue, pressed_cue
 
 
-def _send_led_pulse_on_flip(chip, pin: int, duration_us: int):
+def _send_led_pulse_on_flip(chip, pin: int, duration_us: int, capture=None):
     """GPIO pulse callback executed by PsychoPy at flip time.
     
-    This is called by PsychoPy's callOnFlip mechanism, ensuring the GPIO write
-    happens at the exact moment the frame is presented, minimizing latency.
+    This runs just after the swap through PsychoPy's callOnFlip mechanism.
+    Capture the GPIO operation itself; its completion can follow the swap.
     
     Args:
         chip: lgpio chip handle
@@ -2123,9 +2132,10 @@ def _send_led_pulse_on_flip(chip, pin: int, duration_us: int):
     import lgpio
     
     # Set pin HIGH immediately (called at flip time by PsychoPy)
-    lgpio.gpio_write(chip, pin, 1)
+    _set_gpio_level_on_flip(lgpio, chip, pin, 1, capture)
     
-    # Use hardware-timed pulse to turn it off after duration
+    # Queue the asynchronous clear only after preserving the HIGH write time.
+    # lgpio's pulse worker is software timed; this call does not wait for LOW.
     result = lgpio.tx_pulse(chip, pin, 0, duration_us, 0, 1)
     
     # If pulse fails, at least turn the pin back off
@@ -2134,7 +2144,7 @@ def _send_led_pulse_on_flip(chip, pin: int, duration_us: int):
             lgpio.gpio_write(chip, pin, 0)
         except Exception:
             pass
-        raise RuntimeError(f"Hardware pulse failed with code {result} during flip callback")
+        raise RuntimeError(f"GPIO pulse scheduling failed with code {result} during flip callback")
 
 
 def present_trial_with_persistent_dots(
@@ -2246,11 +2256,10 @@ def present_trial_with_persistent_dots(
         # duration is intentionally a no-op in this presentation mode.
         stim_plan = plan_frame_duration(0.0, fps)
 
-    def _set_initiation_time(perf_s: Optional[float] = None):
-        if trial_meta is None or "initiation_time_s" in trial_meta:
+    def _set_initiation_time(*, perf_ns: int):
+        if trial_meta is None or "initiation_task_time_ns" in trial_meta:
             return
-        perf_now = float(perf_s) if perf_s is not None else time.perf_counter()
-        trial_meta["initiation_time_s"] = logger.seconds_since_session_start(perf_now)
+        trial_meta["initiation_task_time_ns"] = logger.task_time_ns(timestamp_perf_ns=perf_ns)
 
     from psychopy import event as _event
     mouse = _event.Mouse(win=win)
@@ -2265,6 +2274,7 @@ def present_trial_with_persistent_dots(
     fixation_color = (255, 255, 255) if white_fixation_until_choice else (0, 0, 0)
     trial_start_signal_armed_s: Optional[float] = None
     trial_start_signal_sent = False
+    trial_signal_capture = {}
 
     def _set_fixation_color(color_rgb: Tuple[int, int, int]) -> None:
         nonlocal fixation_color
@@ -2357,7 +2367,8 @@ def present_trial_with_persistent_dots(
         try:
             pulse_s = 0.25
             duration_us = int(pulse_s * 1_000_000)
-            win.callOnFlip(_send_led_pulse_on_flip, pigpio_pi, raspi_pin, duration_us)
+            arm_flip_timestamp(win)
+            win.callOnFlip(_send_led_pulse_on_flip, pigpio_pi, raspi_pin, duration_us, trial_signal_capture)
             trial_start_signal_armed_s = pulse_s
             _log_message(msg_logger, "INFO", f"raspi_pulse_registered trial_num={trial_num} duration_s={pulse_s:.6f}")
             return True
@@ -2366,18 +2377,15 @@ def present_trial_with_persistent_dots(
             _log_message(msg_logger, "ERROR", error_msg)
             return False
 
-    def _commit_trial_start_signal(
-        flip_perf_s: float,
-        requested_perf_s: Optional[float] = None,
-    ) -> None:
+    def _commit_trial_start_signal() -> None:
         nonlocal trial_start_signal_armed_s, trial_start_signal_sent
         if trial_start_signal_armed_s is None:
             return
         logger.log_signal(
             trial_num=trial_num,
             event="trial_start_signal_on",
-            timestamp_perf_s=flip_perf_s,
-            requested_timestamp_perf_s=requested_perf_s,
+            timestamp_perf_ns=trial_signal_capture["actual_perf_ns"],
+            requested_timestamp_perf_ns=trial_signal_capture["requested_perf_ns"],
             requested_duration=trial_start_signal_armed_s,
         )
         trial_start_signal_sent = True
@@ -2461,7 +2469,8 @@ def present_trial_with_persistent_dots(
             entry["reward_level"] = int(reward_level)
         return entry
 
-    def _log_initiation_cue_release(release_perf_s: float) -> None:
+    def _log_initiation_cue_release(release_perf_ns: int) -> None:
+        release_perf_s = release_perf_ns / 1_000_000_000
         nonlocal initiation_cue_released, held_initiation_cue_visible
         if initiation_cue_released:
             return
@@ -2470,7 +2479,7 @@ def present_trial_with_persistent_dots(
         logger.log_interaction(
             trial_num=trial_num,
             event=_interaction_event_name("cue_release"),
-            timestamp_perf_s=float(release_perf_s),
+            timestamp_perf_ns=release_perf_ns,
         )
         if trial_meta is not None:
             trial_meta["initiation_cue_released"] = True
@@ -2493,6 +2502,8 @@ def present_trial_with_persistent_dots(
         _show_preview([])
         if trial_meta is not None:
             trial_meta["gray_flip_perf_s"] = float(gray_timing.actual_perf_s)
+            trial_meta["gray_flip_perf_ns"] = gray_timing.actual_perf_ns
+            trial_meta["gray_flip_requested_perf_ns"] = gray_timing.requested_perf_ns
             if gray_timing.requested_perf_s is not None:
                 trial_meta["gray_flip_requested_perf_s"] = float(
                     gray_timing.requested_perf_s
@@ -2512,13 +2523,13 @@ def present_trial_with_persistent_dots(
         if not enforce_initiation_hold or initiation_cue_released:
             return initiation_cue_released
         touch_sample = mouse_presses.poll()
-        now = time.perf_counter()
+        now = touch_sample.observed_perf_s
         hold_sample = initiation_hold.update(
             touch_sample.down and _cue_contains(touch_sample.position),
-            now,
+            now, timestamp_perf_ns=touch_sample.observed_perf_ns,
         )
         if hold_sample.released:
-            _log_initiation_cue_release(hold_sample.missing_since_s or now)
+            _log_initiation_cue_release(hold_sample.missing_since_perf_ns)
             return True
         return False
 
@@ -2561,12 +2572,12 @@ def present_trial_with_persistent_dots(
         mouse_presses.reset()
         oc_timing = flip_with_timestamps(win)
         oc_perf = oc_timing.actual_perf_s
-        _commit_trial_start_signal(oc_perf, oc_timing.requested_perf_s)
+        _commit_trial_start_signal()
         logger.log_frame_flip(
             trial_num=trial_num,
             event=_frame_event_name("onset_cue"),
-            timestamp_perf_s=oc_perf,
-            requested_timestamp_perf_s=oc_timing.requested_perf_s,
+            timestamp_perf_ns=oc_timing.actual_perf_ns,
+            requested_timestamp_perf_ns=oc_timing.requested_perf_ns,
         )
         initiation_started = False
         while True:
@@ -2578,19 +2589,19 @@ def present_trial_with_persistent_dots(
 
             touch_sample = mouse_presses.poll()
             click_pos = touch_sample.position
-            now = time.perf_counter()
+            now = touch_sample.observed_perf_s
             if (
                 not initiation_started
                 and touch_sample.press_started
                 and _cue_contains(click_pos)
             ):
                 initiation_started = True
-                initiation_hold.start(now)
-                _set_initiation_time(now)
+                initiation_hold.start(touch_sample.timestamp_perf_s)
+                _set_initiation_time(perf_ns=touch_sample.timestamp_perf_ns)
                 logger.log_interaction(
                     trial_num=trial_num,
                     event=_interaction_event_name("cue_touch"),
-                    timestamp_perf_s=now,
+                    timestamp_perf_ns=touch_sample.timestamp_perf_ns,
                 )
                 bg_rect.draw()
                 pressed_onset_cue.draw()
@@ -2616,7 +2627,7 @@ def present_trial_with_persistent_dots(
             if initiation_started:
                 hold_sample = initiation_hold.update(
                     touch_sample.down and _cue_contains(click_pos),
-                    now,
+                    now, timestamp_perf_ns=touch_sample.observed_perf_ns,
                 )
                 if hold_sample.qualified:
                     held_initiation_cue_visible = hold_before_choice
@@ -2625,11 +2636,11 @@ def present_trial_with_persistent_dots(
                 if hold_sample.released:
                     if hold_before_choice:
                         _log_initiation_cue_release(
-                            hold_sample.missing_since_s or now
+                            hold_sample.missing_since_perf_ns
                         )
                         return _finish_released_trial()
                     if trial_meta is not None:
-                        trial_meta.pop("initiation_time_s", None)
+                        trial_meta.pop("initiation_task_time_ns", None)
                     initiation_started = False
                     initiation_hold.reset()
                     bg_rect.draw()
@@ -2730,12 +2741,12 @@ def present_trial_with_persistent_dots(
             )
             if not cue_contains_touch:
                 return
-            touch_perf = time.perf_counter()
+            touch_perf = touch_sample.timestamp_perf_s
             pre_options_cue_touched = True
             logger.log_interaction(
                 trial_num=trial_num,
                 event=pre_options_cue_touch_event,
-                timestamp_perf_s=touch_perf,
+                timestamp_perf_ns=touch_sample.timestamp_perf_ns,
             )
             if trial_meta is not None:
                 trial_meta["match_cue_touched"] = True
@@ -2748,13 +2759,13 @@ def present_trial_with_persistent_dots(
             return _finish_released_trial()
         cue_timing = flip_with_timestamps(win)
         cue_perf = cue_timing.actual_perf_s
-        _commit_trial_start_signal(cue_perf, cue_timing.requested_perf_s)
-        _set_initiation_time(cue_perf)
+        _commit_trial_start_signal()
+        _set_initiation_time(perf_ns=cue_timing.actual_perf_ns)
         logger.log_frame_flip(
             trial_num=trial_num,
             event=pre_options_cue_event,
-            timestamp_perf_s=cue_perf,
-            requested_timestamp_perf_s=cue_timing.requested_perf_s,
+            timestamp_perf_ns=cue_timing.actual_perf_ns,
+            requested_timestamp_perf_ns=cue_timing.requested_perf_ns,
             requested_duration=cue_plan.requested_s,
         )
 
@@ -2805,7 +2816,7 @@ def present_trial_with_persistent_dots(
                     "INFO",
                     (
                         f"match_cue_cleared trial_num={trial_num} "
-                        f"timestamp_perf_s={clear_timing.actual_perf_s:.9f} "
+                        f"task_time_ns={logger.task_time_ns(timestamp_perf_ns=clear_timing.actual_perf_ns)} "
                         "reason=match_cue_touch_window_end"
                     ),
                 )
@@ -2815,8 +2826,8 @@ def present_trial_with_persistent_dots(
                 logger.log_frame_flip(
                     trial_num=trial_num,
                     event=pre_options_delay_event,
-                    timestamp_perf_s=clear_timing.actual_perf_s,
-                    requested_timestamp_perf_s=clear_timing.requested_perf_s,
+                    timestamp_perf_ns=clear_timing.actual_perf_ns,
+                    requested_timestamp_perf_ns=clear_timing.requested_perf_ns,
                     requested_duration=delay_plan.requested_s,
                 )
 
@@ -2948,7 +2959,8 @@ def present_trial_with_persistent_dots(
         except Exception:
             pass
 
-    def _commit_choice(chosen_idx: int, click_pos: Tuple[float, float], click_perf: float) -> None:
+    def _commit_choice(chosen_idx: int, click_pos: Tuple[float, float], click_perf_ns: int) -> None:
+        click_perf = click_perf_ns / 1_000_000_000
         nonlocal click_registered, click_perf_capture, click_meta, chosen_info
         click_perf_capture = float(click_perf)
         chosen_info = {
@@ -2963,7 +2975,7 @@ def present_trial_with_persistent_dots(
         logger.log_interaction(
             trial_num=trial_num,
             event=_interaction_event_name("option_touch"),
-            timestamp_perf_s=click_perf_capture,
+            timestamp_perf_ns=click_perf_ns,
         )
         click_meta = {"idx": chosen_idx}
         click_registered = True
@@ -2986,11 +2998,7 @@ def present_trial_with_persistent_dots(
         enforce_initiation_hold = False
         _arm_choice_input()
 
-    def _start_choice_window(
-        start_flip_ps,
-        start_perf: float,
-        requested_perf: Optional[float] = None,
-    ) -> None:
+    def _start_choice_window(timing) -> None:
         nonlocal choice_started, choice_flip, choice_perf, choice_window_s, choice_deadline
         if choice_started:
             return
@@ -2999,8 +3007,8 @@ def present_trial_with_persistent_dots(
             # paths arm immediately before the response-opening flip.
             _arm_choice_input()
         choice_started = True
-        choice_flip = start_flip_ps
-        choice_perf = float(start_perf)
+        choice_flip = timing.psychopy_s
+        choice_perf = timing.actual_perf_s
         choice_window_s = max(0.0, float(choice_s))
         choice_deadline = choice_perf + choice_window_s
         start_touch = mouse_presses.poll()
@@ -3008,13 +3016,13 @@ def present_trial_with_persistent_dots(
         logger.log_frame_flip(
             trial_num=trial_num,
             event=_frame_event_name("choice_start"),
-            timestamp_perf_s=choice_perf,
-            requested_timestamp_perf_s=requested_perf,
+            timestamp_perf_ns=timing.actual_perf_ns,
+            requested_timestamp_perf_ns=timing.requested_perf_ns,
             requested_duration=choice_plan.requested_s,
         )
 
         if start_touch.press_started and choice_perf is not None:
-            touch_onset_perf = time.perf_counter()
+            touch_onset_perf = start_touch.timestamp_perf_s
             chosen_idx = _match_choice_target(start_click_pos)
             start_click_pos_acquired, chosen_idx = _acquire_choice_target(
                 start_click_pos,
@@ -3028,7 +3036,7 @@ def present_trial_with_persistent_dots(
             )
             _log_choice_touch_attempt(start_click_pos_acquired, chosen_idx, origin=start_origin)
             if chosen_idx is not None:
-                _commit_choice(chosen_idx, start_click_pos_acquired, touch_onset_perf)
+                _commit_choice(chosen_idx, start_click_pos_acquired, start_touch.timestamp_perf_ns)
 
     def _abort_from_input(reason: str) -> bool:
         if _event.getKeys(["escape"]):
@@ -3047,7 +3055,7 @@ def present_trial_with_persistent_dots(
             touch_sample = mouse_presses.poll()
             click_pos = touch_sample.position
             if touch_sample.press_started and choice_perf is not None:
-                touch_onset_perf = time.perf_counter()
+                touch_onset_perf = touch_sample.timestamp_perf_s
                 chosen_idx = _match_choice_target(click_pos)
 
                 if chosen_idx is None:
@@ -3056,7 +3064,7 @@ def present_trial_with_persistent_dots(
                 _log_choice_touch_attempt(click_pos, chosen_idx, origin="touch_start")
 
                 if chosen_idx is not None:
-                    _commit_choice(chosen_idx, click_pos, touch_onset_perf)
+                    _commit_choice(chosen_idx, click_pos, touch_sample.timestamp_perf_ns)
                     break
 
             remaining = deadline_perf - time.perf_counter()
@@ -3072,15 +3080,13 @@ def present_trial_with_persistent_dots(
             flip_submission_time(choice_deadline, frame_dur),
         )
 
-    def _record_gray_flip(
-        perf_s: float,
-        requested_perf_s: Optional[float] = None,
-    ) -> None:
+    def _record_gray_flip(timing) -> None:
         if trial_meta is None:
             return
-        trial_meta["gray_flip_perf_s"] = float(perf_s)
-        if requested_perf_s is not None:
-            trial_meta["gray_flip_requested_perf_s"] = float(requested_perf_s)
+        trial_meta["gray_flip_perf_s"] = timing.actual_perf_s
+        trial_meta["gray_flip_requested_perf_s"] = timing.requested_perf_s
+        trial_meta["gray_flip_perf_ns"] = timing.actual_perf_ns
+        trial_meta["gray_flip_requested_perf_ns"] = timing.requested_perf_ns
 
     def _build_stimulus(p, pos):
         if isinstance(p, tuple) and len(p) == 2:
@@ -3172,16 +3178,13 @@ def present_trial_with_persistent_dots(
                 if dot_timing is None:
                     return _interrupted_result()
                 dot_perf = dot_timing.actual_perf_s
-                _commit_trial_start_signal(
-                    dot_perf,
-                    dot_timing.requested_perf_s,
-                )
-                _set_initiation_time(dot_perf)
+                _commit_trial_start_signal()
+                _set_initiation_time(perf_ns=dot_timing.actual_perf_ns)
                 logger.log_frame_flip(
                     trial_num=trial_num,
                     event=_frame_event_name("dot", idx),
-                    timestamp_perf_s=dot_perf,
-                    requested_timestamp_perf_s=dot_timing.requested_perf_s,
+                    timestamp_perf_ns=dot_timing.actual_perf_ns,
+                    requested_timestamp_perf_ns=dot_timing.requested_perf_ns,
                     requested_duration=isi_plan.requested_s,
                 )
                 _show_preview([])
@@ -3208,16 +3211,13 @@ def present_trial_with_persistent_dots(
                 return _interrupted_result()
             flip_ps = stim_timing.psychopy_s
             flip_perf = stim_timing.actual_perf_s
-            _commit_trial_start_signal(
-                flip_perf,
-                stim_timing.requested_perf_s,
-            )
-            _set_initiation_time(flip_perf)
+            _commit_trial_start_signal()
+            _set_initiation_time(perf_ns=stim_timing.actual_perf_ns)
             logger.log_frame_flip(
                 trial_num=trial_num,
                 event=_frame_event_name("stim", idx),
-                timestamp_perf_s=flip_perf,
-                requested_timestamp_perf_s=stim_timing.requested_perf_s,
+                timestamp_perf_ns=stim_timing.actual_perf_ns,
+                requested_timestamp_perf_ns=stim_timing.requested_perf_ns,
                 requested_duration=stim_plan.requested_s,
             )
             _show_preview(current_preview_image)
@@ -3253,8 +3253,8 @@ def present_trial_with_persistent_dots(
                 logger.log_frame_flip(
                     trial_num=trial_num,
                     event=_frame_event_name("inter_stimulus"),
-                    timestamp_perf_s=break_timing.actual_perf_s,
-                    requested_timestamp_perf_s=break_timing.requested_perf_s,
+                    timestamp_perf_ns=break_timing.actual_perf_ns,
+                    requested_timestamp_perf_ns=break_timing.requested_perf_ns,
                     requested_duration=isi_plan.requested_s,
                 )
                 _show_preview([])
@@ -3281,15 +3281,9 @@ def present_trial_with_persistent_dots(
                 )
                 if off_timing is None:
                     return _interrupted_result()
-                off_flip = off_timing.psychopy_s
-                off_perf = off_timing.actual_perf_s
                 next_visual_target_perf_s = None
                 _build_choice_hit_targets()
-                _start_choice_window(
-                    off_flip,
-                    off_perf,
-                    off_timing.requested_perf_s,
-                )
+                _start_choice_window(off_timing)
                 _show_preview(stims_for_choice_preview)
 
     else:
@@ -3328,13 +3322,13 @@ def present_trial_with_persistent_dots(
             if dot_timing is None:
                 return _interrupted_result()
             dot_perf = dot_timing.actual_perf_s
-            _commit_trial_start_signal(dot_perf, dot_timing.requested_perf_s)
-            _set_initiation_time(dot_perf)
+            _commit_trial_start_signal()
+            _set_initiation_time(perf_ns=dot_timing.actual_perf_ns)
             logger.log_frame_flip(
                 trial_num=trial_num,
                 event=_frame_event_name("dot"),
-                timestamp_perf_s=dot_perf,
-                requested_timestamp_perf_s=dot_timing.requested_perf_s,
+                timestamp_perf_ns=dot_timing.actual_perf_ns,
+                requested_timestamp_perf_ns=dot_timing.requested_perf_ns,
                 requested_duration=isi_plan.requested_s,
             )
             _show_preview([])
@@ -3367,8 +3361,8 @@ def present_trial_with_persistent_dots(
             return _interrupted_result()
         flip_ps = stim_timing.psychopy_s
         flip_perf = stim_timing.actual_perf_s
-        _commit_trial_start_signal(flip_perf, stim_timing.requested_perf_s)
-        _set_initiation_time(flip_perf)
+        _commit_trial_start_signal()
+        _set_initiation_time(perf_ns=stim_timing.actual_perf_ns)
         stim_request = (
             stim_plan.requested_s
             if is_memory
@@ -3377,18 +3371,14 @@ def present_trial_with_persistent_dots(
         logger.log_frame_flip(
             trial_num=trial_num,
             event=_frame_event_name("stim"),
-            timestamp_perf_s=flip_perf,
-            requested_timestamp_perf_s=stim_timing.requested_perf_s,
+            timestamp_perf_ns=stim_timing.actual_perf_ns,
+            requested_timestamp_perf_ns=stim_timing.requested_perf_ns,
             requested_duration=stim_request,
         )
         _show_preview(preview_images)
         if not is_memory:
             _build_choice_hit_targets()
-            _start_choice_window(
-                flip_ps,
-                flip_perf,
-                stim_timing.requested_perf_s,
-            )
+            _start_choice_window(stim_timing)
         else:
             next_visual_target_perf_s = transition_scheduler.target_after(
                 flip_perf,
@@ -3430,15 +3420,9 @@ def present_trial_with_persistent_dots(
             )
             if choice_timing is None:
                 return _interrupted_result()
-            choice_flip = choice_timing.psychopy_s
-            choice_perf_now = choice_timing.actual_perf_s
             next_visual_target_perf_s = None
             _build_choice_hit_targets()
-            _start_choice_window(
-                choice_flip,
-                choice_perf_now,
-                choice_timing.requested_perf_s,
-            )
+            _start_choice_window(choice_timing)
             _show_preview([] if is_memory else (stims_for_choice_preview if sequential else preview_images))
 
         # Prepare the static gray scene once while the choice remains visible
@@ -3469,10 +3453,7 @@ def present_trial_with_persistent_dots(
         if clear_timing is None:
             return True, None
     _show_preview([])
-    _record_gray_flip(
-        clear_timing.actual_perf_s,
-        clear_timing.requested_perf_s,
-    )
+    _record_gray_flip(clear_timing)
     if trial_meta is not None:
         trial_meta["main_display_transition_count"] = (
             transition_scheduler.transition_count
@@ -3943,19 +3924,21 @@ def present_delayed_afc_trial(
 
     trial_start_signal_armed_s: Optional[float] = None
     trial_start_signal_sent = False
+    trial_signal_capture = {}
 
-    def _set_initiation_time(perf_s: Optional[float] = None) -> None:
-        if trial_meta is None or "initiation_time_s" in trial_meta:
+    def _set_initiation_time(*, perf_ns: int) -> None:
+        if trial_meta is None or "initiation_task_time_ns" in trial_meta:
             return
-        perf_now = float(perf_s) if perf_s is not None else time.perf_counter()
         try:
-            trial_meta["initiation_time_s"] = logger.seconds_since_session_start(perf_now)
+            trial_meta["initiation_task_time_ns"] = logger.task_time_ns(timestamp_perf_ns=perf_ns)
         except Exception:
-            trial_meta["initiation_time_s"] = ""
+            trial_meta["initiation_task_time_ns"] = ""
 
-    def _record_gray_flip(perf_s: float) -> None:
+    def _record_gray_flip(timing) -> None:
         if trial_meta is not None:
-            trial_meta["gray_flip_perf_s"] = float(perf_s)
+            trial_meta["gray_flip_perf_s"] = timing.actual_perf_s
+            trial_meta["gray_flip_perf_ns"] = timing.actual_perf_ns
+            trial_meta["gray_flip_requested_perf_ns"] = timing.requested_perf_ns
 
     def _abort_from_input(reason: str) -> bool:
         if event.getKeys(["escape"]):
@@ -3987,7 +3970,8 @@ def present_delayed_afc_trial(
         try:
             pulse_s = 0.25
             duration_us = int(pulse_s * 1_000_000)
-            win.callOnFlip(_send_led_pulse_on_flip, pigpio_pi, raspi_pin, duration_us)
+            arm_flip_timestamp(win)
+            win.callOnFlip(_send_led_pulse_on_flip, pigpio_pi, raspi_pin, duration_us, trial_signal_capture)
             trial_start_signal_armed_s = pulse_s
             _log_message(msg_logger, "INFO", f"raspi_pulse_registered trial_num={trial_num} duration_s={pulse_s:.6f}")
             return True
@@ -3995,18 +3979,15 @@ def present_delayed_afc_trial(
             _log_message(msg_logger, "ERROR", f"trial_start_signal_registration_failed trial_num={trial_num} error={e}")
             return False
 
-    def _commit_trial_start_signal(
-        flip_perf_s: float,
-        requested_perf_s: Optional[float] = None,
-    ) -> None:
+    def _commit_trial_start_signal() -> None:
         nonlocal trial_start_signal_armed_s, trial_start_signal_sent
         if trial_start_signal_armed_s is None:
             return
         logger.log_signal(
             trial_num=trial_num,
             event="trial_start_signal_on",
-            timestamp_perf_s=flip_perf_s,
-            requested_timestamp_perf_s=requested_perf_s,
+            timestamp_perf_ns=trial_signal_capture["actual_perf_ns"],
+            requested_timestamp_perf_ns=trial_signal_capture["requested_perf_ns"],
             requested_duration=trial_start_signal_armed_s,
         )
         trial_start_signal_sent = True
@@ -4026,8 +4007,8 @@ def present_delayed_afc_trial(
     logger.log_frame_flip(
         trial_num=trial_num,
         event="onset_cue_on",
-        timestamp_perf_s=oc_perf,
-        requested_timestamp_perf_s=onset_timing.requested_perf_s,
+        timestamp_perf_ns=onset_timing.actual_perf_ns,
+        requested_timestamp_perf_ns=onset_timing.requested_perf_ns,
     )
     while True:
         if _abort_from_input("during_onset_cue"):
@@ -4041,12 +4022,12 @@ def present_delayed_afc_trial(
                 oc_w, oc_h = (200, 200)
             oc_x, oc_y = getattr(onset_cue, "pos", (0, 0))
             if abs(click_pos[0] - oc_x) <= oc_w / 2.0 and abs(click_pos[1] - oc_y) <= oc_h / 2.0:
-                click_perf = time.perf_counter()
-                _set_initiation_time(click_perf)
+                click_perf = touch_sample.timestamp_perf_s
+                _set_initiation_time(perf_ns=touch_sample.timestamp_perf_ns)
                 logger.log_interaction(
                     trial_num=trial_num,
                     event="cue_touch",
-                    timestamp_perf_s=click_perf,
+                    timestamp_perf_ns=touch_sample.timestamp_perf_ns,
                 )
                 _log_message(
                     msg_logger,
@@ -4099,8 +4080,8 @@ def present_delayed_afc_trial(
         if cue_timing is None:
             return True, None
     cue_perf = cue_timing.actual_perf_s
-    _commit_trial_start_signal(cue_perf, cue_timing.requested_perf_s)
-    _set_initiation_time(cue_perf)
+    _commit_trial_start_signal()
+    _set_initiation_time(perf_ns=cue_timing.actual_perf_ns)
     if trial_meta is not None:
         trial_meta["cue_flip_perf_s"] = float(cue_perf)
         trial_meta["cue_feature"] = cue_feature
@@ -4112,8 +4093,8 @@ def present_delayed_afc_trial(
     logger.log_frame_flip(
         trial_num=trial_num,
         event="feature_cue_on",
-        timestamp_perf_s=cue_perf,
-        requested_timestamp_perf_s=cue_timing.requested_perf_s,
+        timestamp_perf_ns=cue_timing.actual_perf_ns,
+        requested_timestamp_perf_ns=cue_timing.requested_perf_ns,
         requested_duration=cue_plan.requested_s,
     )
     next_visual_target_perf_s = transition_scheduler.target_after(
@@ -4136,8 +4117,8 @@ def present_delayed_afc_trial(
         logger.log_frame_flip(
             trial_num=trial_num,
             event="delay_start",
-            timestamp_perf_s=delay_perf,
-            requested_timestamp_perf_s=delay_timing.requested_perf_s,
+            timestamp_perf_ns=delay_timing.actual_perf_ns,
+            requested_timestamp_perf_ns=delay_timing.requested_perf_ns,
             requested_duration=delay_plan.requested_s,
         )
         next_visual_target_perf_s = transition_scheduler.target_after(
@@ -4172,15 +4153,15 @@ def present_delayed_afc_trial(
     logger.log_frame_flip(
         trial_num=trial_num,
         event="options_on",
-        timestamp_perf_s=choice_perf,
-        requested_timestamp_perf_s=choice_timing.requested_perf_s,
+        timestamp_perf_ns=choice_timing.actual_perf_ns,
+        requested_timestamp_perf_ns=choice_timing.requested_perf_ns,
         requested_duration=choice_plan.requested_s,
     )
     logger.log_frame_flip(
         trial_num=trial_num,
         event="choice_start",
-        timestamp_perf_s=choice_perf,
-        requested_timestamp_perf_s=choice_timing.requested_perf_s,
+        timestamp_perf_ns=choice_timing.actual_perf_ns,
+        requested_timestamp_perf_ns=choice_timing.requested_perf_ns,
         requested_duration=choice_plan.requested_s,
     )
 
@@ -4196,12 +4177,12 @@ def present_delayed_afc_trial(
         start_pos = start_touch.position
         immediate_idx = _match_choice(start_pos)
         if immediate_idx is not None:
-            click_perf = time.perf_counter()
+            click_perf = start_touch.timestamp_perf_s
             correct = immediate_idx == int(target_index)
             logger.log_interaction(
                 trial_num=trial_num,
                 event="option_touch",
-                timestamp_perf_s=click_perf,
+                timestamp_perf_ns=start_touch.timestamp_perf_ns,
             )
             choice_info = {
                 "chosen_index": int(immediate_idx),
@@ -4247,12 +4228,12 @@ def present_delayed_afc_trial(
                 ),
             )
             if chosen_idx is not None:
-                click_perf = time.perf_counter()
+                click_perf = touch_sample.timestamp_perf_s
                 correct = chosen_idx == int(target_index)
                 logger.log_interaction(
                     trial_num=trial_num,
                     event="option_touch",
-                    timestamp_perf_s=click_perf,
+                    timestamp_perf_ns=touch_sample.timestamp_perf_ns,
                 )
                 choice_info = {
                     "chosen_index": int(chosen_idx),
@@ -4286,7 +4267,7 @@ def present_delayed_afc_trial(
     else:
         gray_timing = flip_with_timestamps(win)
     gray_perf = gray_timing.actual_perf_s
-    _record_gray_flip(gray_perf)
+    _record_gray_flip(gray_timing)
     if trial_meta is not None:
         trial_meta["gray_flip_requested_perf_s"] = float(
             gray_timing.requested_perf_s

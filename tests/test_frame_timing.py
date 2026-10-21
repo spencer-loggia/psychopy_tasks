@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 from bin.frame_timing import (
     FlipTimestamps,
     FrameTransitionScheduler,
+    arm_flip_timestamp,
     flip_submission_time,
     flip_with_timestamps,
     plan_frame_duration,
@@ -54,12 +55,45 @@ class FrameDurationPlanTests(unittest.TestCase):
 
 
 class FlipTimestampTests(unittest.TestCase):
+    def test_flip_capture_precedes_slow_gpio_callback_and_keeps_native_ns(self):
+        now = 9_007_199_254_740_993
+
+        class Window:
+            def __init__(self):
+                self.callbacks = []
+
+            def callOnFlip(self, callback, *args):
+                self.callbacks.append((callback, args))
+
+            def flip(self):
+                nonlocal now
+                now += 10_000_000
+                for callback, args in self.callbacks:
+                    callback(*args)
+                now += 5_000_000  # Work after callbacks, before flip returns.
+
+        def slow_gpio_write():
+            nonlocal now
+            now += 2_000_000
+
+        win = Window()
+        request_ns = now
+        with patch("bin.frame_timing.time.perf_counter_ns", side_effect=lambda: now):
+            arm_flip_timestamp(win)
+            win.callOnFlip(slow_gpio_write)
+            result = flip_with_timestamps(win)
+
+        self.assertEqual(result.requested_perf_ns, request_ns)
+        self.assertEqual(result.actual_perf_ns, request_ns + 10_000_000)
+        self.assertEqual(now, result.actual_perf_ns + 7_000_000)
+        self.assertEqual(len(win.callbacks), 2)
+
     def test_captures_request_before_realized_flip(self):
         class Window:
             def flip(self):
                 return 42.0
 
-        with patch("bin.frame_timing.time.perf_counter", side_effect=[10.0, 10.01]):
+        with patch("bin.frame_timing.time.perf_counter_ns", side_effect=[10_000_000_000, 10_010_000_000]):
             result = flip_with_timestamps(Window())
 
         self.assertEqual(result.psychopy_s, 42.0)
@@ -77,8 +111,8 @@ class FlipTimestampTests(unittest.TestCase):
                 return 42.0
 
         with patch(
-            "bin.frame_timing.time.perf_counter",
-            side_effect=[10.0, 10.005, 10.01],
+            "bin.frame_timing.time.perf_counter_ns",
+            side_effect=[10_000_000_000, 10_005_000_000, 10_010_000_000],
         ):
             result = flip_with_timestamps(Window())
 

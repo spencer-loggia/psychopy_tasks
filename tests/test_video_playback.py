@@ -790,9 +790,13 @@ class VideoPlaybackTests(unittest.TestCase):
         class FakeGPIO:
             def __init__(self):
                 self.writes = []
+                self.write_times = []
 
             def gpio_write(self, chip, pin, level):
                 self.writes.append((win.refresh_index, chip, pin, level))
+                before_ns = round(clock.now_s * 1_000_000_000)
+                clock.now_s += 0.001  # A slow GPIO write must not shift flip time.
+                self.write_times.append((before_ns, round(clock.now_s * 1_000_000_000)))
                 return 0
 
         gpio = FakeGPIO()
@@ -833,6 +837,8 @@ class VideoPlaybackTests(unittest.TestCase):
                 "perf_counter",
                 side_effect=clock.perf_counter,
             ),
+            patch.object(video_utils.time, "perf_counter_ns",
+                         side_effect=lambda: round(clock.perf_counter() * 1_000_000_000)),
             patch.object(
                 video_utils.time,
                 "sleep",
@@ -985,7 +991,7 @@ class VideoPlaybackTests(unittest.TestCase):
                 call.kwargs["main_display_flip_perf_s"]
                 for call in publish_calls
             ],
-            [flip_time(3), flip_time(7), flip_time(8)],
+            [round(flip_time(i) * 1_000_000_000) / 1_000_000_000 for i in (3, 7, 8)],
         )
 
         # The pulse begins on source frame 2's boundary. The unchanged front
@@ -995,6 +1001,13 @@ class VideoPlaybackTests(unittest.TestCase):
             [(8, "chip", 18, 1), (11, "chip", 18, 0)],
         )
         self.assertEqual(result["sync_pulses"], 1)
+        sync_calls = event_logger.log_signal.call_args_list
+        self.assertEqual(len(sync_calls), 2)
+        self.assertEqual(
+            [(call.kwargs["requested_timestamp_perf_ns"], call.kwargs["timestamp_perf_ns"])
+             for call in sync_calls],
+            gpio.write_times,
+        )
 
         end_flip_call = next(
             call
@@ -1002,15 +1015,17 @@ class VideoPlaybackTests(unittest.TestCase):
             if call.kwargs["event"] == "video_clip_end"
         )
         self.assertAlmostEqual(
-            end_flip_call.kwargs["requested_timestamp_perf_s"],
+            end_flip_call.kwargs["requested_timestamp_perf_ns"] / 1_000_000_000,
             flip_time(3)
             + 3.0 / 24.0
             - 0.49 / measured_refresh_rate,
         )
         self.assertAlmostEqual(
-            end_flip_call.kwargs["timestamp_perf_s"],
+            end_flip_call.kwargs["timestamp_perf_ns"] / 1_000_000_000,
             flip_time(11),
         )
+        self.assertEqual(result["last_frame_end_perf_ns"], end_flip_call.kwargs["timestamp_perf_ns"])
+        self.assertEqual(result["start_flip_perf_ns"], round(flip_time(3) * 1_000_000_000))
 
     @staticmethod
     def _load_utils_without_psychopy_runtime():
@@ -1209,7 +1224,7 @@ class PlayVideoTaskTests(unittest.TestCase):
         messages = []
         session_logs = types.SimpleNamespace(
             event_logger=types.SimpleNamespace(
-                seconds_since_session_start=lambda timestamp: timestamp
+                task_time_ns=lambda timestamp=None, timestamp_perf_ns=None: timestamp_perf_ns if timestamp_perf_ns is not None else timestamp
             ),
             message_logger=types.SimpleNamespace(
                 log=lambda level, message: messages.append((level, message))
@@ -1380,7 +1395,9 @@ class PlayVideoTaskTests(unittest.TestCase):
         )
         playback_result = {
             "start_flip_perf_s": 10.0,
+                    "start_flip_perf_ns": 10000000000,
             "last_frame_end_perf_s": 12.0,
+                    "last_frame_end_perf_ns": 12000000000,
             "video_path": Path("clip.mp4"),
             "video_name": "clip.mp4",
             "source_duration_s": 60.0,
@@ -1445,8 +1462,8 @@ class PlayVideoTaskTests(unittest.TestCase):
 
         class FakeEventLogger:
             @staticmethod
-            def seconds_since_session_start(timestamp):
-                return timestamp
+            def task_time_ns(timestamp=None, timestamp_perf_ns=None):
+                return timestamp_perf_ns if timestamp_perf_ns is not None else timestamp
 
         class FakeBehaviorLogger:
             def __init__(self):

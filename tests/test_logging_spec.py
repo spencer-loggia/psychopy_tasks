@@ -14,9 +14,43 @@ from bin.task_lifecycle import (
     TASK_WINDOW_RELEASE_ENV,
     signal_task_window_ready,
 )
+from bin.task_clock import EXPERIMENT_ORIGIN_ENV
 
 
 class LoggingSpecTests(unittest.TestCase):
+    def test_integer_nanoseconds_and_exact_idempotent_block_boundaries(self):
+        origin = 2**60 + 123
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ, {EXPERIMENT_ORIGIN_ENV: str(origin)}
+        ), patch("bin.logger.time.perf_counter_ns", return_value=origin + 100):
+            bundle = SessionLogBundle(
+                output_root=tmpdir, task_name="active_foraging", config_name="ns",
+                auto_flush=False,
+            )
+            with bundle.event_logger.path.open() as handle:
+                self.assertEqual(list(csv.DictReader(handle, delimiter="\t"))[0]["task_time_ns"], "100")
+            bundle.event_logger.log_frame_flip(
+                trial_num=1, event="options_on",
+                timestamp_perf_ns=origin + 1_000_000_001,
+                requested_timestamp_perf_ns=origin + 1_000_000_000,
+            )
+            bundle.message_logger.log("INFO", "native ns", timestamp_perf_ns=origin + 12345)
+            with patch("bin.logger.time.perf_counter_ns", return_value=origin + 2_000_000_003):
+                bundle.close()
+            bundle.close()
+            with bundle.event_logger.path.open() as handle:
+                rows = list(csv.DictReader(handle, delimiter="\t"))
+            self.assertEqual([row["event"] for row in rows], ["block_start", "options_on", "block_end"])
+            self.assertEqual([row["task_time_ns"] for row in rows], ["100", "1000000001", "2000000003"])
+            self.assertEqual(rows[1]["requested_task_time_ns"], "1000000000")
+            for row in (rows[0], rows[-1]):
+                self.assertEqual(row["trial_num"], "")
+                self.assertEqual(row["requested_task_time_ns"], "")
+            with bundle.message_logger.path.open() as handle:
+                self.assertEqual(list(csv.DictReader(handle, delimiter="\t"))[0]["task_time_ns"], "12345")
+            with self.assertRaisesRegex(ValueError, "closed"):
+                bundle.event_logger.log_signal(trial_num=None, event="pump_off")
+
     def test_task_window_ready_signal_is_manager_opt_in(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertFalse(signal_task_window_ready())
@@ -216,6 +250,8 @@ class LoggingSpecTests(unittest.TestCase):
             self.assertEqual(
                 payload,
                 {
+                    "1": {"event": "block_start", "event_type": "lifecycle", "description": "Task block logging began."},
+                    "2": {"event": "block_end", "event_type": "lifecycle", "description": "Task block ended and log finalization began."},
                     "111": {
                         "description": "Stimuli for all options became visible simultaneously.",
                         "event": "options_on",
@@ -261,13 +297,14 @@ class LoggingSpecTests(unittest.TestCase):
             ) as handle:
                 rows = list(csv.DictReader(handle, delimiter="\t"))
 
-            self.assertEqual(len(rows), 1)
+            self.assertEqual([row["event"] for row in rows], ["block_start", "stimulus_on", "block_end"])
+            rows = rows[1:2]
             self.assertEqual(
                 list(rows[0]),
                 [
                     "trial_num",
-                    "requested_time_since_session_start",
-                    "time_since_session_start",
+                    "requested_task_time_ns",
+                    "task_time_ns",
                     "event",
                     "event_code",
                     "event_type",
@@ -275,7 +312,7 @@ class LoggingSpecTests(unittest.TestCase):
                 ],
             )
             self.assertEqual(rows[0]["trial_num"], "1")
-            self.assertEqual(rows[0]["requested_time_since_session_start"], "-0.001000000")
+            self.assertAlmostEqual(int(rows[0]["requested_task_time_ns"]), -1_000_000, delta=1)
 
     def test_event_log_rejects_nonfinite_requested_duration(self):
         with tempfile.TemporaryDirectory() as tmpdir:

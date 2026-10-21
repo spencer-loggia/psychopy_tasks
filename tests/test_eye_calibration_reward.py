@@ -18,7 +18,7 @@ class CalibrationAutoRewardTests(unittest.TestCase):
         for ms in range(start_ms, end_ms + 1):
             miss = ms in misses
             policy.observe(EyeTrackerState(
-                timestamp_perf_s=ms / 1000, sample_index=ms + 1,
+                timestamp_perf_s=ms / 1000, frame_sequence=ms + 1,
                 x_smooth_px=1 if miss else 0, y_smooth_px=0,
                 valid=not (miss and invalid_reason),
                 rejection_reason=invalid_reason if miss else None,
@@ -100,7 +100,7 @@ class CalibrationAutoRewardTests(unittest.TestCase):
                 policy.toggle(now_s=0)
                 self.feed(policy, 0, 1000)
                 policy.observe(EyeTrackerState(
-                    timestamp_perf_s=1, sample_index=1001,
+                    timestamp_perf_s=1, frame_sequence=1001,
                     valid=False, rejection_reason=reason,
                 ))
                 self.assertFalse(policy.status(now_s=1).due)
@@ -118,7 +118,7 @@ class CalibrationAutoRewardTests(unittest.TestCase):
     def test_duplicate_frames_do_not_manufacture_fixation_history(self):
         policy = self.make_policy()
         policy.toggle(now_s=0)
-        state = EyeTrackerState(timestamp_perf_s=0, sample_index=1, valid=True)
+        state = EyeTrackerState(timestamp_perf_s=0, frame_sequence=1, valid=True)
         for _ in range(200):
             policy.observe(state)
         self.assertFalse(policy.status(now_s=1).due)

@@ -25,6 +25,7 @@ from bin.eye_tracker_wire.protocol import (
     CommandCode,
 )
 from bin.logger import load_task_event_definitions
+from bin.task_clock import TaskClock
 
 FIXTURE = json.loads((Path(__file__).parent / "fixtures/eye_uart_v1.json").read_text())
 STATUS = decode_status(bytes.fromhex(FIXTURE["status"]))
@@ -37,6 +38,40 @@ def sample(frame=1, **kwargs):
 
 
 class EyeTrackingTests(unittest.TestCase):
+    def test_acquisition_publishes_each_camera_measurement_once_with_exact_clocks(self):
+        origin = 2**60 + 123
+        received = []
+        tracker = UARTEyeTracker(
+            task_clock=TaskClock(origin_perf_ns=origin), on_measurement=received.append,
+        )
+        status = replace(sample(), sensor_timestamp_ns=2**55 + 7, result_age_ms=10)
+        tracker._consume_measurement(status, received_perf_ns=origin + 101, round_trip_s=0.002)
+        tracker._consume_measurement(status, received_perf_ns=origin + 10_000_101)
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0].task_time_ns, 101)
+        self.assertEqual(received[0].camera_time_ns, 2**55 + 7)
+        self.assertTrue(received[0].valid)
+        blink = replace(status.eyes[0], valid=False, blink=True)
+        second = replace(status, frame_sequence=2, sensor_timestamp_ns=status.sensor_timestamp_ns + 20_000_000,
+                         eyes=(blink, status.eyes[1]))
+        tracker._consume_measurement(second, received_perf_ns=origin + 20_000_103)
+        tracker._consume_measurement(second, received_perf_ns=origin + 30_000_103)
+        self.assertEqual(len(received), 2)
+        self.assertEqual(received[1].task_time_ns, 20_000_103)
+        self.assertEqual(received[1].camera_time_ns, second.sensor_timestamp_ns)
+        self.assertEqual(received[1].rejection_reason, "blink")
+        self.assertFalse(received[1].valid)
+        # A new invalid/stale measurement must carry its own camera identity,
+        # rather than being mislabeled with the previous valid sample's time.
+        stale = replace(second, frame_sequence=3, sensor_timestamp_ns=second.sensor_timestamp_ns + 20_000_000,
+                        flags=second.flags | StatusFlag.RESULT_STALE)
+        tracker._consume_measurement(stale, received_perf_ns=origin + 40_000_103)
+        self.assertEqual(received[-1].camera_time_ns, stale.sensor_timestamp_ns)
+        self.assertEqual(received[-1].rejection_reason, "stale")
+        tracker._consume_measurement(status, received_perf_ns=origin + 50_000_103)
+        tracker._consume_measurement(stale, received_perf_ns=origin + 60_000_103)
+        self.assertEqual(len(received), 3)
+
     def setUp(self):
         patcher = patch("bin.eye_tracker_warnings.show_eye_tracker_warning")
         self.warning = patcher.start()
@@ -108,7 +143,7 @@ class EyeTrackingTests(unittest.TestCase):
         self.assertEqual(second.smoothed_position, (124.25, -44.5))
         duplicate = f.consume(sample(2, eyes=(changed, STATUS.eyes[1])), now_s=1.04)
         self.assertEqual(duplicate, second)
-        self.assertEqual(duplicate.sample_index, 2)
+        self.assertEqual(duplicate.frame_sequence, 2)
 
     def test_bad_eye_one_does_not_invalidate_eye_zero(self):
         f = EyePositionFilter()
@@ -179,11 +214,11 @@ class EyeTrackingTests(unittest.TestCase):
 
     def test_fixation_requires_distinct_samples_and_valid_current_eye(self):
         window = FixationWindow(0.1, 0.95)
-        state = EyeTrackerState(timestamp_perf_s=1, sample_index=1, valid=True)
+        state = EyeTrackerState(timestamp_perf_s=1, frame_sequence=1, valid=True)
         for _ in range(20):
             self.assertFalse(window.update(state, True))
         self.assertEqual(len(window.history), 1)
-        state = replace(state, timestamp_perf_s=1.11, sample_index=2)
+        state = replace(state, timestamp_perf_s=1.11, frame_sequence=2)
         self.assertTrue(window.update(state, True))
         self.assertFalse(
             window.update(replace(state, valid=False, rejection_reason="stale"), True)
@@ -193,19 +228,19 @@ class EyeTrackingTests(unittest.TestCase):
     def test_fixation_does_not_reward_when_current_eye_is_outside(self):
         window = FixationWindow(0.1, 0.5)
         window.update(
-            EyeTrackerState(timestamp_perf_s=1, sample_index=1, valid=True), True
+            EyeTrackerState(timestamp_perf_s=1, frame_sequence=1, valid=True), True
         )
-        state = EyeTrackerState(timestamp_perf_s=1.11, sample_index=2, valid=True)
+        state = EyeTrackerState(timestamp_perf_s=1.11, frame_sequence=2, valid=True)
         self.assertFalse(window.update(state, False))
 
     def test_missing_observations_cannot_complete_fixation_window(self):
         window = FixationWindow(2, 0.95)
         window.update(
-            EyeTrackerState(timestamp_perf_s=1, sample_index=1, valid=True), True
+            EyeTrackerState(timestamp_perf_s=1, frame_sequence=1, valid=True), True
         )
         self.assertFalse(
             window.update(
-                EyeTrackerState(timestamp_perf_s=3.1, sample_index=2, valid=True), True
+                EyeTrackerState(timestamp_perf_s=3.1, frame_sequence=2, valid=True), True
             )
         )
         self.assertEqual(len(window.history), 1)
@@ -215,7 +250,7 @@ class EyeTrackingTests(unittest.TestCase):
         times_ms = list(range(0, 800, 100)) + list(range(800, 920)) + [920, 950, 1000]
         for index, ms in enumerate(times_ms):
             window.update(
-                EyeTrackerState(timestamp_perf_s=ms / 1000, sample_index=index, valid=True),
+                EyeTrackerState(timestamp_perf_s=ms / 1000, frame_sequence=index, valid=True),
                 not 800 <= ms < 920,
             )
         # 120 ms outside / 1 s = 88% fixation, despite the many out-of-window

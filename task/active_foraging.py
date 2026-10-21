@@ -176,7 +176,7 @@ def _decode_trial_payload(payload: dict) -> Tuple[List[Tuple[int, int]], List[Tu
 
 
 def _build_behavior_fieldnames(num_afc: int) -> List[str]:
-    fieldnames = ["trial_num", "initiation_time"]
+    fieldnames = ["trial_num", "initiation_task_time_ns"]
     for opt_idx in range(int(num_afc)):
         fieldnames.extend([f"shape_{opt_idx}", f"color_{opt_idx}", f"lum_{opt_idx}"])
     fieldnames.extend(
@@ -902,27 +902,27 @@ def run_task(
 
     def _deliver_manual_reward() -> None:
         pulse_duration = max(0.0, float(pump_pulse_time_seconds))
-        start_requested_perf = time.perf_counter()
+        start_requested_perf = time.perf_counter_ns()
         _set_pump_pin(1, context="manual_reward")
-        start_perf = time.perf_counter()
+        start_perf = time.perf_counter_ns()
         try:
             logger.log_signal(
                 trial_num=None,
                 event="pump_on",
-                timestamp_perf_s=start_perf,
-                requested_timestamp_perf_s=start_requested_perf,
+                timestamp_perf_ns=start_perf,
+                requested_timestamp_perf_ns=start_requested_perf,
                 requested_duration=pulse_duration,
             )
             core.wait(pulse_duration)
         finally:
-            end_requested_perf = time.perf_counter()
+            end_requested_perf = time.perf_counter_ns()
             _set_pump_pin(0, context="manual_reward")
-            end_perf = time.perf_counter()
+            end_perf = time.perf_counter_ns()
             logger.log_signal(
                 trial_num=None,
                 event="pump_off",
-                timestamp_perf_s=end_perf,
-                requested_timestamp_perf_s=end_requested_perf,
+                timestamp_perf_ns=end_perf,
+                requested_timestamp_perf_ns=end_requested_perf,
             )
 
     def _poll_experimenter_controls() -> bool:
@@ -1145,9 +1145,9 @@ def run_task(
                 logger.log_frame_flip(
                     trial_num=trial_num,
                     event="grey_inter_trial_interval",
-                    timestamp_perf_s=float(gray_start_perf),
-                    requested_timestamp_perf_s=trial_meta.get(
-                        "gray_flip_requested_perf_s"
+                    timestamp_perf_ns=trial_meta["gray_flip_perf_ns"],
+                    requested_timestamp_perf_ns=trial_meta.get(
+                        "gray_flip_requested_perf_ns"
                     ),
                     requested_duration=gray_duration_requested if gray_duration_requested > 0 else None,
                 )
@@ -1163,14 +1163,14 @@ def run_task(
                     break
 
                 for pulse_num in range(1, num_pulses + 1):
-                    pulse_start_requested_perf = time.perf_counter()
+                    pulse_start_requested_perf = time.perf_counter_ns()
                     _set_pump_pin(1, context="task_reward")
-                    pulse_start_perf = time.perf_counter()
+                    pulse_start_perf = time.perf_counter_ns()
                     logger.log_signal(
                         trial_num=trial_num,
                         event="pump_on",
-                        timestamp_perf_s=pulse_start_perf,
-                        requested_timestamp_perf_s=pulse_start_requested_perf,
+                        timestamp_perf_ns=pulse_start_perf,
+                        requested_timestamp_perf_ns=pulse_start_requested_perf,
                         requested_duration=pump_pulse_time_seconds,
                     )
                     if _wait_or_abort(pump_pulse_time_seconds):
@@ -1178,14 +1178,14 @@ def run_task(
                         msg_logger.log("WARN", f"experimenter_exit_during_pump trial_num={trial_num} pulse={pulse_num}")
                         abort_requested = True
 
-                    pulse_end_requested_perf = time.perf_counter()
+                    pulse_end_requested_perf = time.perf_counter_ns()
                     _set_pump_pin(0, context="task_reward")
-                    pulse_end_perf = time.perf_counter()
+                    pulse_end_perf = time.perf_counter_ns()
                     logger.log_signal(
                         trial_num=trial_num,
                         event="pump_off",
-                        timestamp_perf_s=pulse_end_perf,
-                        requested_timestamp_perf_s=pulse_end_requested_perf,
+                        timestamp_perf_ns=pulse_end_perf,
+                        requested_timestamp_perf_ns=pulse_end_requested_perf,
                     )
                     if abort_requested:
                         break
@@ -1201,14 +1201,14 @@ def run_task(
                     break
 
                 if apply_timeout > 0:
-                    timeout_start_requested_perf = time.perf_counter()
+                    timeout_start_requested_perf = time.perf_counter_ns()
                     _set_buzzer_pin(1, context="timeout")
-                    timeout_start_perf = time.perf_counter()
+                    timeout_start_perf = time.perf_counter_ns()
                     logger.log_signal(
                         trial_num=trial_num,
                         event="buzzer_on",
-                        timestamp_perf_s=timeout_start_perf,
-                        requested_timestamp_perf_s=timeout_start_requested_perf,
+                        timestamp_perf_ns=timeout_start_perf,
+                        requested_timestamp_perf_ns=timeout_start_requested_perf,
                         requested_duration=timeout_duration_seconds,
                     )
                     if _wait_or_abort(timeout_duration_seconds):
@@ -1216,14 +1216,14 @@ def run_task(
                         msg_logger.log("WARN", f"experimenter_exit_during_timeout trial_num={trial_num}")
                         abort_requested = True
 
-                    timeout_end_requested_perf = time.perf_counter()
+                    timeout_end_requested_perf = time.perf_counter_ns()
                     _set_buzzer_pin(0, context="timeout")
-                    timeout_end_perf = time.perf_counter()
+                    timeout_end_perf = time.perf_counter_ns()
                     logger.log_signal(
                         trial_num=trial_num,
                         event="buzzer_off",
-                        timestamp_perf_s=timeout_end_perf,
-                        requested_timestamp_perf_s=timeout_end_requested_perf,
+                        timestamp_perf_ns=timeout_end_perf,
+                        requested_timestamp_perf_ns=timeout_end_requested_perf,
                     )
 
                 if abort_requested or task_end_notes != "done":
@@ -1252,7 +1252,7 @@ def run_task(
 
             behavior_row: Dict[str, Any] = {
                 "trial_num": trial_num,
-                "initiation_time": _fmt_optional(trial_meta.get("initiation_time_s")),
+                "initiation_task_time_ns": trial_meta.get("initiation_task_time_ns", ""),
                 "choice_made_index": chosen_idx_row,
                 "choice_made_color": "",
                 "choice_made_shape": "",

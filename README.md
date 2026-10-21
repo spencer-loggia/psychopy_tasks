@@ -28,14 +28,18 @@ contains:
 
 - `launch_config.json`: a snapshot of the interface launch config.
 - `event_name_library.json`: a snapshot of the shared event-name/code library used by its blocks.
-- `state.json`: the current mutable experiment state.
-- `blocks.tsv`: blocks in launch order, including start and end times in milliseconds from experiment start.
+- `state.json`: the current mutable experiment state plus launch-time Git commit, hostname, OS details, and Python version.
+- `blocks.tsv`: blocks in launch order, with human-readable start and end datetimes to the second.
+- `clock.json`: the experiment origin (`origin_perf_counter_ns`) and its local wall-clock datetime.
 - `blocks/[block_num]_[block_name]/`: the generated config and outputs for each block.
 
 `blocks.tsv` has the fields `block_name`, `block_num`, `subject`, `start_time`, `end_time`, and `out_dir`.
 `block_name` is the task config's `config_name`, falling back to the interface button name for a task with no
 source config. A row is written with a blank `end_time` before the subprocess starts and is updated when it exits,
-so an interrupted or failed block remains visible in the experiment record.
+so an interrupted or failed block remains visible in the experiment record. `start_time` and `end_time` use
+`YYYY-MM-DD HH:MM:SS` (with a UTC offset when the origin is timezone-aware), derived from the experiment
+origin. These describe launcher preparation and subprocess exit; precise task boundaries are in each block
+event log.
 
 Both Raspberry Pi launch configs also synchronize experiment boundaries with the tracker Pi:
 
@@ -114,8 +118,23 @@ those variants with their specific config fields (for example `sequential`, `is_
 combined with the existing family. Config filenames and interface menu labels can remain specific and descriptive.
 
 The launch config must contain `subjects`, `tasks`, and `initial_state` objects. `initial_state` is copied into
-`state.json`, then its `subject` field is set to the selected full subject name. Eye calibration uses this state
-shape:
+`state.json`, then its `subject` field is set to the selected full subject name. The manager also sets
+`git_commit` to the full Git `HEAD` commit ID from the launcher's working directory at experiment creation
+(for example, `99a093fc8a4d9e392a63f53da7472f82b4fe3f4e`). This value remains fixed through block and
+calibration updates; it identifies the commit, not uncommitted edits. It is `null` if Git or a committed
+checkout is unavailable. Existing experiment records are not backfilled with today's commit.
+
+The manager also captures these launch-time fields once and preserves them through state updates:
+
+- `hostname`: the local machine's hostname.
+- `os_details`: `system`, kernel `release` and `version`, `machine` architecture, and a human-readable
+  `platform` string. Linux also includes `distribution` fields from `/etc/os-release` (or its system fallback)
+  when available.
+- `python_version`: the full `sys.version` string, including build/compiler details, from the task
+  interpreter configured by `environment.python`. If no interpreter is configured, it uses the launcher's
+  version. If the configured interpreter cannot be queried within five seconds, the field is `null`.
+
+Eye calibration uses this initial state shape:
 
 ```json
 {
@@ -126,7 +145,7 @@ shape:
       "y_scale": null,
       "x_offset": null,
       "y_offset": null,
-      "set_time": 0.0
+      "task_time_ns": 0
     }
   ]
 }
@@ -134,14 +153,15 @@ shape:
 
 After every block, the manager checks its directory for `calibration.json`. For each top-level field that also
 names a list-valued state field, the calibration object must contain all fields in that state's most recent entry
-except `set_time`. The manager then appends those values and supplies `set_time` in milliseconds from experiment
-start. Extra calibration metadata is ignored. This generic matching rule allows future calibration histories to be
-added to `initial_state` without adding task-specific manager code.
+except `task_time_ns`. The manager then appends those values and supplies `task_time_ns` in integer nanoseconds
+from experiment start. Extra calibration metadata is ignored. This generic matching rule allows future calibration
+histories to be added to `initial_state` without adding task-specific manager code.
 
 Before each block, the manager creates its output directory and writes `config.json` there. It copies the task
 config from its original source at block launch time, sets `config_name`, `output_dir`, and the full-name `subject`, copies
-other non-list state fields, and flattens the newest entry from every list-valued state field into top-level config
-fields, excluding `set_time`. It never injects the calibration-history lists themselves. The task subprocess is
+other non-list state fields except the experiment's `git_commit`, `hostname`, `os_details`, and `python_version`
+metadata, and flattens the newest entry from every list-valued state field into top-level config fields, excluding
+history timestamps. It never injects the calibration-history lists themselves. The task subprocess is
 then launched with `--config` pointing to this generated file.
 
 Interface task entries can be nested into menu pages. A normal leaf has one launch script and an optional config:
@@ -374,11 +394,20 @@ the file.
 
 The repo also includes a shared checked-in `event_name_library.json`. It is the repo-wide source of truth for event names, codes, event types, and descriptions across tasks. Not every event in that file is used by every task.
 
+All task timestamps use **`task_time_ns`**, integer nanoseconds relative to one experiment origin:
+`time.perf_counter_ns() - origin_perf_counter_ns`. The manager captures that origin once at experiment
+creation and passes it to every block through `NEURO_EXPERIMENT_ORIGIN_PERF_NS`. It never resets at a
+block boundary, and includes gaps between blocks. A standalone task creates one origin for its run.
+Flip callbacks, GPIO writes, and input detection capture native `perf_counter_ns()` values. APIs that
+supply float seconds are converted against this same origin; durations, reaction times, and
+media-relative positions remain in seconds. Nanosecond units do not imply
+nanosecond hardware accuracy. Camera timestamps retain their separate, unsynchronized device clock.
+
 `event_log.tsv` is the deployment-facing timing log shared across tasks. Columns:
 
 - `trial_num`
-- `requested_time_since_session_start`
-- `time_since_session_start`
+- `requested_task_time_ns`
+- `task_time_ns`
 - `event`
 - `event_code`
 - `event_type`
@@ -386,14 +415,36 @@ The repo also includes a shared checked-in `event_name_library.json`. It is the 
 
 Common event-log rules:
 
-- `requested_time_since_session_start` records when a refresh-locked flip or hardware change was submitted; it is blank for events that have no separate request time.
-- `time_since_session_start` records when that flip or hardware operation actually completed, measured from session start using high-resolution real time (`time.perf_counter()`).
-- `event_type` is one of `frame_flip`, `interaction`, or `signal`.
-- Frame-flip events are logged at the real flip time for the frame that changed the main display.
-- Interaction events are logged as close as possible to the touch / click / key / eye-tracker event itself.
-- Signal events are logged as close as possible to the GPIO, DAQC2, or external signal send.
+- `requested_task_time_ns` records when a refresh-locked flip or hardware change was submitted; it is blank for events that have no separate request time.
+- `task_time_ns` records the observed flip, interaction, or individual output write, in integer nanoseconds on the experiment clock.
+- `event_type` is one of `frame_flip`, `interaction`, `signal`, or `lifecycle`.
+- The first data row is `block_start` (code 1), captured as the task opens its log bundle. The last is
+  `block_end` (code 2), captured once when the task closes the bundle, before log draining and eye-tracker
+  shutdown. Both use native `perf_counter_ns()` captures, type `lifecycle`, and a blank `trial_num`.
+  Cleanup on normal completion, user exit, and Python exceptions closes the log; a forced kill or power loss
+  cannot supply an exact end timestamp and can leave `block_end` absent.
+- Frame-flip times are captured in the first task `callOnFlip` callback, before GPIO callbacks and
+  post-flip processing. The request is captured immediately before `win.flip()`. A backend without
+  `callOnFlip` falls back to the time immediately after `flip()` returns. These are software observations
+  near the swap, not measurements of physical pixel illumination.
+- Touch/click presses use PsychoPy's buffered event time when available, mapped onto the performance
+  clock using a bracketed `clickReset()` anchor. This preserves a press dispatched during a blocking
+  flip. Without a usable buffered time, the timestamp is captured immediately after `getPressed()`,
+  before position lookup, hit-testing, or logging. Hold release records the first missing-touch detection,
+  even when the release is confirmed later by a grace period. Input dispatch and polling still limit
+  accuracy; see [PsychoPy's mouse event implementation](https://psychopy.org/_modules/psychopy/event.html).
+- Each GPIO sync edge retains the standard two columns: `requested_task_time_ns` immediately before
+  `gpio_write()` and `task_time_ns` immediately after it returns. The timestamp is taken at the individual
+  HIGH or LOW write, **never after waiting for the pulse duration**. A 0.25 s trial-start pulse captures
+  its onset before asking lgpio to schedule the asynchronous clear; its single `trial_start_signal_on`
+  row does not invent a timestamp for that unobserved clear. Video sync logs each explicit HIGH/LOW
+  edge separately. DAQC2 writes use the same before/after capture convention. Deferred log writing
+  preserves these captures and does not substitute a flip, queue-drain, or file-write time.
+- Output timestamps measure the host write call, not electrical feedback. lgpio's pulse worker is
+  [software timed](https://github.com/joan2937/lg/blob/master/lgPthTx.c); validate physical GPIO/display
+  alignment with an external recording and photodiode when measuring hardware latency or pulse width.
 - Events that have no visible effect or a programmatic zero-duration no-op should not be logged.
-- `requested_duration` always retains the exact configured request, not the nearest frame-achievable duration. It is blank only when no duration was requested.
+- `requested_duration` is in seconds and always retains the exact configured request, not the nearest frame-achievable duration. It is blank only when no duration was requested.
 
 `event_code_library.json` is generated per session as the minimal subset of `event_name_library.json` that was actually used in that run. It includes:
 
@@ -404,13 +455,16 @@ Common event-log rules:
 
 `message_log.tsv` is the non-timing log shared across tasks. Columns:
 
-- `time_since_session_start`
+- `task_time_ns`
 - `level`
 - `message`
 
-Allowed levels are `INFO`, `WARN`, and `ERROR`.
+Message timestamps use the same experiment-wide `task_time_ns`. Allowed levels are `INFO`, `WARN`, and `ERROR`.
 
 `behavior_log.tsv` is task-specific. Every behavior log includes `trial_num` so behavior rows can be aligned with `event_log.tsv`.
+Initiation timestamps use `initiation_task_time_ns`. Video behavior uses `first_frame_task_time_ns` and
+`last_frame_end_task_time_ns`; `video_frame_timing.tsv` uses `requested_task_time_ns`, `expected_task_time_ns`,
+and `task_time_ns` for submission, planned, and realized flips.
 
 Task-Specific Logging
 ---------------------
@@ -429,7 +483,7 @@ Active-foraging event naming:
 Active-foraging behavior log columns:
 
 - `trial_num`
-- `initiation_time`
+- `initiation_task_time_ns`
 - `reaction_time`
 - `shape_0 ... shape_(k-1)`
 - `color_0 ... color_(k-1)`
@@ -880,29 +934,40 @@ alongside `event_log.tsv` and `behavior_log.tsv`, for example:
 `logs/exp_Y_20260813_001/blocks/1_active_foraging/eye_tracking.csv`.
 Standalone runs put it in their usual session directory. Disabled eye tracking creates no eye CSV.
 
-Recording runs at **60 Hz** on its own worker, independently of stimulus changes, screen flips, reward waits,
-or whether the experimenter preview is enabled. Set `eye_tracking.record_rate_hz` to change that cadence
-(for example, `50`). UART acquisition keeps its separate `uart.poll_rate_hz` schedule. Each recording tick
-observes the reader's latest state; a camera slower than the recording rate produces repeated source frames.
-Missed recording deadlines leave actual timestamp gaps, without backfilled rows or invented measurements.
+Recording is driven by **new camera measurements**, independently of screen flips, reward waits,
+or the experimenter preview. UART polling remains **100 Hz** for the expected roughly **50 Hz** eye-position
+stream. The existing protocol returns the latest measurement in response to a request; it has no push stream,
+so acquisition still polls on its own worker. Duplicate responses never create additional CSV rows or update
+smoothing. The acquisition worker captures `perf_counter_ns()` immediately after receiving a decoded status,
+and queues that immutable measurement for a separate CSV writer. There is no recorder polling loop or
+logger-observation timestamp. Tasks read the latest state through a short memory lock without waiting for
+serial I/O or disk writes.
 
+Only received measurements with a camera timestamp create rows, including invalid measurements such as
+blink/loss. Startup, UART timeouts, and repeated stale-status responses do not manufacture samples; those
+conditions remain available through the live state and warnings. Out-of-order responses are rejected without
+rewinding the camera timestamp used for deduplication. Missing frames leave gaps in camera
+sequence/timestamps; polling a latest-value protocol cannot guarantee delivery of every camera frame.
+The obsolete `eye_tracking.record_rate_hz` setting is rejected; remove it from existing configs.
 The CSV columns are:
 
 | Column | Meaning |
 | --- | --- |
-| `timestamp_ms` | Observation time in milliseconds since the block's session clock started; same origin as `event_log.tsv` (which uses seconds). Independent of file-flush time and flips. |
+| `task_time_ns` | Local acquisition time in integer nanoseconds from the experiment origin, captured when the UART response is received. Same clock as events; never the writer/flush time or an age-adjusted estimate. |
+| `camera_time_ns` | Original `sensor_timestamp_ns` from the UART status, retained exactly as an integer. This is the camera's clock and must not be subtracted directly from `task_time_ns`. |
 | `x_screen_px`, `y_screen_px` | Calibrated, filtered position in native PsychoPy pixel coordinates: `x = screen_x - W/2`, `y = H/2 - screen_y`, where screen coordinates start at the top left. The full affine transform, scene size and display rotation are applied, matching stimulus positions. Offscreen positions are retained without clamping. |
 | `pupil_diameter_px` | Eye 0 pupil diameter in camera pixels, as supplied by the tracker. |
-| `eye_valid`, `rejection_reason` | Eye validity (`1`/`0`) and reason such as `blink`, `lost`, `stale`, or `uart_error`. Invalid samples write `nan` for both position coordinates and pupil diameter. |
+| `eye_valid`, `rejection_reason` | Eye validity (`1`/`0`) and reason such as `blink`, `lost`, `stale`, or `tracker_error`. Invalid samples write `nan` for both position coordinates and pupil diameter. |
 | `screen_ready` | `1` once the task has supplied its screen geometry. During setup, `0` means screen coordinates are still `nan`; a valid pupil measurement can already be recorded. |
-| `sample_timestamp_ms` | Estimated source-sample time on the same block clock, accounting for reported age and UART round-trip time; `nan` before a source timestamp is available. This is not the unsynchronized remote camera clock. |
-| `sample_index`, `frame_sequence` | Source sample/frame identifiers, allowing repeated camera measurements to be distinguished from new ones. |
+| `session_id`, `frame_sequence` | Tracker service and camera frame identifiers. There is no poll/sample index. |
 
 Thus, after accurate calibration, looking at a stimulus positioned at `(x, y)` should record that same
 centered pixel position. The existing main-thread `get_position()` API continues returning subject-scene
-fractions. Applied calibration, UART/filter settings, recording rate and screen geometry are recorded in
-the block's message log. CSV storage uses a fixed-size buffer, flushes about once per second, and closes
-before UART shutdown; writer failures are reported by task log flushing/cleanup instead of silently losing data.
+fractions. Applied calibration, UART/filter settings and screen geometry are recorded in
+the block's message log. Calibration and geometry are captured when each measurement is queued. CSV storage
+uses a fixed-size buffer and an 8192-measurement queue, flushes about once per second, and drains accepted
+measurements before UART shutdown. Queue overflow or disk failure reports incomplete recording through a
+warning without blocking acquisition or presentation. Freshness checks for live gaze still account for camera result age and UART round-trip time internally; those estimates do not replace acquisition timestamps.
 
 CPU Affinity for Timing-Critical Tasks
 --------------------------------------
@@ -932,7 +997,7 @@ The launcher setup scripts use the same mapping by default: `task/pulse_pump.py`
 
 Active Foraging Timing
 ----------------------
-The main visual timing parameters in `active_foraging` are interpreted by the presentation mode, not as abstract global delays. Any finite duration is accepted; it does not need to be an exact refresh interval. Each visual phase is planned for the nearest achievable refresh transition using the measured synchronized display rate, while the exact configured request is retained in the event log. `requested_time_since_session_start` and `time_since_session_start` expose flip-submission and realized-flip timing. Minimum semantic rules remain: `choice_time` must be positive, and when `sequential=true` or `is_memory=true`, `duration` must be positive. `pump_delay_time` remains a wall-clock delay before reward delivery.
+The main visual timing parameters in `active_foraging` are interpreted by the presentation mode, not as abstract global delays. Any finite duration is accepted; it does not need to be an exact refresh interval. Each visual phase is planned for the nearest achievable refresh transition using the measured synchronized display rate, while the exact configured request is retained in the event log. `requested_task_time_ns` and `task_time_ns` expose flip-submission and realized-flip timing. Minimum semantic rules remain: `choice_time` must be positive, and when `sequential=true` or `is_memory=true`, `duration` must be positive. `pump_delay_time` remains a wall-clock delay before reward delivery.
 
 - `duration`: stimulus display duration. When `sequential=true`, this is the on-screen time for each individual stimulus in the sequence. When `sequential=false` and `is_memory=true`, the full array remains visible for `duration`, then the task switches to dot-only choice for `choice_time`. When `sequential=false` and `is_memory=false`, `duration` must be exactly `0`; the full array appears on the first choice frame and remains visible for `choice_time` only.
 - `isi`: pre-stimulus cue interval, not a between-trial delay. In simultaneous non-memory mode it shows dots at all candidate locations before the full array appears. In sequential mode, for every task using the shared option-presentation backend (including `active_foraging`, `match2cue`, and `afc_trial_sequence`), it shows the dot cue for each item before that item is shown and, between consecutive stimuli, also holds the post-stimulus dot scene unchanged for the same duration.

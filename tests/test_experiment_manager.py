@@ -2,14 +2,19 @@ import csv
 import datetime as dt
 import json
 import os
+import platform
 import random
+import socket
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from bin.logger import SessionLogBundle
+from bin.task_clock import EXPERIMENT_ORIGIN_ENV
 from bin.eye_tracking import (
     EXPERIMENT_BLOCK_NUMBER_ENV,
     EXPERIMENT_UART_PENDING_ENV,
@@ -23,6 +28,8 @@ from interface.experiment_manager import (
     EVENT_LIBRARY_ENV,
     EXACT_SESSION_DIR_ENV,
     ExperimentManager,
+    _git_commit,
+    _runtime_metadata,
     task_run_sequence,
     task_variants,
 )
@@ -37,6 +44,127 @@ class FakeClock:
 
 
 class ExperimentManagerTests(unittest.TestCase):
+    def test_launch_commit_is_from_working_checkout_and_survives_state_updates(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config, path = self._project(root)
+            config["initial_state"]["git_commit"] = "stale-config-value"
+            config["initial_state"].update(
+                hostname="old-host", os_details={"system": "old-os"}, python_version="old-python",
+            )
+            config["environment"] = {"python": sys.executable}
+
+            def git(*args):
+                return subprocess.run(
+                    ["git", "-C", str(root), *args],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip()
+
+            def commit(message):
+                git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                    "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", message)
+                return git("rev-parse", "HEAD")
+
+            git("init")
+            first_commit = commit("launch version")
+            kwargs = dict(
+                working_dir=root, launch_config_path=path, launch_config=config,
+                subject_name="Subject One", subject_code="S1",
+            )
+            manager = ExperimentManager(**kwargs)
+            state = json.loads(manager.state_path.read_text())
+            self.assertEqual(state["git_commit"], first_commit)
+            self.assertEqual(state["hostname"], socket.gethostname())
+            self.assertEqual(state["python_version"], sys.version)
+            self.assertEqual(state["os_details"]["system"], platform.system())
+            self.assertEqual(state["os_details"]["release"], platform.release())
+            self.assertEqual(state["os_details"]["version"], platform.version())
+            self.assertEqual(state["os_details"]["machine"], platform.machine())
+            self.assertEqual(state["os_details"]["platform"], platform.platform())
+            launch_metadata = {key: state[key] for key in (
+                "git_commit", "hostname", "os_details", "python_version",
+            )}
+            self.assertEqual(config["initial_state"]["git_commit"], "stale-config-value")
+
+            # A later HEAD change must not relabel an experiment's launch version.
+            second_commit = commit("next version")
+            self.assertNotEqual(first_commit, second_commit)
+            block = manager.prepare_block(
+                task_name="demo", launch_value="task/demo.py", config_value=None,
+            )
+            generated_config = json.loads(block.config_path.read_text())
+            for key in launch_metadata:
+                self.assertNotIn(key, generated_config)
+            (block.output_dir / "calibration.json").write_text(json.dumps({
+                "eye_tracker_calibration": {
+                    "x_scale": 1, "y_scale": 1, "x_offset": 0, "y_offset": 0,
+                },
+                "git_commit": "incorrect-calibration-value",
+            }))
+            manager.finish_block(block)
+            state = json.loads(manager.state_path.read_text())
+            self.assertEqual(len(state["eye_tracker_calibration"]), 2)
+            self.assertEqual(state["git_commit"], first_commit)
+            self.assertEqual({key: state[key] for key in launch_metadata}, launch_metadata)
+            next_manager = ExperimentManager(**kwargs)
+            self.assertEqual(json.loads(next_manager.state_path.read_text())["git_commit"], second_commit)
+
+    def test_unavailable_git_identity_is_explicitly_null(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config, path = self._project(root)
+            config["initial_state"]["git_commit"] = "stale-config-value"
+            manager = ExperimentManager(
+                working_dir=root, launch_config_path=path, launch_config=config,
+                subject_name="Subject One", subject_code="S1",
+            )
+            self.assertIsNone(json.loads(manager.state_path.read_text())["git_commit"])
+            for error in (FileNotFoundError("git"), subprocess.TimeoutExpired("git", 5)):
+                with self.subTest(error=type(error).__name__), patch(
+                    "interface.experiment_manager.subprocess.run", side_effect=error,
+                ):
+                    self.assertIsNone(_git_commit(root))
+                    self.assertIsNone(_runtime_metadata(root, "unavailable-python")["python_version"])
+
+    def test_subprocess_blocks_share_one_origin_and_exception_still_records_end(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config, path = self._project(root)
+            (root / "event_name_library.json").write_text(
+                (Path(__file__).resolve().parents[1] / "event_name_library.json").read_text()
+            )
+            manager = ExperimentManager(
+                working_dir=root, launch_config_path=path, launch_config=config,
+                subject_name="Test", subject_code="T",
+            )
+            boundaries = []
+            for index in range(2):
+                block = manager.prepare_block(task_name="demo", launch_value="task/demo.py", config_value=None)
+                environment = manager.subprocess_environment(block)
+                self.assertEqual(int(environment[EXPERIMENT_ORIGIN_ENV]), manager.task_clock.origin_perf_ns)
+                script = (
+                    "import os; from bin.logger import SessionLogBundle; "
+                    "logs = SessionLogBundle(output_root=os.environ['NEURO_TASK_SESSION_DIR'], "
+                    "task_name='active_foraging', config_name='test', auto_flush=False); "
+                    + ("logs.close()" if index == 0 else "raise RuntimeError('test task failure')")
+                )
+                result = subprocess.run([sys.executable, "-c", script], env=environment, capture_output=True)
+                self.assertEqual(result.returncode, index, result.stderr.decode())
+                manager.finish_block(block)
+                with (block.output_dir / "event_log.tsv").open() as handle:
+                    rows = list(csv.DictReader(handle, delimiter="\t"))
+                self.assertEqual([row["event"] for row in rows], ["block_start", "block_end"])
+                boundaries.extend(int(row["task_time_ns"]) for row in rows)
+            self.assertGreater(boundaries[0], 0)
+            self.assertEqual(boundaries, sorted(set(boundaries)))
+            metadata = json.loads((manager.experiment_dir / "clock.json").read_text())
+            self.assertEqual(metadata["origin_perf_counter_ns"], manager.task_clock.origin_perf_ns)
+            with manager.blocks_path.open() as handle:
+                for row in csv.DictReader(handle, delimiter="\t"):
+                    for field in ("start_time", "end_time"):
+                        parsed = dt.datetime.strptime(row[field], "%Y-%m-%d %H:%M:%S")
+                        self.assertEqual(parsed.microsecond, 0)
+
     def test_numbered_experiment_and_skipped_block_reach_uart_with_identical_retries(self):
         fixture = json.loads((Path(__file__).parent / "fixtures/eye_uart_v1.json").read_text())
         packets = []
@@ -188,7 +316,7 @@ class ExperimentManagerTests(unittest.TestCase):
                 subject_name="Subject One",
                 subject_code="S1",
                 now=dt.datetime(2026, 8, 13, 9, 30),
-                perf_counter=clock,
+                perf_counter_ns=lambda: round(clock() * 1_000_000_000),
             )
 
             self.assertEqual(manager.experiment_dir.name, "exp_S1_20260813_001")
@@ -197,6 +325,8 @@ class ExperimentManagerTests(unittest.TestCase):
             self.assertFalse((manager.experiment_dir / "task_configs").exists())
             initial_state = json.loads(manager.state_path.read_text(encoding="utf-8"))
             self.assertEqual(initial_state["subject"], "Subject One")
+            self.assertEqual(initial_state["eye_tracker_calibration"][0]["task_time_ns"], 0)
+            self.assertNotIn("set_time", initial_state["eye_tracker_calibration"][0])
 
             # Each block config is based on the source file as it exists when the
             # block is prepared, even if it changed after experiment creation.
@@ -224,7 +354,7 @@ class ExperimentManagerTests(unittest.TestCase):
 
             with manager.blocks_path.open(encoding="utf-8") as handle:
                 block_rows = list(csv.DictReader(handle, delimiter="\t"))
-            self.assertEqual(block_rows[0]["start_time"], "125.000")
+            self.assertEqual(block_rows[0]["start_time"], "2026-08-13 09:30:00")
             self.assertEqual(block_rows[0]["end_time"], "")
             self.assertEqual(block_rows[0]["out_dir"], "blocks/1_changed_later")
 
@@ -254,13 +384,13 @@ class ExperimentManagerTests(unittest.TestCase):
                 {key: latest[key] for key in ("x_scale", "y_scale", "x_offset", "y_offset")},
                 {"x_scale": 0.1, "y_scale": -0.2, "x_offset": 0.3, "y_offset": -0.4},
             )
-            self.assertEqual(latest["set_time"], 500.0)
+            self.assertEqual(latest["task_time_ns"], 500_000_000)
             self.assertEqual((latest["x_cross"], latest["y_cross"]), (0.0, 0.0))
             self.assertNotIn("ignored_metadata", latest)
 
             with manager.blocks_path.open(encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle, delimiter="\t"))
-            self.assertEqual(rows[0]["end_time"], "500.000")
+            self.assertEqual(rows[0]["end_time"], "2026-08-13 09:30:00")
 
             (root / "configs" / "demo.json").write_text(
                 json.dumps({"config_name": "changed_again", "task_value": 1000,

@@ -6,13 +6,18 @@ import csv
 import datetime as dt
 import json
 import os
+import platform
 import random
 import shutil
+import socket
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Optional
 
+from bin.task_clock import EXPERIMENT_ORIGIN_ENV, TaskClock
 from bin.config import load_config
 from bin.eye_tracking import (
     EXPERIMENT_BLOCK_NUMBER_ENV,
@@ -54,6 +59,51 @@ def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     temp_path = path.with_name(f".{path.name}.tmp")
     temp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     os.replace(temp_path, path)
+
+
+def _git_commit(working_dir: Path) -> Optional[str]:
+    """Read the launch checkout's full HEAD identity once, without modifying it."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(working_dir), "rev-parse", "--verify", "HEAD^{commit}"],
+            check=True, capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # Source archives and machines without Git can still run experiments.
+        return None
+    return result.stdout.strip() or None
+
+
+def _runtime_metadata(working_dir: Path, python_command: str = "") -> dict[str, Any]:
+    """Snapshot the host and configured task interpreter at experiment launch."""
+    os_details: dict[str, Any] = {
+        "system": platform.system(),
+        "release": platform.release(),
+        "version": platform.version(),
+        "machine": platform.machine(),
+        "platform": platform.platform(),
+    }
+    if os_details["system"] == "Linux":
+        try:
+            os_details["distribution"] = platform.freedesktop_os_release()
+        except (AttributeError, OSError):
+            pass
+
+    python_version: Optional[str] = sys.version
+    if python_command:
+        try:
+            result = subprocess.run(
+                [python_command, "-c", "import sys; print(sys.version)"],
+                cwd=working_dir, check=True, capture_output=True, text=True, timeout=5,
+            )
+            python_version = result.stdout.strip() or None
+        except (OSError, subprocess.SubprocessError):
+            python_version = None
+    return {
+        "hostname": socket.gethostname(),
+        "os_details": os_details,
+        "python_version": python_version,
+    }
 
 
 def _resolve_path(path_value: str | Path, search_roots: Iterable[Path]) -> Path:
@@ -153,7 +203,7 @@ class ExperimentManager:
         subject_name: str,
         subject_code: str,
         now: Optional[dt.datetime] = None,
-        perf_counter: Callable[[], float] = time.perf_counter,
+        perf_counter_ns: Callable[[], int] = time.perf_counter_ns,
     ):
         self.working_dir = Path(working_dir).resolve()
         self.launch_config_path = Path(launch_config_path).resolve()
@@ -161,8 +211,8 @@ class ExperimentManager:
         self.launch_config = copy.deepcopy(dict(launch_config))
         self.subject_name = str(subject_name)
         self.subject_code = str(subject_code)
-        self._perf_counter = perf_counter
-        self.started_perf_s = float(perf_counter())
+        self._perf_counter_ns = perf_counter_ns
+        self.task_clock = TaskClock(origin_perf_ns=perf_counter_ns())
         self.started_at = now or dt.datetime.now()
         self.blocks: list[dict[str, Any]] = []
         self._eye_calibration_path: Optional[Path] = None
@@ -171,7 +221,19 @@ class ExperimentManager:
         if not isinstance(initial_state, dict):
             raise ValueError("Launcher config field 'initial_state' must be a JSON object")
         self.state = copy.deepcopy(initial_state)
+        # Normalize legacy calibration-history timestamps at the config boundary.
+        for history in self.state.values():
+            if isinstance(history, list):
+                for entry in history:
+                    if isinstance(entry, dict) and "set_time" in entry:
+                        milliseconds = entry.pop("set_time")
+                        entry.setdefault("task_time_ns", round(float(milliseconds) * 1_000_000))
         self.state["subject"] = self.subject_name
+        self.state["git_commit"] = _git_commit(self.working_dir)
+        python_command = str(
+            (self.launch_config.get("environment") or {}).get("python") or ""
+        ).strip()
+        self.state.update(_runtime_metadata(self.working_dir, python_command))
 
         self.logs_dir = self.working_dir / "logs"
         self.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -187,6 +249,10 @@ class ExperimentManager:
         if not source_event_library.is_file():
             raise FileNotFoundError(f"Event library not found: {source_event_library}")
         shutil.copy2(source_event_library, self.event_library_path)
+        _write_json_atomic(self.experiment_dir / "clock.json", {
+            "origin_perf_counter_ns": self.task_clock.origin_perf_ns,
+            "origin_datetime": self.started_at.isoformat(timespec="microseconds"),
+        })
         self._write_state()
         self._write_blocks()
         self.eye_tracker = ExperimentEyeTracker(
@@ -215,8 +281,14 @@ class ExperimentManager:
         self.experiment_number = experiment_id
         return experiment_dir
 
-    def milliseconds_since_start(self) -> float:
-        return (float(self._perf_counter()) - self.started_perf_s) * 1000.0
+    def task_time_ns(self) -> int:
+        return self.task_clock.task_time_ns(timestamp_perf_ns=self._perf_counter_ns())
+
+    def _block_datetime(self) -> str:
+        # Derive human-readable times from the same experiment origin, so wall
+        # clock adjustments during a run cannot change elapsed block timing.
+        when = self.started_at + dt.timedelta(microseconds=self.task_time_ns() // 1000)
+        return when.isoformat(sep=" ", timespec="seconds")
 
     def _write_state(self) -> None:
         _write_json_atomic(self.state_path, self.state)
@@ -269,11 +341,11 @@ class ExperimentManager:
             injected[key] = copy.deepcopy(value)
 
         for state_name, state_value in self.state.items():
-            if state_name == "subject":
+            if state_name in {"subject", "git_commit", "hostname", "os_details", "python_version"}:
                 continue
             if isinstance(state_value, list) and state_value and isinstance(state_value[-1], dict):
                 for key, value in state_value[-1].items():
-                    if key != "set_time":
+                    if key not in {"set_time", "task_time_ns"}:
                         _inject(key, value, state_name)
             elif not isinstance(state_value, list):
                 _inject(state_name, state_value, state_name)
@@ -320,7 +392,7 @@ class ExperimentManager:
                 "block_name": block_name,
                 "block_num": block_num,
                 "subject": self.subject_name,
-                "start_time": f"{self.milliseconds_since_start():.3f}",
+                "start_time": self._block_datetime(),
                 "end_time": "",
                 "out_dir": str(relative_output),
             }
@@ -338,6 +410,7 @@ class ExperimentManager:
         environment = os.environ.copy()
         environment[EXACT_SESSION_DIR_ENV] = str(block.output_dir)
         environment[EVENT_LIBRARY_ENV] = str(self.event_library_path)
+        environment[EXPERIMENT_ORIGIN_ENV] = str(self.task_clock.origin_perf_ns)
         for key in (EXPERIMENT_UART_PENDING_ENV, EXPERIMENT_UART_READY_ENV, EXPERIMENT_BLOCK_NUMBER_ENV):
             environment.pop(key, None)
         if self.eye_tracker.start_future is not None:
@@ -349,7 +422,7 @@ class ExperimentManager:
     def finish_block(self, block: PreparedBlock) -> None:
         if not self.blocks or int(self.blocks[-1]["block_num"]) != block.block_num:
             raise ValueError(f"Block {block.block_num} is not the active block")
-        self.blocks[-1]["end_time"] = f"{self.milliseconds_since_start():.3f}"
+        self.blocks[-1]["end_time"] = self._block_datetime()
         self._write_blocks()
         self._import_calibration(block.output_dir / CALIBRATION_FILENAME)
 
@@ -367,7 +440,7 @@ class ExperimentManager:
             candidate = payload.get(state_name)
             if not isinstance(candidate, dict):
                 continue
-            required_fields = [key for key in history[-1] if key != "set_time"]
+            required_fields = [key for key in history[-1] if key not in {"set_time", "task_time_ns"}]
             if state_name == "eye_tracker_calibration":
                 # Older launch configs declare only diagonal gains and offsets.
                 # Keep fitted cross terms in state so block-level overrides do
@@ -381,7 +454,7 @@ class ExperimentManager:
             if not all(field in candidate for field in required_fields):
                 continue
             entry = {field: copy.deepcopy(candidate[field]) for field in required_fields}
-            entry["set_time"] = self.milliseconds_since_start()
+            entry["task_time_ns"] = self.task_time_ns()
             history.append(entry)
             if state_name == "eye_tracker_calibration":
                 self._eye_calibration_path = calibration_path.resolve()

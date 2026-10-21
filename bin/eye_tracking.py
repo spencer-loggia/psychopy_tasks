@@ -17,6 +17,7 @@ import threading
 import time
 from typing import Optional, Sequence, Tuple
 
+from .task_clock import TaskClock
 from .eye_tracker_wire.controller import EyeTrackerController, SerialPacketChannel
 from .eye_tracker_warnings import EyeTrackerWarnings
 from .eye_tracker_wire.protocol import (
@@ -68,7 +69,7 @@ class UARTEyeTrackerConfig:
 
 @dataclass(frozen=True)
 class EyeFilterConfig:
-    # The source is ~30 camera frames/s, not 240 ADC reads/s. No extra smoothing
+    # The source is about 50 camera frames/s. No extra smoothing
     # by default; 0.98 would add seconds of lag at the camera's frame rate.
     ema_gamma: float = 0.0
 
@@ -200,13 +201,13 @@ class EyeCalibration:
 
 @dataclass(frozen=True)
 class EyeTrackerState:
-    # Estimated local production time: receive time minus result age and RTT.
-    # The remote sensor timestamp is metadata, never compared to our clock.
+    # Internal freshness estimate only: receive time minus result age and RTT.
+    # Logged times below preserve the local acquisition and remote camera clocks.
     timestamp_perf_s: float = 0.0
-    sample_index: int = 0
+    task_time_ns: int = 0
     session_id: int = 0
     frame_sequence: int = 0
-    sensor_timestamp_ns: int = 0
+    camera_time_ns: int = 0
     x_raw_px: float = 0.0
     y_raw_px: float = 0.0
     x_smooth_px: float = 0.0
@@ -252,8 +253,33 @@ class EyePositionFilter:
         return self.state
 
     def consume(
-        self, status: DecodedStatus, *, now_s: float, round_trip_s: float = 0.0
+        self, status: DecodedStatus, *, now_s: float, round_trip_s: float = 0.0,
+        task_time_ns: int = 0,
     ):
+        key = (status.session_id, status.frame_sequence, status.sensor_timestamp_ns)
+        previous_key = self._last_key
+        is_new = status.sensor_timestamp_ns != 0 and key != previous_key
+        if (
+            is_new and previous_key is not None
+            and status.session_id == previous_key[0]
+            and status.sensor_timestamp_ns <= previous_key[2]
+        ):
+            # Do not move the camera watermark backwards: replaying an older
+            # response must not make a previously recorded frame new again.
+            return self.invalidate("out_of_order")
+        age_s = status.result_age_ms / 1000.0 + max(0.0, round_trip_s)
+        if now_s - self.state.timestamp_perf_s > self.config.max_sample_age_s:
+            self._smooth = None
+        if is_new:
+            self._last_key = key
+            self.state = replace(
+                self.state,
+                task_time_ns=task_time_ns,
+                session_id=status.session_id,
+                frame_sequence=status.frame_sequence,
+                camera_time_ns=status.sensor_timestamp_ns,
+                timestamp_perf_s=now_s - age_s,
+            )
         if self._session_id is None:
             self._session_id = status.session_id
         elif status.session_id != self._session_id:
@@ -274,7 +300,6 @@ class EyePositionFilter:
             or status.flags & (StatusFlag.CALIBRATING | StatusFlag.SHUTTING_DOWN)
         ):
             return self.invalidate("not_tracking_or_configured")
-        age_s = status.result_age_ms / 1000.0 + max(0.0, round_trip_s)
         if (
             status.flags & StatusFlag.RESULT_STALE
             or age_s > self.config.max_sample_age_s
@@ -283,28 +308,8 @@ class EyePositionFilter:
         if status.sensor_timestamp_ns == 0:
             return self.invalidate("waiting_for_sample")
 
-        key = (status.session_id, status.frame_sequence, status.sensor_timestamp_ns)
         # Eye 0 is the only experimental signal, even with two eyes configured.
         eye = status.eyes[0]
-        is_new = key != self._last_key
-        if (
-            is_new
-            and self._last_key is not None
-            and status.sensor_timestamp_ns <= self._last_key[2]
-        ):
-            return self.invalidate("out_of_order")
-        if now_s - self.state.timestamp_perf_s > self.config.max_sample_age_s:
-            self._smooth = None
-        if is_new:
-            self._last_key = key
-            self.state = replace(
-                self.state,
-                sample_index=self.state.sample_index + 1,
-                session_id=status.session_id,
-                frame_sequence=status.frame_sequence,
-                sensor_timestamp_ns=status.sensor_timestamp_ns,
-                timestamp_perf_s=now_s - age_s,
-            )
         if not eye.valid:
             return self.invalidate("blink" if eye.blink else "lost")
         if not is_new:
@@ -343,7 +348,8 @@ class EyePositionFilter:
 class UARTEyeTracker:
     """Own the UART in one worker thread, leaving both screen loops responsive."""
 
-    def __init__(self, *, uart_config=None, filter_config=None, on_state=None):
+    def __init__(self, *, uart_config=None, filter_config=None, on_state=None,
+                 on_measurement=None, task_clock=None):
         self.config = uart_config or UARTEyeTrackerConfig()
         self.filter = EyePositionFilter(
             uart_config=self.config, filter_config=filter_config
@@ -351,6 +357,8 @@ class UARTEyeTracker:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
+        self.task_clock = task_clock or TaskClock()
+        self._on_measurement = on_measurement
         self._on_state = on_state
         self._callback_error = None
         self.warnings = EyeTrackerWarnings()
@@ -429,6 +437,19 @@ class UARTEyeTracker:
                 self.filter.invalidate("consumer_error", error=str(exc))
             self._stop.set()
 
+    def _consume_measurement(self, status, *, received_perf_ns, round_trip_s=0.0):
+        with self._lock:
+            previous_key = self.filter._last_key
+            state = self.filter.consume(
+                status, now_s=received_perf_ns / 1_000_000_000,
+                round_trip_s=round_trip_s,
+                task_time_ns=self.task_clock.task_time_ns(timestamp_perf_ns=received_perf_ns),
+            )
+            is_new = self.filter._last_key != previous_key
+        # Pass the exact acquisition snapshot, never a later get_state() read.
+        if is_new and self._on_measurement is not None:
+            self._on_measurement(state)
+
     def _run(self):
         channel = None
         controller = None
@@ -452,32 +473,37 @@ class UARTEyeTracker:
                     block_number = validate_run_number(int(number)) if number is not None else None
                     start_attempted = True
                     status = controller.start_tracking(block_number=block_number)
-                    with self._lock:
-                        self.filter.consume(status, now_s=time.perf_counter())
+                    received_perf_ns = time.perf_counter_ns()
+                    self._consume_measurement(status, received_perf_ns=received_perf_ns)
                     self._check_status(status)
                     self._publish_state()
             next_poll = time.perf_counter()
             while not self._stop.is_set():
                 try:
-                    sent_s = time.perf_counter()
+                    sent_ns = time.perf_counter_ns()
+                    sent_s = sent_ns / 1_000_000_000
                     if self.config.simulate:
                         with self._lock:
                             state = self.filter.state
                             self.filter.state = replace(
                                 state,
                                 timestamp_perf_s=sent_s,
-                                sample_index=state.sample_index + 1,
+                                task_time_ns=self.task_clock.task_time_ns(timestamp_perf_ns=sent_ns),
+                                camera_time_ns=sent_ns,
+                                frame_sequence=state.frame_sequence + 1,
                                 valid=True,
                                 rejection_reason=None,
                                 error=None,
                             )
+                        if self._on_measurement is not None:
+                            self._on_measurement(self.filter.state)
                     else:
                         status = controller.poll()
-                        now_s = time.perf_counter()
-                        with self._lock:
-                            self.filter.consume(
-                                status, now_s=now_s, round_trip_s=now_s - sent_s
-                            )
+                        received_perf_ns = time.perf_counter_ns()
+                        self._consume_measurement(
+                            status, received_perf_ns=received_perf_ns,
+                            round_trip_s=(received_perf_ns - sent_ns) / 1_000_000_000,
+                        )
                         self._check_status(status)
                 except Exception as exc:
                     with self._lock:
@@ -538,14 +564,15 @@ class FixationWindow:
 
     def clear(self):
         self.history = deque()
-        self._last_index = None
+        self._last_key = None
         self.acceptance = 0.0
 
     def update(self, state, in_window):
         if not state.valid and state.rejection_reason not in ("blink", "lost"):
             self.clear()
             return False
-        if state.sample_index != self._last_index:
+        key = (state.session_id, state.frame_sequence, state.camera_time_ns)
+        if key != self._last_key:
             if (
                 self.history
                 and (
@@ -555,7 +582,7 @@ class FixationWindow:
             ):
                 # Missing observations cannot be evidence of sustained fixation.
                 self.clear()
-            self._last_index = state.sample_index
+            self._last_key = key
             self.history.append(
                 (state.timestamp_perf_s, state.valid and bool(in_window))
             )
@@ -673,5 +700,8 @@ def calibration_payload(
         }
     )
     if latest_state is not None:
-        eye_tracker_calibration["latest_state"] = asdict(latest_state)
+        eye_tracker_calibration["latest_state"] = {
+            key: value for key, value in asdict(latest_state).items()
+            if key != "timestamp_perf_s"
+        }
     return {"eye_tracker_calibration": eye_tracker_calibration}

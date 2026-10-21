@@ -163,7 +163,7 @@ def _build_behavior_fieldnames(num_afc: int) -> List[str]:
         "target_index",
         "target_shape",
         "target_color",
-        "initiation_time",
+        "initiation_task_time_ns",
     ]
     for idx in range(int(num_afc)):
         fields.extend([f"option_{idx}_shape", f"option_{idx}_color"])
@@ -989,23 +989,27 @@ def run_task(
                 except Exception:
                     pass
                 return
-            start_perf = time.perf_counter()
+            start_perf_requested_ns = time.perf_counter_ns()
             _set_pump_pin(1, context="manual_reward")
+            start_perf_ns = time.perf_counter_ns()
             try:
                 logger.log_signal(
                     trial_num=None,
                     event="pump_on",
-                    timestamp_perf_s=start_perf,
+                    timestamp_perf_ns=start_perf_ns,
+                    requested_timestamp_perf_ns=start_perf_requested_ns,
                     requested_duration=pulse_duration,
                 )
                 core.wait(pulse_duration)
             finally:
-                end_perf = time.perf_counter()
+                end_perf_requested_ns = time.perf_counter_ns()
                 _set_pump_pin(0, context="manual_reward")
+                end_perf_ns = time.perf_counter_ns()
                 logger.log_signal(
                     trial_num=None,
                     event="pump_off",
-                    timestamp_perf_s=end_perf,
+                    timestamp_perf_ns=end_perf_ns,
+                    requested_timestamp_perf_ns=end_perf_requested_ns,
                 )
 
         # Keep exactly one experimenter-control poller. It does not treat poll errors
@@ -1230,9 +1234,9 @@ def run_task(
                 logger.log_frame_flip(
                     trial_num=trial_num,
                     event="gray_inter_trial_interval",
-                    timestamp_perf_s=float(gray_start_perf),
-                    requested_timestamp_perf_s=trial_meta.get(
-                        "gray_flip_requested_perf_s"
+                    timestamp_perf_ns=trial_meta["gray_flip_perf_ns"],
+                    requested_timestamp_perf_ns=trial_meta.get(
+                        "gray_flip_requested_perf_ns"
                     ),
                     requested_duration=(
                         gray_duration_requested
@@ -1249,24 +1253,28 @@ def run_task(
                         msg_logger.log("WARN", f"experimenter_exit_during_pump_delay trial_num={trial_num}")
                         break
 
-                pulse_start = time.perf_counter()
+                pulse_start_requested_ns = time.perf_counter_ns()
                 _set_pump_pin(1, context="afc_reward")
+                pulse_start_ns = time.perf_counter_ns()
                 aborted_reward = False
                 try:
                     logger.log_signal(
                         trial_num=trial_num,
                         event="pump_on",
-                        timestamp_perf_s=pulse_start,
+                        timestamp_perf_ns=pulse_start_ns,
+                        requested_timestamp_perf_ns=pulse_start_requested_ns,
                         requested_duration=pulse_duration,
                     )
                     aborted_reward = _wait_or_abort(pulse_duration)
                 finally:
-                    pulse_end = time.perf_counter()
+                    pulse_end_requested_ns = time.perf_counter_ns()
                     _set_pump_pin(0, context="afc_reward")
+                    pulse_end_ns = time.perf_counter_ns()
                     logger.log_signal(
                         trial_num=trial_num,
                         event="pump_off",
-                        timestamp_perf_s=pulse_end,
+                        timestamp_perf_ns=pulse_end_ns,
+                        requested_timestamp_perf_ns=pulse_end_requested_ns,
                     )
                 if aborted_reward:
                     task_end_notes = "experimenter_exit"
@@ -1291,7 +1299,7 @@ def run_task(
                 "target_index": int(target_index - 1),
                 "target_shape": int(target_sid),
                 "target_color": _fmt_optional_int(target_cid),
-                "initiation_time": _fmt_optional(trial_meta.get("initiation_time_s")),
+                "initiation_task_time_ns": trial_meta.get("initiation_task_time_ns", ""),
                 "choice_made_index": chosen_idx_zero_based,
                 "choice_made_shape": "",
                 "choice_made_color": "",

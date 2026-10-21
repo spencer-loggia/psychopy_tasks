@@ -21,15 +21,6 @@ class EyeTrackingSettings:
     calibration: EyeCalibration = field(default_factory=EyeCalibration)
     show_preview: bool = True
     gain_anchor_px: Optional[tuple[float, float]] = None
-    record_rate_hz: float = 60.0
-
-    def __post_init__(self):
-        if (
-            isinstance(self.record_rate_hz, bool)
-            or not math.isfinite(self.record_rate_hz)
-            or self.record_rate_hz <= 0
-        ):
-            raise ValueError("eye_tracking.record_rate_hz must be positive and finite")
 
 
 def _object(value, name):
@@ -75,6 +66,8 @@ def load_eye_tracking_settings(cfg, *, for_calibration=False):
     to zero. Merely having state fields never opens UART.
     """
     section = _object(cfg.get("eye_tracking"), "eye_tracking")
+    if "record_rate_hz" in section:
+        raise ValueError("eye_tracking.record_rate_hz was removed; recording follows new camera measurements")
     enabled = _boolean(section.get("enabled", False), "eye_tracking.enabled")
     if not for_calibration and not enabled:
         return None
@@ -155,7 +148,6 @@ def load_eye_tracking_settings(cfg, *, for_calibration=False):
                 section.get("show_preview", True), "eye_tracking.show_preview"
             ),
             gain_anchor_px=anchor,
-            record_rate_hz=section.get("record_rate_hz", 60.0),
         )
     except TypeError as exc:
         raise ValueError(f"Invalid eye-tracking configuration: {exc}") from exc

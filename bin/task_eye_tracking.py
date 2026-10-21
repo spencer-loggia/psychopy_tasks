@@ -14,6 +14,7 @@ from pathlib import Path
 import threading
 import time
 
+from .task_clock import TaskClock
 from .eye_tracking import UARTEyeTracker
 from .eye_tracking_log import EYE_DATA_FILENAME, EyeDataRecorder
 from .eye_tracker_warnings import EyeTrackerWarnings
@@ -38,7 +39,7 @@ def read_preview_gaze(shared, *, now_s=None):
 class TaskEyeTrackingSession:
     """Own an optional Eye 0 tracker, recorder, and calibrated preview mailbox."""
 
-    def __init__(self, settings, *, output_dir=None, start_perf_s=None):
+    def __init__(self, settings, *, output_dir=None, task_clock=None):
         self.settings = settings
         self.preview_state = (
             mp.get_context("spawn").Array(
@@ -57,25 +58,29 @@ class TaskEyeTrackingSession:
             uart_config=settings.uart,
             filter_config=settings.filter,
             on_state=self._update_preview,
+            on_measurement=self._record_measurement,
+            task_clock=task_clock or TaskClock(),
         )
         self.recorder = None
         try:
-            self.tracker.start()
             if output_dir is not None:
                 self.recorder = EyeDataRecorder(
                     Path(output_dir) / EYE_DATA_FILENAME,
-                    get_state=self.tracker.get_state,
                     calibration=settings.calibration,
-                    start_perf_s=(
-                        time.perf_counter() if start_perf_s is None else start_perf_s
-                    ),
-                    rate_hz=settings.record_rate_hz,
                 )
         except Exception as exc:
             self.warnings.warn("recording", f"Could not start eye data acquisition/CSV recording: {exc}")
+        try:
+            self.tracker.start()
+        except Exception as exc:
+            self.warnings.warn("tracking", f"Could not start eye acquisition: {exc}")
         # Normal cleanup goes through SessionLogBundle. Also stop tracking if a
         # legacy task exits before its main loop's finally block is established.
         atexit.register(self.close)
+
+    def _record_measurement(self, state):
+        if self.recorder is not None:
+            self.recorder.submit(state)
 
     def _update_preview(self, state):
         with self._preview_lock:
@@ -132,7 +137,7 @@ class TaskEyeTrackingSession:
         if self._closed:
             return
         try:
-            # End CSV observations before a potentially slow remote STOP ACK.
+            # Stop accepting measurements and drain CSV before a slow STOP ACK.
             try:
                 if self.recorder is not None:
                     self.recorder.close()

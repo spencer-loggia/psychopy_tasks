@@ -257,8 +257,8 @@ def run_task(
             logger.log_frame_flip(
                 trial_num=trial_num,
                 event="trial_cue",
-                timestamp_perf_s=cue_timing.actual_perf_s,
-                requested_timestamp_perf_s=cue_timing.requested_perf_s,
+                timestamp_perf_ns=cue_timing.actual_perf_ns,
+                requested_timestamp_perf_ns=cue_timing.requested_perf_ns,
                 requested_duration=isi,
             )
             wait_until(cue_timing.actual_perf_s + isi_plan.scheduled_s)
@@ -322,9 +322,9 @@ def run_task(
             logger.log_frame_flip(
                 trial_num=trial_num,
                 event="gray_inter_trial_interval",
-                timestamp_perf_s=float(gray_start_perf),
-                requested_timestamp_perf_s=trial_meta.get(
-                    "gray_flip_requested_perf_s"
+                timestamp_perf_ns=trial_meta["gray_flip_perf_ns"],
+                requested_timestamp_perf_ns=trial_meta.get(
+                    "gray_flip_requested_perf_ns"
                 ),
                 requested_duration=iti if iti > 0.0 else None,
             )

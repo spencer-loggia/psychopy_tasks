@@ -116,7 +116,7 @@
                 "y_scale": null,
                 "x_offset": null,
                 "y_offset": null,
-                "set_time": 0.0
+                "task_time_ns": 0
             }
         ]
     }

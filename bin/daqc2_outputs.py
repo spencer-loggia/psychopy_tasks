@@ -16,8 +16,16 @@ class DOUTPulseEdge:
 
     active: bool
     pulse_index: int
-    requested_perf_s: float
-    actual_perf_s: float
+    requested_perf_ns: int
+    actual_perf_ns: int
+
+    @property
+    def requested_perf_s(self):
+        return self.requested_perf_ns / 1_000_000_000
+
+    @property
+    def actual_perf_s(self):
+        return self.actual_perf_ns / 1_000_000_000
 
 
 class DAQC2DigitalOutputs:
@@ -193,15 +201,17 @@ class PeriodicDOUTPulseController:
         *,
         active: bool,
         pulse_index: int,
-        requested_perf_s: float,
     ) -> None:
+        # The schedule target is not the observed hardware request time.
+        requested_ns = time.perf_counter_ns()
         self.outputs.write(self.bit, active)
+        actual_ns = time.perf_counter_ns()
         self._edges.put(
             DOUTPulseEdge(
                 active=bool(active),
                 pulse_index=int(pulse_index),
-                requested_perf_s=float(requested_perf_s),
-                actual_perf_s=self._clock(),
+                requested_perf_ns=requested_ns,
+                actual_perf_ns=actual_ns,
             )
         )
 
@@ -230,17 +240,14 @@ class PeriodicDOUTPulseController:
                 self._record_edge(
                     active=True,
                     pulse_index=pulse_index,
-                    requested_perf_s=requested_on_perf_s,
                 )
                 output_active = True
 
-                requested_off_perf_s = requested_on_perf_s + self.pulse_duration_s
                 if self._stop_event.wait(self.pulse_duration_s):
                     break
                 self._record_edge(
                     active=False,
                     pulse_index=pulse_index,
-                    requested_perf_s=requested_off_perf_s,
                 )
                 output_active = False
                 next_on_perf_s = requested_on_perf_s + self.interval_s
@@ -260,7 +267,6 @@ class PeriodicDOUTPulseController:
                     self._record_edge(
                         active=False,
                         pulse_index=pulse_index,
-                        requested_perf_s=self._clock(),
                     )
                 except BaseException as exc:
                     if self._failure is None:

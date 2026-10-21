@@ -226,8 +226,8 @@ def run_task(
             "scheduled_video_frames",
             "actual_source_start_seconds",
             "actual_source_last_frame_seconds",
-            "first_frame_time_since_session_start",
-            "last_frame_end_time_since_session_start",
+            "first_frame_task_time_ns",
+            "last_frame_end_task_time_ns",
             "displayed_duration_seconds",
             "display_frames",
             "aborted",
@@ -257,9 +257,9 @@ def run_task(
                 "expected_source_time_seconds",
                 "source_pts_error_seconds",
                 "expected_time_since_video_start_seconds",
-                "requested_time_since_session_start",
-                "expected_time_since_session_start",
-                "actual_time_since_session_start",
+                "requested_task_time_ns",
+                "expected_task_time_ns",
+                "task_time_ns",
                 "timing_error_seconds",
                 "planned_hold_refreshes",
                 "realized_hold_refreshes",
@@ -292,8 +292,8 @@ def run_task(
             logger.log_signal(
                 trial_num=None,
                 event="pump_on" if edge.active else "pump_off",
-                timestamp_perf_s=edge.actual_perf_s,
-                requested_timestamp_perf_s=edge.requested_perf_s,
+                timestamp_perf_ns=edge.actual_perf_ns,
+                requested_timestamp_perf_ns=edge.requested_perf_ns,
                 requested_duration=(
                     float(pump_pulse_time_seconds) if edge.active else None
                 ),
@@ -315,15 +315,13 @@ def run_task(
     ) -> None:
         playback = dict(playback_info or {})
         first_frame_time = (
-            logger.seconds_since_session_start(playback["start_flip_perf_s"])
-            if playback.get("start_flip_perf_s") is not None
+            logger.task_time_ns(timestamp_perf_ns=playback["start_flip_perf_ns"])
+            if playback.get("start_flip_perf_ns") is not None
             else None
         )
         last_frame_end_time = (
-            logger.seconds_since_session_start(
-                playback["last_frame_end_perf_s"]
-            )
-            if playback.get("last_frame_end_perf_s") is not None
+            logger.task_time_ns(timestamp_perf_ns=playback["last_frame_end_perf_ns"])
+            if playback.get("last_frame_end_perf_ns") is not None
             else None
         )
         behavior_logger.writerow(
@@ -364,13 +362,13 @@ def run_task(
                     if playback.get("actual_source_last_frame_s") is not None
                     else ""
                 ),
-                "first_frame_time_since_session_start": (
-                    f"{float(first_frame_time):.9f}"
+                "first_frame_task_time_ns": (
+                    str(first_frame_time)
                     if first_frame_time is not None
                     else ""
                 ),
-                "last_frame_end_time_since_session_start": (
-                    f"{float(last_frame_end_time):.9f}"
+                "last_frame_end_task_time_ns": (
+                    str(last_frame_end_time)
                     if last_frame_end_time is not None
                     else ""
                 ),
@@ -486,14 +484,14 @@ def run_task(
                         if video_fps > 0.0
                         else ""
                     ),
-                    "requested_time_since_session_start": (
-                        f"{logger.seconds_since_session_start(float(record['flip_requested_perf_s'])):.9f}"
+                    "requested_task_time_ns": (
+                        str(logger.task_time_ns(timestamp_perf_ns=record['flip_requested_perf_ns']))
                     ),
-                    "expected_time_since_session_start": (
-                        f"{logger.seconds_since_session_start(float(record['expected_flip_perf_s'])):.9f}"
+                    "expected_task_time_ns": (
+                        str(logger.task_time_ns(float(record['expected_flip_perf_s'])))
                     ),
-                    "actual_time_since_session_start": (
-                        f"{logger.seconds_since_session_start(float(record['actual_flip_perf_s'])):.9f}"
+                    "task_time_ns": (
+                        str(logger.task_time_ns(timestamp_perf_ns=record['actual_flip_perf_ns']))
                     ),
                     "timing_error_seconds": (
                         f"{float(record['timing_error_s']):.9f}"

@@ -191,17 +191,12 @@ class EyeTrackingConfigTests(unittest.TestCase):
                     },
                 })
 
-    def test_recording_rate_defaults_to_60_and_can_be_set_independently_of_uart(self):
+    def test_recording_has_no_polling_rate_and_uart_defaults_to_100_hz(self):
         cfg = {**asdict(EyeCalibration()), "eye_tracking": {"enabled": True}}
-        self.assertEqual(load_eye_tracking_settings(cfg).record_rate_hz, 60)
+        self.assertEqual(load_eye_tracking_settings(cfg).uart.poll_rate_hz, 100)
         cfg["eye_tracking"]["record_rate_hz"] = 50
-        settings = load_eye_tracking_settings(cfg)
-        self.assertEqual(settings.record_rate_hz, 50)
-        self.assertEqual(settings.uart.poll_rate_hz, 100)
-        for value in (0, -1, float("nan"), float("inf"), True, "bad"):
-            cfg["eye_tracking"]["record_rate_hz"] = value
-            with self.subTest(value=value), self.assertRaises(ValueError):
-                load_eye_tracking_settings(cfg)
+        with self.assertRaisesRegex(ValueError, "record_rate_hz was removed"):
+            load_eye_tracking_settings(cfg)
 
     def test_invalid_units_eye_coefficients_and_boolean_flags_rejected(self):
         for override in (

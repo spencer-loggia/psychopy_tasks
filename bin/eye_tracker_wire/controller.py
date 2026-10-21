@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 import select
@@ -31,6 +32,7 @@ DEFAULT_STATE_TIMEOUT_S = 10.0
 DEFAULT_RETRY_DELAY_S = 0.02
 DEFAULT_INTER_BYTE_TIMEOUT_S = 0.10
 DEFAULT_POLL_RATE_HZ = 100.0
+_LOG = logging.getLogger(__name__)
 
 
 class ControllerError(RuntimeError):
@@ -87,16 +89,32 @@ class SerialPacketChannel:
 
     def exchange(self, packet: bytes, timeout_s: float) -> bytes:
         _validate_request(packet, timeout_s)
-        expected_sequence = decode_command(packet).sequence
+        command = decode_command(packet)
+        expected_sequence = command.sequence
         with self._lock:
             if self._closed:
                 raise ControllerError("UART packet channel is closed")
-            deadline = time.monotonic() + timeout_s
+            started = time.monotonic()
+            deadline = started + timeout_s
             try:
                 _write_fd_exact(self._fd, packet, deadline)
+                written_at = time.monotonic()
+                if command.code is not CommandCode.POLL:
+                    # write() confirms submission to the local tty, not receipt
+                    # or completion on the tracker. Keep these timings separate.
+                    _LOG.info(
+                        "Eye UART %s sequence=%d submitted 64 bytes in %.3fs; waiting for ACK",
+                        command.code.name, expected_sequence, written_at - started,
+                    )
                 while True:
                     response = _read_status_packet(self._fd, self._pending, deadline)
                     if _response_is_current_or_protocol_error(response, expected_sequence):
+                        if command.code is not CommandCode.POLL:
+                            _LOG.info(
+                                "Eye UART %s sequence=%d response after %.3fs (write %.3fs)",
+                                command.code.name, expected_sequence,
+                                time.monotonic() - written_at, written_at - started,
+                            )
                         return response
             except OSError as exc:
                 raise ControllerError(f"UART transaction failed: {exc}") from exc
@@ -214,8 +232,15 @@ class EyeTrackerController:
         command_packet = encode_command(command)
         attempts = self.retries + 1
         for attempt in range(attempts):
+            # A missing first packet/ACK must not cost the entire camera-start
+            # timeout. Retransmit promptly, then give the final attempt the full
+            # action timeout. The sequence cache makes in-flight duplicates safe.
+            timeout = (
+                min(self.response_timeout_s, self.state_timeout_s)
+                if attempt + 1 < attempts else self.state_timeout_s
+            )
             try:
-                status = self._exchange(command_packet, self.state_timeout_s)
+                status = self._exchange(command_packet, timeout)
             except (ProtocolError, ResponseTimeout):
                 status = None
             acknowledged = self._matching_ack(sequence, status)
@@ -225,8 +250,13 @@ class EyeTrackerController:
             # repeat the exact command: the service's sequence cache makes this
             # idempotent and preserves a rejection outcome. A POLL is never used
             # as proof that a state command succeeded.
-            if attempt + 1 < attempts and self.retry_delay_s:
-                self._sleep(self.retry_delay_s)
+            if attempt + 1 < attempts:
+                _LOG.info(
+                    "Eye UART %s sequence=%d retry %d/%d after missing/invalid ACK",
+                    command.code.name, sequence, attempt + 1, self.retries,
+                )
+                if self.retry_delay_s:
+                    self._sleep(self.retry_delay_s)
         raise AcknowledgementTimeout(sequence, attempts)
 
     def _exchange(self, packet: bytes, timeout_s: float | None = None) -> DecodedStatus:

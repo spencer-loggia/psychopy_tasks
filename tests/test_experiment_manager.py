@@ -4,6 +4,7 @@ import json
 import os
 import platform
 import random
+import shutil
 import signal
 import socket
 import struct
@@ -36,6 +37,7 @@ from interface.experiment_manager import (
 )
 from interface.experiment_history import HISTORY_FILENAME
 from interface.data_sync import ExperimentDataSync, SyncPlan
+from interface.subject_calibration import SubjectCalibrationStore
 
 
 class FakeClock:
@@ -47,6 +49,107 @@ class FakeClock:
 
 
 class ExperimentManagerTests(unittest.TestCase):
+    def test_subject_calibration_is_restored_after_all_experiment_folders_are_removed(self):
+        from tests.test_subject_calibration import calibration
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config, path = self._project(root)
+            kwargs = dict(working_dir=root, launch_config_path=path, launch_config=config,
+                          subject_name="Subject One", subject_code="S1")
+            manager = ExperimentManager(**kwargs, now=dt.datetime(2026, 10, 20))
+            for value in (calibration(0.1), calibration(0.4)):
+                block = manager.prepare_block(task_name="demo", launch_value="task/demo.py",
+                                              config_value="configs/demo.json")
+                (block.output_dir / "calibration.json").write_text(
+                    json.dumps({"eye_tracker_calibration": value}))
+                manager.finish_block(block)
+            manager.finish()
+            shutil.rmtree(manager.experiment_dir)
+            current = ExperimentManager(**kwargs, now=dt.datetime(2026, 10, 21))
+            self.assertEqual(current.state["eye_tracker_calibration"][-1]["x_offset"], 0.4)
+            self.assertEqual(current.state["eye_tracker_calibration"][-1]["task_time_ns"], 0)
+            (root / "configs" / "demo.json").write_text(json.dumps({
+                "eye_tracking": {"enabled": True, "calibration_file": "obsolete.json"},
+                "initial_x_scale": 99,
+            }))
+            block = current.prepare_block(task_name="demo", launch_value="task/demo.py",
+                                          config_value="configs/demo.json")
+            generated = json.loads(block.config_path.read_text())
+            for for_calibration in (True, False):
+                settings = load_eye_tracking_settings(generated, for_calibration=for_calibration)
+                self.assertEqual(settings.calibration.x_offset, 0.4)
+                self.assertEqual(settings.calibration.x_cross, 0.001)
+                self.assertEqual(settings.gain_anchor_px, (100, 50))
+                self.assertEqual(settings.filter.ema_gamma, 0.2)
+            snapshot = Path(generated["eye_tracking"]["calibration_file"])
+            self.assertEqual(snapshot.parent, current.experiment_dir)
+            original = snapshot.read_bytes()
+            # A newer experiment/cache write cannot change this run's snapshot.
+            SubjectCalibrationStore(root / "logs").save(
+                subject="Subject One", experiment_name="exp_S1_20261022_001",
+                block_number=1, calibration=calibration(0.9))
+            self.assertEqual(snapshot.read_bytes(), original)
+            other = ExperimentManager(**{**kwargs, "subject_name": "Other", "subject_code": "S2"})
+            self.assertIsNone(other.state["eye_tracker_calibration"][-1]["x_scale"])
+
+    def test_launch_backfills_latest_local_calibration_without_promoting_uncalibrated_runs(self):
+        from tests.test_subject_calibration import calibration
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config, path = self._project(root)
+            older = root / "logs" / "exp_S1_20261020_001"
+            block = older / "blocks" / "12_calibrate"
+            block.mkdir(parents=True)
+            (older / "state.json").write_text(json.dumps({"subject": "Subject One"}))
+            (block / "calibration.json").write_text(json.dumps({"eye_tracker_calibration": calibration()}))
+            kwargs = dict(working_dir=root, launch_config_path=path, launch_config=config,
+                          subject_name="Subject One", subject_code="S1")
+            first = ExperimentManager(**kwargs, now=dt.datetime(2026, 10, 21))
+            self.assertEqual(first.state["eye_tracker_calibration"][-1]["x_offset"], 0.1)
+            shutil.rmtree(older)
+            second = ExperimentManager(**kwargs, now=dt.datetime(2026, 10, 22))
+            saved = SubjectCalibrationStore(root / "logs").load("Subject One")
+            self.assertEqual(saved["experiment_name"], older.name)
+            self.assertEqual(second.state["eye_tracker_calibration"][-1]["x_offset"], 0.1)
+
+    def test_uart_start_is_queued_before_metadata_probes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config, path = self._project(root)
+            with patch("interface.experiment_manager.ExperimentEyeTracker") as tracker:
+                def probe(*args):
+                    tracker.assert_called_once()
+                    directory = tracker.call_args.kwargs["directory"]
+                    self.assertTrue((directory / "event_name_library.json").is_file())
+                    return "commit"
+
+                with patch("interface.experiment_manager._git_commit", side_effect=probe), patch(
+                    "interface.experiment_manager._runtime_metadata",
+                    side_effect=lambda *args: {"hostname": probe()},
+                ):
+                    manager = ExperimentManager(
+                        working_dir=root, launch_config_path=path, launch_config=config,
+                        subject_name="Yuri", subject_code="Y",
+                    )
+                state = json.loads(manager.state_path.read_text())
+                self.assertEqual(state["git_commit"], "commit")
+                self.assertEqual(state["hostname"], "commit")
+                tracker.return_value.finish.assert_not_called()
+
+    def test_setup_failure_after_uart_start_queues_stop(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config, path = self._project(root)
+            with patch("interface.experiment_manager.ExperimentEyeTracker") as tracker, patch(
+                "interface.experiment_manager._runtime_metadata", side_effect=OSError("metadata failed"),
+            ), self.assertRaisesRegex(OSError, "metadata failed"):
+                ExperimentManager(
+                    working_dir=root, launch_config_path=path, launch_config=config,
+                    subject_name="Yuri", subject_code="Y",
+                )
+            tracker.assert_called_once()
+            tracker.return_value.finish.assert_called_once_with()
+
     def test_launch_commit_is_from_working_checkout_and_survives_state_updates(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

@@ -1271,6 +1271,29 @@ class PlayVideoTaskTests(unittest.TestCase):
         fake_utils.setup_task_window.assert_not_called()
         fake_utils.play_video_fill_screen.assert_not_called()
 
+    def test_eye_tracking_session_starts_before_display_and_closes_on_setup_failure(self):
+        module, fake_utils, _ = self._make_validation_harness(
+            source_rate="30/1", monitor_rate=60.0,
+        )
+        settings = object()
+
+        def setup(*args, **kwargs):
+            module.SessionLogBundle.assert_called_once()
+            self.assertIs(module.SessionLogBundle.call_args.kwargs["eye_tracking_config"], settings)
+            raise RuntimeError("display failed")
+
+        fake_utils.setup_task_window.side_effect = setup
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "clip.mp4"
+            path.touch()
+            with self.assertRaisesRegex(RuntimeError, "display failed"):
+                module.run_task(
+                    video_files=[str(path)], clip_duration_seconds=2.0,
+                    output_dir=tmpdir, num_clips=1, frame_rate=30.0,
+                    eye_tracking_config=settings,
+                )
+        module.SessionLogBundle.return_value.close.assert_called_once_with()
+
     def test_run_task_accepts_noninteger_monitor_cadence_without_drift(self):
         module, fake_utils, messages = self._make_validation_harness(
             source_rate="30/1",

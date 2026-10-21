@@ -109,6 +109,7 @@ class ExperimentDataSyncTests(unittest.TestCase):
                     "--no-group",
                     "--exclude=/experiment_history.tsv",
                     "--exclude=/.experiment_history.*",
+                    "--exclude=/.subject_calibrations/",
                     "--",
                     f"{logs}/",
                     f"{remote / 'experiments'}/",

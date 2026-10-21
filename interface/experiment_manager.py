@@ -38,6 +38,7 @@ from bin.screen import (
 )
 from interface.experiment_eye_tracker import ExperimentEyeTracker
 from interface.experiment_history import ExperimentHistory
+from interface.subject_calibration import SubjectCalibrationStore, validate_eye_calibration
 
 
 BLOCKS_FILENAME = "blocks.tsv"
@@ -230,14 +231,10 @@ class ExperimentManager:
                         milliseconds = entry.pop("set_time")
                         entry.setdefault("task_time_ns", round(float(milliseconds) * 1_000_000))
         self.state["subject"] = self.subject_name
-        self.state["git_commit"] = _git_commit(self.working_dir)
-        python_command = str(
-            (self.launch_config.get("environment") or {}).get("python") or ""
-        ).strip()
-        self.state.update(_runtime_metadata(self.working_dir, python_command))
 
         self.logs_dir = self.working_dir / "logs"
         self.history = ExperimentHistory(self.logs_dir)
+        self.subject_calibrations = SubjectCalibrationStore(self.logs_dir)
         self.experiment_dir = self._create_experiment_dir()
         self.blocks_dir = self.experiment_dir / "blocks"
         self.blocks_dir.mkdir()
@@ -254,13 +251,28 @@ class ExperimentManager:
             "origin_perf_counter_ns": self.task_clock.origin_perf_ns,
             "origin_datetime": self.started_at.isoformat(timespec="microseconds"),
         })
-        self._write_state()
-        self._write_blocks()
         self.eye_tracker = ExperimentEyeTracker(
             self.launch_config, subject=self.subject_name,
             started_at=self.started_at, directory=self.experiment_dir,
             experiment_number=self.experiment_number,
         )
+        try:
+            # Start UART as soon as the experiment identity and required files
+            # exist. Git/interpreter probes can each take five seconds; neither
+            # is needed to send START_EXPERIMENT.
+            self._restore_subject_calibration()
+            self.state["git_commit"] = _git_commit(self.working_dir)
+            python_command = str(
+                (self.launch_config.get("environment") or {}).get("python") or ""
+            ).strip()
+            self.state.update(_runtime_metadata(self.working_dir, python_command))
+            self._write_state()
+            self._write_blocks()
+        except BaseException:
+            # An aborted local setup must close the experiment already queued
+            # on the tracker, preserving START/STOP ordering in its worker.
+            self.eye_tracker.finish()
+            raise
 
     def finish(self) -> None:
         """Save the final local summary and request remote recording closure."""
@@ -268,6 +280,27 @@ class ExperimentManager:
             self._update_history(ended=True)
         finally:
             self.eye_tracker.finish()
+
+    def _restore_subject_calibration(self) -> None:
+        self.subject_calibrations.remember_experiments(
+            self.logs_dir.iterdir(), subject=self.subject_name,
+        )
+        saved = self.subject_calibrations.load(self.subject_name)
+        if saved is None:
+            return
+        candidate = validate_eye_calibration(saved["eye_tracker_calibration"])
+        history = self.state.get("eye_tracker_calibration")
+        template = (history[-1] if isinstance(history, list) and history
+                    and isinstance(history[-1], dict) else {})
+        fields = list(dict.fromkeys([*template, *_EYE_CALIBRATION_COEFFICIENTS]))
+        entry = {key: copy.deepcopy(candidate.get(key, template.get(key)))
+                 for key in fields if key not in {"set_time", "task_time_ns"}}
+        entry["task_time_ns"] = 0
+        self.state["eye_tracker_calibration"] = [entry]
+        # A run owns its starting snapshot; later subject-cache updates cannot
+        # change metadata underneath this experiment's block configurations.
+        self._eye_calibration_path = self.experiment_dir / "initial_eye_calibration.json"
+        _write_json_atomic(self._eye_calibration_path, saved)
 
     def _create_experiment_dir(self) -> Path:
         experiment_dir, self.experiment_number = self.history.reserve(
@@ -456,6 +489,12 @@ class ExperimentManager:
                 ))
             if not all(field in candidate for field in required_fields):
                 continue
+            if state_name == "eye_tracker_calibration":
+                candidate = validate_eye_calibration(candidate)
+                self.subject_calibrations.save(
+                    subject=self.subject_name, experiment_name=self.experiment_dir.name,
+                    block_number=len(self.blocks), calibration=candidate,
+                )
             entry = {field: copy.deepcopy(candidate[field]) for field in required_fields}
             entry["task_time_ns"] = self.task_time_ns()
             history.append(entry)

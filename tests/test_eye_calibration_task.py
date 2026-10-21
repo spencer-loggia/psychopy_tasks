@@ -54,6 +54,26 @@ class EyeCalibrationTaskTests(unittest.TestCase):
     def setUp(self):
         self.task = load_task()
 
+    def test_uart_starts_before_display_setup_and_stops_if_setup_fails(self):
+        task = self.task
+        tracker = Mock()
+
+        def setup(*args, **kwargs):
+            tracker.start.assert_called_once_with()
+            raise RuntimeError("display failed")
+
+        def make_tracker(**kwargs):
+            # A fast UART response before the reward controller exists is safe.
+            tracker.start.side_effect = lambda: kwargs["on_state"](EyeTrackerState())
+            return tracker
+
+        task.utils.setup_task_window.side_effect = setup
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            task, "UARTEyeTracker", side_effect=make_tracker,
+        ), self.assertRaisesRegex(RuntimeError, "display failed"):
+            task.run_task(output_dir=tmp, fullscreen=False)
+        tracker.stop.assert_called_once_with()
+
     def test_points_fit_affine_sync_sliders_and_snap_back_after_manual_gain_edit(self):
         task = self.task
         win = Mock(size=(800, 600))

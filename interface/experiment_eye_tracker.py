@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
+import logging
 import math
 from pathlib import Path
+import time
 
 from bin.eye_tracking import UARTEyeTrackerConfig
 from bin.eye_tracker_warnings import EyeTrackerWarnings
@@ -15,6 +17,7 @@ from bin.eye_tracker_wire.protocol import StatusFlag
 
 # Preserve START/STOP ordering even if a new experiment is opened immediately.
 _COMMANDS = ThreadPoolExecutor(max_workers=1, thread_name_prefix="experiment-uart")
+_LOG = logging.getLogger(__name__)
 
 
 def _experiment_uart(config):
@@ -103,7 +106,7 @@ class ExperimentEyeTracker:
             ):
                 raise ValueError("eye_tracker_experiment.start_timeout_s must be positive and finite")
             self.pending_path.touch()
-            self.start_future = _COMMANDS.submit(self._send, start=True)
+            self.start_future = _COMMANDS.submit(self._send, start=True, queued_at=time.monotonic())
         except Exception as exc:
             self.uart = None
             self.warnings.warn("config", f"Experiment synchronization is unavailable: {exc}")
@@ -114,12 +117,17 @@ class ExperimentEyeTracker:
         self._finished = True
         if self.uart is not None and not self.uart.simulate:
             try:
-                self.stop_future = _COMMANDS.submit(self._send, start=False)
+                self.stop_future = _COMMANDS.submit(self._send, start=False, queued_at=time.monotonic())
             except Exception as exc:
                 self.warnings.warn("end", f"Could not queue STOP_EXPERIMENT: {exc}")
 
-    def _send(self, *, start: bool):
+    def _send(self, *, start: bool, queued_at: float):
         action = "start" if start else "end"
+        _LOG.info(
+            "Eye UART %s queue wait %.3fs; opening %s",
+            "START_EXPERIMENT" if start else "STOP_EXPERIMENT",
+            time.monotonic() - queued_at, self.uart.device,
+        )
         try:
             with SerialPacketChannel(self.uart.device, baud=self.uart.baud) as channel:
                 controller = EyeTrackerController(

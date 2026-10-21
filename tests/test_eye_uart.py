@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import select
 import struct
 import threading
 import time
@@ -208,8 +209,106 @@ class UARTProtocolTests(unittest.TestCase):
         controller.poll()
         calls = channel.exchange.call_args_list
         self.assertEqual(calls[0].args[0], calls[1].args[0])
-        self.assertEqual(calls[0].args[1], 10)
+        self.assertEqual(calls[0].args[1], 0.25)
+        self.assertEqual(calls[1].args[1], 10)
         self.assertEqual(decode_command(calls[2].args[0]).sequence, 43)
+
+    def test_state_retry_budget_and_slow_action_timeout(self):
+        for retries, response_timeout, state_timeout, expected in (
+            (0, 0.25, 15, [15]),
+            (1, 0.25, 15, [0.25, 15]),
+            (2, 0.25, 10, [0.25, 0.25, 10]),
+            (1, 0.25, 0.1, [0.1, 0.1]),
+        ):
+            with self.subTest(retries=retries, state_timeout=state_timeout):
+                channel = Mock()
+                channel.exchange.side_effect = ResponseTimeout("missing ACK")
+                controller = EyeTrackerController(
+                    channel, initial_sequence=42, retries=retries, retry_delay_s=0,
+                    response_timeout_s=response_timeout, state_timeout_s=state_timeout,
+                )
+                with self.assertRaises(AcknowledgementTimeout) as failure:
+                    controller.start_recording(block_number=7)
+                self.assertEqual(failure.exception.attempts, retries + 1)
+                calls = channel.exchange.call_args_list
+                self.assertEqual([call.args[1] for call in calls], expected)
+                self.assertEqual(len({call.args[0] for call in calls}), 1)
+
+    def test_start_commands_reach_serial_peer_promptly_after_dropped_packet(self):
+        for method, kwargs in (
+            ("start_experiment", {"subject": "Yuri", "experiment_number": 7}),
+            ("start_tracking", {"block_number": 3}),
+            ("start_recording", {"block_number": 3}),
+        ):
+            with self.subTest(method=method):
+                self._serial_start_exchange(method, kwargs, slow_ack=False)
+
+    def test_slow_start_ack_survives_early_retry_and_late_duplicate(self):
+        self._serial_start_exchange("start_tracking", {"block_number": 3}, slow_ack=True)
+
+    def _serial_start_exchange(self, method, kwargs, *, slow_ack):
+        master, slave = pty.openpty()
+        errors, received = [], []
+        started = time.monotonic()
+        channel = None
+        worker = None
+
+        def read_command():
+            packet = bytearray()
+            deadline = time.monotonic() + 0.6
+            while len(packet) < 64:
+                remaining = max(0, deadline - time.monotonic())
+                if not select.select([master], [], [], remaining)[0]:
+                    raise TimeoutError("command did not reach serial peer promptly")
+                packet.extend(os.read(master, 64 - len(packet)))
+            received.append((time.monotonic() - started, bytes(packet)))
+            return decode_command(bytes(packet))
+
+        def peer():
+            try:
+                first = read_command()  # Simulate a lost first request/ACK.
+                second = read_command()
+                self.assertEqual(first, second)
+                if slow_ack:
+                    # Longer than the fast retry timeout, shorter than the
+                    # action timeout: completion must still be accepted.
+                    time.sleep(0.15)
+                reply = status_bytes(sequence=first.sequence)
+                os.write(master, reply + reply)  # Include the duplicate's ACK.
+                poll = read_command()
+                self.assertEqual(poll.code, CommandCode.POLL)
+                os.write(master, status_bytes(sequence=poll.sequence))
+            except BaseException as exc:
+                errors.append(exc)
+
+        try:
+            channel = SerialPacketChannel(os.ttyname(slave), baud=9600)
+            controller = EyeTrackerController(
+                channel, initial_sequence=42, retries=1,
+                response_timeout_s=0.05, state_timeout_s=1.0,
+                retry_delay_s=0.01,
+            )
+            worker = threading.Thread(target=peer, daemon=True)
+            worker.start()
+            with self.assertLogs("bin.eye_tracker_wire.controller", level="INFO") as logs:
+                status = getattr(controller, method)(**kwargs)
+            self.assertEqual(status.request_sequence, 42)
+            self.assertEqual(controller.poll().request_sequence, 43)
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+            self.assertFalse(errors, errors)
+            self.assertLess(received[0][0], 0.5)
+            self.assertLess(received[1][0] - received[0][0], 0.5)
+            self.assertEqual(received[0][1], received[1][1])
+            self.assertTrue(any("submitted 64 bytes" in line for line in logs.output))
+            self.assertTrue(any("response after" in line for line in logs.output))
+        finally:
+            if worker is not None:
+                worker.join(1)
+            if channel is not None:
+                channel.close()
+            os.close(slave)
+            os.close(master)
 
     def test_rejected_state_and_mismatched_ack_are_not_success(self):
         channel = Mock()

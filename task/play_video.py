@@ -163,50 +163,13 @@ def run_task(
         )
         video_streams[video_path] = stream
 
-    win, main_screen, experimenter_screen = utils.setup_task_window(
-        screen_config,
-        bg_rgb_255=bg,
-        fullscreen=fullscreen,
-        size=win_size,
-        allow_same_screen=True,
-    )
-    bg_rect = utils.make_bg_rect(win, bg)
-    mouse = event.Mouse(win=win)
+    win = None
     experimenter_preview = None
     frame_publisher = None
     sync_lgpio = None
     sync_gpio_chip = None
     pump_outputs = None
     pump_controller = None
-    native_main_size = resolve_scene_size(
-        main_screen,
-        fullscreen=bool(fullscreen),
-        requested_size=win_size,
-        realized_size=tuple(win.size),
-    )
-    main_rotation_deg = software_stimulus_rotation(main_screen.rotation)
-    subject_main_size = oriented_size(native_main_size, main_rotation_deg)
-    maximum_frame_bytes = 0
-    minimum_runtime_crop_fraction = 1.0
-    for stream in video_streams.values():
-        source_size = (int(stream["width"]), int(stream["height"]))
-        crop_bounds = center_crop_bounds(
-            source_size,
-            subject_main_size,
-            alignment=2,
-        )
-        cropped_width = crop_bounds[2] - crop_bounds[0]
-        cropped_height = crop_bounds[3] - crop_bounds[1]
-        maximum_frame_bytes = max(
-            maximum_frame_bytes,
-            cropped_width * cropped_height * 3,
-        )
-        minimum_runtime_crop_fraction = min(
-            minimum_runtime_crop_fraction,
-            (cropped_width * cropped_height)
-            / float(source_size[0] * source_size[1]),
-        )
-
     resolved_config_name = str(config_name).strip() if config_name else "play_video"
     session_logs = SessionLogBundle(
         eye_tracking_config=eye_tracking_config,
@@ -269,7 +232,60 @@ def run_task(
         },
         auto_flush=False,
     )
-    session_logs.set_eye_tracking_screen(native_main_size, main_rotation_deg)
+    # Session creation starts the UART worker. Display setup can take seconds,
+    # especially on the first block, and must not postpone START_TRACKING.
+    def close_main_window():
+        nonlocal win
+        if win is None:
+            return None
+        closing, win = win, None
+        return utils.close_task_window(closing)
+
+    try:
+        win, main_screen, experimenter_screen = utils.setup_task_window(
+            screen_config,
+            bg_rgb_255=bg,
+            fullscreen=fullscreen,
+            size=win_size,
+            allow_same_screen=True,
+        )
+        bg_rect = utils.make_bg_rect(win, bg)
+        mouse = event.Mouse(win=win)
+        native_main_size = resolve_scene_size(
+            main_screen,
+            fullscreen=bool(fullscreen),
+            requested_size=win_size,
+            realized_size=tuple(win.size),
+        )
+        main_rotation_deg = software_stimulus_rotation(main_screen.rotation)
+        subject_main_size = oriented_size(native_main_size, main_rotation_deg)
+        maximum_frame_bytes = 0
+        minimum_runtime_crop_fraction = 1.0
+        for stream in video_streams.values():
+            source_size = (int(stream["width"]), int(stream["height"]))
+            crop_bounds = center_crop_bounds(
+                source_size,
+                subject_main_size,
+                alignment=2,
+            )
+            cropped_width = crop_bounds[2] - crop_bounds[0]
+            cropped_height = crop_bounds[3] - crop_bounds[1]
+            maximum_frame_bytes = max(
+                maximum_frame_bytes,
+                cropped_width * cropped_height * 3,
+            )
+            minimum_runtime_crop_fraction = min(
+                minimum_runtime_crop_fraction,
+                (cropped_width * cropped_height)
+                / float(source_size[0] * source_size[1]),
+            )
+        session_logs.set_eye_tracking_screen(native_main_size, main_rotation_deg)
+    except BaseException:
+        try:
+            close_main_window()
+        finally:
+            session_logs.close()
+        raise
     logger = session_logs.event_logger
     msg_logger = session_logs.message_logger
     behavior_logger = session_logs.behavior_logger
@@ -994,7 +1010,7 @@ def run_task(
             except Exception:
                 pass
         try:
-            restore_detail = utils.close_task_window(win)
+            restore_detail = close_main_window()
             msg_logger.log(
                 "INFO",
                 f"main_vblank_reference_restored detail={restore_detail}",

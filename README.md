@@ -98,11 +98,17 @@ the identical packet and sequence so a lost acknowledgement does not restart or 
 the block again. Standalone task launches and launches with experiment synchronization
 disabled retain automatic tracker numbering. `uart.manage_tracking: false` remains poll-only.
 
-These commands run in order on a background worker. Experiment start allows 15 seconds per
-attempt (`eye_tracker_experiment.start_timeout_s`), with one identical-packet retry by default,
-giving a slow startup about 30 seconds to acknowledge before a timeout warning. When omitted,
-the start timeout is the greater of 15 seconds and `uart.state_timeout_s`. Stop and shutdown retain
-the 10-second state timeout (`uart.state_timeout_s`); `uart.state_retries` controls retries for all three.
+These commands run in order on a background worker. START is queued once the experiment's
+number and required files exist, before Git and interpreter metadata probes (which can each
+take five seconds). State commands retry a missing/invalid acknowledgement after
+`uart.response_timeout_s` (0.25 s), plus a 0.02 s retry delay, using the identical packet.
+Only the final attempt waits the full action timeout: 15 seconds for experiment start
+(`eye_tracker_experiment.start_timeout_s`), or 10 seconds for other state commands
+(`uart.state_timeout_s`). With the default one retry, experiment start takes at most about
+15.27 seconds waiting on the transport, and a single dropped request can be resent after
+about 0.27 seconds instead of 15 seconds. When omitted, the start timeout is the greater of
+15 seconds and `uart.state_timeout_s`. `uart.state_retries` controls the number of retries;
+zero disables the short retry window and waits the full action timeout on the first attempt.
 The UART is closed after each command. Task eye acquisition waits for the experiment-start
 handoff in its own worker, so the launcher and task rendering remain responsive.
 If experiment start is not confirmed, task eye acquisition stays off for that experiment
@@ -112,6 +118,16 @@ nonmodal warning dialogs and write warnings to stderr; experiments and tasks con
 Repeated warnings of the same kind are suppressed within each session. Missing recording
 does not invalidate otherwise valid gaze, but stopped, unconfigured, calibrating, stale,
 or error telemetry is unusable. Local eye CSV failures also warn without aborting the task.
+
+For latency diagnosis, enable Python INFO logging for `interface.experiment_eye_tracker`
+and `bin.eye_tracker_wire.controller`. State commands report executor queue wait, submission
+of all 64 bytes to the local tty, retries, and time until the response. Submission is not proof
+of remote receipt or completion; only a matching successful acknowledgement confirms the
+action. POLL traffic is not logged. The tty uses nonblocking writes and raw 8-N-1 with no
+flow control or deliberate pre-send sleep. Quiet-mode preparation and experiment-number
+reservation still precede experiment creation; pending earlier STOP commands must finish
+before the next START. Task recording uses START_TRACKING and the tracker's
+`record_on_tracking` setting, rather than a separate START_RECORDING command.
 
 Experiment synchronization defaults to disabled when this launcher section is absent;
 set `enabled` to `false` (or `uart.simulate` to `true`) for hardware-free operation.
@@ -180,6 +196,21 @@ names a list-valued state field, the calibration object must contain all fields 
 except `task_time_ns`. The manager then appends those values and supplies `task_time_ns` in integer nanoseconds
 from experiment start. Extra calibration metadata is ignored. This generic matching rule allows future calibration
 histories to be added to `initial_state` without adding task-specific manager code.
+
+Accepted gaze calibrations are also saved locally per full subject name in
+`logs/.subject_calibrations/`. This cache is excluded from data sync and experiment deletion.
+Each new experiment starts with that subject's latest accepted calibration, selected by experiment
+date/number and then block number. It preserves all six affine coefficients and the complete saved
+metadata, including the gain anchor and axis directions. The experiment keeps its own
+`initial_eye_calibration.json` snapshot, so later calibration updates cannot change its starting settings.
+Subjects without a saved calibration continue to use the launch config's initial values.
+
+Existing local block calibrations are imported into this cache on experiment startup and before sync
+cleanup. Interrupted `calibration_recovery.json` files and runs without a completed calibration do not
+replace the last accepted calibration. A cache-write failure prevents cleanup from deleting experiments.
+Calibrations whose experiment folders were already deleted before this feature was installed must be
+restored from their archived experiment folders or recalibrated. This cache stores the task Pi's gaze
+mapping; the tracker Pi manages its pupil-image calibration separately.
 
 Before each block, the manager creates its output directory and writes `config.json` there. It copies the task
 config from its original source at block launch time, sets `config_name`, `output_dir`, and the full-name `subject`, copies
@@ -796,8 +827,12 @@ Connection and protocol:
 - `uart.manage_tracking: true` sends acknowledged START_TRACKING on entry and STOP_TRACKING on exit.
   START can also start recording if the tracker config enables `record_on_tracking`; STOP flushes it.
   Set this option to `false` to poll an already-running tracker without changing its state.
-  State commands wait up to `uart.state_timeout_s` (10 s) and retry the identical command
-  `uart.state_retries` times (default 1). Close may wait for these acknowledgements.
+  State commands retry the identical command `uart.state_retries` times (default 1).
+  Retry attempts start after the short `uart.response_timeout_s` wait (0.25 s) and a
+  0.02 s delay; the final attempt waits up to `uart.state_timeout_s` (10 s).
+  Calibration and video tasks start their UART workers before display initialization
+  and vblank checks, so those operations no longer delay START_TRACKING. Configuration
+  and required media validation still precede task startup. Close may wait for ACKs.
 - `uart.expect_recording` defaults to `true`: a missing `RECORDING` status flag shows a
   warning while allowing the task and valid gaze acquisition to continue. Set it to `false`
   when recording on the tracker Pi is intentionally disabled. Error, stopped/unconfigured,

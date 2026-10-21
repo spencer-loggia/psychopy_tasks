@@ -272,6 +272,11 @@ def run_task(
         temporary.replace(path)
         msg_logger.log("INFO", f"eye_calibration_saved path={path}")
 
+    def observe_eye_state(state):
+        # Acquisition can start before display geometry and reward gating exist.
+        if auto_reward is not None:
+            auto_reward.observe(state)
+
     try:
         outputs.open()
         output_opened = True
@@ -279,6 +284,16 @@ def run_task(
         msg_logger.log(
             "INFO",
             f"DAQC2 reward address={daq_address} pump_dout={pump_pin} enabled={int(raspi)}",
+        )
+        tracker = UARTEyeTracker(
+            uart_config=uart_config, filter_config=filter_config,
+            on_state=observe_eye_state,
+            task_clock=session_logs.session_clock,
+        )
+        tracker.start()
+        msg_logger.log(
+            "INFO",
+            f"eye_uart_started eye_id=0 config={asdict(uart_config)} filter={asdict(filter_config)}",
         )
         main_win, main_screen, experimenter_screen = utils.setup_task_window(
             screen_config,
@@ -332,16 +347,6 @@ def run_task(
             reward_interval=reward_interval, calibration=calibration,
             fixation=fixation, screen_size=subject_size, fix_diameter=fix_diameter,
             max_sample_age_s=uart_config.max_sample_age_s,
-        )
-        tracker = UARTEyeTracker(
-            uart_config=uart_config, filter_config=filter_config,
-            on_state=auto_reward.observe,
-            task_clock=session_logs.session_clock,
-        )
-        tracker.start()
-        msg_logger.log(
-            "INFO",
-            f"eye_uart_started eye_id=0 config={asdict(uart_config)} filter={asdict(filter_config)}",
         )
         main_bg = utils.make_bg_rect(main_win, bg)
         cross = _make_fixation_cross(

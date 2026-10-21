@@ -14,6 +14,9 @@ from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 from interface.experiment_history import ExperimentHistory, HISTORY_SYNC_EXCLUDES
+from interface.subject_calibration import (
+    CALIBRATION_CACHE_DIRECTORY, CALIBRATION_SYNC_EXCLUDE, SubjectCalibrationStore,
+)
 
 
 NFS_FILESYSTEM_TYPES = frozenset({"nfs", "nfs4"})
@@ -226,6 +229,7 @@ class SyncPlan:
             "--no-owner",
             "--no-group",
             *(f"--exclude={pattern}" for pattern in HISTORY_SYNC_EXCLUDES),
+            f"--exclude={CALIBRATION_SYNC_EXCLUDE}",
             "--",
             f"{self.source}/",
             f"{self.destination}/",
@@ -325,6 +329,12 @@ class ExperimentDataSync:
         # This also covers upgrades followed by shutdown/sync before any new
         # experiment has been opened. A history write failure prevents pruning.
         ExperimentHistory(self.logs_dir).import_existing(plan.experiments)
+        try:
+            SubjectCalibrationStore(self.logs_dir).remember_experiments(plan.experiments)
+        except (TypeError, ValueError) as exc:
+            # The interface reports pruning failures as OSError and leaves all
+            # source directories intact so the calibration can be recovered.
+            raise OSError(f"Could not preserve subject eye calibrations: {exc}") from exc
         removed = []
         for experiment_dir in plan.experiments:
             if experiment_dir == plan.retained_experiment:
@@ -341,6 +351,7 @@ class ExperimentDataSync:
                 child
                 for child in self.logs_dir.iterdir()
                 if child.is_dir() and not child.is_symlink()
+                and child.name != CALIBRATION_CACHE_DIRECTORY
             ),
             key=lambda path: path.name,
         )

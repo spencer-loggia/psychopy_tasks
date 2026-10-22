@@ -1,15 +1,15 @@
 { 
   "config_name": "wooster_rigtrain_delay",
   "shapes_tsv": "./task/resources/csc1/csc1_shapes/shape_definitions_csc1.tsv",
-  "colors_tsv": "./task/resources/csc1/csc1_colors/corrected_rgb_targets_pass2_reordered.tsv",
+  "colors_tsv": "./task/resources/csc1/csc1_colors/csc1_atlantis_final_matched.tsv",
   "pump_delay_time": 0.0,
   "pump_pulse_time_seconds": 0.6,
   "inter_pump_interval": 0.1, 
   "timeout_duration_seconds": 3.0,
  
 
-  "pump_pin": 24,
-  "buzz_pin": 23,
+  "pump_pin": 0,
+  "buzz_pin": 1,
   "trial_start_pin": 18,
 
   "seed": null,
@@ -34,7 +34,7 @@
   "stroke_color": [0, 0, 0],
   "stroke_linejoin": "round",
   "stroke_linecap": "round",
-  "image_size": [64, 64],
+  "image_size": [128, 128],
 
 
   "self_initiation": true,

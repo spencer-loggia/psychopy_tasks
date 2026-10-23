@@ -502,7 +502,8 @@ Common event-log rules:
 - Output timestamps measure the host write call, not electrical feedback. lgpio's pulse worker is
   [software timed](https://github.com/joan2937/lg/blob/master/lgPthTx.c); validate physical GPIO/display
   alignment with an external recording and photodiode when measuring hardware latency or pulse width.
-- Events that have no visible effect or a programmatic zero-duration no-op should not be logged.
+- Frame-flip events describe actual display flips. Explicit lifecycle events can mark behavioral
+  interval boundaries while the display remains unchanged. Zero-duration interval no-ops are not logged.
 - `requested_duration` is in seconds and always retains the exact configured request, not the nearest frame-achievable duration. It is blank only when no duration was requested.
 
 `event_code_library.json` is generated per session as the minimal subset of `event_name_library.json` that was actually used in that run. It includes:
@@ -534,7 +535,14 @@ Active-foraging event naming:
 - Sequential runs (`sequential=true`) log option-specific frame-flip events such as `option_1_dot` and `option_1_on`.
 - Simultaneous runs (`sequential=false`) log combined frame-flip events such as `options_dot` and `options_on`.
 - `choice_start` marks the first frame where a choice can be made.
-- `grey_inter_trial_interval` marks the flip to the gray post-choice / inter-trial screen.
+- `grey_inter_trial_interval` (109) marks the flip to the gray post-choice screen; its requested
+  duration includes the reward or timeout interval plus the ITI. This legacy event is a display
+  transition, not the start of the behavioral ITI.
+- `reward_interval` (3) marks the fixed reward-interval onset at that same flip, including
+  zero-pulse outcomes. `timeout_interval` (4) replaces it on timeout trials. `inter_trial_interval`
+  (5) marks the actual ITI onset after either interval. These lifecycle events carry their own
+  requested duration; they do not introduce extra display flips. Pump/buzzer event timestamps
+  still record the individual hardware edges.
 - `cue_touch` and `option_touch` are the current touch interaction events.
 - `trial_start_signal_on/off`, `pump_on/off`, and `buzzer_on/off` are the current signal events.
 - `event_name_library.json` is shared across tasks. For active-foraging sequential runs it defines `option_{n}_dot` and `option_{n}_on` through templates rather than duplicating a separate static entry for each possible option index.
@@ -1065,10 +1073,36 @@ The main visual timing parameters in `active_foraging` are interpreted by the pr
 - `duration`: stimulus display duration. When `sequential=true`, this is the on-screen time for each individual stimulus in the sequence. When `sequential=false` and `is_memory=true`, the full array remains visible for `duration`, then the task switches to dot-only choice for `choice_time`. When `sequential=false` and `is_memory=false`, `duration` must be exactly `0`; the full array appears on the first choice frame and remains visible for `choice_time` only.
 - `isi`: pre-stimulus cue interval, not a between-trial delay. In simultaneous non-memory mode it shows dots at all candidate locations before the full array appears. In sequential mode, for every task using the shared option-presentation backend (including `active_foraging`, `match2cue`, and `afc_trial_sequence`), it shows the dot cue for each item before that item is shown and, between consecutive stimuli, also holds the post-stimulus dot scene unchanged for the same duration.
 - `choice_time`: response-window extension after the stimulus display phase defined by the active mode. In simultaneous non-memory mode the response window starts on the first frame of the full array and lasts `choice_time`, with the full array remaining visible throughout. In memory modes, the response window begins only after the stimulus display phase has finished and lasts `choice_time`, with only the remembered dot locations visible.
-- `iti`: inter-trial interval after choice handling. This begins only after reward delivery or timeout handling completes; it is not inserted between option presentations within a trial. The old `ibi` config/CLI name remains accepted only as a deprecated compatibility alias.
+- `iti`: a separate inter-trial interval after the entire reward interval or timeout interval,
+  immediately before the next initiation cue. Early pump completion does not start the ITI early,
+  and a double reward does not consume any of the ITI. The old `ibi` config/CLI name remains accepted
+  only as a deprecated compatibility alias.
 - `pump_delay_time`: delay in seconds between a rewarded choice being made and the first pump pulse. It applies only on rewarded trials with at least one configured pump pulse, and defaults to `0.0`.
 - `pump_pulse_time_seconds`: duration in seconds that the pump output remains on for each reward pulse.
 - `inter_pump_interval`: delay in seconds between repeated pump pulses. When omitted, it defaults to `pump_pulse_time_seconds`, preserving the previous behavior.
+
+Every non-timeout trial reserves a fixed reward interval from the actual post-choice gray-screen
+flip. Its duration is derived from the largest pulse count in `reward_to_pulse_map`, across all
+configured levels, rather than from the chosen option or the options sampled on that trial.
+With the standard level-3 double reward, the duration is
+`pump_delay_time + pump_pulse_time_seconds + inter_pump_interval + pump_pulse_time_seconds`.
+A level-2 single reward waits the remaining `inter_pump_interval + pump_pulse_time_seconds`
+after its pulse. Zero-pulse outcomes, including trials with no response, wait the entire reward
+interval. If no pump pulses are configured at any level, the reward interval is zero.
+
+Timeout trials instead use `timeout_duration_seconds`, with no reward interval or pump train
+added, and then receive the full ITI. Timeout takes precedence if a level is mapped to both a
+timeout and pump pulses. Pump timing values and the timeout must be finite and non-negative;
+pulse counts must be non-negative integers.
+
+For example, with delay `0.2 s`, pulse width `0.25 s`, gap `0.1 s`, and ITI `0.2 s`, all
+non-timeout outcomes have a `0.8 s` reward interval followed by `0.2 s` ITI. A `1.5 s` timeout
+instead gives `1.5 s` timeout followed by `0.2 s` ITI. Reward/timeout durations use monotonic
+wall-clock deadlines; the ITI retains its existing nearest-refresh duration planning. Event
+submission and log flushing occur within the ITI budget. Hardware or scheduling delays can
+overrun an interval; overruns above `1 ms` are reported as `outcome_interval_overrun`, and neither
+the final pump pulse nor the following ITI is shortened to hide them. Manual reward requests
+during an automated outcome wait until that interval has finished.
 
 Common `active_foraging` configurations:
 

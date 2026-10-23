@@ -165,6 +165,21 @@
       "code": 2,
       "event_type": "lifecycle",
       "description": "Task block ended and log finalization began."
+    },
+    "reward_interval": {
+      "code": 3,
+      "event_type": "lifecycle",
+      "description": "The fixed-duration reward interval began at the post-choice gray-screen flip, including zero-pulse outcomes."
+    },
+    "timeout_interval": {
+      "code": 4,
+      "event_type": "lifecycle",
+      "description": "A timeout interval began at the post-choice gray-screen flip, replacing the reward interval."
+    },
+    "inter_trial_interval": {
+      "code": 5,
+      "event_type": "lifecycle",
+      "description": "The inter-trial interval began after the reward or timeout interval; the gray screen remains unchanged."
     }
   },
   "task_event_sets": {
@@ -206,6 +221,9 @@
       "block_end"
     ],
     "active_foraging": [
+      "reward_interval",
+      "timeout_interval",
+      "inter_trial_interval",
       "onset_cue_on",
       "choice_start",
       "grey_inter_trial_interval",

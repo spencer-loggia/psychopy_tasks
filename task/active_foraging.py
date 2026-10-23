@@ -18,6 +18,8 @@ Config keys required/additional:
   hold_cue_to_init_time_s
 - pump_delay_time: delay in seconds between a rewarded choice and the first pump pulse
 - inter_pump_interval: optional delay in seconds between pump pulses; defaults to pump_pulse_time_seconds
+- The reward interval reserves the longest configured pump train for every non-timeout
+  outcome. A timeout replaces that interval; the full ITI follows either interval.
 - trial_start_pin is a Raspberry Pi BCM GPIO pin; pump_pin and buzz_pin are
   DAQC2 DOUT bits on the Pi-Plate.
 
@@ -71,6 +73,8 @@ from bin.screen import (
 from interface.rig_mode import IS_RIG_ENV_VAR, experimenter_cursor_visible_for_touchscreen
 from task.active_foraging_timing import (
     duration_requires_visible_phase,
+    reward_interval_duration,
+    run_outcome_interval,
     validate_duration_for_presentation_mode,
 )
 
@@ -360,9 +364,14 @@ def run_task(
     if seed is not None:
         random.seed(seed)
 
-    inter_pump_interval_seconds = max(
-        0.0,
-        float(pump_pulse_time_seconds if inter_pump_interval is None else inter_pump_interval),
+    inter_pump_interval_seconds = float(
+        pump_pulse_time_seconds if inter_pump_interval is None else inter_pump_interval
+    )
+    reward_interval_s = reward_interval_duration(
+        pump_delay_time=pump_delay_time,
+        pump_pulse_time_seconds=pump_pulse_time_seconds,
+        inter_pump_interval=inter_pump_interval_seconds,
+        reward_to_pulse_map=reward_to_pulse_map,
     )
     if raspi:
         DAQC2DigitalOutputs.validate_address(int(daq_address))
@@ -408,7 +417,8 @@ def run_task(
             is_memory=bool(is_memory),
         )
         validate_requested_durations(
-            {"isi": isi, "choice_time": choice_time, "iti": iti},
+            {"isi": isi, "choice_time": choice_time, "iti": iti,
+             "timeout_duration_seconds": timeout_duration_seconds},
             positive={"choice_time"},
             context="active_foraging",
         )
@@ -781,21 +791,6 @@ def run_task(
             main_rotation_deg=stimulus_rotation_degrees,
         )
 
-    def _wait_or_abort(duration_s: float) -> bool:
-        if duration_s is None or float(duration_s) <= 0:
-            return _poll_experimenter_controls()
-        if experimenter_preview is not None:
-            deadline = time.perf_counter() + max(0.0, float(duration_s))
-            while time.perf_counter() < deadline:
-                if _poll_experimenter_controls():
-                    return True
-                remaining = deadline - time.perf_counter()
-                if remaining > 0:
-                    time.sleep(min(0.05, remaining))
-            return _poll_experimenter_controls()
-        core.wait(duration_s)
-        return False
-
     # If self-initiation requested, build an onset cue ImageStim via utility
     onset_stim = None
     pressed_onset_stim = None
@@ -925,13 +920,14 @@ def run_task(
                 requested_timestamp_perf_ns=end_requested_perf,
             )
 
-    def _poll_experimenter_controls() -> bool:
+    def _poll_experimenter_controls(*, allow_manual_reward=True) -> bool:
         manual_reward_requested = False
         try:
-            manual_reward_requested = bool(event.getKeys(keyList=["r"]))
+            if allow_manual_reward:
+                manual_reward_requested = bool(event.getKeys(keyList=["r"]))
         except Exception:
             pass
-        if experimenter_preview is not None:
+        if experimenter_preview is not None and allow_manual_reward:
             manual_reward_requested = (
                 experimenter_preview.consume_manual_reward_request()
                 or manual_reward_requested
@@ -1005,6 +1001,9 @@ def run_task(
     task_end_notes = "done"
     iti_plan = plan_frame_duration(iti, fps)
     iti_frames = iti_plan.frame_count
+    msg_logger.log("INFO", f"outcome_timing reward_interval_s={reward_interval_s:.9f} "
+                   f"timeout_interval_s={timeout_duration_seconds:.9f} "
+                   f"iti_s={iti_plan.scheduled_s:.9f}")
 
     def _fmt_optional(value: Any) -> str:
         if value == "" or value is None:
@@ -1116,7 +1115,6 @@ def run_task(
             apply_timeout = 0
 
             if choice_info is not None:
-                abort_requested = False
                 chosen_idx = choice_info["chosen_index"]
                 chosen_pair = trial_options[chosen_idx - 1]
                 reward_level = reward_map.get(chosen_pair, 0)
@@ -1129,106 +1127,45 @@ def run_task(
                 if reward_to_timeout_map is not None:
                     apply_timeout = reward_to_timeout_map.get(str(reward_level), 0)
 
-                gray_duration_requested = float(iti)
-                if num_pulses > 0:
-                    gray_duration_requested += max(0.0, float(pump_delay_time))
-                    gray_duration_requested += float(num_pulses * pump_pulse_time_seconds)
-                    gray_duration_requested += float(max(0, num_pulses - 1) * inter_pump_interval_seconds)
-                if apply_timeout > 0:
-                    gray_duration_requested += float(timeout_duration_seconds)
-            else:
-                abort_requested = False
-                gray_duration_requested = float(iti)
-
-            gray_start_perf = trial_meta.get("gray_flip_perf_s", None)
-            if gray_start_perf is not None:
-                logger.log_frame_flip(
-                    trial_num=trial_num,
-                    event="grey_inter_trial_interval",
-                    timestamp_perf_ns=trial_meta["gray_flip_perf_ns"],
-                    requested_timestamp_perf_ns=trial_meta.get(
-                        "gray_flip_requested_perf_ns"
-                    ),
-                    requested_duration=gray_duration_requested if gray_duration_requested > 0 else None,
+            outcome_duration_s = timeout_duration_seconds if apply_timeout > 0 else reward_interval_s
+            gray_duration_requested = outcome_duration_s + float(iti)
+            gray_start_ns = trial_meta["gray_flip_perf_ns"]
+            logger.log_frame_flip(
+                trial_num=trial_num,
+                event="grey_inter_trial_interval",
+                timestamp_perf_ns=gray_start_ns,
+                requested_timestamp_perf_ns=trial_meta.get("gray_flip_requested_perf_ns"),
+                requested_duration=gray_duration_requested if gray_duration_requested > 0 else None,
+            )
+            iti_start_ns = run_outcome_interval(
+                trial_num=trial_num, onset_perf_ns=gray_start_ns,
+                num_pulses=num_pulses, apply_timeout=apply_timeout > 0,
+                reward_interval_s=reward_interval_s, timeout_duration_s=timeout_duration_seconds,
+                pump_delay_s=pump_delay_time, pump_pulse_s=pump_pulse_time_seconds,
+                inter_pump_interval_s=inter_pump_interval_seconds, logger=logger,
+                set_pump=lambda value: _set_pump_pin(value, context="task_reward"),
+                set_buzzer=lambda value: _set_buzzer_pin(value, context="timeout"),
+                # Manual rewards wait until automated outputs are off; a nested
+                # manual pulse must not truncate or lengthen the trial's pulse.
+                poll_callback=lambda: _poll_experimenter_controls(allow_manual_reward=False),
+            )
+            if iti_start_ns is None:
+                task_end_notes = "experimenter_exit"
+                msg_logger.log("WARN", f"experimenter_exit_during_outcome_interval trial_num={trial_num}")
+                break
+            if iti_frames > 0:
+                logger.log_event(
+                    trial_num=trial_num, event="inter_trial_interval", event_type="lifecycle",
+                    timestamp_perf_ns=iti_start_ns, requested_duration=iti,
+                )
+            outcome_overrun_s = (iti_start_ns - gray_start_ns) / 1_000_000_000 - outcome_duration_s
+            if outcome_overrun_s > 0.001:
+                msg_logger.log(
+                    "WARN", f"outcome_interval_overrun trial_num={trial_num} "
+                    f"overrun_s={outcome_overrun_s:.9f}; full ITI preserved",
                 )
 
             if choice_info is not None:
-                if num_pulses > 0 and pump_delay_time > 0:
-                    if _wait_or_abort(pump_delay_time):
-                        task_end_notes = "experimenter_exit"
-                        msg_logger.log("WARN", f"experimenter_exit_during_pump_delay trial_num={trial_num}")
-                        abort_requested = True
-
-                if abort_requested:
-                    break
-
-                for pulse_num in range(1, num_pulses + 1):
-                    pulse_start_requested_perf = time.perf_counter_ns()
-                    _set_pump_pin(1, context="task_reward")
-                    pulse_start_perf = time.perf_counter_ns()
-                    logger.log_signal(
-                        trial_num=trial_num,
-                        event="pump_on",
-                        timestamp_perf_ns=pulse_start_perf,
-                        requested_timestamp_perf_ns=pulse_start_requested_perf,
-                        requested_duration=pump_pulse_time_seconds,
-                    )
-                    if _wait_or_abort(pump_pulse_time_seconds):
-                        task_end_notes = "experimenter_exit"
-                        msg_logger.log("WARN", f"experimenter_exit_during_pump trial_num={trial_num} pulse={pulse_num}")
-                        abort_requested = True
-
-                    pulse_end_requested_perf = time.perf_counter_ns()
-                    _set_pump_pin(0, context="task_reward")
-                    pulse_end_perf = time.perf_counter_ns()
-                    logger.log_signal(
-                        trial_num=trial_num,
-                        event="pump_off",
-                        timestamp_perf_ns=pulse_end_perf,
-                        requested_timestamp_perf_ns=pulse_end_requested_perf,
-                    )
-                    if abort_requested:
-                        break
-
-                    if pulse_num < num_pulses:
-                        if _wait_or_abort(inter_pump_interval_seconds):
-                            task_end_notes = "experimenter_exit"
-                            msg_logger.log("WARN", f"experimenter_exit_during_inter_pulse_interval trial_num={trial_num} pulse={pulse_num}")
-                            abort_requested = True
-                            break
-
-                if abort_requested:
-                    break
-
-                if apply_timeout > 0:
-                    timeout_start_requested_perf = time.perf_counter_ns()
-                    _set_buzzer_pin(1, context="timeout")
-                    timeout_start_perf = time.perf_counter_ns()
-                    logger.log_signal(
-                        trial_num=trial_num,
-                        event="buzzer_on",
-                        timestamp_perf_ns=timeout_start_perf,
-                        requested_timestamp_perf_ns=timeout_start_requested_perf,
-                        requested_duration=timeout_duration_seconds,
-                    )
-                    if _wait_or_abort(timeout_duration_seconds):
-                        task_end_notes = "experimenter_exit"
-                        msg_logger.log("WARN", f"experimenter_exit_during_timeout trial_num={trial_num}")
-                        abort_requested = True
-
-                    timeout_end_requested_perf = time.perf_counter_ns()
-                    _set_buzzer_pin(0, context="timeout")
-                    timeout_end_perf = time.perf_counter_ns()
-                    logger.log_signal(
-                        trial_num=trial_num,
-                        event="buzzer_off",
-                        timestamp_perf_ns=timeout_end_perf,
-                        requested_timestamp_perf_ns=timeout_end_requested_perf,
-                    )
-
-                if abort_requested or task_end_notes != "done":
-                    break
-
                 msg_logger.log(
                     "INFO",
                     (
@@ -1273,28 +1210,6 @@ def run_task(
                 behavior_row["choice_made_color"] = int(chosen_color_row)
                 behavior_row["choice_made_lum"] = int(chosen_lum_row)
 
-            if iti_frames > 0:
-                post_choice_delay_present = (
-                    choice_info is not None
-                    and ((num_pulses > 0) or (apply_timeout > 0))
-                )
-                iti_start_perf = (
-                    time.perf_counter()
-                    if post_choice_delay_present
-                    else float(gray_start_perf)
-                )
-                _show_preview_idle()
-                iti_completed = wait_until(
-                    iti_start_perf + iti_plan.scheduled_s,
-                    poll_callback=_poll_experimenter_controls,
-                )
-                if not iti_completed:
-                    task_end_notes = "experimenter_exit"
-                    msg_logger.log(
-                        "WARN",
-                        f"experimenter_exit_during_iti trial_num={trial_num}",
-                    )
-
             transition_count = trial_meta.get(
                 "main_display_transition_count",
                 "",
@@ -1327,6 +1242,17 @@ def run_task(
                 break
 
             _flush_between_trials()
+            if iti_frames > 0:
+                _show_preview_idle()
+                # Preview updates and log flushing consume the existing ITI,
+                # rather than adding another outcome-dependent pause after it.
+                if not wait_until(
+                    (iti_start_ns + round(iti_plan.scheduled_s * 1_000_000_000)) / 1_000_000_000,
+                    poll_callback=_poll_experimenter_controls,
+                ):
+                    task_end_notes = "experimenter_exit"
+                    msg_logger.log("WARN", f"experimenter_exit_during_iti trial_num={trial_num}")
+                    break
             trial_num += 1
 
     finally:

@@ -522,6 +522,7 @@ class SessionLogBundle:
         auto_flush: bool = True,
         event_name_library_path: Optional[str | Path] = None,
         eye_tracking_config=None,
+        on_eye_state=None,
     ):
         self.session_clock = TaskClock(started_at=when)
         block_start_perf_ns = time.perf_counter_ns()
@@ -592,6 +593,7 @@ class SessionLogBundle:
                     eye_tracking_config,
                     output_dir=self.session_dir,
                     task_clock=self.session_clock,
+                    on_state=on_eye_state,
                 )
                 self.message_logger.log(
                     "INFO", f"eye_tracking_started eye_id=0 settings={json.dumps(asdict(eye_tracking_config))}"

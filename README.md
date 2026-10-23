@@ -720,10 +720,20 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
   `[100, 300]`) for each interval. `sync_pulse_frames` controls pulse width and
   defaults to `1`.
 - On Raspberry Pi, `play_video` also drives the reward pump through Pi-Plates
-  DAQC2 `DOUT pump_pin`. Both `pump_interval` and
-  `pump_pulse_time_seconds` are required. The first onset occurs one
-  `pump_interval` after task startup and subsequent onsets remain on one
-  absolute session schedule across clip boundaries. Pump writes run on a
+  DAQC2 `DOUT pump_pin`. Both `reward_interval` and
+  `pump_pulse_time_seconds` are required, with a positive pulse duration shorter
+  than `reward_interval`. `reward_interval` is the standard interval name for
+  timed fixation rewards, shared with eye tracker calibration; it replaces
+  `pump_interval`. With eye tracking disabled, the first onset occurs one
+  `reward_interval` after task startup and subsequent onsets remain on one
+  absolute session schedule across clip boundaries. With eye tracking enabled,
+  rewards require valid calibrated gaze within the full subject-screen rectangle
+  (including its edges): more than 95% of the preceding 100 ms and more than 80%
+  of the preceding `reward_interval`, matching calibration auto reward. Current
+  offscreen, invalid or stale gaze blocks delivery. Rolling windows are checked
+  continuously and a reward is delivered as soon as both criteria pass. Each
+  reward clears both windows, requiring a full new `reward_interval` of observations;
+  continuous fixation can earn repeated rewards across clips. Pump writes run on a
   worker thread so DAQC2 I/O cannot stall display flips; delayed intervals are
   skipped rather than replayed. `pump_on` and `pump_off` log rows contain both
   requested and actual edge timestamps. Optional `daq.address`/`daq_address`
@@ -747,7 +757,7 @@ A minimal video-source portion of the configuration is:
   "video_buffer_megabytes": 512,
   "pump_pin": 0,
   "pump_pulse_time_seconds": 0.25,
-  "pump_interval": 60.0
+  "reward_interval": 60.0
 }
 ```
 
@@ -940,16 +950,18 @@ Reward and fixation settings:
 - `fix_diameter` is a fraction of the shorter subject-scene dimension (default 0.05).
 - Press **A** to toggle automatic rewards; the mode starts **off**. The preview shows ON/OFF and both
   fixation percentages. `reward_interval` defaults to **2 seconds** and must exceed the pump pulse duration.
-  Each automatic reward requires **more than 95% fixation during the past 100 ms** and **more than 85%
+  Each automatic reward requires **more than 95% fixation during the past 100 ms** and **more than 80%
   during the past `reward_interval` seconds**, plus a currently valid, in-target eye position.
 - Percentages measure time inside the fixation area, using distinct camera samples and clipping their
   held durations to each window. Blink/loss count as non-fixation; stale/error states and long observation
   gaps invalidate history. Repeated UART replies cannot manufacture new camera observations.
-  Acquisition continues during pump pulses, so sustained fixation can earn repeated rewards without a
-  fixation break. Rewards are spaced by at least `reward_interval` between pulse onsets; if fixation fails
-  at the due time, the task waits until both criteria pass and never queues catch-up pulses.
+  Both rolling windows are checked continuously. As soon as both criteria pass, a reward is delivered
+  and both windows are cleared. A full new `reward_interval` of observations is required before another
+  reward can qualify. Acquisition continues during pump pulses, counting toward that fresh interval,
+  so sustained fixation can earn repeated rewards without a fixation break. A blink can delay a reward
+  until the rolling windows qualify; rewards do not wait for fixed schedule boundaries or queue up.
 - Toggling the mode or changing gain, zero, or target clears history and requires a fresh full interval.
-  Manual **R** rewards remain available and postpone the next automatic reward by one interval.
+  Manual **R** rewards remain available and also clear both windows.
   `fix_accept_percent` is superseded by the two fixed thresholds; an older positive `fix_accept_time` is
   used as the interval only when `reward_interval` is absent.
 
@@ -995,7 +1007,9 @@ it to `false` when switching a simulated calibration to hardware, and recalibrat
 
 Tasks with an experimenter preview show a blue gaze marker in the subject-oriented scene, including video.
 Invalid, stale and offscreen gaze is hidden. The two sequence tasks currently have no experimenter preview,
-but provide the same main-thread gaze access. No choices or stimulus timing depend on gaze at present.
+but provide the same main-thread gaze access. In `play_video`, enabled eye tracking also gates timed
+rewards using the calibration auto-reward acceptance rules over the full screen, as described above.
+Video playback continues while gaze is offscreen or unavailable.
 
 For future gaze-dependent task logic, use `session_logs.eye_tracking.get_position()` in the main task thread:
 it returns an unclamped `(x, y)` pair in centered subject-scene fractions, or `None` when invalid/stale.
@@ -1003,6 +1017,8 @@ it returns an unclamped `(x, y)` pair in centered subject-scene fractions, or `N
 `session_logs.eye_tracking` is not `None` when eye tracking is optional. Both methods read the worker's latest
 state without serial I/O on the presentation thread. `"show_preview": false` disables the marker while keeping
 that API available. The session owns tracker startup/shutdown; gaze updates do not alter stimulus commands.
+Tasks needing continuous fixation history can pass `on_eye_state` to `SessionLogBundle`; it runs on the
+UART worker independently of preview visibility, display flips and pump pulses, and must not block on I/O.
 
 Every enabled presentation block also writes **`eye_tracking.csv` directly in that block's directory**,
 alongside `event_log.tsv` and `behavior_log.tsv`, for example:

@@ -259,6 +259,8 @@ def run_task(
                     "interval_fraction_threshold": CalibrationAutoReward.INTERVAL_THRESHOLD,
                     "threshold_comparison": "strictly_greater",
                     "fraction_basis": "time",
+                    "window_mode": "rolling",
+                    "reset_on_reward": True,
                     "diameter_units": "fraction_of_shorter_subject_scene_dimension",
                 },
             }
@@ -422,8 +424,8 @@ def run_task(
                 # pulse; the UART observation worker is already independent.
                 on_wait=draw_scene if videos.enabled else None,
             )
-            # The UART callback continues both observation windows during the
-            # pulse. Do not discard that history or require a fixation break.
+            # The UART callback builds fresh history during the pulse, after
+            # the reset at onset. Keep those new samples for the next reward.
 
         while not should_exit():
             latest_state = tracker.get_state()

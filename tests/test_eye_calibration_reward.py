@@ -45,11 +45,11 @@ class CalibrationAutoRewardTests(unittest.TestCase):
                 self.feed(policy, 0, 1000, misses=range(950, 950 + missing_ms))
                 status = policy.status(now_s=1)
                 self.assertAlmostEqual(status.recent_fraction, 1 - missing_ms / 100)
-                self.assertGreater(status.interval_fraction, 0.85)
+                self.assertGreater(status.interval_fraction, 0.80)
                 self.assertEqual(status.due, expected)
 
-    def test_interval_window_must_be_strictly_above_85_percent_including_blinks(self):
-        for missing_ms, expected in ((149, True), (150, False), (151, False)):
+    def test_interval_window_must_be_strictly_above_80_percent_including_blinks(self):
+        for missing_ms, expected in ((199, True), (200, False), (201, False)):
             for reason in (None, "blink", "lost"):
                 with self.subTest(missing_ms=missing_ms, reason=reason):
                     policy = self.make_policy()
@@ -63,24 +63,31 @@ class CalibrationAutoRewardTests(unittest.TestCase):
                     self.assertAlmostEqual(status.recent_fraction, 1)
                     self.assertEqual(status.due, expected)
 
-    def test_continuous_fixation_repeats_without_clearing_history_after_pulses(self):
+    def test_automatic_and_manual_rewards_require_full_new_history(self):
         policy = self.make_policy()
         policy.toggle(now_s=0)
         self.feed(policy, 0, 1000)
         self.assertTrue(policy.status(now_s=1).due)
         policy.reward_delivered(now_s=1)
+        status = policy.status(now_s=1)
+        self.assertFalse(status.due)
+        self.assertEqual((status.recent_fraction, status.interval_fraction), (0, 0))
         # Acquisition continues while the main thread is occupied by the pump.
         self.feed(policy, 1001, 1999)
         self.assertFalse(policy.status(now_s=1.999).due)
         self.feed(policy, 2000, 2000)
-        self.assertTrue(policy.status(now_s=2).due)
-        policy.reward_delivered(now_s=2)
-        self.feed(policy, 2001, 2400)
-        policy.reward_delivered(now_s=2.4)  # Manual R also spaces later rewards.
+        self.assertFalse(policy.status(now_s=2).due)  # First fresh sample was 1.001.
+        self.feed(policy, 2001, 2001)
+        self.assertTrue(policy.status(now_s=2.001).due)
+        policy.reward_delivered(now_s=2.001)
+        self.feed(policy, 2002, 2400)
+        policy.reward_delivered(now_s=2.4)  # Manual R also clears both windows.
         self.feed(policy, 2401, 3000)
         self.assertFalse(policy.status(now_s=3).due)
         self.feed(policy, 3001, 3400)
-        self.assertTrue(policy.status(now_s=3.4).due)
+        self.assertFalse(policy.status(now_s=3.4).due)
+        self.feed(policy, 3401, 3401)
+        self.assertTrue(policy.status(now_s=3.401).due)
 
     def test_failed_check_waits_for_fixation_without_catchup_rewards(self):
         policy = self.make_policy()

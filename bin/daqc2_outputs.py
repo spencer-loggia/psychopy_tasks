@@ -125,6 +125,8 @@ class PeriodicDOUTPulseController:
     Hardware writes run on a dedicated thread. If that thread is delayed, it
     skips expired intervals instead of emitting catch-up pulses. Edge records
     are queued for the task's main thread so log writers remain single-threaded.
+    An optional fixation reward policy continuously checks rolling gaze windows
+    once a full interval can exist, resetting their history at each reward onset.
     """
 
     def __init__(
@@ -135,20 +137,22 @@ class PeriodicDOUTPulseController:
         interval_s: float,
         pulse_duration_s: float,
         clock: Callable[[], float] = time.perf_counter,
+        reward_policy=None,
     ):
         self.outputs = outputs
         self.bit = outputs.validate_bit(bit)
         self.interval_s = float(interval_s)
         self.pulse_duration_s = float(pulse_duration_s)
         if not math.isfinite(self.interval_s) or self.interval_s <= 0.0:
-            raise ValueError("pump_interval must be a positive finite value")
+            raise ValueError("reward_interval must be a positive finite value")
         if not math.isfinite(self.pulse_duration_s) or self.pulse_duration_s <= 0.0:
             raise ValueError("pump_pulse_time_seconds must be a positive finite value")
         if self.pulse_duration_s >= self.interval_s:
             raise ValueError(
-                "pump_pulse_time_seconds must be shorter than pump_interval"
+                "pump_pulse_time_seconds must be shorter than reward_interval"
             )
         self._clock = clock
+        self._reward_policy = reward_policy
         self._stop_event = threading.Event()
         self._failed_event = threading.Event()
         self._edges: queue.SimpleQueue[DOUTPulseEdge] = queue.SimpleQueue()
@@ -228,7 +232,13 @@ class PeriodicDOUTPulseController:
                     break
 
                 now_perf_s = self._clock()
-                if now_perf_s >= next_on_perf_s + self.interval_s:
+                if self._reward_policy is not None:
+                    if not self._reward_policy.status(now_s=now_perf_s).due:
+                        # Keep checking the rolling windows without waiting for
+                        # another scheduled interval or blocking presentation.
+                        next_on_perf_s = now_perf_s + 0.005
+                        continue
+                elif now_perf_s >= next_on_perf_s + self.interval_s:
                     skipped_intervals = int(
                         (now_perf_s - next_on_perf_s) // self.interval_s
                     )
@@ -242,6 +252,9 @@ class PeriodicDOUTPulseController:
                     pulse_index=pulse_index,
                 )
                 output_active = True
+                if self._reward_policy is not None:
+                    requested_on_perf_s = self._clock()
+                    self._reward_policy.reward_delivered(now_s=requested_on_perf_s)
 
                 if self._stop_event.wait(self.pulse_duration_s):
                     break
@@ -252,7 +265,7 @@ class PeriodicDOUTPulseController:
                 output_active = False
                 next_on_perf_s = requested_on_perf_s + self.interval_s
                 now_perf_s = self._clock()
-                if next_on_perf_s <= now_perf_s:
+                if self._reward_policy is None and next_on_perf_s <= now_perf_s:
                     expired = int(
                         math.floor((now_perf_s - next_on_perf_s) / self.interval_s)
                     ) + 1

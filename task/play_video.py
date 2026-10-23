@@ -24,6 +24,7 @@ from bin.daqc2_outputs import DAQC2DigitalOutputs, PeriodicDOUTPulseController
 from bin.buffered_video import DEFAULT_BUFFER_BYTES
 from bin.frame_timing import plan_frame_duration
 from bin.eye_tracking_config import load_eye_tracking_settings
+from bin.fixation_reward import ScreenAutoReward
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.video_playback import (
@@ -72,7 +73,7 @@ def parse_args():
     parser.add_argument("--daq_module", default=None, help="Python module for the DAQC2plate driver")
     parser.add_argument("--pump_pin", type=int, default=None, help="DAQC2 DOUT bit for the periodic pump pulse (0-7)")
     parser.add_argument("--pump_pulse_time_seconds", type=float, default=None, help="Duration of each pump pulse")
-    parser.add_argument("--pump_interval", type=float, default=None, help="Seconds between periodic pump onsets")
+    parser.add_argument("--reward_interval", type=float, default=None, help="Seconds between reward onsets; requires on-screen fixation when eye tracking is enabled")
     parser.add_argument("--main_screen", default=None, help="Main task screen index or output name")
     parser.add_argument("--experimenter_screen", default=None, help="Experimenter screen index or output name")
     return parser.parse_args()
@@ -100,7 +101,7 @@ def run_task(
     daq_module_name: str = "piplates.DAQC2plate",
     pump_pin: int = 0,
     pump_pulse_time_seconds: Optional[float] = None,
-    pump_interval: Optional[float] = None,
+    reward_interval: Optional[float] = None,
     frame_rate: float = 30.0,
     video_buffer_megabytes: float = DEFAULT_BUFFER_BYTES / (1024 * 1024),
     eye_tracking_config=None,
@@ -145,9 +146,9 @@ def run_task(
         )
         if sync_pin < 0:
             raise ValueError("sync_pin must be a non-negative BCM GPIO number")
-        if pump_interval is None or pump_pulse_time_seconds is None:
+        if reward_interval is None or pump_pulse_time_seconds is None:
             raise ValueError(
-                "pump_interval and pump_pulse_time_seconds are required when raspi=true"
+                "reward_interval and pump_pulse_time_seconds are required when raspi=true"
             )
 
     resolved_video_files = _resolve_video_files(video_files)
@@ -170,9 +171,19 @@ def run_task(
     sync_gpio_chip = None
     pump_outputs = None
     pump_controller = None
+    screen_reward = (
+        ScreenAutoReward(
+            reward_interval=float(reward_interval),
+            calibration=eye_tracking_config.calibration,
+            max_sample_age_s=eye_tracking_config.uart.max_sample_age_s,
+        )
+        if raspi and eye_tracking_config is not None
+        else None
+    )
     resolved_config_name = str(config_name).strip() if config_name else "play_video"
     session_logs = SessionLogBundle(
         eye_tracking_config=eye_tracking_config,
+        on_eye_state=screen_reward.observe if screen_reward is not None else None,
         output_root=output_dir,
         task_name="play_video",
         config_name=resolved_config_name,
@@ -560,8 +571,9 @@ def run_task(
             pump_controller = PeriodicDOUTPulseController(
                 pump_outputs,
                 bit=pump_pin,
-                interval_s=float(pump_interval),
+                interval_s=float(reward_interval),
                 pulse_duration_s=float(pump_pulse_time_seconds),
+                reward_policy=screen_reward,
             )
 
         msg_logger.log(
@@ -598,17 +610,29 @@ def run_task(
             msg_logger.log("WARN", f"cpu_affinity_unavailable {affinity_plan.get('reason')}")
 
         if pump_controller is not None:
-            pump_controller.start(anchor_perf_s=time.perf_counter())
+            reward_anchor_s = time.perf_counter()
+            if screen_reward is not None:
+                screen_reward.toggle(now_s=reward_anchor_s)
+            pump_controller.start(anchor_perf_s=reward_anchor_s)
             msg_logger.log(
                 "INFO",
                 (
                     f"periodic_pump_started daq_module={daq_module_name} "
                     f"daq_address={daq_address} pump_dout={pump_pin} "
-                    f"pump_interval_s={float(pump_interval):.6f} "
+                    f"reward_interval_s={float(reward_interval):.6f} "
                     f"pulse_duration_s={float(pump_pulse_time_seconds):.6f} "
-                    "schedule=absolute_onset skip_missed_intervals=1"
+                    f"schedule={'screen_fixation' if screen_reward is not None else 'absolute_onset'} "
+                    "skip_missed_intervals=1"
                 ),
             )
+            if screen_reward is not None:
+                msg_logger.log(
+                    "INFO",
+                    "reward_fixation area=subject_screen window_mode=rolling reset_on_reward=1 "
+                    f"recent_seconds={screen_reward.RECENT_SECONDS} "
+                    f"recent_fraction_gt={screen_reward.RECENT_THRESHOLD} "
+                    f"interval_fraction_gt={screen_reward.INTERVAL_THRESHOLD}",
+                )
 
         msg_logger.log(
             "INFO",
@@ -1114,7 +1138,7 @@ def main():
             ),
             pump_pin=int(_get("pump_pin", cfg.get("pump_pin", 0))),
             pump_pulse_time_seconds=_optional_float("pump_pulse_time_seconds"),
-            pump_interval=_optional_float("pump_interval"),
+            reward_interval=_optional_float("reward_interval"),
         )
         if stop_reason != "done":
             sys.exit(USER_EXIT_CODE)

@@ -23,6 +23,8 @@ from bin.buffered_video import (
     copy_ffpyplayer_rgb24,
     plan_video_chunks,
 )
+from bin.eye_tracking import EyeTrackerState
+from bin.eye_tracking_config import EyeTrackingSettings
 from bin.video_playback import (
     RandomFramePulseSchedule,
     SharedVideoFrameBuffer,
@@ -1330,6 +1332,77 @@ class PlayVideoTaskTests(unittest.TestCase):
                 for level, message in messages
             )
         )
+
+    def test_reward_interval_config_and_cli_override_reach_task(self):
+        module, _, _ = self._make_validation_harness(
+            source_rate="30/1", monitor_rate=60,
+        )
+        module.load_config = Mock(return_value={
+            "config_name": "video", "output_dir": "unused", "video_files": ["clip.mp4"],
+            "clip_duration_seconds": 2, "num_clips": 1, "reward_interval": 4,
+        })
+        module.run_task = Mock(return_value="done")
+        for extra_args, expected in (([], 4), (["--reward_interval", "2.5"], 2.5)):
+            with self.subTest(extra_args=extra_args), patch.object(
+                sys, "argv", ["play_video", "--config", "video.json", *extra_args],
+            ):
+                module.main()
+                self.assertEqual(module.run_task.call_args.kwargs["reward_interval"], expected)
+
+    def test_enabled_eye_tracking_connects_acquisition_to_pump_gate_without_preview(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                module, fake_utils, messages = self._make_validation_harness(
+                    source_rate="30/1", monitor_rate=60,
+                )
+                settings = EyeTrackingSettings(show_preview=False) if enabled else None
+                controller = Mock(failed=False, failure=None)
+                controller.drain_edges.return_value = []
+                module.PeriodicDOUTPulseController = Mock(return_value=controller)
+                fake_utils.play_video_fill_screen.return_value = {
+                    "video_name": "clip.mp4", "aborted": False,
+                }
+
+                def start(*, anchor_perf_s):
+                    policy = module.PeriodicDOUTPulseController.call_args.kwargs["reward_policy"]
+                    observe = module.SessionLogBundle.call_args.kwargs["on_eye_state"]
+                    if not enabled:
+                        self.assertIsNone(policy)
+                        self.assertIsNone(observe)
+                        return
+                    self.assertTrue(policy.status(now_s=anchor_perf_s).enabled)
+                    self.assertFalse(policy.status(now_s=anchor_perf_s + 1).due)
+                    # The same UART observer updates the actual pump's gate.
+                    for ms in range(1001):
+                        observe(EyeTrackerState(
+                            timestamp_perf_s=anchor_perf_s + ms / 1000,
+                            frame_sequence=ms + 1, valid=True,
+                        ))
+                    self.assertTrue(policy.status(now_s=anchor_perf_s + 1).due)
+                    observe(EyeTrackerState(
+                        timestamp_perf_s=anchor_perf_s + 1, frame_sequence=1001,
+                        valid=False, rejection_reason="uart_error",
+                    ))
+                    self.assertFalse(policy.status(now_s=anchor_perf_s + 1).due)
+
+                controller.start.side_effect = start
+                gpio = types.SimpleNamespace(
+                    gpiochip_open=Mock(return_value=0), gpio_claim_output=Mock(return_value=0),
+                    gpio_write=Mock(return_value=0), gpiochip_close=Mock(),
+                )
+                with tempfile.TemporaryDirectory() as tmpdir, patch.dict(sys.modules, {"lgpio": gpio}):
+                    path = Path(tmpdir) / "clip.mp4"
+                    path.touch()
+                    self.assertEqual(module.run_task(
+                        video_files=[str(path)], clip_duration_seconds=2,
+                        output_dir=tmpdir, num_clips=1, raspi=True,
+                        reward_interval=1, pump_pulse_time_seconds=0.1,
+                        eye_tracking_config=settings,
+                    ), "done")
+                controller.stop.assert_called_once()
+                self.assertEqual(module.PeriodicDOUTPulseController.call_args.kwargs["interval_s"], 1)
+                schedule = "screen_fixation" if enabled else "absolute_onset"
+                self.assertTrue(any(f"schedule={schedule}" in message for _, message in messages))
 
     def test_run_task_propagates_native_geometry_and_clockwise_rotation(self):
         mouse = types.SimpleNamespace(

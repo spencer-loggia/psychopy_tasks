@@ -4,6 +4,8 @@ import unittest
 from unittest.mock import patch
 
 from bin.daqc2_outputs import DAQC2DigitalOutputs, PeriodicDOUTPulseController
+from bin.eye_tracking import EyeCalibration, EyeTrackerState
+from bin.fixation_reward import ScreenAutoReward
 
 
 class DAQC2DigitalOutputsTests(unittest.TestCase):
@@ -103,13 +105,71 @@ class DAQC2DigitalOutputsTests(unittest.TestCase):
 
     def test_periodic_controller_rejects_overlapping_pulses(self):
         outputs = DAQC2DigitalOutputs(enabled=False)
-        with self.assertRaisesRegex(ValueError, "shorter than pump_interval"):
+        with self.assertRaisesRegex(ValueError, "shorter than reward_interval"):
             PeriodicDOUTPulseController(
                 outputs,
                 bit=0,
                 interval_s=0.25,
                 pulse_duration_s=0.25,
             )
+
+    def run_fixation_pulses(self, *, misses=(), samples_end_ms=2300, stop_s=2.3):
+        policy = ScreenAutoReward(
+            reward_interval=1, calibration=EyeCalibration(x_scale=1, y_scale=1),
+            max_sample_age_s=0.15,
+        )
+        policy.toggle(now_s=0)
+        now = 0.0
+        last_sample_ms = -1
+        writes = []
+
+        def wait(seconds):
+            nonlocal now, last_sample_ms
+            now = min(stop_s, round(now + seconds, 9))
+            end_ms = min(samples_end_ms, int(round(now * 1000)))
+            for ms in range(last_sample_ms + 1, end_ms + 1):
+                policy.observe(EyeTrackerState(
+                    timestamp_perf_s=ms / 1000, frame_sequence=ms + 1,
+                    x_smooth_px=1 if ms in misses else 0, y_smooth_px=0, valid=True,
+                ))
+            last_sample_ms = end_ms
+            return now >= stop_s
+
+        outputs = types.SimpleNamespace(
+            validate_bit=int, write=lambda bit, active: writes.append((active, now)),
+        )
+        controller = PeriodicDOUTPulseController(
+            outputs, bit=0, interval_s=1, pulse_duration_s=0.1,
+            clock=lambda: now, reward_policy=policy,
+        )
+        controller._anchor_perf_s = 0
+        controller._stop_event = types.SimpleNamespace(wait=wait)
+        controller._run()
+        self.assertIsNone(controller.failure)
+        return writes
+
+    def test_fixation_pump_waits_until_gaze_qualifies_and_spaces_delayed_rewards(self):
+        writes = self.run_fixation_pulses(misses=range(980, 1000))
+        onsets = [when for active, when in writes if active]
+        self.assertEqual(len(onsets), 2)
+        self.assertGreater(onsets[0], 1.095)
+        self.assertLessEqual(onsets[0], 1.105)
+        # History starts with the first new camera sample after reset; the
+        # worker delivers at the first check with a complete fresh interval.
+        self.assertGreaterEqual(onsets[1] - onsets[0], 1.001)
+        self.assertLessEqual(onsets[1] - onsets[0], 1.006)
+        self.assertEqual([active for active, _ in writes], [True, False, True, False])
+        self.assertAlmostEqual(writes[1][1] - writes[0][1], 0.1)
+
+    def test_fixation_pump_blocks_without_samples_and_when_acquisition_stops(self):
+        self.assertEqual(self.run_fixation_pulses(samples_end_ms=-1), [])
+        self.assertEqual(self.run_fixation_pulses(misses=range(2301)), [])
+        writes = self.run_fixation_pulses(samples_end_ms=1000)
+        self.assertEqual([active for active, _ in writes], [True, False])
+
+    def test_fixation_pump_stopping_during_pulse_clears_output(self):
+        writes = self.run_fixation_pulses(stop_s=1.05)
+        self.assertEqual(writes, [(True, 1), (False, 1.05)])
 
 
 if __name__ == "__main__":

@@ -98,6 +98,25 @@ class TaskEyeTrackingTests(unittest.TestCase):
             finally:
                 session.close()
 
+    def test_state_observer_receives_valid_and_invalid_gaze_without_preview(self):
+        tracker = Mock()
+        observed = []
+        with patch("bin.task_eye_tracking.UARTEyeTracker", return_value=tracker) as factory:
+            session = TaskEyeTrackingSession(
+                EyeTrackingSettings(show_preview=False), on_state=observed.append,
+            )
+            callback = factory.call_args.kwargs["on_state"]
+            valid = EyeTrackerState(timestamp_perf_s=100, frame_sequence=1, valid=True)
+            lost = replace(valid, valid=False, rejection_reason="lost")
+            try:
+                callback(valid)
+                callback(lost)
+                self.assertEqual(observed, [valid, lost])
+            finally:
+                session.close()
+            callback(valid)
+            self.assertEqual(observed, [valid, lost])
+
     def test_shared_session_lifecycle_for_all_presentation_tasks(self):
         for task in (
             "active_foraging",
@@ -140,6 +159,7 @@ class TaskEyeTrackingTests(unittest.TestCase):
 
     def test_recording_follows_acquisition_without_flips_in_exact_experiment_block_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
+            observed = []
             block_dir = Path(tmp).resolve() / "experiment" / "blocks" / "1_active_foraging"
             with patch.dict(os.environ, {EXACT_SESSION_DIR_ENV: str(block_dir)}):
                 logs = SessionLogBundle(
@@ -147,6 +167,7 @@ class TaskEyeTrackingTests(unittest.TestCase):
                     eye_tracking_config=EyeTrackingSettings(
                         uart=UARTEyeTrackerConfig(simulate=True), show_preview=False
                     ),
+                    on_eye_state=observed.append,
                 )
             session = logs.eye_tracking
             try:
@@ -158,6 +179,7 @@ class TaskEyeTrackingTests(unittest.TestCase):
                 with session.recorder.path.open(newline="") as handle:
                     live_rows = list(csv.DictReader(handle))
                 self.assertGreater(len(live_rows), 35)
+                self.assertGreater(sum(state.valid for state in observed), 35)
             finally:
                 logs.close()
             with session.recorder.path.open(newline="") as handle:

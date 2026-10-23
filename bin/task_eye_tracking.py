@@ -39,8 +39,9 @@ def read_preview_gaze(shared, *, now_s=None):
 class TaskEyeTrackingSession:
     """Own an optional Eye 0 tracker, recorder, and calibrated preview mailbox."""
 
-    def __init__(self, settings, *, output_dir=None, task_clock=None):
+    def __init__(self, settings, *, output_dir=None, task_clock=None, on_state=None):
         self.settings = settings
+        self._on_state = on_state
         self.preview_state = (
             mp.get_context("spawn").Array(
                 "d",
@@ -84,7 +85,13 @@ class TaskEyeTrackingSession:
 
     def _update_preview(self, state):
         with self._preview_lock:
-            if self._closed or state == self._last_state or self.preview_state is None:
+            if self._closed:
+                return
+            # Fixation history follows acquisition, even with no preview or
+            # while the presentation thread is busy decoding/flipping video.
+            if self._on_state is not None:
+                self._on_state(state)
+            if state == self._last_state or self.preview_state is None:
                 return
             self._last_state = state
             fraction = (
@@ -122,7 +129,7 @@ class TaskEyeTrackingSession:
 
         Safe on the main task thread: this reads a short-lived memory lock,
         never serial I/O. None includes startup, blink/loss, stale data, errors
-        and service restarts. Current tasks use gaze only for the preview.
+        and service restarts.
         """
         if self._closed:
             return None

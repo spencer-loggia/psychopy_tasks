@@ -19,8 +19,8 @@
   "sync_pulse_frames": 1,
 
   "pump_pin": 0,
-  "pump_pulse_time_seconds": 0.35,
-  "pump_interval": 16.0,
+  "pump_pulse_time_seconds": 0.1,
+  "reward_interval": 4.0,
 
   "eye_tracking": {"enabled": true}
 }

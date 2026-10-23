@@ -510,6 +510,9 @@ class EyeCalibrationTaskTests(unittest.TestCase):
         self.assertIn("auto OFF", statuses[-1])
         self.assertEqual(saved["fixation_acceptance"]["reward_interval"], 0.3)
         self.assertEqual(saved["fixation_acceptance"]["fraction_basis"], "time")
+        self.assertEqual(saved["fixation_acceptance"]["interval_fraction_threshold"], 0.80)
+        self.assertEqual(saved["fixation_acceptance"]["window_mode"], "rolling")
+        self.assertTrue(saved["fixation_acceptance"]["reset_on_reward"])
         tracker.stop.assert_called_once()
 
     def test_invalid_auto_reward_interval_is_rejected_before_hardware_or_windows(self):

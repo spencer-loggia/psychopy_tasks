@@ -30,14 +30,15 @@ def reward_interval_duration(
 
 
 def run_outcome_interval(
-    *, trial_num, onset_perf_ns, num_pulses, apply_timeout,
+    *, trial_num, onset_perf_ns, onset_requested_perf_ns, num_pulses, apply_timeout,
     reward_interval_s, timeout_duration_s, pump_delay_s, pump_pulse_s,
     inter_pump_interval_s, logger, set_pump, set_buzzer, poll_callback=None,
 ):
     """Run reward OR timeout, returning the actual ITI start, or None on abort.
 
     All non-timeout outcomes share one deadline anchored to the choice-clear
-    flip. Pulse widths/gaps are anchored to hardware edges, so event logging
+    flip, whose request and observed timestamps belong to the outcome event.
+    Pulse widths/gaps are anchored to hardware edges, so event logging
     does not add a fresh delay. Hardware overruns never truncate a pump pulse.
     The caller must still run a complete ITI after this function returns.
     """
@@ -91,9 +92,11 @@ def run_outcome_interval(
     finally:
         # Preserve edge timestamps, but submit rows only after outputs are off
         # and the ITI start is captured. More pump events must not add reward time.
-        if duration > 0:
-            logger.log_event(trial_num=trial_num, event=phase, event_type="lifecycle",
-                             timestamp_perf_ns=onset_perf_ns, requested_duration=duration)
+        # Even a zero-duration outcome has a real choice-clear flip to record.
+        logger.log_frame_flip(
+            trial_num=trial_num, event=phase, timestamp_perf_ns=onset_perf_ns,
+            requested_timestamp_perf_ns=onset_requested_perf_ns, requested_duration=duration,
+        )
         for signal in signals:
             logger.log_signal(**signal)
 

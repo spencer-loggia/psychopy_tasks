@@ -274,6 +274,14 @@ class LoggingSpecTests(unittest.TestCase):
         self.assertEqual(option_on.code, 1102)
         self.assertEqual(option_on.description, "Stimulus for option 2 became visible.")
 
+    def test_active_foraging_reserves_legacy_gray_code_without_emitting_it(self):
+        definitions, _ = load_task_event_definitions("active_foraging")
+        self.assertNotIn("grey_inter_trial_interval", definitions)
+        path = Path(__file__).resolve().parents[1] / "event_name_library.json"
+        payload = json.loads(path.read_text())
+        reserved = [name for name, entry in payload["events"].items() if entry["code"] == 109]
+        self.assertEqual(reserved, ["grey_inter_trial_interval"])
+
     def test_event_log_uses_trial_num_without_stimulus_counter(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             bundle = SessionLogBundle(

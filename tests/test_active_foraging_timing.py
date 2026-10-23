@@ -29,7 +29,7 @@ class OutcomeTimingTests(unittest.TestCase):
         edges = []
         logger = Mock()
         logger.log_signal.side_effect = lambda **kw: clock.sleep(log_delay) if log_delay else None
-        logger.log_event.side_effect = lambda **kw: clock.sleep(log_delay) if log_delay else None
+        logger.log_frame_flip.side_effect = lambda **kw: clock.sleep(log_delay) if log_delay else None
         def pump(value):
             if hardware_delay:
                 clock.sleep(hardware_delay)
@@ -37,6 +37,7 @@ class OutcomeTimingTests(unittest.TestCase):
 
         kwargs = dict(
             trial_num=7, onset_perf_ns=start, num_pulses=pulses, apply_timeout=timeout,
+            onset_requested_perf_ns=start - 100,
             reward_interval_s=0.8, timeout_duration_s=1.5, pump_delay_s=0.2,
             pump_pulse_s=0.25, inter_pump_interval_s=0.1, logger=logger,
             set_pump=pump,
@@ -66,9 +67,10 @@ class OutcomeTimingTests(unittest.TestCase):
                 self.assertEqual(end, 10_800_000_000)
                 self.assertEqual(next_cue, 11_100_000_000)
                 self.assertEqual(edges, expected_edges[count])
-                logger.log_event.assert_called_once_with(
-                    trial_num=7, event="reward_interval", event_type="lifecycle",
-                    timestamp_perf_ns=10_000_000_000, requested_duration=0.8)
+                logger.log_frame_flip.assert_called_once_with(
+                    trial_num=7, event="reward_interval", timestamp_perf_ns=10_000_000_000,
+                    requested_timestamp_perf_ns=9_999_999_900, requested_duration=0.8)
+                logger.log_event.assert_not_called()
                 self.assertEqual(logger.log_signal.call_count, count * 2)
 
     def test_timeout_replaces_reward_even_when_mapping_also_requests_pulses(self):
@@ -76,7 +78,9 @@ class OutcomeTimingTests(unittest.TestCase):
         self.assertEqual(end, 11_500_000_000)
         self.assertEqual(next_cue, 11_800_000_000)
         self.assertEqual(edges, [("buzzer", 1, 0), ("buzzer", 0, 1_500_000_000)])
-        self.assertEqual(logger.log_event.call_args.kwargs["event"], "timeout_interval")
+        logger.log_frame_flip.assert_called_once_with(
+            trial_num=7, event="timeout_interval", timestamp_perf_ns=10_000_000_000,
+            requested_timestamp_perf_ns=9_999_999_900, requested_duration=1.5)
 
     def test_slow_logging_does_not_extend_pulses_reward_interval_or_restart_iti(self):
         for count in (0, 1, 2):
@@ -94,9 +98,12 @@ class OutcomeTimingTests(unittest.TestCase):
                                          (2, False, 500_000_000), (1, False, 600_000_000),
                                          (0, False, 100_000_000), (2, True, 100_000_000)):
             with self.subTest(pulses=pulses, timeout=timeout, abort_ns=abort_ns):
-                end, _, edges, _ = self._run(pulses=pulses, timeout=timeout,
-                                             poll=lambda elapsed: elapsed >= abort_ns)
+                end, _, edges, logger = self._run(pulses=pulses, timeout=timeout,
+                                                 poll=lambda elapsed: elapsed >= abort_ns)
                 self.assertIsNone(end)
+                self.assertEqual(logger.log_frame_flip.call_count, 1)
+                self.assertEqual(logger.log_frame_flip.call_args.kwargs["timestamp_perf_ns"], 10_000_000_000)
+                self.assertEqual(logger.log_frame_flip.call_args.kwargs["requested_timestamp_perf_ns"], 9_999_999_900)
                 if edges:
                     self.assertEqual(edges[-1][1], 0)
 
@@ -129,12 +136,20 @@ class OutcomeTimingTests(unittest.TestCase):
             self._run(pulses=2, poll=fail_when_pumping, set_pump=outputs.append)
         self.assertEqual(outputs, [1, 0])
 
-    def test_zero_duration_does_not_emit_noop_interval_or_hardware_events(self):
-        end, _, edges, logger = self._run(pulses=0, reward_interval_s=0)
-        self.assertEqual(end, 10_000_000_000)
-        self.assertEqual(edges, [])
-        logger.log_event.assert_not_called()
-        logger.log_signal.assert_not_called()
+    def test_zero_duration_preserves_actual_flip_without_noop_hardware_events(self):
+        for timeout in (False, True):
+            with self.subTest(timeout=timeout):
+                end, _, edges, logger = self._run(pulses=0, timeout=timeout,
+                                                 reward_interval_s=0, timeout_duration_s=0)
+                self.assertEqual(end, 10_000_000_000)
+                self.assertEqual(edges, [])
+                logger.log_frame_flip.assert_called_once_with(
+                    trial_num=7, event="timeout_interval" if timeout else "reward_interval",
+                    timestamp_perf_ns=10_000_000_000, requested_timestamp_perf_ns=9_999_999_900,
+                    requested_duration=0,
+                )
+                logger.log_event.assert_not_called()
+                logger.log_signal.assert_not_called()
 
     def test_duration_uses_largest_configured_reward_and_validates_timings(self):
         kwargs = dict(pump_delay_time=0.2, pump_pulse_time_seconds=0.25,

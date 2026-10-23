@@ -1128,17 +1128,10 @@ def run_task(
                     apply_timeout = reward_to_timeout_map.get(str(reward_level), 0)
 
             outcome_duration_s = timeout_duration_seconds if apply_timeout > 0 else reward_interval_s
-            gray_duration_requested = outcome_duration_s + float(iti)
             gray_start_ns = trial_meta["gray_flip_perf_ns"]
-            logger.log_frame_flip(
-                trial_num=trial_num,
-                event="grey_inter_trial_interval",
-                timestamp_perf_ns=gray_start_ns,
-                requested_timestamp_perf_ns=trial_meta.get("gray_flip_requested_perf_ns"),
-                requested_duration=gray_duration_requested if gray_duration_requested > 0 else None,
-            )
             iti_start_ns = run_outcome_interval(
                 trial_num=trial_num, onset_perf_ns=gray_start_ns,
+                onset_requested_perf_ns=trial_meta.get("gray_flip_requested_perf_ns"),
                 num_pulses=num_pulses, apply_timeout=apply_timeout > 0,
                 reward_interval_s=reward_interval_s, timeout_duration_s=timeout_duration_seconds,
                 pump_delay_s=pump_delay_time, pump_pulse_s=pump_pulse_time_seconds,

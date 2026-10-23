@@ -111,6 +111,8 @@ class ActiveForagingTaskTests(unittest.TestCase):
         event_path = next((root / "logs").rglob("event_log.tsv"))
         with event_path.open() as handle:
             rows = list(csv.DictReader(handle, delimiter="\t"))
+        self.assertNotIn("grey_inter_trial_interval", [row["event"] for row in rows])
+        self.assertNotIn("109", [row["event_code"] for row in rows])
         for trial in range(1, len(choices) + 1):
             events = [row for row in rows if row["trial_num"] == str(trial)]
             timeout = trial == 4
@@ -119,6 +121,11 @@ class ActiveForagingTaskTests(unittest.TestCase):
             self.assertEqual([row["event"] for row in phases],
                              ["timeout_interval" if timeout else "reward_interval", "inter_trial_interval"])
             self.assertEqual([row["event_code"] for row in phases], ["4" if timeout else "3", "5"])
+            self.assertEqual([row["event_type"] for row in phases], ["frame_flip", "lifecycle"])
+            self.assertEqual(int(phases[0]["task_time_ns"]) - int(phases[0]["requested_task_time_ns"]), 100)
+            cue_event = next(row for row in events if row["event"] == "onset_cue_on")
+            self.assertEqual(int(phases[0]["task_time_ns"]) - int(cue_event["task_time_ns"]), 50_000_000)
+            self.assertEqual(phases[1]["requested_task_time_ns"], "")
             self.assertEqual(float(phases[0]["requested_duration"]), 1.5 if timeout else reward_s)
             self.assertEqual(float(phases[1]["requested_duration"]), 0.2)
             self.assertEqual(int(phases[1]["task_time_ns"]) - int(phases[0]["task_time_ns"]),
@@ -126,5 +133,7 @@ class ActiveForagingTaskTests(unittest.TestCase):
             self.assertEqual(len([row for row in events if row["event"] == "pump_on"]),
                              {2: 1, 3: 2, 6: 0}.get(trial, 0))
         library = json.loads((event_path.parent / "event_code_library.json").read_text())
+        self.assertNotIn("109", library)
         for code, name in (("3", "reward_interval"), ("4", "timeout_interval"), ("5", "inter_trial_interval")):
             self.assertEqual(library[code]["event"], name)
+            self.assertEqual(library[code]["event_type"], "lifecycle" if code == "5" else "frame_flip")

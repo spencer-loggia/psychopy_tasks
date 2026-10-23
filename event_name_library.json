@@ -3,7 +3,8 @@
     "This is the shared repo-wide event name library.",
     "Not every event in this file is used by every task.",
     "Per-session event_code_library.json files contain the minimal subset of event names, codes, event types, and descriptions actually used in that run.",
-    "Indexed AFC-style sequential events are defined through templates so option_{n}_dot and option_{n}_on do not need to be duplicated as static entries."
+    "Indexed AFC-style sequential events are defined through templates so option_{n}_dot and option_{n}_on do not need to be duplicated as static entries.",
+    "Code 109 (grey_inter_trial_interval) remains reserved for historical logs; active_foraging now records the choice-clear flip as reward_interval or timeout_interval."
   ],
   "events": {
     "gray_pre_sequence": {
@@ -168,12 +169,12 @@
     },
     "reward_interval": {
       "code": 3,
-      "event_type": "lifecycle",
+      "event_type": "frame_flip",
       "description": "The fixed-duration reward interval began at the post-choice gray-screen flip, including zero-pulse outcomes."
     },
     "timeout_interval": {
       "code": 4,
-      "event_type": "lifecycle",
+      "event_type": "frame_flip",
       "description": "A timeout interval began at the post-choice gray-screen flip, replacing the reward interval."
     },
     "inter_trial_interval": {
@@ -226,7 +227,6 @@
       "inter_trial_interval",
       "onset_cue_on",
       "choice_start",
-      "grey_inter_trial_interval",
       "cue_touch",
       "initiation_cue_release",
       "option_touch",

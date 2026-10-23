@@ -535,14 +535,18 @@ Active-foraging event naming:
 - Sequential runs (`sequential=true`) log option-specific frame-flip events such as `option_1_dot` and `option_1_on`.
 - Simultaneous runs (`sequential=false`) log combined frame-flip events such as `options_dot` and `options_on`.
 - `choice_start` marks the first frame where a choice can be made.
-- `grey_inter_trial_interval` (109) marks the flip to the gray post-choice screen; its requested
-  duration includes the reward or timeout interval plus the ITI. This legacy event is a display
-  transition, not the start of the behavioral ITI.
-- `reward_interval` (3) marks the fixed reward-interval onset at that same flip, including
-  zero-pulse outcomes. `timeout_interval` (4) replaces it on timeout trials. `inter_trial_interval`
-  (5) marks the actual ITI onset after either interval. These lifecycle events carry their own
-  requested duration; they do not introduce extra display flips. Pump/buzzer event timestamps
-  still record the individual hardware edges.
+- `reward_interval` (3), or `timeout_interval` (4) on timeout trials, is the single `frame_flip`
+  event for the post-choice transition to gray. It carries that flip's requested and observed
+  timestamps and only the reward/timeout interval's requested duration. Zero-pulse outcomes
+  still receive the reward interval. A configured zero-duration outcome retains this event with
+  duration `0` because the choice-clear flip still occurred.
+- `inter_trial_interval` (5) is a `lifecycle` event marking actual ITI onset after either interval,
+  with its own requested duration and no separate request timestamp. The gray display stays
+  unchanged. The next phase's onset marks the preceding phase's end; no interval-end events or
+  additional flips are introduced. Pump/buzzer events still record individual hardware edges.
+- `grey_inter_trial_interval` (109) is no longer emitted by active foraging. Its shared-library
+  definition and code remain reserved for historical logs. Earlier sessions retain their own
+  event-code-library snapshots, including the earlier `lifecycle` types for codes 3 and 4.
 - `cue_touch` and `option_touch` are the current touch interaction events.
 - `trial_start_signal_on/off`, `pump_on/off`, and `buzzer_on/off` are the current signal events.
 - `event_name_library.json` is shared across tasks. For active-foraging sequential runs it defines `option_{n}_dot` and `option_{n}_on` through templates rather than duplicating a separate static entry for each possible option index.

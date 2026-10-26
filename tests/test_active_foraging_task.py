@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 
 import bin
 import numpy as np
-from bin.screen import ScreenGeometry
+from bin.screen import ScreenGeometry, oriented_size, rotate_centered_point, software_stimulus_rotation
 from tests.test_active_foraging_timing import FakeClock
 
 
@@ -39,6 +39,24 @@ def load_task():
 
 
 class ActiveForagingTaskTests(unittest.TestCase):
+    def test_display_margin_config_and_cli_reach_task(self):
+        config_path = Path(__file__).resolve().parents[1] / "config_files/csc2/yuri_headfix_train_noseq_nomem_20260930.json"
+        cfg = json.loads(config_path.read_text())
+        for configured, cli, expected in ((None, [], 0), (200, [], 200), (200, ["--display_margin", "75.5"], 75.5)):
+            with self.subTest(configured=configured, cli=cli):
+                task = load_task()
+                config = dict(cfg)
+                config["screens"] = {"main": 0, "experimenter": 1}
+                config["eye_tracking"] = {"enabled": False}
+                config.pop("display_margin", None)
+                if configured is not None:
+                    config["display_margin"] = configured
+                with patch.object(sys, "argv", ["active_foraging", "--config", str(config_path), *cli]), patch.object(
+                    task, "load_config", return_value=config,
+                ), patch.object(task, "run_task", return_value="done") as run:
+                    task.main()
+                self.assertEqual(run.call_args.kwargs["display_margin"], expected)
+
     def test_all_modes_keep_full_iti_after_fixed_reward_or_replacement_timeout(self):
         for sequential, memory in ((False, False), (False, True), (True, False), (True, True)):
             with self.subTest(sequential=sequential, memory=memory), tempfile.TemporaryDirectory() as tmp:
@@ -48,18 +66,29 @@ class ActiveForagingTaskTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self._exercise_task(Path(tmp), False, False, gap=None, reward_s=0.95)
 
-    def _exercise_task(self, root, sequential, memory, *, gap=0.1, reward_s=0.8):
+    def test_trials_reuse_safe_arcs_with_rotated_rectangular_images(self):
+        for rotation in ("normal", "right", "inverted", "left"):
+            with self.subTest(rotation=rotation), tempfile.TemporaryDirectory() as tmp:
+                self._exercise_task(
+                    Path(tmp), True, True, image_size=(80, 20), output_rotation=rotation,
+                    placement_options=dict(center_point=(-235, 0), stim_range_radius=200, display_margin=50,
+                                           initiation_cue_center_position=(-120, -75)),
+                )
+
+    def _exercise_task(self, root, sequential, memory, *, gap=0.1, reward_s=0.8,
+                       image_size=(10, 10), output_rotation="normal", placement_options=None):
         task = load_task()
+        placement_options = placement_options or {}
         clock = FakeClock()
         utils = task.utils
         utils.split_background_from_palette.return_value = (128, 128, 128), {1: (255, 0, 0)}
         utils.load_shape_definitions.return_value = {i: Path("shape.svg") for i in range(4)}
         utils.setup_task_window.return_value = (
-            Mock(size=(800, 600)), ScreenGeometry(0, 0, 0, 800, 600), None,
+            Mock(size=(800, 600)), ScreenGeometry(0, 0, 0, 800, 600, rotation=output_rotation), None,
         )
         utils.resolve_frame_rate.return_value = 60.0, 1 / 60.0
         utils.make_initiation_cue_stims.return_value = Mock(), Mock()
-        image = np.zeros((10, 10, 3), dtype=np.uint8)
+        image = np.zeros((image_size[1], image_size[0], 3), dtype=np.uint8)
         choices = [2, 3, 4, 1, None, 2]  # levels 1, 2, 3, timeout, no response, next trial
         utils.TrialBufferManager.return_value.get_next_trial.side_effect = [dict(
             type="trial", trial_idx=i, trial_options=[(sid, 1) for sid in range(4)],
@@ -71,6 +100,15 @@ class ActiveForagingTaskTests(unittest.TestCase):
         def present(**kwargs):
             self.assertEqual(kwargs["sequential"], sequential)
             self.assertEqual(kwargs["is_memory"], memory)
+            margin = placement_options.get("display_margin", 0)
+            stim_w, stim_h = oriented_size(image_size, software_stimulus_rotation(output_rotation))
+            for x, y in kwargs["positions"]:
+                self.assertLessEqual(abs(x) + stim_w / 2, 400 - margin + 1e-9)
+                self.assertLessEqual(abs(y) + stim_h / 2, 300 - margin + 1e-9)
+                if "center_point" in placement_options:
+                    sx, sy = rotate_centered_point((x, y), -software_stimulus_rotation(output_rotation))
+                    cx, cy = placement_options["center_point"]
+                    self.assertAlmostEqual(np.hypot(sx - cx, sy - cy), placement_options["stim_range_radius"])
             cue_times.append(clock.ns)
             kwargs["logger"].log_frame_flip(trial_num=kwargs["trial_num"], event="onset_cue_on",
                                             timestamp_perf_ns=clock.ns)
@@ -89,19 +127,26 @@ class ActiveForagingTaskTests(unittest.TestCase):
             "time.perf_counter", side_effect=clock.seconds,
         ), patch("time.perf_counter_ns", side_effect=lambda: clock.ns), patch(
             "time.sleep", side_effect=clock.sleep,
-        ):
+        ), patch.object(task, "prepare_afc_placement", wraps=task.prepare_afc_placement) as prepare:
             result = task.run_task(
                 colors_tsv="colors.tsv", shapes_tsv="shapes.tsv", n_trials=len(choices), num_afc=4,
                 duration=0.1 if sequential or memory else 0, choice_time=1, isi=0.1, iti=0.2,
                 init_dot_color=None, dot_size=10, dot_color=(128, 128, 128),
-                output_dir=str(root / "logs"), subject="Test", image_size=(10, 10),
+                output_dir=str(root / "logs"), subject="Test", image_size=image_size, seed=4,
                 freq_space_tsv={"Test": str(frequency)}, reward_space_tsv={"Test": str(rewards)},
                 sequential=sequential, is_memory=memory, self_initiation=True, fixation_size=0,
                 pump_delay_time=0.2, pump_pulse_time_seconds=0.25, inter_pump_interval=gap,
                 timeout_duration_seconds=1.5,
                 reward_to_pulse_map={"0": 0, "1": 0, "2": 1, "3": 2},
                 reward_to_timeout_map={"0": 1, "1": 0, "2": 0, "3": 0},
+                **placement_options,
             )
+        prepare.assert_called_once()
+        cue_pos = utils.make_initiation_cue_stims.call_args.kwargs["position"]
+        self.assertEqual(
+            rotate_centered_point(cue_pos, -software_stimulus_rotation(output_rotation)),
+            placement_options.get("initiation_cue_center_position", (0, 0)),
+        )
         self.assertEqual(result, "done")
         reward_and_iti_ns = round((reward_s + 0.2) * 1_000_000_000)
         for trial, duration_ns in enumerate((reward_and_iti_ns, reward_and_iti_ns, reward_and_iti_ns,

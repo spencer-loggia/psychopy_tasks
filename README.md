@@ -1145,10 +1145,16 @@ Common `active_foraging` configurations:
 
 Active Foraging Positioning
 ---------------------------
-`active_foraging` places every stimulus center on a stimulus circle in native main-framebuffer pixel coordinates. `center_point` is `[x, y]` with origin at the upper-left of the native `2560x1600` screen. When `center_point` is `null`, it defaults to the exact middle of the main screen. `stim_range_radius` is the circle radius in pixels. When it is `null`, it defaults to half the distance from `center_point` to the closest screen edge. Authored image sizes remain `[width, height]`; their native axis-aligned bounds swap after a 90-degree turn, which placement and overlap checks account for.
+`active_foraging` places every stimulus center on a stimulus circle. Its `center_point` uses PsychoPy-style centered pixel coordinates in the participant's view: `[0, 0]` is screen center, positive X is right, and positive Y is up. `[-500, -500]` therefore means 500 pixels left and down from screen center. `null` also means `[0, 0]`. The task applies the display's software rotation when converting these positions to native framebuffer coordinates for rendering and logging. These settings previously used upper-left-origin native pixels; existing non-null positions authored in that convention must be converted.
+
+`stim_range_radius` is the circle radius in pixels. When it is `null`, it defaults to half the distance from an interior `center_point` to the closest screen edge. Circle centers on or outside the screen edge require an explicit positive radius; circles may extend off-screen.
+
+`display_margin` is the minimum clearance in pixels between **any part of the stimulus image** and each screen edge (default `0`). Before the first trial, active foraging intersects the circle with the rectangle inset by that margin plus half the rotated image dimensions. Random positions are sampled directly and uniformly along the remaining arcs, so no off-screen proposals need to be rejected at trial time. Overlap rejection between stimuli still applies. Authored image sizes remain `[width, height]`; their native axis-aligned bounds swap after a 90- or 270-degree software turn. The calculation uses the actual native framebuffer size and the same output-dependent software rotation as rendering, so the margin also holds in the participant's view. A circle with no usable arc raises a configuration error before trials begin.
+
+For example, on the rig's `1600x2560` participant-facing screen, `center_point: [-500, -500]`, `stim_range_radius: 500`, `image_size: [150, 150]`, and `display_margin: 200` produce an arc toward the central region while excluding positions too near the left edge. A radius of approximately `707.1068` would make that circle pass through `[0, 0]` exactly. The initiation cue is separate and must still have an on-screen center or `null`.
 
 Active foraging and match-to-cue require four self-initiation settings. `initiation_cue_center_position` is either
-`null` for the screen center or `[x, y]` in the same upper-left-origin native framebuffer coordinates.
+`null` for the screen center or `[x, y]` in the same participant-centered, Y-up coordinates as `center_point`.
 `initiation_cue_style` is `"checker"` for the legacy Gaussian-masked checkerboard or `"blob"` for a
 Gaussian-faded cue in `init_dot_color`; both styles have the same dimensions and darken when pressed.
 `hold_cue_to_init_time_s` is the continuous cue-hold duration required to initiate a trial.
@@ -1157,9 +1163,9 @@ A missing or out-of-cue touch lasting at most 100 ms is tolerated. A longer brea
 logs `initiation_cue_release`, and starts the inter-trial interval. When a fixation cross is enabled, it is white
 before and after choice and black while the choice window is open.
 
-- `fixed_positions=true`: locations are evenly spaced around the circle. The spacing angle is `2*pi / num_afc`, and the first location is offset by half that spacing from the point directly below `center_point`.
+- `fixed_positions=true`: locations retain their evenly spaced native-framebuffer layout around the circle. The spacing angle is `2*pi / num_afc`, and the first location is offset by half that spacing from the point directly below the circle center in native coordinates. A fixed location whose full image crosses `display_margin` raises a configuration error rather than moving or dropping an option.
 - `fixed_positions=false`: locations are random points on the circle, with rejected draws when stimulus bounding boxes would overlap.
-- Custom `center_point` and `stim_range_radius` values can be provided in JSON or as `--center_point X Y --stim_range_radius R`.
+- Custom `center_point`, `stim_range_radius`, and `display_margin` values can be provided in JSON or as `--center_point X Y --stim_range_radius R --display_margin M`.
 
 Active Foraging Subject Maps
 ----------------------------
@@ -1277,8 +1283,9 @@ All tasks in this repository must support loading a JSON configuration file as a
 - `win_size` (array of 2 ints, optional)
 - `fixation_size` (int, optional)
 - `image_size` (array of 2 ints, optional)
-- `center_point` (array of 2 ints or null, optional): AFC-style stimulus circle center in main-screen pixels
+- `center_point` (array of 2 ints or null, optional): AFC-style stimulus circle center in participant-centered pixels (X right, Y up; null means `[0, 0]`)
 - `stim_range_radius` (int or null, optional): AFC-style stimulus circle radius in pixels
+- `display_margin` (non-negative number, optional): active-foraging minimum full-image clearance from each screen edge in pixels (default `0`)
 - `trial_start_pin` (int, optional): AFC-style BCM GPIO pin for the trial-start pulse
 - `daq.address` or `daq_address` (int, optional): DAQC2plate address for task hardware outputs
 - `pump_pin` and `buzz_pin` (int, optional): DAQC2 DOUT bits, not Raspberry Pi GPIO pins

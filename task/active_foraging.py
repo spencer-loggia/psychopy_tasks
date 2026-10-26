@@ -13,6 +13,7 @@ Config keys required/additional:
 - colors_tsv: path to TSV file with ID, R, G, B
 - shapes_tsv: path to TSV file with ID, PATH (SVG)
 - image_size: [W, H]
+- display_margin: minimum clearance in pixels between the full stimulus and each screen edge
 - num_afc, n, duration, isi, iti, choice_time, dot_size, dot_color, init_dot_color
 - initiation_cue_center_position, initiation_cue_style, hold_before_choice,
   hold_cue_to_init_time_s
@@ -46,7 +47,11 @@ from bin.affinity import (
     set_process_cpu_affinity,
 )
 from bin.daqc2_outputs import DAQC2DigitalOutputs
-from bin.afc_geometry import compute_afc_positions, screen_px_to_psychopy, stimulus_size
+from bin.afc_geometry import (
+    prepare_afc_placement,
+    screen_px_to_psychopy,
+    subject_centered_to_screen_px,
+)
 from bin.afc_stimuli import render_afc_stimulus
 from bin.frame_timing import (
     plan_frame_duration,
@@ -250,8 +255,9 @@ def parse_args():
     p.add_argument("--self_initiation", action="store_true", default=None, help="Require participant to self-initiate each trial by clicking an onset cue")
     p.add_argument("--fixation_size", type=int, default=None, help="Fixation cross size in pixels; 0 disables fixation")
     p.add_argument("--fixed_positions", action="store_true", default=None, help="Fix option positions to evenly spaced locations on the stimulus circle")
-    p.add_argument("--center_point", type=int, nargs=2, default=None, help="Stimulus circle center in main-screen pixels: X Y")
+    p.add_argument("--center_point", type=int, nargs=2, default=None, help="Stimulus circle center in participant-centered pixels: X right, Y up; 0 0 is screen center")
     p.add_argument("--stim_range_radius", type=int, default=None, help="Stimulus circle radius in pixels")
+    p.add_argument("--display_margin", type=float, default=None, help="Minimum clearance from the full stimulus to each screen edge in pixels (default: 0)")
     p.add_argument("--is_memory", action="store_true", default=None, help="If set, items are removed and replaced by dots for the choice period (memory task). If not set, config value or default True is used")
     p.add_argument("--sequential", action="store_true", default=None, help="Present stimuli sequentially (one at a time). If not set, config value or default True is used")
     p.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate (Hz); skip auto-detection if provided")
@@ -345,6 +351,7 @@ def run_task(
     stroke_linecap: Optional[str] = None,
     screen_config: Optional[Dict[str, Any]] = None,
     eye_tracking_config=None,
+    display_margin: float = 0.0,
 ):
     resolved_subject = "" if subject is None else str(subject).strip()
     freq_space_tsv = resolve_subject_mapped_value(
@@ -799,7 +806,12 @@ def run_task(
             (0.0, 0.0)
             if initiation_cue_center_position is None
             else screen_px_to_psychopy(
-                initiation_cue_center_position,
+                subject_centered_to_screen_px(
+                    initiation_cue_center_position,
+                    main_scene_size,
+                    stimulus_rotation_degrees,
+                    field_name="initiation_cue_center_position",
+                ),
                 main_scene_size,
                 field_name="initiation_cue_center_position",
             )
@@ -1011,6 +1023,28 @@ def run_task(
         return f"{float(value):.9f}"
 
     try:
+        # All trial images are rasterized at image_size. Clip the circle once,
+        # using the renderer's actual native orientation, before any trial.
+        placement = prepare_afc_placement(
+            fixed_positions=fixed_positions,
+            num_afc=num_afc,
+            center_point=(
+                None if center_point is None else subject_centered_to_screen_px(
+                    center_point, main_scene_size, stimulus_rotation_degrees,
+                    field_name="center_point",
+                )
+            ),
+            stim_range_radius=stim_range_radius,
+            stim_size=oriented_size(image_size, stimulus_rotation_degrees),
+            effective_win_size=main_scene_size,
+            display_margin=display_margin,
+        )
+        msg_logger.log(
+            "INFO",
+            f"stimulus_placement subject_center={center_point} center_px={placement.center_px} radius_px={placement.radius_px} "
+            f"stim_size={placement.stim_size} display_margin={display_margin} "
+            f"valid_arcs_rad={placement.valid_arcs}",
+        )
         msg_logger.log(
             "INFO",
             (
@@ -1040,21 +1074,7 @@ def run_task(
                 f"trial_loaded trial_num={trial_num} trial_option_meta={trial_option_meta}",
             )
 
-            first_pair = trial_options[0]
-            stim_size = oriented_size(
-                stimulus_size(preloaded, first_pair),
-                stimulus_rotation_degrees,
-            )
-
-            effective_win_size = main_scene_size
-            sampled_positions, positions = compute_afc_positions(
-                fixed_positions=fixed_positions,
-                num_afc=num_afc,
-                center_point=center_point,
-                stim_range_radius=stim_range_radius,
-                stim_size=stim_size,
-                effective_win_size=effective_win_size,
-            )
+            sampled_positions, positions = placement.sample()
 
             for i, (spos, cpos) in enumerate(zip(sampled_positions, positions), start=1):
                 msg_logger.log("INFO", f"position_assigned trial_num={trial_num} option_num={i} screen_px={spos} psychopy_pos={cpos}")
@@ -1093,7 +1113,7 @@ def run_task(
                 trial_meta=trial_meta,
                 experimenter_preview=experimenter_preview,
                 external_abort_checker=_poll_experimenter_controls,
-                scene_main_size=effective_win_size,
+                scene_main_size=main_scene_size,
                 event_profile="active_foraging",
                 reward_levels=[reward_map.get(pair, 0) for pair in trial_options],
                 stimulus_rotation_degrees=stimulus_rotation_degrees,
@@ -1346,6 +1366,7 @@ def main():
     center_point = tuple(center_point_val) if center_point_val is not None else None
     stim_range_radius_val = _get("stim_range_radius", cfg.get("stim_range_radius", None))
     stim_range_radius = float(stim_range_radius_val) if stim_range_radius_val is not None else None
+    display_margin = float(_get("display_margin", cfg.get("display_margin", 0.0)))
     sequential = bool(_get("sequential", cfg.get("sequential", True)))
     is_memory = bool(_get("is_memory", cfg.get("is_memory", True)))
     
@@ -1409,6 +1430,7 @@ def main():
             fixed_positions=fixed_positions,
             center_point=center_point,
             stim_range_radius=stim_range_radius,
+            display_margin=display_margin,
             sequential=sequential,
             is_memory=is_memory,
             freq_space_tsv=freq_space_tsv,

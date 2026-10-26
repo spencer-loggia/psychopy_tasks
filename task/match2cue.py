@@ -25,7 +25,12 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from bin import utils
-from bin.afc_geometry import compute_afc_positions, screen_px_to_psychopy, stimulus_size
+from bin.afc_geometry import (
+    compute_afc_positions,
+    screen_px_to_psychopy,
+    stimulus_size,
+    subject_centered_to_screen_px,
+)
 from bin.afc_stimuli import (
     AFCStimulusSpace,
     StimulusKey,
@@ -387,7 +392,12 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
             (0.0, 0.0)
             if initiation_config.cue_center_position is None
             else screen_px_to_psychopy(
-                initiation_config.cue_center_position,
+                subject_centered_to_screen_px(
+                    initiation_config.cue_center_position,
+                    main_scene_size,
+                    stimulus_rotation_degrees,
+                    field_name="initiation_cue_center_position",
+                ),
                 main_scene_size,
                 field_name="initiation_cue_center_position",
             )
@@ -599,7 +609,12 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     run_indefinitely = n_trials <= 0
     fixed_positions = bool(cfg.get("fixed_positions", False))
     center_value = cfg.get("center_point")
-    center_point = tuple(center_value) if center_value is not None else None
+    center_point = (
+        subject_centered_to_screen_px(
+            center_value, main_scene_size, stimulus_rotation_degrees,
+            field_name="center_point",
+        ) if center_value is not None else None
+    )
     radius_value = cfg.get("stim_range_radius")
     stim_range_radius = float(radius_value) if radius_value is not None else None
 

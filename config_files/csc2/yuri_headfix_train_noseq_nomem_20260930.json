@@ -57,7 +57,7 @@
   "dot_size": 40,
   "dot_color": [50, 50, 50],
   "init_dot_color": [50, 50, 50],
-  "center_point": [-500, -500],
+  "center_point": [300, -400],
   "stim_range_radius": 566,
   "stroke_width": 0.2,
   "stroke_color": [0, 0, 0],

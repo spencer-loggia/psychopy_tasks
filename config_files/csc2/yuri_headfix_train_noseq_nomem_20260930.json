@@ -21,7 +21,7 @@
     "Sally": "./task/resources/csc2/reward_space_SB.csv"
   },
   "pump_delay_time": 0.0,
-  "pump_pulse_time_seconds": 0.325,
+  "pump_pulse_time_seconds": 0.30,
   "inter_pump_interval": 0.1, 
   "timeout_duration_seconds": 2.25,
   "reward_to_pulse_map": {
@@ -57,8 +57,8 @@
   "dot_size": 40,
   "dot_color": [50, 50, 50],
   "init_dot_color": [50, 50, 50],
-  "center_point": [300, -400],
-  "stim_range_radius": 566,
+  "center_point": [300, -480],
+  "stim_range_radius": 700,
   "stroke_width": 0.2,
   "stroke_color": [0, 0, 0],
   "stroke_linejoin": "round",

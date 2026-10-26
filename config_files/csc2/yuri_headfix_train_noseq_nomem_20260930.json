@@ -58,7 +58,7 @@
   "dot_color": [50, 50, 50],
   "init_dot_color": [50, 50, 50],
   "center_point": [-500, -500],
-  "stim_range_radius": 500,
+  "stim_range_radius": 806,
   "stroke_width": 0.2,
   "stroke_color": [0, 0, 0],
   "stroke_linejoin": "round",
@@ -66,7 +66,7 @@
   "image_size": [150, 150],
   "display_margin": 200,
 
-  "initiation_cue_center_position": [-500, -500],
+  "initiation_cue_center_position": [-700, -400],
   "initiation_cue_style": "checker",
 
   "self_initiation": true,

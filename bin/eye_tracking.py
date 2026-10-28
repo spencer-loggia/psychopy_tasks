@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import asdict, dataclass, replace
+import logging
 import math
 import os
 from pathlib import Path
@@ -18,11 +19,12 @@ import time
 from typing import Optional, Sequence, Tuple
 
 from .task_clock import TaskClock
-from .eye_tracker_wire.controller import EyeTrackerController, SerialPacketChannel
+from .eye_tracker_wire.controller import EyeTrackerController, ResponseTimeout, SerialPacketChannel
 from .eye_tracker_warnings import EyeTrackerWarnings
 from .eye_tracker_wire.protocol import (
     CommandCode,
     DecodedStatus,
+    ProtocolError,
     StatusCode,
     StatusFlag,
     validate_run_number,
@@ -31,6 +33,7 @@ from .eye_tracker_wire.protocol import (
 EXPERIMENT_UART_PENDING_ENV = "NEURO_EYE_TRACKER_EXPERIMENT_PENDING"
 EXPERIMENT_UART_READY_ENV = "NEURO_EYE_TRACKER_EXPERIMENT_READY"
 EXPERIMENT_BLOCK_NUMBER_ENV = "NEURO_EYE_TRACKER_BLOCK_NUMBER"
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -394,7 +397,11 @@ class UARTEyeTracker:
     def _check_status(self, status):
         problems = {}
         if status.status != StatusCode.OK or status.flags & StatusFlag.ERROR:
-            problems["status"] = f"Eye tracker reported an error ({status.status.name}); gaze may be unavailable."
+            problems["status"] = (
+                "UART reply received: eye tracker reports a health error "
+                f"(status={status.status.name}, flags={int(status.flags):#x}); "
+                "gaze may be unavailable. Check the tracker display/logs."
+            )
         if status.flags & StatusFlag.CALIBRATING:
             problems["calibrating"] = "Eye tracker is in calibration mode; tracking/recording may not have started."
         if status.flags & StatusFlag.SHUTTING_DOWN:
@@ -478,6 +485,7 @@ class UARTEyeTracker:
                     self._check_status(status)
                     self._publish_state()
             next_poll = time.perf_counter()
+            consecutive_link_errors = 0
             while not self._stop.is_set():
                 try:
                     sent_ns = time.perf_counter_ns()
@@ -505,10 +513,20 @@ class UARTEyeTracker:
                             round_trip_s=(received_perf_ns - sent_ns) / 1_000_000_000,
                         )
                         self._check_status(status)
+                    consecutive_link_errors = 0
                 except Exception as exc:
                     with self._lock:
                         self.filter.invalidate("uart_error", error=str(exc))
-                    self.warnings.warn("link", f"Eye tracker communication failed: {exc}")
+                    consecutive_link_errors += 1
+                    _LOG.info("Eye UART poll failed (%d consecutive): %s", consecutive_link_errors, exc)
+                    # A single lost telemetry reply does not mean START failed.
+                    # Invalidate gaze immediately, but surface a dialog only
+                    # for a sustained link failure or a non-transient error.
+                    if consecutive_link_errors >= 3 or not isinstance(exc, (ResponseTimeout, ProtocolError)):
+                        self.warnings.warn(
+                            "link", f"Eye tracker telemetry unavailable after {consecutive_link_errors} "
+                            f"consecutive poll failures; acquisition will keep retrying: {exc}"
+                        )
                 self._publish_state()
                 next_poll = max(
                     next_poll + 1 / self.config.poll_rate_hz, time.perf_counter()
@@ -517,14 +535,19 @@ class UARTEyeTracker:
         except Exception as exc:
             with self._lock:
                 self.filter.invalidate("uart_error", error=str(exc))
-            self.warnings.warn("link", f"Eye tracker is unavailable or could not start tracking/recording: {exc}")
+            self.warnings.warn("link", f"Eye tracker is unavailable or tracking/recording start could not be confirmed: {exc}")
             self._publish_state()
         finally:
             try:
                 if start_attempted and controller is not None:
                     status = controller.send_state_command(CommandCode.STOP_TRACKING)
-                    if status.flags & (StatusFlag.TRACKING | StatusFlag.RECORDING | StatusFlag.ERROR):
+                    if status.flags & (StatusFlag.TRACKING | StatusFlag.RECORDING):
                         self.warnings.warn("stop", "Eye tracker did not confirm tracking/recording stopped cleanly.")
+                    elif status.flags & StatusFlag.ERROR:
+                        self.warnings.warn(
+                            "status", "Eye tracker confirmed tracking/recording stopped, "
+                            "but still reports a tracker health error."
+                        )
             except Exception as exc:
                 self._cleanup_error = str(exc)
             finally:

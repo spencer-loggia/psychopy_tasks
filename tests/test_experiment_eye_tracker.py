@@ -72,13 +72,16 @@ class ExperimentEyeTrackerTests(unittest.TestCase):
         self.warning.assert_called_once()
         self.assertIn("Local shutdown will continue", self.warning.call_args.args[0])
 
-    def test_shutdown_requires_shutting_down_flag_without_error(self):
+    def test_shutdown_distinguishes_missing_confirmation_from_health_error(self):
         for flags in (StatusFlag(0), StatusFlag.SHUTTING_DOWN | StatusFlag.ERROR):
             with self.subTest(flags=flags):
                 self.warning.reset_mock()
                 self.controller.shutdown.return_value = Mock(flags=flags)
                 request_eye_tracker_shutdown(self.config).result(timeout=2)
                 self.warning.assert_called_once()
+                if flags & StatusFlag.SHUTTING_DOWN:
+                    self.assertIn("acknowledged shutdown", self.warning.call_args.args[0])
+                    self.assertNotIn("did not confirm", self.warning.call_args.args[0])
 
     def test_shutdown_disabled_and_simulation_never_send_uart(self):
         for config in ({}, {"eye_tracker_experiment": {"enabled": False}},
@@ -164,7 +167,7 @@ class ExperimentEyeTrackerTests(unittest.TestCase):
         self.assertFalse(tracker.ready_path.exists())
 
     def test_unconfirmed_experiment_prevents_numbered_tracking_in_previous_experiment(self):
-        for flags in (StatusFlag(0), StatusFlag.ERROR | StatusFlag.EXPERIMENT_ACTIVE):
+        for flags in (StatusFlag(0), StatusFlag.ERROR):
             with self.subTest(flags=flags):
                 self.controller.start_experiment.return_value = Mock(flags=flags)
                 tracker = self.create()
@@ -178,6 +181,25 @@ class ExperimentEyeTrackerTests(unittest.TestCase):
                     task_tracker._run()
                 channel.assert_not_called()
                 self.assertIn("experiment start was not confirmed", task_tracker.get_state().error)
+
+    def test_successful_start_with_health_error_releases_task_handoff(self):
+        self.controller.start_experiment.return_value = Mock(
+            flags=StatusFlag.ERROR | StatusFlag.EXPERIMENT_ACTIVE,
+        )
+        tracker = self.create()
+        tracker.start_future.result(timeout=2)
+        self.assertFalse(tracker.pending_path.exists())
+        self.assertTrue(tracker.ready_path.is_file())
+        with patch.dict("os.environ", {
+            EXPERIMENT_UART_PENDING_ENV: str(tracker.pending_path),
+            EXPERIMENT_UART_READY_ENV: str(tracker.ready_path),
+        }):
+            UARTEyeTracker()._wait_for_experiment_start()
+        self.warning.assert_called_once()
+        message = self.warning.call_args.args[0]
+        self.assertIn("acknowledged", message)
+        self.assertIn("health error", message)
+        self.assertNotIn("Could not start", message)
 
     def test_disabled_simulated_and_invalid_settings_do_not_open_uart(self):
         for config in ({}, {"eye_tracker_experiment": {"enabled": True, "uart": {"simulate": True}}}, {"eye_tracker_experiment": {"enabled": "yes"}}):

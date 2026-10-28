@@ -26,6 +26,7 @@ from bin.eye_tracker_wire.protocol import (
 )
 from bin.logger import load_task_event_definitions
 from bin.task_clock import TaskClock
+from bin.eye_tracker_wire.controller import ResponseTimeout
 
 FIXTURE = json.loads((Path(__file__).parent / "fixtures/eye_uart_v1.json").read_text())
 STATUS = decode_status(bytes.fromhex(FIXTURE["status"]))
@@ -38,6 +39,58 @@ def sample(frame=1, **kwargs):
 
 
 class EyeTrackingTests(unittest.TestCase):
+    def test_poll_warnings_require_sustained_failure_and_reset_after_recovery(self):
+        for failures, warn in (([1, 1], False), ([2, 2], False), ([3], True)):
+            with self.subTest(failures=failures):
+                self.warning.reset_mock()
+                states = []
+                tracker = UARTEyeTracker(
+                    on_state=states.append, uart_config=UARTEyeTrackerConfig(expect_recording=False),
+                )
+                controller = Mock()
+                controller.start_tracking.return_value = sample()
+                controller.send_state_command.return_value = sample(flags=StatusFlag(0))
+                replies = []
+                for count in failures:
+                    replies.extend([ResponseTimeout("lost telemetry")] * count)
+                    replies.append(sample(len(replies) + 2))
+                def poll():
+                    result = replies.pop(0)
+                    if not replies:
+                        tracker._stop.set()
+                    if isinstance(result, Exception):
+                        raise result
+                    return result
+                controller.poll.side_effect = poll
+                with patch("bin.eye_tracking.SerialPacketChannel"), patch(
+                    "bin.eye_tracking.EyeTrackerController", return_value=controller,
+                ):
+                    tracker._run()
+                self.assertTrue(any(state.rejection_reason == "uart_error" for state in states))
+                self.assertTrue(states[-2].valid)
+                if warn:
+                    self.warning.assert_called_once()
+                    self.assertIn("3 consecutive poll failures", self.warning.call_args.args[0])
+                else:
+                    self.warning.assert_not_called()
+
+    def test_confirmed_stop_with_health_error_is_not_a_communication_failure(self):
+        tracker = UARTEyeTracker(uart_config=UARTEyeTrackerConfig(expect_recording=False))
+        controller = Mock()
+        def start(**kwargs):
+            tracker._stop.set()
+            return sample()
+        controller.start_tracking.side_effect = start
+        controller.send_state_command.return_value = sample(flags=StatusFlag.ERROR)
+        with patch("bin.eye_tracking.SerialPacketChannel"), patch(
+            "bin.eye_tracking.EyeTrackerController", return_value=controller,
+        ):
+            tracker._run()
+        self.warning.assert_called_once()
+        self.assertIn("confirmed tracking/recording stopped", self.warning.call_args.args[0])
+        self.assertIn("health error", self.warning.call_args.args[0])
+        self.assertIsNone(tracker.get_state().error)
+
     def test_acquisition_publishes_each_camera_measurement_once_with_exact_clocks(self):
         origin = 2**60 + 123
         received = []

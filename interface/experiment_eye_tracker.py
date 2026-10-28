@@ -62,9 +62,13 @@ def _shutdown_eye_tracker(uart, warnings):
                 retries=uart.state_retries,
             )
             status = controller.shutdown()
-            if status.flags & StatusFlag.ERROR or not status.flags & StatusFlag.SHUTTING_DOWN:
+            if not status.flags & StatusFlag.SHUTTING_DOWN:
                 warnings.warn(
                     "shutdown", "The eye tracker did not confirm SHUTTING_DOWN. Local shutdown will continue."
+                )
+            elif status.flags & StatusFlag.ERROR:
+                warnings.warn(
+                    "health", "The eye tracker acknowledged shutdown but also reports a tracker health error."
                 )
     except Exception as exc:
         warnings.warn(
@@ -143,10 +147,9 @@ class ExperimentEyeTracker:
                     )
                     if start else controller.stop_experiment()
                 )
-                if status.flags & StatusFlag.ERROR:
-                    self.warnings.warn(action, f"The eye tracker reported an error while trying to {action} the experiment.")
-                elif start and not status.flags & StatusFlag.EXPERIMENT_ACTIVE:
-                    self.warnings.warn(action, "The eye tracker did not report an active experiment after START_EXPERIMENT.")
+                problems = {}
+                if start and not status.flags & StatusFlag.EXPERIMENT_ACTIVE:
+                    problems[action] = "The eye tracker did not report an active experiment after START_EXPERIMENT."
                 elif start:
                     # Numbered starts can replace remote blocks. Release them
                     # only after the intended experiment was acknowledged.
@@ -155,9 +158,18 @@ class ExperimentEyeTracker:
                     StatusFlag.EXPERIMENT_ACTIVE | StatusFlag.TRACKING
                     | StatusFlag.RECORDING | StatusFlag.CALIBRATING
                 ):
-                    self.warnings.warn(action, "The eye tracker is still active after STOP_EXPERIMENT; recording may not have been flushed.")
+                    problems[action] = "The eye tracker is still active after STOP_EXPERIMENT; recording may not have been flushed."
+                if status.flags & StatusFlag.ERROR:
+                    # The controller already checked this command's matching OK
+                    # ACK. ERROR is independent service health, not failed UART
+                    # delivery; do not withhold the confirmed experiment handoff.
+                    problems["health"] = (
+                        f"The eye tracker acknowledged the experiment {action} command "
+                        "but also reports a tracker health error. Check the tracker display/logs."
+                    )
+                self.warnings.warn_many(problems)
         except Exception as exc:
-            self.warnings.warn(action, f"Could not {action} the eye tracker experiment for {self.subject}: {exc}")
+            self.warnings.warn(action, f"Could not confirm the eye tracker experiment {action} for {self.subject}: {exc}")
         finally:
             if start:
                 # Task UART workers wait here, never the task's rendering thread.

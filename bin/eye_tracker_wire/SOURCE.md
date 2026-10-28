@@ -37,3 +37,11 @@ state retries now use the short response timeout before retransmitting, with the
 action timeout reserved for the final attempt. INFO logs distinguish tty write time
 from response wait time. These controller-side changes have not been synchronized
 with the companion repository.
+
+Acknowledgement handling was reviewed against companion commit
+`1ef6c72` on 2026-10-28. The wire schema and exact sequence/OK checks agree.
+Both controller copies now retain the full read deadline through corrupt/partial
+records and ignore uncorrelated sequence-zero replies. UART close keeps raw mode
+to prevent late-ACK echo loops. Explicit `TIOCNXCL` release was brought over from
+the companion UART helper. Local launcher warnings now distinguish command outcome
+from the independent tracker-health ERROR flag.

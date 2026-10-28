@@ -115,6 +115,18 @@ If experiment start is not confirmed, task eye acquisition stays off for that ex
 to avoid writing numbered blocks into a previously active tracker experiment.
 Missing hardware, rejected commands, unexpected status flags, or recording failures show
 nonmodal warning dialogs and write warnings to stderr; experiments and tasks continue.
+Command acknowledgement requires a checksum-valid reply with the exact request sequence
+and status `OK`. The `ERROR` flag separately reports tracker health: it does not undo a
+successful command acknowledgement. An acknowledged active experiment releases task
+startup even if a health warning is present; unsafe gaze still remains invalid. Missing
+ACKs are reported as unconfirmed outcomes, since the remote action may already have run.
+Noise, damaged/truncated replies, late duplicate ACKs, and uncorrelated sequence-zero
+errors are skipped while waiting for the matching reply, within the transaction timeout.
+The UART stays in raw, non-echoing mode between owners so a late reply cannot echo back
+to the tracker. Closing explicitly releases exclusive ownership before the next task.
+An isolated lost telemetry reply invalidates gaze immediately and is retried; three
+consecutive failed polls produce a communication warning (non-transient errors warn
+immediately). Any successful poll resets that consecutive-failure count.
 Repeated warnings of the same kind are suppressed within each session. Missing recording
 does not invalidate otherwise valid gaze, but stopped, unconfigured, calibrating, stale,
 or error telemetry is unusable. Local eye CSV failures also warn without aborting the task.

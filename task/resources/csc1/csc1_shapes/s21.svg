@@ -1,13 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg id="Layer_1" data-name="Layer 1" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 78.24 42.07">
+<svg id="Layer_1" xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 85.04 85.04">
+  <!-- Generator: Adobe Illustrator 30.8.2, SVG Export Plug-In . SVG Version: 2.1.4 Build 7)  -->
   <defs>
     <style>
-      .cls-1 {
+      .st0 {
         fill: none;
         stroke: #000;
         stroke-miterlimit: 10;
       }
     </style>
   </defs>
-  <polygon class="cls-1" points="69.45 21 77.45 4 63.55 4 58.45 15 23.45 14 23.45 1.1 .75 21 22.45 41 23.45 27 57.45 27 62.45 38 77.45 38.4 69.45 21"/>
+  <polygon class="st0" points="72.69 41.35 80.69 24.35 66.79 24.35 61.69 35.35 26.69 34.35 26.69 21.45 3.99 41.35 25.69 61.35 26.69 47.35 60.69 47.35 65.69 58.35 80.69 58.75 72.69 41.35"/>
 </svg>

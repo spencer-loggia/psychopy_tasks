@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg id="Layer_1" data-name="Layer 1" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 63.5 76.15">
+<svg id="Layer_1" xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 85.04 85.04">
+  <!-- Generator: Adobe Illustrator 30.8.2, SVG Export Plug-In . SVG Version: 2.1.4 Build 7)  -->
   <defs>
     <style>
-      .cls-1 {
+      .st0 {
         fill: #fff;
         isolation: isolate;
         stroke: #000;
@@ -10,5 +11,5 @@
       }
     </style>
   </defs>
-  <polygon class="cls-1" points="32.5 .65 .5 26.65 .5 40.05 25.7 20.35 26.5 75.65 38.5 75.65 38.5 19.65 63 38.15 63 26.55 32.5 .65"/>
+  <polygon class="st0" points="43.11 4.96 11.11 30.96 11.11 44.35 36.31 24.66 37.11 79.96 49.11 79.96 49.11 23.96 73.61 42.46 73.61 30.85 43.11 4.96"/>
 </svg>

@@ -3,7 +3,7 @@
   "video_files": [
     "/mnt/data/stim_videos/preproc/monkey_kingdom.mp4"
   ],
-  "clip_duration_seconds": 60.0,
+  "clip_duration_seconds": 80.0,
   "seek_timeout_seconds": 30.0,
   "num_clips": 1, 
   "frame_rate": 24,
@@ -20,7 +20,7 @@
 
   "pump_pin": 0,
   "pump_pulse_time_seconds": 0.1,
-  "reward_interval": 4.0,
+  "reward_interval": 5.0,
 
   "eye_tracking": {"enabled": true}
 }

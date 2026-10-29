@@ -1,0 +1,22 @@
+{
+  "config_name": "touch_and_hold",
+  "subject": "Test",
+  "colors_tsv": "./task/resources/csc2/mt2_062026_amoledB_colors.tsv",
+  "output_dir": "./logs/trainings",
+  "screens": {"main": null, "experimenter": null},
+  "fullscreen": true,
+  "touchscreen": true,
+  "initiation_cue_center_position": [300, -480],
+  "initiation_cue_style": "checker",
+  "init_dot_color": [50, 50, 50],
+  "duration": null,
+  "iti": 1.5,
+  "reward_interval": 1.0,
+  "end_on_release": true,
+  "n": 100,
+  "raspi": true,
+  "daq": {"address": 0},
+  "pump_pin": 0,
+  "pump_pulse_time_seconds": 0.15,
+  "eye_tracking": {"enabled": true}
+}

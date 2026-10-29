@@ -4,8 +4,50 @@ Repository layout
 
 - `bin/`: shared presentation, timing, hardware, screen, and TSV logging helpers.
 - `task/`: runnable tasks, including `active_foraging.py`, `match2cue.py`, `afc_csc1.py`, `afc_trial_sequence.py`, standalone image/video stimulus tasks, and hardware setup utilities.
+- `task/trainings/`: behavior-shaping tasks (touch-and-hold, and future action/fixation training) whose sessions are not experimental data.
 - `config_files/`: deployment configurations.
 - `test_configs/` and `tests/`: development configurations and automated tests.
+
+Touch-and-hold training
+-----------------------
+Select `trainings` → `touch_and_hold` in the Raspberry Pi interface, or run:
+
+```bash
+python task/trainings/touch_and_hold.py --config config_files/trainings/touch_and_hold.json
+```
+
+The initial config uses the same checker initiation cue, `[300, -480]` subject-centered
+position, palette background, cue size, Gaussian mask, and pressed feedback as
+`config_files/csc2/yuri_headfix_train_noseq_nomem_20260930.json`. Position conversion,
+software screen rotation, and cue construction are shared with active foraging.
+
+- `duration`: trial length in seconds from the first cue touch; `null` removes the time limit.
+- `end_on_release`: when `true`, lifting off or moving outside the cue immediately ends the
+  trial, including when `duration` is `null`. There is no release grace period.
+- `iti`: seconds with the cue hidden after a trial ends, measured from cue removal.
+  A fresh touch is required after the cue reappears; holding through ITI does not start a trial.
+- `reward_interval`: seconds of uninterrupted cue contact before the first reward and between
+  subsequent rewards. Release resets this timer. When `end_on_release` is `false`, recontact
+  can earn rewards within the original trial duration.
+- With `duration: null` and `end_on_release: false`, the cue remains continuously present,
+  there are no trial boundaries or ITIs, and `n` is ignored.
+- `n`: number of completed trials; `null` runs until Exit/Escape. The initial config uses
+  100 trials, `duration: 5.0`, `reward_interval: 1.0`, `iti: 0.2`, and `end_on_release: true`.
+- `pump_pulse_time_seconds`: pulse width (initially 0.275), which must be positive and shorter
+  than `reward_interval`. Automatic pulses stop on release or trial end. Reward timing and
+  release detection continue during pulses; missed intervals do not produce catch-up rewards.
+
+The simplified active-foraging experimenter preview shows the cue and gaze, subject/trial
+progress, completed trials, and automatic/manual reward counts. The shared `rew.` / `r`
+manual reward and Exit/Escape controls are available. Eye tracking uses the same settings
+and calibration loader as active foraging; it monitors gaze without gating touch rewards.
+The initial config enables eye tracking, so standalone runs need a saved calibration or
+explicit calibration coefficients; the interface supplies the subject's calibration.
+
+Standalone diagnostic logs default to `logs/trainings/`. Interface runs use their assigned
+experiment block directory. Each session includes `training.json` with
+`"session_type": "training"` and `"experimental_data": false`, plus event/message logs
+and the eye recording when enabled; these are training records, not experimental behavior data.
 
 Experiment Manager
 ------------------
@@ -995,7 +1037,7 @@ mapping on the rig, and exit normally to write a completed `calibration.json`.
 
 Eye tracking in presentation tasks
 ---------------------------------
-`active_foraging`, `play_video`, `match2cue`, `afc_csc1`, `afc_trial_sequence`, and `random_image_sequence`
+`active_foraging`, `play_video`, `match2cue`, `afc_csc1`, `afc_trial_sequence`, `random_image_sequence`, and `trainings/touch_and_hold`
 use the same Eye 0 UART reader and calibration loader. Enable it in a task config with
 `"eye_tracking": {"enabled": true}`. The experiment manager passes the latest calibration coefficients and
 references the calibration artifact so UART/filter settings and pixel-coordinate metadata also carry forward.

@@ -25,6 +25,22 @@ class InitiationConfig:
     hold_cue_to_init_time_s: float
 
 
+def initiation_cue_position(position, main_scene_size, rotation_degrees=0):
+    """Map subject-centered cue coordinates to the native PsychoPy window."""
+    from .afc_geometry import screen_px_to_psychopy, subject_centered_to_screen_px
+
+    if position is None:
+        return (0.0, 0.0)
+    return screen_px_to_psychopy(
+        subject_centered_to_screen_px(
+            position, main_scene_size, rotation_degrees,
+            field_name="initiation_cue_center_position",
+        ),
+        main_scene_size,
+        field_name="initiation_cue_center_position",
+    )
+
+
 def build_initiation_cue_image(
     size_px: int,
     *,

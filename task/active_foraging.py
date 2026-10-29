@@ -49,7 +49,6 @@ from bin.affinity import (
 from bin.daqc2_outputs import DAQC2DigitalOutputs
 from bin.afc_geometry import (
     prepare_afc_placement,
-    screen_px_to_psychopy,
     subject_centered_to_screen_px,
 )
 from bin.afc_stimuli import render_afc_stimulus
@@ -63,7 +62,7 @@ from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 import numpy as np
 from bin.config import load_config, resolve_subject_mapped_value, validate_config
-from bin.initiation import INITIATION_CONFIG_KEYS, resolve_initiation_config
+from bin.initiation import INITIATION_CONFIG_KEYS, initiation_cue_position, resolve_initiation_config
 from bin.screen import (
     ExperimenterPreview,
     describe_screen,
@@ -802,19 +801,8 @@ def run_task(
     onset_stim = None
     pressed_onset_stim = None
     if self_initiation:
-        onset_position = (
-            (0.0, 0.0)
-            if initiation_cue_center_position is None
-            else screen_px_to_psychopy(
-                subject_centered_to_screen_px(
-                    initiation_cue_center_position,
-                    main_scene_size,
-                    stimulus_rotation_degrees,
-                    field_name="initiation_cue_center_position",
-                ),
-                main_scene_size,
-                field_name="initiation_cue_center_position",
-            )
+        onset_position = initiation_cue_position(
+            initiation_cue_center_position, main_scene_size, stimulus_rotation_degrees,
         )
         onset_stim, pressed_onset_stim = utils.make_initiation_cue_stims(
             win,

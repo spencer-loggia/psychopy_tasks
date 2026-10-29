@@ -75,6 +75,12 @@
             }
             
         },
+        "trainings": {
+            "touch_and_hold": {
+                "launch": "task/trainings/touch_and_hold.py",
+                "config": "config_files/trainings/touch_and_hold.json"
+            }
+        },
         "Match2Cue": {
             "launch": "task/match2cue.py",
             "config": "config_files/csc2/match2cue_auxillary.json"

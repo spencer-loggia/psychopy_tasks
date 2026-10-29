@@ -102,6 +102,21 @@
       "event_type": "interaction",
       "description": "A touch or click was registered on the self-initiation cue."
     },
+    "training_cue_release": {
+      "code": 204,
+      "event_type": "interaction",
+      "description": "Contact with the training cue ended by release or movement outside the cue."
+    },
+    "training_trial_start": {
+      "code": 6,
+      "event_type": "lifecycle",
+      "description": "A training trial began on contact with the cue."
+    },
+    "training_trial_end": {
+      "code": 7,
+      "event_type": "lifecycle",
+      "description": "A training trial ended on release or at its duration limit."
+    },
     "option_touch": {
       "code": 201,
       "event_type": "interaction",
@@ -184,6 +199,18 @@
     }
   },
   "task_event_sets": {
+    "touch_and_hold": [
+      "block_start",
+      "block_end",
+      "onset_cue_on",
+      "cue_touch",
+      "training_cue_release",
+      "training_trial_start",
+      "training_trial_end",
+      "gray_inter_trial_interval",
+      "pump_on",
+      "pump_off"
+    ],
     "random_image_sequence": [
       "gray_pre_sequence",
       "stimulus_on",

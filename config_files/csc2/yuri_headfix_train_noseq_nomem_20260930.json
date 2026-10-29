@@ -23,7 +23,7 @@
   "pump_delay_time": 0.0,
   "pump_pulse_time_seconds": 0.275,
   "inter_pump_interval": 0.1, 
-  "timeout_duration_seconds": 2.25,
+  "timeout_duration_seconds": 2.50,
   "reward_to_pulse_map": {
     "0": 0,
     "1": 0,
@@ -50,7 +50,7 @@
     "main": null,
     "experimenter": null
   },
-  "n": 100,
+  "n": 120,
 
   "fullscreen": true,
   "fixation_size": 20,

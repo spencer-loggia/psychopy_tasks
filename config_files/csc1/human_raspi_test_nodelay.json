@@ -3,7 +3,7 @@
   "shapes_tsv": "./task/resources/csc1/csc1_shapes/shape_definitions_csc1.tsv",
   "colors_tsv": "./task/resources/csc1/csc1_colors/csc1_amoled_C.tsv",
   "pump_delay_time": 0.0,
-  "pump_pulse_time_seconds": 0.6,
+  "pump_pulse_time_seconds": 0.5,
   "inter_pump_interval": 0.1, 
   "timeout_duration_seconds": 3.0,
  

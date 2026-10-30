@@ -1209,8 +1209,10 @@ For example, on the rig's `1600x2560` participant-facing screen, `center_point: 
 
 Active foraging and match-to-cue require four self-initiation settings. `initiation_cue_center_position` is either
 `null` for the screen center or `[x, y]` in the same participant-centered, Y-up coordinates as `center_point`.
-`initiation_cue_style` is `"checker"` for the legacy Gaussian-masked checkerboard or `"blob"` for a
-Gaussian-faded cue in `init_dot_color`; both styles have the same dimensions and darken when pressed.
+`initiation_cue_style` is `"checker"` for the legacy Gaussian-masked checkerboard,
+`"dotted_checker"` for that checkerboard with a centered black dot (diameter approximately 20% of cue width),
+or `"blob"` for a Gaussian-faded cue in `init_dot_color`. All styles have the same dimensions and
+Gaussian mask and darken when pressed; the dotted checker's center dot stays black.
 `hold_cue_to_init_time_s` is the continuous cue-hold duration required to initiate a trial.
 `hold_before_choice=true` keeps the pressed cue visible and requires that hold through the pre-choice phases.
 A missing or out-of-cue touch lasting at most 100 ms is tolerated. A longer break aborts only the current trial,

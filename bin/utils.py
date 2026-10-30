@@ -5,7 +5,7 @@ Also supports loading SVG by rasterizing to a requested pixel size (via cairosvg
 
 Modularity helpers included:
 - make_bg_rect: create a full-window background rect in one call.
-- make_onset_cue_stim: build a checker or blob ImageStim with a Gaussian alpha mask.
+- make_onset_cue_stim: build a checker, dotted checker, or blob ImageStim with a Gaussian alpha mask.
 - make_initiation_cue_stims: build matched idle and pressed initiation cues.
 """
 from pathlib import Path
@@ -2055,14 +2055,15 @@ def make_onset_cue_stim(
     cue_color: Optional[Tuple[int, int, int]] = None,
     pressed: bool = False,
 ):
-    """Create a checker or gray-blob onset cue with a Gaussian alpha mask.
+    """Create a checker, dotted checker, or blob cue with a Gaussian alpha mask.
 
     Parameters:
     - size_frac: fraction of min(window size) for cue edge length
     - cells: number of checkerboard cells per side
     - sigma_frac: sigma expressed as a fraction of cue width
     - zero_threshold: values <= this threshold in [0..255] are set to 0 in the mask
-    - style: ``checker`` for the legacy checkerboard or ``blob`` for a solid
+    - style: ``checker`` for the legacy checkerboard, ``dotted_checker`` to add
+      a centered black dot (20% of cue width), or ``blob`` for a solid
       ``cue_color`` that fades into the background
     - pressed: darken the cue to provide immediate press feedback
     """

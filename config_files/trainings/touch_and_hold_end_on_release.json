@@ -7,7 +7,7 @@
   "fullscreen": true,
   "touchscreen": true,
   "initiation_cue_center_position": [300, -480],
-  "initiation_cue_style": "checker",
+  "initiation_cue_style": "dotted_checker",
   "init_dot_color": [50, 50, 50],
   "duration": null,
   "iti": 1.5,

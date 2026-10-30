@@ -15,6 +15,7 @@ INITIATION_CONFIG_KEYS = (
     "hold_before_choice",
     "hold_cue_to_init_time_s",
 )
+INITIATION_CUE_STYLES = ("checker", "dotted_checker", "blob")
 
 
 @dataclass(frozen=True)
@@ -52,11 +53,11 @@ def build_initiation_cue_image(
     zero_threshold: int = 1,
     pressed: bool = False,
 ) -> Image.Image:
-    """Build the RGBA pixels for a checker or Gaussian blob initiation cue."""
+    """Build a checker, dotted checker, or blob cue with a Gaussian fade."""
     size_px = max(4, int(size_px))
     style = str(style).strip().lower()
-    if style not in {"checker", "blob"}:
-        raise ValueError("style must be 'checker' or 'blob'")
+    if style not in INITIATION_CUE_STYLES:
+        raise ValueError(f"style must be one of {INITIATION_CUE_STYLES}")
 
     darken_by = 32 if pressed else 0
 
@@ -65,7 +66,7 @@ def build_initiation_cue_image(
             raise ValueError("cue colors must contain three RGB values")
         return tuple(max(0, min(255, int(channel)) - darken_by) for channel in rgb)
 
-    if style == "checker":
+    if style in {"checker", "dotted_checker"}:
         cue_image = Image.new("RGB", (size_px, size_px), color=darkened(bg_rgb_255))
         draw = ImageDraw.Draw(cue_image)
         cell = max(2, size_px // int(cells))
@@ -75,6 +76,13 @@ def build_initiation_cue_image(
                 yi = y // cell
                 fill = (0, 0, 0) if ((xi + yi) % 2 == 0) else darkened((255, 255, 255))
                 draw.rectangle([x, y, x + cell - 1, y + cell - 1], fill=fill)
+        if style == "dotted_checker":
+            center = (size_px - 1) / 2.0
+            radius = max(1.0, size_px * 0.1)
+            draw.ellipse(
+                (center - radius, center - radius, center + radius, center + radius),
+                fill=(0, 0, 0),
+            )
     else:
         cue_image = Image.new(
             "RGB",
@@ -129,10 +137,10 @@ def resolve_initiation_config(
 
     cue_style_value = cfg.get("initiation_cue_style", "checker")
     if not isinstance(cue_style_value, str):
-        raise ValueError("Config field 'initiation_cue_style' must be 'checker' or 'blob'")
+        raise ValueError(f"Config field 'initiation_cue_style' must be one of {INITIATION_CUE_STYLES}")
     cue_style = cue_style_value.strip().lower()
-    if cue_style not in {"checker", "blob"}:
-        raise ValueError("Config field 'initiation_cue_style' must be 'checker' or 'blob'")
+    if cue_style not in INITIATION_CUE_STYLES:
+        raise ValueError(f"Config field 'initiation_cue_style' must be one of {INITIATION_CUE_STYLES}")
 
     hold_before_choice = cfg.get("hold_before_choice", False)
     if not isinstance(hold_before_choice, bool):

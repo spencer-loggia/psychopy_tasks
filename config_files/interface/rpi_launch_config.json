@@ -79,6 +79,10 @@
             "touch_and_hold": {
                 "launch": "task/trainings/touch_and_hold.py",
                 "config": "config_files/trainings/touch_and_hold.json"
+            },
+            "touch_and_hold_end_on_release": {
+                "launch": "task/trainings/touch_and_hold.py",
+                "config": "config_files/trainings/touch_and_hold_end_on_release.json"
             }
         },
         "Match2Cue": {

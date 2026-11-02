@@ -1519,6 +1519,16 @@ def compute_aspect_cover_size(
     return (content_w * scale, content_h * scale)
 
 
+def compute_preview_aspect_fit(container_size, content_size, *, settings_height=0.0):
+    """Fit the complete subject scene above the optional settings strip."""
+    width, height = map(float, container_size)
+    settings_height = min(max(float(settings_height), 0.0), max(0.0, height - 1))
+    layout = compute_centered_aspect_fit((width, height - settings_height), content_size)
+    layout["box_center"] = (0.0, settings_height / 2)
+    layout["bottom_margin"] += settings_height
+    return layout
+
+
 def scale_scene_length(value: float, main_size: Sequence[float], preview_size: Sequence[float]) -> float:
     main_w = max(float(main_size[0]), 1.0)
     main_h = max(float(main_size[1]), 1.0)
@@ -1780,6 +1790,8 @@ def _experimenter_preview_process(
     calibration_controls_shared=None,
     eye_tracking_shared=None,
     calibration_actions_queue=None,
+    pump_control=None,
+    live_settings=None,
 ) -> None:
     startup_reported = False
 
@@ -1809,7 +1821,12 @@ def _experimenter_preview_process(
             }
         )
         raise
+    from .live_settings_ui import SETTINGS_STRIP_HEIGHT, SettingsPanel
+
+    if live_settings is None and pump_control is not None:
+        live_settings = pump_control.settings
     preview_canvas_size = resolve_screen_canvas_size(screen_info)
+    settings_height = SETTINGS_STRIP_HEIGHT if live_settings is not None else 0.0
     outside_bg_rgb = (30, 30, 30)
     preview_outline_rgb = (150, 150, 150)
 
@@ -1846,9 +1863,10 @@ def _experimenter_preview_process(
             payload.get("main_rotation_deg", 0)
         )
         oriented_main_size = oriented_size(main_size, scene_rotation_deg)
-        layout = compute_centered_aspect_fit(
+        layout = compute_preview_aspect_fit(
             preview_canvas_size,
             oriented_main_size,
+            settings_height=settings_height,
         )
         preview_size = layout["box_size"]
         box_center = layout["box_center"]
@@ -2023,13 +2041,15 @@ def _experimenter_preview_process(
 
     def _place_overlay_controls(layout: Optional[Dict[str, Any]]) -> None:
         if not layout:
-            layout = compute_centered_aspect_fit(preview_canvas_size, preview_canvas_size)
+            layout = compute_preview_aspect_fit(
+                preview_canvas_size, preview_canvas_size, settings_height=settings_height,
+            )
         canvas_w = float(preview_canvas_size[0])
         canvas_h = float(preview_canvas_size[1])
         canvas_left = -canvas_w * 0.5
         canvas_right = canvas_w * 0.5
         canvas_top = canvas_h * 0.5
-        canvas_bottom = -canvas_h * 0.5
+        canvas_bottom = -canvas_h * 0.5 + settings_height
         margin = max(10.0, min(canvas_w, canvas_h) * 0.018)
         box_center = layout.get("box_center", (0.0, 0.0))
         box_size = layout.get("box_size", preview_canvas_size)
@@ -2163,6 +2183,8 @@ def _experimenter_preview_process(
         reward_button_text.draw()
         exit_button_rect.draw()
         exit_button_text.draw()
+        if settings_panel is not None:
+            settings_panel.draw()
 
     try:
         win = open_psychopy_window(
@@ -2208,6 +2230,8 @@ def _experimenter_preview_process(
                 reward_event,
                 exit_event,
                 actions_queue=calibration_actions_queue,
+                pump_control=pump_control,
+                live_settings=live_settings,
             )
             payload = {}
             controls.draw(payload)
@@ -2237,6 +2261,9 @@ def _experimenter_preview_process(
                 win.close()
         return
     mouse = event.Mouse(win=win)
+    settings_panel = SettingsPanel(win, live_settings, visual=visual) if live_settings is not None else None
+    if settings_panel is not None:
+        settings_panel.layout_strip(preview_canvas_size)
     gaze_dot = None
     last_gaze_redraw_s = 0.0
     if eye_tracking_shared is not None:
@@ -2494,9 +2521,10 @@ def _experimenter_preview_process(
                             current_main_size,
                             current_main_rotation_deg,
                         )
-                        movie_layout = compute_centered_aspect_fit(
+                        movie_layout = compute_preview_aspect_fit(
                             preview_canvas_size,
                             shared_movie_target_size,
+                            settings_height=settings_height,
                         )
                         movie_bg_rect = _make_bg_rect(outside_bg_rgb)
                         movie_subject_bg_rect = visual.Rect(
@@ -2572,9 +2600,16 @@ def _experimenter_preview_process(
                 except Exception:
                     continue
 
+            editing_this_frame = settings_panel is not None and settings_panel.editing
             try:
-                if event.getKeys(keyList=["r"]):
+                keys = event.getKeys()
+                if settings_panel is not None:
+                    redraw_requested = redraw_requested or bool(keys)
+                    keys = settings_panel.handle_keys(keys)
+                if "r" in keys:
                     reward_event.set()
+                if "escape" in keys:
+                    exit_event.set()
             except Exception:
                 pass
 
@@ -2590,7 +2625,9 @@ def _experimenter_preview_process(
                         else static_scene.get("layout")
                     )
                     mouse_pos = mouse.getPos()
-                    if reward_button_rect.contains(mouse_pos):
+                    if editing_this_frame or (settings_panel is not None and settings_panel.click(mouse_pos)):
+                        redraw_requested = True
+                    elif reward_button_rect.contains(mouse_pos):
                         reward_event.set()
                     elif exit_button_rect.contains(mouse_pos):
                         exit_event.set()
@@ -2730,6 +2767,8 @@ class ExperimenterPreview:
         startup_timeout_s: float = 10.0,
         calibration_config: Optional[Dict[str, Any]] = None,
         eye_tracking_shared=None,
+        pump_control=None,
+        live_settings=None,
     ):
         self.screen_info = screen_info
         self.task_label = task_label
@@ -2741,6 +2780,10 @@ class ExperimenterPreview:
         self.update_interval_s = max(0.05, float(update_interval_s))
         self.exit_requested = False
         self._closed = False
+        self._live_settings = (
+            live_settings if live_settings is not None else
+            pump_control.settings if pump_control is not None else None
+        )
         self._preview_reward_counts = None
         self._preview_highlight_box = None
         self._preview_bg_rgb_255 = None
@@ -2804,6 +2847,8 @@ class ExperimenterPreview:
                 self._calibration_controls,
                 eye_tracking_shared,
                 self._calibration_actions,
+                pump_control,
+                self._live_settings,
             ),
             daemon=True,
         )
@@ -3218,8 +3263,19 @@ class ExperimenterPreview:
         except Exception:
             pass
         try:
-            if self._process.is_alive():
-                self._process.join(timeout=1.0)
+            settings = getattr(self, "_live_settings", None)
+            join_deadline = time.monotonic() + 1.0
+            while self._process.is_alive():
+                # Queue producers wait for their feeder thread at process
+                # exit. Drain confirmations while joining so a full pipe
+                # cannot make a healthy renderer look hung and lose edits.
+                # This path is shutdown-only; it performs no disk logging.
+                if settings is not None:
+                    settings.collect_requests()
+                remaining = join_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._process.join(timeout=min(0.025, remaining))
         except Exception:
             pass
         try:
@@ -3229,6 +3285,12 @@ class ExperimenterPreview:
             pass
         try:
             self._process.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            settings = getattr(self, "_live_settings", None)
+            if settings is not None:
+                settings.collect_requests()
         except Exception:
             pass
         try:

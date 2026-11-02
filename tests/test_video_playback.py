@@ -1,6 +1,7 @@
 from collections import deque
 import ctypes
 import importlib.util
+import json
 import math
 from multiprocessing import shared_memory
 import queue
@@ -1229,7 +1230,7 @@ class PlayVideoTaskTests(unittest.TestCase):
                 task_time_ns=lambda timestamp=None, timestamp_perf_ns=None: timestamp_perf_ns if timestamp_perf_ns is not None else timestamp
             ),
             message_logger=types.SimpleNamespace(
-                log=lambda level, message: messages.append((level, message))
+                log=Mock(side_effect=lambda level, message, **kwargs: messages.append((level, message)))
             ),
             behavior_logger=types.SimpleNamespace(writerow=Mock()),
             session_dir=Path("test-session"),
@@ -1403,6 +1404,188 @@ class PlayVideoTaskTests(unittest.TestCase):
                 self.assertEqual(module.PeriodicDOUTPulseController.call_args.kwargs["interval_s"], 1)
                 schedule = "screen_fixation" if enabled else "absolute_onset"
                 self.assertTrue(any(f"schedule={schedule}" in message for _, message in messages))
+
+    def test_pulse_edit_updates_next_clip_controller_and_behavior_row(self):
+        from bin.pump_control import PumpPulseControl
+
+        module, utils, _ = self._make_validation_harness(source_rate="30/1", monitor_rate=60)
+        control = PumpPulseControl(0.1, allow_zero=False, reward_interval=1, boundary="clip")
+        self.addCleanup(control.settings.close, module.SessionLogBundle.return_value.message_logger)
+        module.PumpPulseControl = Mock(return_value=control)
+        controller = Mock(failed=False, failure=None)
+        controller.drain_edges.return_value = []
+        module.PeriodicDOUTPulseController = Mock(return_value=controller)
+        durations = []
+
+        def play(*args, **kwargs):
+            durations.append(control.snapshot()[0])
+            control.request(0.2)
+            return {"video_name": "clip.mp4", "aborted": False}
+
+        utils.play_video_fill_screen.side_effect = play
+        gpio = types.SimpleNamespace(
+            gpiochip_open=Mock(return_value=0), gpio_claim_output=Mock(return_value=0),
+            gpio_write=Mock(return_value=0), gpiochip_close=Mock(),
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(sys.modules, {"lgpio": gpio}):
+            path = Path(tmp) / "clip.mp4"
+            path.touch()
+            self.assertEqual(module.run_task(
+                video_files=[str(path)], clip_duration_seconds=2, num_clips=2,
+                output_dir=tmp, raspi=True, reward_interval=1, pump_pulse_time_seconds=0.1,
+            ), "done")
+        self.assertEqual(durations, [0.1, 0.2])
+        self.assertEqual([call.kwargs for call in controller.set_timing.call_args_list], [
+            {"interval_s": 1, "pulse_duration_s": 0.2},
+        ])
+        rows = module.SessionLogBundle.return_value.behavior_logger.writerow.call_args_list
+        self.assertEqual([call.args[0]["pump_pulse_time"] for call in rows], [0.1, 0.2])
+
+    def test_grouped_reward_edits_apply_next_clip_and_reset_screen_fixation_history(self):
+        from bin.pump_control import PumpPulseControl
+
+        module, utils, _ = self._make_validation_harness(source_rate="30/1", monitor_rate=60)
+        control = PumpPulseControl(0.4, allow_zero=False, reward_interval=1, boundary="clip")
+        logger = module.SessionLogBundle.return_value.message_logger
+        self.addCleanup(control.settings.close, logger)
+        module.PumpPulseControl = Mock(return_value=control)
+        controller = Mock(failed=False, failure=None)
+        controller.drain_edges.return_value = []
+        module.PeriodicDOUTPulseController = Mock(return_value=controller)
+        clock = [100.0]
+        clip_values = []
+        update_order = []
+
+        def policy():
+            return module.PeriodicDOUTPulseController.call_args.kwargs["reward_policy"]
+
+        def observe_window(start_s, duration_ms, sequence_start):
+            observe = module.SessionLogBundle.call_args.kwargs["on_eye_state"]
+            for ms in range(duration_ms + 1):
+                observe(EyeTrackerState(
+                    timestamp_perf_s=start_s + ms / 1000,
+                    frame_sequence=sequence_start + ms, valid=True,
+                ))
+
+        def set_timing(**timing):
+            # The pump receives the complete new pair before the separate
+            # fixation policy is reset. The old width cannot fit the new
+            # interval, making separate partial timing writes unsafe.
+            update_order.append((timing, policy().reward_interval))
+
+        controller.set_timing.side_effect = set_timing
+
+        def play(*args, **kwargs):
+            clip_values.append(control.settings.values)
+            if len(clip_values) == 1:
+                observe_window(100, 1000, 1)
+                self.assertTrue(policy().status(now_s=101).due)
+                clock[0] = 101
+                control.settings.request("pump_pulse_time", 0.1)
+                clock[0] = 101.05
+                control.settings.request("reward_interval", 0.2)
+                controller.set_timing.assert_not_called()
+                self.assertEqual(policy().reward_interval, 1)
+                self.assertEqual(control.settings.values, clip_values[0])
+                clock[0] = 102
+            else:
+                self.assertEqual(policy().reward_interval, 0.2)
+                self.assertFalse(policy().status(now_s=102).due)
+                observe_window(101, 1000, 2000)
+                self.assertFalse(policy().status(now_s=102).due)
+                observe_window(102, 210, 4000)
+                self.assertTrue(policy().status(now_s=102.21).due)
+            return {"video_name": "clip.mp4", "aborted": False}
+
+        utils.play_video_fill_screen.side_effect = play
+        gpio = types.SimpleNamespace(
+            gpiochip_open=Mock(return_value=0), gpio_claim_output=Mock(return_value=0),
+            gpio_write=Mock(return_value=0), gpiochip_close=Mock(),
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(sys.modules, {"lgpio": gpio}), patch.object(
+            module.time, "perf_counter", side_effect=lambda: clock[0],
+        ), patch.object(module.time, "perf_counter_ns", side_effect=lambda: round(clock[0] * 1e9)):
+            path = Path(tmp) / "clip.mp4"
+            path.touch()
+            self.assertEqual(module.run_task(
+                video_files=[str(path)], clip_duration_seconds=2, num_clips=2,
+                output_dir=tmp, raspi=True, reward_interval=1, pump_pulse_time_seconds=0.4,
+                eye_tracking_config=EyeTrackingSettings(show_preview=False),
+            ), "done")
+            control.settings.log_requests(logger, finish=True)
+
+        self.assertEqual(clip_values, [
+            {"pump_pulse_time": 0.4, "reward_interval": 1},
+            {"pump_pulse_time": 0.1, "reward_interval": 0.2},
+        ])
+        self.assertEqual(update_order, [({"interval_s": 0.2, "pulse_duration_s": 0.1}, 1)])
+        rows = [call.args[0] for call in module.SessionLogBundle.return_value.behavior_logger.writerow.call_args_list]
+        self.assertEqual([row["pump_pulse_time"] for row in rows], [0.4, 0.1])
+        self.assertEqual([row["reward_interval"] for row in rows], [1, 0.2])
+        audits = [
+            (json.loads(call.args[1].removeprefix("live_setting ")), call.kwargs["timestamp_perf_ns"])
+            for call in logger.log.call_args_list if call.args[1].startswith("live_setting ")
+        ]
+        self.assertEqual(
+            [(item["name"], item["new_value"], timestamp) for item, timestamp in audits if item["phase"] == "confirmed"],
+            [("pump_pulse_time", 0.1, 101_000_000_000), ("reward_interval", 0.2, 101_050_000_000)],
+        )
+        self.assertEqual(
+            [(item["name"], item["new_value"], timestamp) for item, timestamp in audits if item["phase"] == "applied"],
+            [("pump_pulse_time", 0.1, 102_000_000_000), ("reward_interval", 0.2, 102_000_000_000)],
+        )
+
+    def test_busy_fixation_policy_defers_entire_edit_without_waiting_for_acquisition(self):
+        from bin.pump_control import PumpPulseControl
+
+        module, utils, _ = self._make_validation_harness(source_rate="30/1", monitor_rate=60)
+        control = PumpPulseControl(0.1, allow_zero=False, reward_interval=1, boundary="clip")
+        self.addCleanup(control.settings.close, module.SessionLogBundle.return_value.message_logger)
+        module.PumpPulseControl = Mock(return_value=control)
+        controller = Mock(failed=False, failure=None)
+        controller.drain_edges.return_value = []
+        module.PeriodicDOUTPulseController = Mock(return_value=controller)
+        values_by_clip = []
+        policy_lock = []
+
+        class BusyAcquisitionLock:
+            def acquire(self, blocking=True):
+                if blocking:
+                    raise AssertionError("The clip boundary must not wait for eye acquisition")
+                return False
+
+        def play(*args, **kwargs):
+            policy = module.PeriodicDOUTPulseController.call_args.kwargs["reward_policy"]
+            values_by_clip.append(control.settings.values["reward_interval"])
+            if len(values_by_clip) == 1:
+                control.settings.request("reward_interval", 0.5)
+                policy_lock.append(policy._lock)
+                policy._lock = BusyAcquisitionLock()
+            elif len(values_by_clip) == 2:
+                controller.set_timing.assert_not_called()
+                self.assertEqual(policy.reward_interval, 1)
+                policy._lock = policy_lock.pop()
+            else:
+                self.assertEqual(policy.reward_interval, 0.5)
+            return {"video_name": "clip.mp4", "aborted": False}
+
+        utils.play_video_fill_screen.side_effect = play
+        gpio = types.SimpleNamespace(
+            gpiochip_open=Mock(return_value=0), gpio_claim_output=Mock(return_value=0),
+            gpio_write=Mock(return_value=0), gpiochip_close=Mock(),
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(sys.modules, {"lgpio": gpio}):
+            path = Path(tmp) / "clip.mp4"
+            path.touch()
+            self.assertEqual(module.run_task(
+                video_files=[str(path)], clip_duration_seconds=2, num_clips=3,
+                output_dir=tmp, raspi=True, reward_interval=1, pump_pulse_time_seconds=0.1,
+                eye_tracking_config=EyeTrackingSettings(show_preview=False),
+            ), "done")
+        self.assertEqual(values_by_clip, [1, 1, 0.5])
+        controller.set_timing.assert_called_once_with(interval_s=0.5, pulse_duration_s=0.1)
+        rows = module.SessionLogBundle.return_value.behavior_logger.writerow.call_args_list
+        self.assertEqual([call.args[0]["reward_interval"] for call in rows], [1, 1, 0.5])
 
     def test_run_task_propagates_native_geometry_and_clockwise_rotation(self):
         mouse = types.SimpleNamespace(

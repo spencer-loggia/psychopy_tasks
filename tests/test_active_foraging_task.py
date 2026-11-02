@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 import bin
 import numpy as np
 from bin.screen import ScreenGeometry, oriented_size, rotate_centered_point, software_stimulus_rotation
+from bin.pump_control import PumpPulseControl
 from tests.test_active_foraging_timing import FakeClock
 
 
@@ -64,7 +65,12 @@ class ActiveForagingTaskTests(unittest.TestCase):
 
     def test_omitted_inter_pump_interval_defaults_to_pulse_width(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self._exercise_task(Path(tmp), False, False, gap=None, reward_s=0.95)
+            self._exercise_task(Path(tmp), False, False, gap=None)
+
+    def test_live_edit_keeps_current_trial_width_and_updates_next_trial_timing_and_log(self):
+        for gap in (None, 0.1):
+            with self.subTest(gap=gap), tempfile.TemporaryDirectory() as tmp:
+                self._exercise_task(Path(tmp), False, False, gap=gap, change_pulse=True)
 
     def test_trials_reuse_safe_arcs_with_rotated_rectangular_images(self):
         for rotation in ("normal", "right", "inverted", "left"):
@@ -75,9 +81,16 @@ class ActiveForagingTaskTests(unittest.TestCase):
                                            initiation_cue_center_position=(-120, -75)),
                 )
 
-    def _exercise_task(self, root, sequential, memory, *, gap=0.1, reward_s=0.8,
-                       image_size=(10, 10), output_rotation="normal", placement_options=None):
+    def _exercise_task(self, root, sequential, memory, *, gap=0.1,
+                       image_size=(10, 10), output_rotation="normal", placement_options=None,
+                       change_pulse=False):
         task = load_task()
+        control = PumpPulseControl(0.25)
+        task.PumpPulseControl = Mock(return_value=control)
+        widths = [0.25] * 6
+        if change_pulse:
+            widths[2:] = [0.4] * 4
+        reward_durations = [0.2 + 2 * width + (width if gap is None else gap) for width in widths]
         placement_options = placement_options or {}
         clock = FakeClock()
         utils = task.utils
@@ -98,6 +111,8 @@ class ActiveForagingTaskTests(unittest.TestCase):
         cue_times, gray_times = [], []
 
         def present(**kwargs):
+            if change_pulse and kwargs["trial_num"] == 2:
+                control.request(0.4)
             self.assertEqual(kwargs["sequential"], sequential)
             self.assertEqual(kwargs["is_memory"], memory)
             margin = placement_options.get("display_margin", 0)
@@ -148,18 +163,25 @@ class ActiveForagingTaskTests(unittest.TestCase):
             placement_options.get("initiation_cue_center_position", (0, 0)),
         )
         self.assertEqual(result, "done")
-        reward_and_iti_ns = round((reward_s + 0.2) * 1_000_000_000)
-        for trial, duration_ns in enumerate((reward_and_iti_ns, reward_and_iti_ns, reward_and_iti_ns,
-                                            1_700_000_000, reward_and_iti_ns)):
+        for trial, duration_ns in enumerate(
+            round(((1.5 if i == 3 else reward_durations[i]) + 0.2) * 1e9) for i in range(5)
+        ):
             self.assertEqual(cue_times[trial + 1] - gray_times[trial], duration_ns)
 
         event_path = next((root / "logs").rglob("event_log.tsv"))
         with event_path.open() as handle:
             rows = list(csv.DictReader(handle, delimiter="\t"))
+        with (event_path.parent / "behavior_log.tsv").open() as handle:
+            behavior = list(csv.DictReader(handle, delimiter="\t"))
+        self.assertEqual([float(row["pump_pulse_time"]) for row in behavior], widths)
         self.assertNotIn("grey_inter_trial_interval", [row["event"] for row in rows])
         self.assertNotIn("109", [row["event_code"] for row in rows])
         for trial in range(1, len(choices) + 1):
+            reward_s = reward_durations[trial - 1]
             events = [row for row in rows if row["trial_num"] == str(trial)]
+            for row in events:
+                if row["event"] == "pump_on":
+                    self.assertEqual(float(row["requested_duration"]), widths[trial - 1])
             timeout = trial == 4
             phases = [row for row in events if row["event"] in (
                 "reward_interval", "timeout_interval", "inter_trial_interval")]
@@ -171,7 +193,7 @@ class ActiveForagingTaskTests(unittest.TestCase):
             cue_event = next(row for row in events if row["event"] == "onset_cue_on")
             self.assertEqual(int(phases[0]["task_time_ns"]) - int(cue_event["task_time_ns"]), 50_000_000)
             self.assertEqual(phases[1]["requested_task_time_ns"], "")
-            self.assertEqual(float(phases[0]["requested_duration"]), 1.5 if timeout else reward_s)
+            self.assertAlmostEqual(float(phases[0]["requested_duration"]), 1.5 if timeout else reward_s)
             self.assertEqual(float(phases[1]["requested_duration"]), 0.2)
             self.assertEqual(int(phases[1]["task_time_ns"]) - int(phases[0]["task_time_ns"]),
                              1_500_000_000 if timeout else round(reward_s * 1_000_000_000))

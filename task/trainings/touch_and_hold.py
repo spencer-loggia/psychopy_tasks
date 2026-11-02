@@ -23,6 +23,7 @@ from bin.daqc2_outputs import DAQC2DigitalOutputs
 from bin.eye_tracking_config import load_eye_tracking_settings
 from bin.frame_timing import flip_with_timestamps
 from bin.initiation import initiation_cue_position, resolve_initiation_config
+from bin.pump_control import PumpPulseControl
 from bin.logger import SessionLogBundle
 from bin.screen import (
     ExperimenterPreview, describe_screen, load_screen_config, resolve_scene_size,
@@ -50,6 +51,10 @@ def run_task(
     pulse_s = seconds(pump_pulse_time_seconds, "pump_pulse_time_seconds", positive=True)
     if pulse_s >= state.reward_interval:
         raise ValueError("pump_pulse_time_seconds must be shorter than reward_interval")
+    pump_control = PumpPulseControl(
+        pulse_s, allow_zero=False, reward_interval=state.reward_interval,
+        boundary="update" if state.continuous else "trial", interval_label="Hold interval",
+    )
     outputs = DAQC2DigitalOutputs(address=daq_address, module_name=daq_module_name, enabled=raspi)
     pump_pin = outputs.validate_bit(pump_pin)
 
@@ -62,6 +67,8 @@ def run_task(
         logs = SessionLogBundle(
             output_root=output_dir, task_name="touch_and_hold", config_name=config_name,
             eye_tracking_config=eye_tracking_config, auto_flush=False,
+            live_settings=pump_control.settings,
+            behavior_fieldnames=None if state.continuous else ["trial_num", "pump_pulse_time", "reward_interval", "end_reason"],
         )
         cleanup.callback(logs.close)
         logger = logs.event_logger
@@ -102,6 +109,7 @@ def run_task(
                 current_trial_num=None if state.continuous else 1,
                 total_trials=None if state.continuous else n,
                 eye_tracking_shared=logs.eye_tracking_preview,
+                pump_control=pump_control,
                 mouse_visible=experimenter_cursor_visible_for_touchscreen(
                     touchscreen, os.environ.get(IS_RIG_ENV_VAR),
                 ),
@@ -145,13 +153,14 @@ def run_task(
                 return
             pump_trial = None if manual or state.continuous else state.trial_num
             pump_manual = manual
+            duration_s = pulse_s
             requested_ns = time.perf_counter_ns()
             outputs.write(pump_pin, True)
             actual_ns = time.perf_counter_ns()
-            pump_until_s = actual_ns / 1e9 + pulse_s
+            pump_until_s = actual_ns / 1e9 + duration_s
             logger.log_signal(
                 trial_num=pump_trial, event="pump_on", timestamp_perf_ns=actual_ns,
-                requested_timestamp_perf_ns=requested_ns, requested_duration=pulse_s,
+                requested_timestamp_perf_ns=requested_ns, requested_duration=duration_s,
             )
             if manual:
                 manual_rewards += 1
@@ -206,6 +215,9 @@ def run_task(
                 )
                 preview_key = new_preview_key
 
+        def apply_reward_settings(values, timestamp_ns):
+            state.set_reward_interval(values["reward_interval"], now_s=timestamp_ns / 1e9)
+
         show_scene()
         status = "done"
         while state.phase != "done":
@@ -216,6 +228,11 @@ def run_task(
             manual = "r" in keys
             if preview is not None:
                 manual = preview.consume_manual_reward_request() or manual
+            # Never wait for the preview. Keep bounded-trial settings fixed;
+            # continuous training applies between pulses and starts a fresh hold.
+            if pump_until_s is None and (state.continuous or state.phase == "waiting"):
+                values = pump_control.settings.apply_pending(messages, on_apply=apply_reward_settings)
+                pulse_s = values["pump_pulse_time"]
             sample = mouse.poll()
             now = sample.observed_perf_s
             was_visible, was_touching = state.cue_visible, state.touching
@@ -243,6 +260,10 @@ def run_task(
                 logger.log_event(trial_num=trial_num, event="training_trial_end", event_type="lifecycle",
                                  timestamp_perf_ns=sample.observed_perf_ns)
                 messages.log("INFO", f"trial_end trial={trial_num} reason={state.end_reason}")
+                logs.behavior_logger.writerow({
+                    "trial_num": trial_num, "pump_pulse_time": pulse_s,
+                    "reward_interval": state.reward_interval, "end_reason": state.end_reason,
+                })
             if pump_until_s is not None and (
                 now >= pump_until_s or (not pump_manual and not state.touching)
             ):
@@ -258,6 +279,11 @@ def run_task(
                 logs.flush()
                 next_flush_s = time.perf_counter() + 1.0
             core.wait(0.001)
+        if not state.continuous and state.phase == "holding":
+            logs.behavior_logger.writerow({
+                "trial_num": state.trial_num, "pump_pulse_time": pulse_s,
+                "reward_interval": state.reward_interval, "end_reason": status,
+            })
         messages.log("INFO", f"training_end status={status} completed_trials={state.completed_trials} "
                      f"hold_rewards={automatic_rewards} manual_rewards={manual_rewards}")
         return status

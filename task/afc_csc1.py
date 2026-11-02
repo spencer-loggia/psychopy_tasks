@@ -42,6 +42,7 @@ from bin.config import load_config, validate_config
 from bin.daqc2_outputs import DAQC2DigitalOutputs
 from bin.frame_timing import plan_frame_duration, wait_until
 from bin.eye_tracking_config import load_eye_tracking_settings
+from bin.pump_control import PumpPulseControl
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.screen import (
@@ -159,6 +160,7 @@ def _fmt_optional_int(value: Optional[int]) -> Any:
 def _build_behavior_fieldnames(num_afc: int) -> List[str]:
     fields = [
         "trial_num",
+        "pump_pulse_time",
         "trial_type",
         "cue_feature",
         "choice_feature",
@@ -477,6 +479,7 @@ def run_task(
         if pump_pulse_time_seconds is not None
         else float(reward_pulse_time)
     )
+    pump_control = PumpPulseControl(reward_pulse_s)
     pump_delay_s = float(pump_delay_time)
 
     for label, seconds in (("cue_time", cue_time), ("choice_time", choice_time)):
@@ -580,6 +583,7 @@ def run_task(
         config_name=resolved_config_name,
         behavior_fieldnames=behavior_fieldnames,
         auto_flush=False,
+        live_settings=pump_control.settings if pump_control is not None else None,
     )
     logger = session_logs.event_logger
     msg_logger = session_logs.message_logger
@@ -699,6 +703,7 @@ def run_task(
             experimenter_preview = ExperimenterPreview(
                 experimenter_screen,
                 eye_tracking_shared=session_logs.eye_tracking_preview,
+                pump_control=pump_control,
                 task_label=resolved_config_name,
                 start_perf_s=time.perf_counter(),
                 update_interval_s=0.1,
@@ -1118,6 +1123,7 @@ def run_task(
         msg_logger.log("INFO", f"task_ready n_trials={n_trials} num_afc={num_afc} delay_time={delay_time:.6f}")
 
         for trial_num in range(1, int(n_trials) + 1):
+            reward_pulse_s = pump_control.apply_pending(msg_logger)
             if _poll_experimenter_controls():
                 task_end_notes = "experimenter_exit"
                 msg_logger.log("WARN", "experimenter_exit_before_trial_start")
@@ -1338,6 +1344,7 @@ def run_task(
 
             behavior_row: Dict[str, Any] = {
                 "trial_num": int(trial_num),
+                "pump_pulse_time": reward_pulse_s,
                 "trial_type": current_trial_type,
                 "cue_feature": trial_meta.get("cue_feature", ""),
                 "choice_feature": trial_meta.get("choice_feature", ""),
@@ -1416,12 +1423,12 @@ def run_task(
         except Exception:
             pass
         try:
-            session_logs.close()
+            if experimenter_preview is not None:
+                experimenter_preview.close()
         except Exception:
             pass
         try:
-            if experimenter_preview is not None:
-                experimenter_preview.close()
+            session_logs.close()
         except Exception:
             pass
         try:

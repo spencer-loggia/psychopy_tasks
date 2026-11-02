@@ -321,11 +321,17 @@ def _preview_to_fraction(
 class EyeCalibrationControls:
     def __init__(
         self, win, canvas_size, config, controls_shared, reward_event, exit_event,
-        actions_queue=None,
+        actions_queue=None, pump_control=None, live_settings=None,
     ):
         from bin.eye_tracking import EyeCalibration
 
         self.win = exp_win = win
+        from bin.live_settings_ui import SettingsPanel
+
+        if live_settings is None and pump_control is not None:
+            live_settings = pump_control.settings
+        self.settings_panel = SettingsPanel(win, live_settings, visual=visual) if live_settings is not None else None
+        self.pump_editor = self.settings_panel  # Backwards-compatible inspection alias.
         self.controls_shared = controls_shared
         self.actions_queue = actions_queue
         self.reward_event = reward_event
@@ -397,6 +403,11 @@ class EyeCalibrationControls:
         button_w, button_h = 90.0, 48.0
         reward_pos = (-exp_w / 2 + 65, screen_top - 45)
         exit_pos = (exp_w / 2 - 65, screen_top - 45)
+        if self.settings_panel is not None:
+            self.settings_panel.layout_gutter(
+                left=exp_w / 2 - 125, right=exp_w / 2 - 5,
+                top=screen_top - 82, bottom=-exp_h / 2 + 10,
+            )
         zero_pos = (-exp_w / 2 + 65, -exp_h / 2 + 50)
         x_slider_pos = (0, -exp_h / 2 + 55)
         y_slider_pos = (-exp_w / 2 + 65, 0)
@@ -555,7 +566,10 @@ class EyeCalibrationControls:
         self._publish_controls()
 
     def poll_controls(self):
-        keys = event.getKeys(keyList=("escape", *CALIBRATION_KEYS))
+        editing_this_frame = self.settings_panel is not None and self.settings_panel.editing
+        keys = event.getKeys() if self.settings_panel is not None else event.getKeys(keyList=("escape", *CALIBRATION_KEYS))
+        if self.settings_panel is not None:
+            keys = self.settings_panel.handle_keys(keys)
         with self.controls_shared.get_lock():
             self._apply_pending_gains_locked()
             x_steps, y_steps = self.controls_shared[7:9]
@@ -609,7 +623,9 @@ class EyeCalibrationControls:
         down = bool(self.mouse.getPressed()[0])
         pos = self.mouse.getPos()
         if down and not self.last_down:
-            if self.exit_button[0].contains(pos):
+            if editing_this_frame or (self.settings_panel is not None and self.settings_panel.click(pos)):
+                self.dragging = None
+            elif self.exit_button[0].contains(pos):
                 self.exit_event.set()
             elif self.reward_button[0].contains(pos):
                 self.reward_event.set()
@@ -685,6 +701,8 @@ class EyeCalibrationControls:
             self.status_text, payload.get("status_text", "Waiting for Eye 0 UART data")
         )
         self.status_text.draw()
+        if self.settings_panel is not None:
+            self.settings_panel.draw()
 
     def close(self):
         if self.video_reader is not None:

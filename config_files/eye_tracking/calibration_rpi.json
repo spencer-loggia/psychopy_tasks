@@ -25,5 +25,6 @@
   "seek_timeout_seconds": 30.0,
   "video_buffer_megabytes": 16,
   "ffprobe": "ffprobe",
-  "seed": null
+  "seed": null,
+  "fixation_radius": 0.025
 }

@@ -48,6 +48,20 @@ class TouchAndHoldState:
     def start_iti(self, flip_s):
         self.iti_until_s = flip_s + self.iti
 
+    def set_reward_interval(self, reward_interval, *, now_s):
+        """Apply an interval edit without crediting contact under the old rule.
+
+        The task applies edits during continuous training or between bounded
+        trials. An unchanged value preserves the existing reward deadline.
+        """
+        reward_interval = seconds(reward_interval, "reward_interval", positive=True)
+        now_s = seconds(now_s, "now_s")
+        if reward_interval == self.reward_interval:
+            return False
+        self.reward_interval = reward_interval
+        self.next_reward_s = now_s + reward_interval if self.touching else None
+        return True
+
     def update(self, now, *, touching, pressed=False, press_s=None):
         """Return whether a reward is due; caller acknowledges actual delivery."""
         if self.phase == "iti":

@@ -58,6 +58,7 @@ from bin.frame_timing import (
     wait_until,
 )
 from bin.eye_tracking_config import load_eye_tracking_settings
+from bin.pump_control import PumpPulseControl
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 import numpy as np
@@ -184,7 +185,7 @@ def _decode_trial_payload(payload: dict) -> Tuple[List[Tuple[int, int]], List[Tu
 
 
 def _build_behavior_fieldnames(num_afc: int) -> List[str]:
-    fieldnames = ["trial_num", "initiation_task_time_ns"]
+    fieldnames = ["trial_num", "pump_pulse_time", "initiation_task_time_ns"]
     for opt_idx in range(int(num_afc)):
         fieldnames.extend([f"shape_{opt_idx}", f"color_{opt_idx}", f"lum_{opt_idx}"])
     fieldnames.extend(
@@ -370,6 +371,7 @@ def run_task(
     if seed is not None:
         random.seed(seed)
 
+    pump_control = PumpPulseControl(pump_pulse_time_seconds)
     inter_pump_interval_seconds = float(
         pump_pulse_time_seconds if inter_pump_interval is None else inter_pump_interval
     )
@@ -401,6 +403,7 @@ def run_task(
         config_name=resolved_config_name,
         behavior_fieldnames=behavior_fieldnames,
         auto_flush=False,
+        live_settings=pump_control.settings if pump_control is not None else None,
     )
     logger = session_logs.event_logger
     msg_logger = session_logs.message_logger
@@ -621,6 +624,7 @@ def run_task(
         experimenter_preview = ExperimenterPreview(
             experimenter_screen,
             eye_tracking_shared=session_logs.eye_tracking_preview,
+            pump_control=pump_control,
             task_label=resolved_config_name,
             subject=resolved_subject or "(not set)",
             current_trial_num=1,
@@ -1043,6 +1047,13 @@ def run_task(
 
         trial_num = 1
         while True:
+            pump_pulse_time_seconds = pump_control.apply_pending(msg_logger)
+            if inter_pump_interval is None:
+                inter_pump_interval_seconds = pump_pulse_time_seconds
+            reward_interval_s = reward_interval_duration(
+                pump_delay_time=pump_delay_time, pump_pulse_time_seconds=pump_pulse_time_seconds,
+                inter_pump_interval=inter_pump_interval_seconds, reward_to_pulse_map=reward_to_pulse_map,
+            )
             if experimenter_preview is not None:
                 experimenter_preview.set_trial_progress(trial_num, n_trials)
             if _poll_experimenter_controls():
@@ -1190,6 +1201,7 @@ def run_task(
 
             behavior_row: Dict[str, Any] = {
                 "trial_num": trial_num,
+                "pump_pulse_time": pump_pulse_time_seconds,
                 "initiation_task_time_ns": trial_meta.get("initiation_task_time_ns", ""),
                 "choice_made_index": chosen_idx_row,
                 "choice_made_color": "",

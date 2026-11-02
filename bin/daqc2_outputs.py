@@ -18,6 +18,7 @@ class DOUTPulseEdge:
     pulse_index: int
     requested_perf_ns: int
     actual_perf_ns: int
+    pulse_duration_s: Optional[float] = None
 
     @property
     def requested_perf_s(self):
@@ -26,6 +27,14 @@ class DOUTPulseEdge:
     @property
     def actual_perf_s(self):
         return self.actual_perf_ns / 1_000_000_000
+
+
+@dataclass(frozen=True)
+class _PulseTiming:
+    interval_s: float
+    pulse_duration_s: float
+    interval_revision: int = 0
+    interval_changed_perf_s: Optional[float] = None
 
 
 class DAQC2DigitalOutputs:
@@ -127,7 +136,11 @@ class PeriodicDOUTPulseController:
     are queued for the task's main thread so log writers remain single-threaded.
     An optional fixation reward policy continuously checks rolling gaze windows
     once a full interval can exist, resetting their history at each reward onset.
+    Timing updates publish one immutable snapshot without waiting for the worker
+    or performing hardware I/O on the presentation thread.
     """
+
+    _TIMING_POLL_SECONDS = 0.005
 
     def __init__(
         self,
@@ -141,16 +154,10 @@ class PeriodicDOUTPulseController:
     ):
         self.outputs = outputs
         self.bit = outputs.validate_bit(bit)
-        self.interval_s = float(interval_s)
-        self.pulse_duration_s = float(pulse_duration_s)
-        if not math.isfinite(self.interval_s) or self.interval_s <= 0.0:
-            raise ValueError("reward_interval must be a positive finite value")
-        if not math.isfinite(self.pulse_duration_s) or self.pulse_duration_s <= 0.0:
-            raise ValueError("pump_pulse_time_seconds must be a positive finite value")
-        if self.pulse_duration_s >= self.interval_s:
-            raise ValueError(
-                "pump_pulse_time_seconds must be shorter than reward_interval"
-            )
+        interval_s, pulse_duration_s = self._validate_timing(
+            interval_s, pulse_duration_s,
+        )
+        self._timing = _PulseTiming(interval_s, pulse_duration_s)
         self._clock = clock
         self._reward_policy = reward_policy
         self._stop_event = threading.Event()
@@ -159,6 +166,28 @@ class PeriodicDOUTPulseController:
         self._thread: Optional[threading.Thread] = None
         self._failure: Optional[BaseException] = None
         self._anchor_perf_s: Optional[float] = None
+
+    @staticmethod
+    def _validate_timing(interval_s: float, pulse_duration_s: float) -> tuple[float, float]:
+        interval_s = float(interval_s)
+        pulse_duration_s = float(pulse_duration_s)
+        if not math.isfinite(interval_s) or interval_s <= 0.0:
+            raise ValueError("reward_interval must be a positive finite value")
+        if not math.isfinite(pulse_duration_s) or pulse_duration_s <= 0.0:
+            raise ValueError("pump_pulse_time_seconds must be a positive finite value")
+        if pulse_duration_s >= interval_s:
+            raise ValueError(
+                "pump_pulse_time_seconds must be shorter than reward_interval"
+            )
+        return interval_s, pulse_duration_s
+
+    @property
+    def interval_s(self) -> float:
+        return self._timing.interval_s
+
+    @property
+    def pulse_duration_s(self) -> float:
+        return self._timing.pulse_duration_s
 
     @property
     def failed(self) -> bool:
@@ -183,6 +212,32 @@ class PeriodicDOUTPulseController:
         )
         self._thread.start()
 
+    def set_pulse_duration(self, duration_s: float) -> None:
+        """Update subsequent pulses; an active pulse keeps its captured width."""
+        self.set_timing(self.interval_s, duration_s)
+
+    def set_timing(self, interval_s: float, pulse_duration_s: float) -> None:
+        """Publish timing for subsequent pulses without blocking presentation.
+
+        Call from the task's settings thread. An interval change requires a full
+        new interval from this call; a width-only change keeps the schedule.
+        The worker captures each pulse's width before raising the output, so an
+        in-flight pulse always completes with its original width. When changing
+        a separate fixation policy, publish this timing before updating that
+        policy so the new interval fences out its previous eligibility.
+        """
+        interval_s, pulse_duration_s = self._validate_timing(
+            interval_s, pulse_duration_s,
+        )
+        previous = self._timing
+        interval_changed = interval_s != previous.interval_s
+        self._timing = _PulseTiming(
+            interval_s,
+            pulse_duration_s,
+            previous.interval_revision + int(interval_changed),
+            self._clock() if interval_changed else previous.interval_changed_perf_s,
+        )
+
     def drain_edges(self) -> list[DOUTPulseEdge]:
         edges: list[DOUTPulseEdge] = []
         while True:
@@ -205,6 +260,7 @@ class PeriodicDOUTPulseController:
         *,
         active: bool,
         pulse_index: int,
+        pulse_duration_s: Optional[float] = None,
     ) -> None:
         # The schedule target is not the observed hardware request time.
         requested_ns = time.perf_counter_ns()
@@ -216,60 +272,77 @@ class PeriodicDOUTPulseController:
                 pulse_index=int(pulse_index),
                 requested_perf_ns=requested_ns,
                 actual_perf_ns=actual_ns,
+                pulse_duration_s=pulse_duration_s,
             )
         )
 
     def _run(self) -> None:
         if self._anchor_perf_s is None:
             return
-        next_on_perf_s = self._anchor_perf_s + self.interval_s
+        timing = self._timing
+        next_on_perf_s = self._anchor_perf_s + timing.interval_s
         pulse_index = 0
         output_active = False
         try:
             while True:
+                latest_timing = self._timing
+                if latest_timing.interval_revision != timing.interval_revision:
+                    next_on_perf_s = (
+                        latest_timing.interval_changed_perf_s + latest_timing.interval_s
+                    )
+                timing = latest_timing
                 remaining_s = next_on_perf_s - self._clock()
-                if self._stop_event.wait(max(0.0, remaining_s)):
+                if self._stop_event.wait(min(
+                    max(0.0, remaining_s), self._TIMING_POLL_SECONDS,
+                )):
                     break
 
                 now_perf_s = self._clock()
+                if self._timing is not timing or now_perf_s < next_on_perf_s:
+                    continue
                 if self._reward_policy is not None:
                     if not self._reward_policy.status(now_s=now_perf_s).due:
                         # Keep checking the rolling windows without waiting for
                         # another scheduled interval or blocking presentation.
-                        next_on_perf_s = now_perf_s + 0.005
+                        next_on_perf_s = now_perf_s + self._TIMING_POLL_SECONDS
                         continue
-                elif now_perf_s >= next_on_perf_s + self.interval_s:
+                elif now_perf_s >= next_on_perf_s + timing.interval_s:
                     skipped_intervals = int(
-                        (now_perf_s - next_on_perf_s) // self.interval_s
+                        (now_perf_s - next_on_perf_s) // timing.interval_s
                     )
-                    next_on_perf_s += skipped_intervals * self.interval_s
+                    next_on_perf_s += skipped_intervals * timing.interval_s
                     pulse_index += skipped_intervals
 
+                # A policy check may run concurrently with a settings update.
+                if self._timing is not timing:
+                    continue
                 pulse_index += 1
                 requested_on_perf_s = next_on_perf_s
+                pulse_duration_s = timing.pulse_duration_s
                 self._record_edge(
                     active=True,
                     pulse_index=pulse_index,
+                    pulse_duration_s=pulse_duration_s,
                 )
                 output_active = True
                 if self._reward_policy is not None:
                     requested_on_perf_s = self._clock()
                     self._reward_policy.reward_delivered(now_s=requested_on_perf_s)
 
-                if self._stop_event.wait(self.pulse_duration_s):
+                if self._stop_event.wait(pulse_duration_s):
                     break
                 self._record_edge(
                     active=False,
                     pulse_index=pulse_index,
                 )
                 output_active = False
-                next_on_perf_s = requested_on_perf_s + self.interval_s
+                next_on_perf_s = requested_on_perf_s + timing.interval_s
                 now_perf_s = self._clock()
                 if self._reward_policy is None and next_on_perf_s <= now_perf_s:
                     expired = int(
-                        math.floor((now_perf_s - next_on_perf_s) / self.interval_s)
+                        math.floor((now_perf_s - next_on_perf_s) / timing.interval_s)
                     ) + 1
-                    next_on_perf_s += expired * self.interval_s
+                    next_on_perf_s += expired * timing.interval_s
                     pulse_index += expired
         except BaseException as exc:
             self._failure = exc

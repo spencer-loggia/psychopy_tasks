@@ -131,6 +131,67 @@ class CalibrationAutoRewardTests(unittest.TestCase):
         self.assertFalse(policy.status(now_s=1).due)
         self.assertEqual(len(policy._interval.history), 1)
 
+    def test_radius_uses_the_shorter_screen_dimension_and_legacy_diameter(self):
+        settings = dict(
+            reward_interval=1, calibration=EyeCalibration(x_scale=1, y_scale=1),
+            fixation=(0, 0), screen_size=(1000, 500), max_sample_age_s=0.15,
+        )
+        for kwargs in ({"fix_diameter": 0.2}, {"fixation_radius": 0.1},
+                       {"fix_diameter": 0.2, "fixation_radius": 0.1}):
+            with self.subTest(kwargs=kwargs):
+                policy = CalibrationAutoReward(**settings, **kwargs)
+                self.assertEqual(policy.fixation_radius, 0.1)
+                for position, expected in (
+                    ((0.05, 0), True), ((0, 0.1), True),
+                    ((0.05001, 0), False), ((0, 0.10001), False),
+                    ((0.04, 0.08), False),  # Outside the circular region.
+                ):
+                    self.assertEqual(policy._in_window(position), expected)
+                policy.set_fixation_radius(0.2, now_s=0)
+                self.assertTrue(policy._in_window((0.1, 0)))
+                self.assertTrue(policy._in_window((0, 0.2)))
+                self.assertFalse(policy._in_window((0.10001, 0)))
+
+    def test_radius_changes_reset_both_windows_and_reject_prechange_samples(self):
+        policy = self.make_policy()
+        policy.toggle(now_s=0)
+        self.feed(policy, 0, 1000)
+        self.assertTrue(policy.status(now_s=1).due)
+        self.assertTrue(policy.set_fixation_radius(0.1, now_s=1.05))
+        self.feed(policy, 1000, 1000)
+        status = policy.status(now_s=1.05)
+        self.assertEqual((status.recent_fraction, status.interval_fraction), (0, 0))
+        self.feed(policy, 1051, 2050)
+        self.assertFalse(policy.status(now_s=2.05).due)
+        self.feed(policy, 2051, 2051)
+        self.assertTrue(policy.status(now_s=2.051).due)
+
+    def test_combined_changes_validate_before_updating_either_setting(self):
+        policy = self.make_policy()
+        policy.toggle(now_s=0)
+        self.feed(policy, 0, 1000)
+        self.assertFalse(policy.configure(
+            reward_interval=1, fixation_radius=0.05, now_s=1,
+        ))
+        for invalid in (0, -1, float("nan"), float("inf"), "invalid", None):
+            with self.subTest(radius=invalid):
+                with self.assertRaisesRegex(ValueError, "fixation_radius"):
+                    policy.set_fixation_radius(invalid, now_s=1)
+                if invalid is not None:
+                    with self.assertRaisesRegex(ValueError, "fixation_radius"):
+                        policy.configure(reward_interval=0.3, fixation_radius=invalid, now_s=1)
+                self.assertEqual(policy.reward_interval, 1)
+                self.assertEqual(policy.fixation_radius, 0.05)
+                self.assertTrue(policy.status(now_s=1).due)
+        self.assertTrue(policy.configure(
+            reward_interval=0.3, fixation_radius=0.1, now_s=1,
+        ))
+        self.assertEqual(policy.reward_interval, 0.3)
+        self.assertEqual(policy.fixation_radius, 0.1)
+        self.assertFalse(policy.status(now_s=1).due)
+        self.feed(policy, 1001, 1301)
+        self.assertTrue(policy.status(now_s=1.301).due)
+
 
 if __name__ == "__main__":
     unittest.main()

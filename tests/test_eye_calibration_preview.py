@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 
 import bin
 from bin.preview_text import set_preview_text
+from bin.pump_control import PumpPulseControl
 from bin.screen import ExperimenterPreview
 
 
@@ -97,7 +98,7 @@ def load_renderer():
 class EyeCalibrationPreviewTests(unittest.TestCase):
     def make_controls(
         self, canvas=(1280, 1024), subject=(1080, 1920), calibration=None,
-        actions_queue=None,
+        actions_queue=None, pump_control=None, live_settings=None,
     ):
         from bin.eye_tracking import EyeCalibration
 
@@ -123,6 +124,8 @@ class EyeCalibrationPreviewTests(unittest.TestCase):
             threading.Event(),
             threading.Event(),
             actions_queue=actions_queue,
+            pump_control=pump_control,
+            live_settings=live_settings,
         )
         return controls, shared, mouse
 
@@ -132,6 +135,23 @@ class EyeCalibrationPreviewTests(unittest.TestCase):
         mouse.getPos.return_value = pos
         mouse.getPressed.return_value = (True, False, False)
         controls.poll_controls()
+
+    def test_shared_pump_editor_consumes_escape_and_keypad_target_commands(self):
+        pump_control = PumpPulseControl(0.25, maximum_s=2, boundary="reward")
+        controls, shared, mouse = self.make_controls(pump_control=pump_control)
+        controls.draw({})
+        self.click(controls, mouse, controls.pump_editor.button.pos)
+        self.renderer.event.getKeys.return_value = ["num_0", "num_decimal", "num_5", "return"]
+        controls.poll_controls()
+        self.assertEqual(pump_control.snapshot(), (0.25, 0.5))
+        self.assertEqual(controls.fixation, (0, 0))
+        self.assertFalse(controls.reward_event.is_set())
+        self.renderer.event.getKeys.return_value = []
+        self.click(controls, mouse, controls.pump_editor.button.pos)
+        self.renderer.event.getKeys.return_value = ["escape"]
+        controls.poll_controls()
+        self.assertFalse(controls.exit_event.is_set())
+        self.assertFalse(controls.pump_editor.editing)
 
     def test_layout_preserves_subject_aspect_and_keeps_controls_outside(self):
         for canvas, subject in (
@@ -151,6 +171,44 @@ class EyeCalibrationPreviewTests(unittest.TestCase):
                 self.assertFalse(controls.preview_box.contains(button[0].pos))
             self.assertFalse(controls.preview_box.contains(controls.x_slider.pos))
             self.assertFalse(controls.preview_box.contains(controls.y_slider.pos))
+
+    def test_all_live_settings_and_popup_stay_in_gutter_and_do_not_leak_input(self):
+        from tests.test_live_settings_ui import SettingsModel
+
+        for canvas, subject in (((800, 600), (800, 600)), ((1280, 1024), (1080, 1920))):
+            settings = SettingsModel()
+            controls, shared, mouse = self.make_controls(canvas, subject, live_settings=settings)
+            panel = controls.settings_panel
+            controls.draw({})
+            right_edge = controls.box_center[0] + controls.box_size[0] / 2
+            for rect in (*panel.buttons.values(), panel.panel):
+                self.assertGreater(rect.pos[0] - rect.width / 2, right_edge)
+                self.assertLessEqual(rect.pos[0] + rect.width / 2, canvas[0] / 2)
+            for spec in settings.specs:
+                self.click(controls, mouse, panel.buttons[spec.name].pos)
+                self.renderer.event.getKeys.return_value = ["num_0", "num_decimal", "num_4", "return", "r", "escape", "z"]
+                controls.poll_controls()
+                self.assertEqual(settings.snapshot()[spec.name], (0.25, 0.4))
+                self.assertEqual(controls.fixation, (0, 0))
+                self.assertFalse(controls.reward_event.is_set())
+                self.assertFalse(controls.exit_event.is_set())
+                self.assertEqual(shared[5], 0)
+                self.renderer.event.getKeys.return_value = []
+
+    def test_closing_editor_does_not_leak_same_frame_reward_click(self):
+        from tests.test_live_settings_ui import SettingsModel
+
+        controls, _, mouse = self.make_controls(live_settings=SettingsModel())
+        self.click(controls, mouse, controls.settings_panel.button.pos)
+        mouse.getPressed.return_value = (False, False, False)
+        controls.poll_controls()
+        self.renderer.event.getKeys.return_value = ["escape"]
+        mouse.getPos.return_value = controls.reward_button[0].pos
+        mouse.getPressed.return_value = (True, False, False)
+        controls.poll_controls()
+        self.assertFalse(controls.settings_panel.editing)
+        self.assertFalse(controls.reward_event.is_set())
+        self.assertFalse(controls.exit_event.is_set())
 
     def test_click_maps_target_then_slider_and_zero_preserve_target(self):
         controls, shared, mouse = self.make_controls()

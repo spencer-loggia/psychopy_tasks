@@ -1,5 +1,6 @@
 """Training timing, real event logs, and display/hardware wiring without a rig."""
 import csv
+from contextlib import nullcontext
 import json
 from pathlib import Path
 import sys
@@ -96,6 +97,55 @@ class TouchAndHoldStateTests(unittest.TestCase):
         self.assertFalse(state.update(10.001, touching=True))
         self.assertTrue(state.update(11, touching=True))
 
+    def test_interval_edit_requires_a_fresh_full_hold_without_catchup_rewards(self):
+        for interval in (0.25, 2):
+            with self.subTest(interval=interval):
+                state = self.state(duration=None, end_on_release=False)
+                state.update(0, touching=True)
+                self.assertTrue(state.set_reward_interval(interval, now_s=0.8))
+                deadline = 0.8 + interval
+                self.assertEqual(state.next_reward_s, deadline)
+                self.assertFalse(state.update(deadline - 0.001, touching=True))
+                self.assertTrue(state.update(deadline, touching=True))
+                state.reward_delivered(10)  # A delayed delivery starts one new interval.
+                self.assertFalse(state.update(10.001, touching=True))
+                self.assertTrue(state.update(10 + interval, touching=True))
+
+    def test_interval_edit_without_contact_waits_for_a_new_hold(self):
+        state = self.state(duration=None, end_on_release=False)
+        self.assertTrue(state.set_reward_interval(0.5, now_s=5))
+        self.assertIsNone(state.next_reward_s)
+        self.assertFalse(state.update(10, touching=False))
+        self.assertFalse(state.update(11, touching=True))
+        self.assertFalse(state.update(11.499, touching=True))
+        self.assertTrue(state.update(11.5, touching=True))
+
+    def test_between_trial_interval_edit_preserves_iti_and_uses_new_trial_start(self):
+        state = self.state(duration=None)
+        state.update(0, touching=True, pressed=True)
+        state.update(0.1, touching=False)
+        state.start_iti(0.11)
+        iti_until = state.iti_until_s
+        self.assertTrue(state.set_reward_interval(0.5, now_s=0.15))
+        self.assertEqual(state.iti_until_s, iti_until)
+        self.assertIsNone(state.next_reward_s)
+        state.update(0.32, touching=False)
+        self.assertFalse(state.update(1, touching=True, pressed=True))
+        self.assertFalse(state.update(1.499, touching=True))
+        self.assertTrue(state.update(1.5, touching=True))
+
+    def test_unchanged_or_invalid_interval_edits_preserve_reward_deadline(self):
+        state = self.state(duration=None, end_on_release=False)
+        state.update(0, touching=True)
+        self.assertFalse(state.set_reward_interval(1, now_s=0.8))
+        for invalid in (0, -1, float("nan"), float("inf"), True, "1", None):
+            with self.subTest(interval=invalid):
+                with self.assertRaisesRegex(ValueError, "reward_interval"):
+                    state.set_reward_interval(invalid, now_s=0.8)
+                self.assertEqual(state.reward_interval, 1)
+                self.assertEqual(state.next_reward_s, 1)
+        self.assertTrue(state.update(1, touching=True))
+
     def test_buffered_repress_detects_a_break_without_an_up_sample(self):
         for duration, end_on_release in ((None, True), (5, True), (None, False), (5, False)):
             with self.subTest(duration=duration, end_on_release=end_on_release):
@@ -123,9 +173,12 @@ class TouchAndHoldStateTests(unittest.TestCase):
 
 class TouchAndHoldTaskTests(unittest.TestCase):
     def exercise(self, *, contacts, until=3, rotation="normal", preview_enabled=False,
-                 preview_failure=False, manual_at=None, eye_enabled=False, **options):
+                 preview_failure=False, manual_at=None, eye_enabled=False, pulse_change=None,
+                 setting_changes=(), **options):
         clock = FakeClock()
         origin = clock.seconds()
+        origin_ns = clock.ns
+        pending_changes = list(setting_changes)
         def elapsed():
             return clock.seconds() - origin
         def contact():
@@ -157,7 +210,19 @@ class TouchAndHoldTaskTests(unittest.TestCase):
         pressed_cue = Mock(pos=(0, 0), size=(100, 100), image=cue.image)
         utils.make_initiation_cue_stims.return_value = cue, pressed_cue
         preview = Mock()
+        preview.setting_requests = []
         def poll_preview():
+            nonlocal pulse_change
+            if pulse_change is not None and elapsed() >= pulse_change[0]:
+                preview_factory.call_args.kwargs["pump_control"].request(pulse_change[1])
+                pulse_change = None
+            while pending_changes and elapsed() >= pending_changes[0][0]:
+                _, name, value = pending_changes.pop(0)
+                preview.setting_requests.append({
+                    "name": name, "new_value": value, "task_time_ns": clock.ns - origin_ns,
+                    "timestamp_perf_ns": clock.ns,
+                })
+                preview_factory.call_args.kwargs["pump_control"].settings.request(name, value)
             if preview_failure and elapsed() >= 1.15:
                 raise RuntimeError("preview failed")
             return False
@@ -192,6 +257,16 @@ class TouchAndHoldTaskTests(unittest.TestCase):
             with event_path.open() as handle:
                 rows = list(csv.DictReader(handle, delimiter="\t"))
             metadata = json.loads((event_path.parent / "training.json").read_text())
+            behavior_path = event_path.parent / "behavior_log.tsv"
+            with behavior_path.open() if behavior_path.exists() else nullcontext() as handle:
+                preview.behavior_rows = list(csv.DictReader(handle, delimiter="\t")) if handle else []
+            with (event_path.parent / "message_log.tsv").open() as handle:
+                preview.message_rows = list(csv.DictReader(handle, delimiter="\t"))
+            preview.setting_rows = [
+                dict(json.loads(row["message"].split(" ", 1)[1]),
+                     task_time_ns=int(row["task_time_ns"]))
+                for row in preview.message_rows if row["message"].startswith("live_setting ")
+            ]
         self.assertFalse(edges[-1][0])
         self.assertEqual(rows[-1]["event"], "block_end")
         self.assertFalse(metadata["experimental_data"])
@@ -217,6 +292,97 @@ class TouchAndHoldTaskTests(unittest.TestCase):
         self.assertLess(off - on, 0.275)
         gray = next(row for row in rows if row["event"] == "gray_inter_trial_interval")
         self.assertGreaterEqual(int(rows[-1]["task_time_ns"]) - int(gray["task_time_ns"]), 200_000_000)
+
+    def test_pulse_edit_applies_to_next_trial_and_is_logged_for_each_trial(self):
+        status, rows, _, _, preview = self.exercise(
+            contacts=[(0.1, 1.5, (0, 0)), (1.8, 3.5, (0, 0))],
+            duration=1.3, n=2, until=3.5, preview_enabled=True, pulse_change=(0.5, 0.15),
+        )
+        self.assertEqual(status, "done")
+        self.assertEqual([float(row["pump_pulse_time"]) for row in preview.behavior_rows], [0.275, 0.15])
+        self.assertEqual([float(row["requested_duration"]) for row in rows if row["event"] == "pump_on"],
+                         [0.275, 0.15])
+
+    def test_continuous_pulse_edit_applies_on_next_reward(self):
+        _, rows, _, _, preview = self.exercise(
+            contacts=[(0.1, 3, (0, 0))], duration=None, end_on_release=False,
+            preview_enabled=True, pulse_change=(1.15, 0.15),
+        )
+        self.assertEqual([float(row["requested_duration"]) for row in rows if row["event"] == "pump_on"],
+                         [0.275, 0.15])
+        self.assertEqual(preview.behavior_rows, [])
+
+    def test_hold_interval_edit_is_frozen_per_trial_and_logs_confirmation_and_application(self):
+        status, rows, edges, _, preview = self.exercise(
+            contacts=[(0.1, 1.5, (0, 0)), (1.8, 3.5, (0, 0))],
+            duration=1.3, n=2, until=3.5, preview_enabled=True,
+            setting_changes=[(0.5, "reward_interval", 0.5)],
+        )
+        self.assertEqual(status, "done")
+        self.assertEqual([float(row["reward_interval"]) for row in preview.behavior_rows], [1, 0.5])
+        self.assertEqual([float(row["pump_pulse_time"]) for row in preview.behavior_rows], [0.275, 0.275])
+        onsets = [timestamp for active, timestamp in edges if active]
+        self.assertEqual(len(onsets), 3)
+        for actual, expected in zip(onsets, (1.1, 2.3, 2.8)):
+            self.assertAlmostEqual(actual, expected, delta=0.002)
+        changes = {row["phase"]: row for row in preview.setting_rows if row["name"] == "reward_interval"}
+        request, confirmed, applied = preview.setting_requests[0], changes["confirmed"], changes["applied"]
+        self.assertEqual(confirmed["task_time_ns"], request["task_time_ns"])
+        self.assertEqual((confirmed["old_value"], confirmed["new_value"]), (1, 0.5))
+        self.assertEqual((applied["old_value"], applied["new_value"]), (1, 0.5))
+        self.assertEqual(applied["request_id"], confirmed["request_id"])
+        self.assertEqual(applied["requested_perf_ns"], request["timestamp_perf_ns"])
+        first_end = next(int(row["task_time_ns"]) for row in rows if row["event"] == "training_trial_end")
+        second_start = next(int(row["task_time_ns"]) for row in rows
+                            if row["event"] == "training_trial_start" and row["trial_num"] == "2")
+        self.assertGreater(applied["task_time_ns"], first_end)
+        self.assertLess(applied["task_time_ns"], second_start)
+
+    def test_continuous_hold_interval_edit_requires_full_new_hold(self):
+        _, _, edges, _, preview = self.exercise(
+            contacts=[(0.1, 3, (0, 0))], duration=None, end_on_release=False,
+            until=2.2, preview_enabled=True, setting_changes=[(0.8, "reward_interval", 0.5)],
+        )
+        onsets = [timestamp for active, timestamp in edges if active]
+        self.assertEqual(len(onsets), 2)
+        applied = next(row for row in preview.setting_rows
+                       if row["name"] == "reward_interval" and row["phase"] == "applied")
+        self.assertEqual(applied["task_time_ns"], preview.setting_requests[0]["task_time_ns"])
+        self.assertAlmostEqual(onsets[0], applied["task_time_ns"] / 1e9 + 0.5, delta=0.002)
+        self.assertAlmostEqual(onsets[1] - onsets[0], 0.5, delta=0.002)
+        self.assertEqual(preview.behavior_rows, [])
+
+    def test_pump_only_and_unchanged_interval_edits_preserve_reward_schedule(self):
+        _, rows, edges, _, preview = self.exercise(
+            contacts=[(0.1, 3, (0, 0))], duration=None, end_on_release=False,
+            until=2.5, preview_enabled=True,
+            setting_changes=[(0.8, "reward_interval", 1), (0.8, "pump_pulse_time", 0.15)],
+        )
+        onsets = [timestamp for active, timestamp in edges if active]
+        self.assertEqual(len(onsets), 2)
+        for actual, expected in zip(onsets, (1.1, 2.1)):
+            self.assertAlmostEqual(actual, expected, delta=0.002)
+        self.assertEqual([float(row["requested_duration"]) for row in rows if row["event"] == "pump_on"],
+                         [0.15, 0.15])
+        self.assertFalse(any(row["name"] == "reward_interval" and row["phase"] != "initial"
+                             for row in preview.setting_rows))
+
+    def test_interval_edit_during_pulse_waits_for_pump_off_before_restarting_hold(self):
+        _, _, edges, _, preview = self.exercise(
+            contacts=[(0.1, 3, (0, 0))], duration=None, end_on_release=False,
+            until=2.3, preview_enabled=True, setting_changes=[(1.15, "reward_interval", 0.5)],
+        )
+        onsets = [timestamp for active, timestamp in edges if active]
+        self.assertEqual(len(onsets), 2)
+        first_off = next(timestamp for active, timestamp in edges if not active and timestamp > onsets[0])
+        changes = {row["phase"]: row for row in preview.setting_rows if row["name"] == "reward_interval"}
+        confirmed, applied = changes["confirmed"], changes["applied"]
+        self.assertEqual(confirmed["task_time_ns"], preview.setting_requests[0]["task_time_ns"])
+        self.assertGreater(confirmed["task_time_ns"] / 1e9, onsets[0])
+        self.assertLess(confirmed["task_time_ns"] / 1e9, first_off)
+        self.assertGreater(applied["task_time_ns"] / 1e9, first_off)
+        self.assertAlmostEqual(first_off - onsets[0], 0.275, delta=0.002)
+        self.assertAlmostEqual(onsets[1], applied["task_time_ns"] / 1e9 + 0.5, delta=0.002)
 
     def test_duration_expires_even_when_release_is_disabled(self):
         status, rows, edges, _, _ = self.exercise(

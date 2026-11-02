@@ -25,6 +25,7 @@ from bin.buffered_video import DEFAULT_BUFFER_BYTES
 from bin.frame_timing import plan_frame_duration
 from bin.eye_tracking_config import load_eye_tracking_settings
 from bin.fixation_reward import ScreenAutoReward
+from bin.pump_control import PumpPulseControl
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.video_playback import (
@@ -171,6 +172,11 @@ def run_task(
     sync_gpio_chip = None
     pump_outputs = None
     pump_controller = None
+    pump_control = (
+        PumpPulseControl(pump_pulse_time_seconds, allow_zero=False, reward_interval=float(reward_interval),
+                         boundary="clip", interval_label="Fix interval" if eye_tracking_config is not None else "Reward interval")
+        if raspi else None
+    )
     screen_reward = (
         ScreenAutoReward(
             reward_interval=float(reward_interval),
@@ -189,6 +195,8 @@ def run_task(
         config_name=resolved_config_name,
         behavior_fieldnames=[
             "trial_num",
+            "pump_pulse_time",
+            "reward_interval",
             "source_video_path",
             "source_video_name",
             "source_duration_seconds",
@@ -242,6 +250,7 @@ def run_task(
             ]
         },
         auto_flush=False,
+        live_settings=pump_control.settings if pump_control is not None else None,
     )
     # Session creation starts the UART worker. Display setup can take seconds,
     # especially on the first block, and must not postpone START_TRACKING.
@@ -322,7 +331,7 @@ def run_task(
                 timestamp_perf_ns=edge.actual_perf_ns,
                 requested_timestamp_perf_ns=edge.requested_perf_ns,
                 requested_duration=(
-                    float(pump_pulse_time_seconds) if edge.active else None
+                    edge.pulse_duration_s if edge.active else None
                 ),
             )
         if pump_controller.failure is not None and not pump_failure_logged:
@@ -354,6 +363,8 @@ def run_task(
         behavior_logger.writerow(
             {
                 "trial_num": int(trial_num),
+                "pump_pulse_time": pump_pulse_time_seconds if pump_control is not None else "",
+                "reward_interval": reward_interval if pump_control is not None else "",
                 "source_video_path": str(
                     playback.get("video_path", chosen_video)
                 ),
@@ -756,6 +767,7 @@ def run_task(
             experimenter_preview = ExperimenterPreview(
                 experimenter_screen,
                 eye_tracking_shared=session_logs.eye_tracking_preview,
+                pump_control=pump_control,
                 task_label=resolved_config_name,
                 start_perf_s=time.perf_counter(),
                 update_interval_s=0.1,
@@ -855,7 +867,26 @@ def run_task(
                 return "experimenter_exit"
             return False
 
+        def apply_reward_settings(values, timestamp_ns):
+            def publish_timing():
+                pump_controller.set_timing(
+                    interval_s=values["reward_interval"], pulse_duration_s=values["pump_pulse_time"],
+                )
+
+            if screen_reward is not None:
+                # Never wait for the gaze worker. Publish timing only after
+                # acquiring its policy without blocking, then reset history.
+                return screen_reward.try_configure(
+                    reward_interval=values["reward_interval"], now_s=timestamp_ns / 1e9,
+                    before_update=publish_timing,
+                ) is not None
+            publish_timing()
+            return True
+
         while played_videos < num_clips:
+            if pump_control is not None:
+                values = pump_control.settings.apply_pending(msg_logger, on_apply=apply_reward_settings)
+                pump_pulse_time_seconds, reward_interval = values["pump_pulse_time"], values["reward_interval"]
             _drain_pump_edges()
             if pump_controller is not None and pump_controller.failed:
                 raise RuntimeError(

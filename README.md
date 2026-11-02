@@ -8,6 +8,67 @@ Repository layout
 - `config_files/`: deployment configurations.
 - `test_configs/` and `tests/`: development configurations and automated tests.
 
+Live reward and fixation controls
+---------------------------------
+The experimenter preview offers compact numeric controls shared by all reward tasks:
+
+| Control | Tasks | Units |
+| --- | --- | --- |
+| Pump | All juice-reward tasks | Pulse duration in seconds |
+| Hold interval | Touch-and-hold | Seconds of continuous contact between rewards |
+| Fix interval | Eye calibration and video with eye tracking/reward enabled | Fixation reward interval in seconds |
+| Reward interval | Video with reward output but no eye tracking | Seconds between reward onsets |
+| Fix radius | Eye calibration | Radius as a fraction of the shorter subject-scene dimension |
+
+Click a control to edit; typing replaces the value, Enter confirms, and Esc cancels
+without exiting the task. Invalid values leave the editor open with an explanation.
+Pump duration and reward interval are validated together: the pulse must remain
+shorter than the interval, including when several edits are pending. The display
+shows the applied value and a `Next` value until the edit takes effect. Controls and
+text entry stay in a reserved 60-pixel bottom strip, or the calibration preview's
+existing side gutter, outside the subject-scene image. Video fixation remains fixed
+to the full screen and has no radius control.
+
+Trial-based tasks apply changes at the next trial boundary (next clip for video);
+touch-and-hold can apply them while waiting for a fresh initiation touch. All pulses
+within that trial use the same configured settings. Calibration and continuous
+training apply changes between pulses. A changed interval or fixation radius clears
+old acceptance history and requires a fresh full interval; a pump-only edit preserves
+that history. No edit truncates a pulse already in progress. An explicit
+`inter_pump_interval` stays fixed; its omitted default in active foraging and
+match-to-cue follows the pump duration.
+
+Every trial behavior row contains `pump_pulse_time` in seconds; touch-and-hold and
+reward-enabled video also record `reward_interval`. A video block without reward
+output leaves these columns blank. Calibration and continuous training have no trial
+rows. Their pulse events still record the requested pulse width.
+
+All tasks, including pump-only tasks, write `live_setting` JSON records in
+`message_log.tsv`: `initial`, `confirmed`, and `applied` phases. Records identify the
+setting, units, old/new values and request ID. The normal `task_time_ns` column records
+the original confirmation or effective application time in the experiment clock;
+application records also retain `requested_perf_ns`. Superseded or unapplied edits
+remain in the confirmation history. Buffered records may be written out of timestamp
+order: sort by `task_time_ns` when reconstructing changes. Edits affect the running
+block and do not rewrite its source config; saved calibration metadata contains the
+last applied interval and radius.
+
+The reusable implementation is `bin/live_settings.py` (`SettingSpec`, `LiveSettings`,
+and the `reward_settings` factory) plus `bin/live_settings_ui.py` (`SettingsPanel`).
+New tasks supply specs/initial values, pass the model as `live_settings` to
+`ExperimenterPreview` and `SessionLogBundle`, and call
+`apply_pending(message_logger, on_apply=...)` at an appropriate boundary. The callback
+receives the complete setting snapshot and effective performance timestamp; the
+returned snapshot supplies behavior-log values. Stop the preview before closing logs.
+`PumpPulseControl` remains a compatibility facade for the common reward specs.
+
+Input and rendering run exclusively in the separate preview process. The task tries
+the settings lock once without waiting; a busy editor defers the update. Application
+performs no preview IPC wait, hardware write, or disk flush. Change confirmations use
+a separate ordered queue and are drained at existing log flush points and shutdown,
+so the preview's latest-scene mailbox cannot lose them. Trial display deadlines and
+in-flight pulse deadlines remain intact.
+
 Touch-and-hold training
 -----------------------
 Select `trainings` → `touch_and_hold` in the Raspberry Pi interface, or run:
@@ -47,7 +108,8 @@ explicit calibration coefficients; the interface supplies the subject's calibrat
 Standalone diagnostic logs default to `logs/trainings/`. Interface runs use their assigned
 experiment block directory. Each session includes `training.json` with
 `"session_type": "training"` and `"experimental_data": false`, plus event/message logs
-and the eye recording when enabled; these are training records, not experimental behavior data.
+and the eye recording when enabled. Bounded trials also have a behavior log with their
+pump pulse durations, hold reward intervals, and end reasons. These remain training records, not experimental data.
 
 Experiment Manager
 ------------------
@@ -1001,7 +1063,11 @@ Reward and fixation settings:
   The preview indicates when reward output is disabled; `--raspi` enables it for a direct launch with a test config.
 - `pump_pulse_time_seconds` defaults to 0.25. Pulses use software timing and log actual on/off times.
   The pump is cleared on exit or exceptions, before UART/camera shutdown.
-- `fix_diameter` is a fraction of the shorter subject-scene dimension (default 0.05).
+- `fixation_radius` sets the allowed distance from the target as a fraction of the shorter
+  subject-scene dimension (default 0.025). For example, on a `1600x2560` scene, `0.025`
+  means a 40-pixel radius. It is configurable and editable through **Fix radius**.
+  If omitted, legacy `fix_diameter` is divided by two (legacy default 0.05);
+  an explicit `fixation_radius` takes precedence.
 - Press **A** to toggle automatic rewards; the mode starts **off**. The preview shows ON/OFF and both
   fixation percentages. `reward_interval` defaults to **2 seconds** and must exceed the pump pulse duration.
   Each automatic reward requires **more than 95% fixation during the past 100 ms** and **more than 80%
@@ -1014,7 +1080,8 @@ Reward and fixation settings:
   reward can qualify. Acquisition continues during pump pulses, counting toward that fresh interval,
   so sustained fixation can earn repeated rewards without a fixation break. A blink can delay a reward
   until the rolling windows qualify; rewards do not wait for fixed schedule boundaries or queue up.
-- Toggling the mode or changing gain, zero, or target clears history and requires a fresh full interval.
+- Toggling the mode or changing gain, zero, target, reward interval, or fixation radius clears history
+  and requires a fresh full interval.
   Manual **R** rewards remain available and also clear both windows.
   `fix_accept_percent` is superseded by the two fixed thresholds; an older positive `fix_accept_time` is
   used as the interval only when `reward_interval` is absent.

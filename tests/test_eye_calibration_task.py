@@ -1,6 +1,7 @@
 """Exercise calibration wiring and pump cleanup without PsychoPy or hardware."""
 
 import importlib.util
+import csv
 from dataclasses import replace
 import json
 import math
@@ -521,6 +522,132 @@ class EyeCalibrationTaskTests(unittest.TestCase):
                 self.task.run_task(reward_interval=interval)
         self.task.utils.setup_task_window.assert_not_called()
 
+    def test_fixation_radius_overrides_legacy_diameter_and_falls_back_when_absent(self):
+        for radius, expected in ((None, 0.06), (0.03, 0.03)):
+            with self.subTest(radius=radius):
+                task = load_task()
+                win = Mock(size=(800, 600))
+                task.utils.setup_task_window.return_value = (
+                    win, ScreenGeometry(0, 0, 0, 800, 600), ScreenGeometry(1, 800, 0, 800, 600),
+                )
+                preview, tracker = Mock(), Mock()
+                preview.poll.side_effect = lambda: win.flip.call_count >= 1
+                preview.consume_manual_reward_request.return_value = False
+                preview.get_calibration_controls.return_value = dict(
+                    x_scale=0.005, y_scale=-0.005, fix_x=0, fix_y=0, revision=0, zero_count=0,
+                )
+                tracker.get_state.return_value = EyeTrackerState(valid=True)
+                with tempfile.TemporaryDirectory() as tmp, patch.object(
+                    task, "ExperimenterPreview", return_value=preview,
+                ), patch.object(task, "UARTEyeTracker", return_value=tracker):
+                    path = task.run_task(
+                        output_dir=tmp, fullscreen=False, fix_diameter=0.12, fixation_radius=radius,
+                    )
+                    saved = json.loads(path.read_text())["eye_tracker_calibration"]["fixation_acceptance"]
+                    control = task.ExperimenterPreview.call_args.kwargs["pump_control"]
+                self.assertEqual(saved["fixation_radius"], expected)
+                self.assertEqual(saved["fix_diameter"], 2 * expected)
+                self.assertEqual(saved["radius_units"], "fraction_of_shorter_subject_scene_dimension")
+                self.assertEqual(control.settings.values["fixation_radius"], expected)
+
+    def test_reward_edits_reset_history_change_radius_and_save_timestamped_changes(self):
+        task = self.task
+        win = Mock(size=(800, 600))
+        task.utils.setup_task_window.return_value = (
+            win, ScreenGeometry(0, 0, 0, 800, 600), ScreenGeometry(1, 800, 0, 800, 600),
+        )
+        preview, tracker = Mock(), Mock()
+        preview.poll.side_effect = lambda: win.flip.call_count >= 3
+        preview.consume_manual_reward_request.return_value = False
+        preview.get_calibration_controls.return_value = dict(
+            x_scale=0.005, y_scale=-0.005, fix_x=0, fix_y=0, revision=0, zero_count=0,
+        )
+        clock = [100.0]
+        current = [EyeTrackerState(timestamp_perf_s=100, frame_sequence=1, valid=True)]
+        tracker.get_state.side_effect = lambda: current[0]
+        consumer = [None]
+        policies = []
+
+        class RecordingPolicy(task.CalibrationAutoReward):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                policies.append(self)
+                self.toggle(now_s=100)
+
+        def make_tracker(**kwargs):
+            consumer[0] = kwargs["on_state"]
+            return tracker
+
+        def observe_window(start_s, duration_ms, sequence_start, x_px):
+            for ms in range(0, duration_ms + 1, 10):
+                current[0] = EyeTrackerState(
+                    timestamp_perf_s=start_s + ms / 1000,
+                    frame_sequence=sequence_start + ms, x_smooth_px=x_px, valid=True,
+                )
+                consumer[0](current[0])
+
+        def flip():
+            policy = policies[0]
+            control = task.ExperimenterPreview.call_args.kwargs["pump_control"]
+            if win.flip.call_count == 1:
+                observe_window(100, 1000, 1, 0)
+                self.assertTrue(policy.status(now_s=101).due)
+                # This location is outside the old acceptance circle but
+                # inside the requested larger radius on an 800 x 600 screen.
+                self.assertFalse(policy._in_window((0.05, 0)))
+                clock[0] = 101
+                control.settings.request("reward_interval", 0.4)
+                clock[0] = 101.01
+                control.settings.request("fixation_radius", 0.1)
+                self.assertEqual((policy.reward_interval, policy.fixation_radius), (1, 0.02))
+                clock[0] = 101.05
+            elif win.flip.call_count == 2:
+                self.assertEqual((policy.reward_interval, policy.fixation_radius), (0.4, 0.1))
+                self.assertFalse(policy.status(now_s=101.05).due)
+                task._deliver_reward_pulse.assert_not_called()
+                self.assertTrue(policy._in_window((0.05, 0)))
+                observe_window(101.05, 410, 2000, 10)
+                clock[0] = 101.46
+                self.assertTrue(policy.status(now_s=clock[0]).due)
+
+        win.flip.side_effect = flip
+        delivered = []
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            task, "ExperimenterPreview", return_value=preview,
+        ), patch.object(task, "UARTEyeTracker", side_effect=make_tracker), patch.object(
+            task, "CalibrationAutoReward", RecordingPolicy,
+        ), patch.object(task, "_deliver_reward_pulse", side_effect=lambda **kwargs: delivered.append(clock[0])), patch.object(
+            task.time, "perf_counter", side_effect=lambda: clock[0],
+        ), patch.object(task.time, "perf_counter_ns", side_effect=lambda: round(clock[0] * 1e9)):
+            path = task.run_task(
+                output_dir=tmp, fullscreen=False, reward_interval=1,
+                fixation_radius=0.02, pump_pulse_time_seconds=0.1,
+            )
+            saved = json.loads(path.read_text())["eye_tracker_calibration"]["fixation_acceptance"]
+            with (path.parent / "message_log.tsv").open() as stream:
+                rows = list(csv.DictReader(stream, delimiter="\t"))
+
+        self.assertEqual(delivered, [101.46])
+        self.assertEqual(saved["reward_interval"], 0.4)
+        self.assertEqual(saved["fixation_radius"], 0.1)
+        self.assertEqual(saved["fix_diameter"], 0.2)
+        self.assertIn("0.4s:", preview.show_calibration_state.call_args.kwargs["status_text"])
+        audits = [
+            (json.loads(row["message"].removeprefix("live_setting ")), int(row["task_time_ns"]))
+            for row in rows if row["message"].startswith("live_setting ")
+        ]
+        initial_time = next(timestamp for entry, timestamp in audits if entry["phase"] == "initial")
+        self.assertEqual(
+            [(entry["name"], entry["new_value"], timestamp - initial_time)
+             for entry, timestamp in audits if entry["phase"] == "confirmed"],
+            [("reward_interval", 0.4, 1_000_000_000), ("fixation_radius", 0.1, 1_010_000_000)],
+        )
+        self.assertEqual(
+            [(entry["name"], entry["new_value"], timestamp - initial_time)
+             for entry, timestamp in audits if entry["phase"] == "applied"],
+            [("reward_interval", 0.4, 1_050_000_000), ("fixation_radius", 0.1, 1_050_000_000)],
+        )
+
     def _exercise_hotkeys(self, source, valid):
         task = self.task
         win = Mock(size=(800, 600))
@@ -798,6 +925,7 @@ class EyeCalibrationTaskTests(unittest.TestCase):
             "initial_x_scale": 0.003,
             "initial_y_scale": -0.004,
             "reward_interval": 1.5,
+            "fixation_radius": 0.07,
             "video_files": ["attention.mp4"],
             "video_size": [120, 80],
             "clip_duration_seconds": 3.5,
@@ -814,6 +942,7 @@ class EyeCalibrationTaskTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["frame_rate"], 24)
         initial = run.call_args.kwargs["initial_calibration"]
         self.assertEqual(run.call_args.kwargs["reward_interval"], 1.5)
+        self.assertEqual(run.call_args.kwargs["fixation_radius"], 0.07)
         self.assertEqual(
             (initial.x_scale, initial.y_scale, initial.x_offset, initial.y_offset),
             (0.003, -0.004, 0.0, 0.0),

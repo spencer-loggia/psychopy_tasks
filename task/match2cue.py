@@ -50,6 +50,7 @@ from bin.frame_timing import (
     wait_until,
 )
 from bin.eye_tracking_config import load_eye_tracking_settings
+from bin.pump_control import PumpPulseControl
 from bin.logger import SessionLogBundle
 from bin.match2cue_logic import (
     Match2CueTrial,
@@ -149,6 +150,7 @@ def _meta_values(
 def _build_behavior_fieldnames(num_afc: int) -> List[str]:
     fields = [
         "trial_num",
+        "pump_pulse_time",
         "initiation_task_time_ns",
         "cue_shape",
         "cue_color",
@@ -268,6 +270,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     pump_pin = int(cfg.get("pump_pin", 0))
     pump_delay_time = max(0.0, float(cfg.get("pump_delay_time", 0.0)))
     pump_pulse_time = max(0.0, float(cfg.get("pump_pulse_time_seconds", 0.25)))
+    pump_control = PumpPulseControl(pump_pulse_time)
     reward_settings = resolve_match2cue_reward_settings(
         reward_match_cue_prob=cfg.get("reward_match_cue_prob", 0.0),
         correct_num_pulse=cfg.get("correct_num_pulse", 1),
@@ -275,6 +278,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
         pump_pulse_time_seconds=pump_pulse_time,
         tie_mode=cfg.get("tie_mode", "random"),
     )
+    inter_pump_interval_s = reward_settings.inter_pump_interval
     if raspi:
         DAQC2DigitalOutputs.validate_address(daq_address)
         DAQC2DigitalOutputs.validate_bit(pump_pin)
@@ -287,6 +291,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
         config_name=config_name,
         behavior_fieldnames=_build_behavior_fieldnames(num_afc),
         auto_flush=False,
+        live_settings=pump_control.settings if pump_control is not None else None,
     )
     logger = session_logs.event_logger
     msg_logger = session_logs.message_logger
@@ -339,6 +344,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
         experimenter_preview = ExperimenterPreview(
             experimenter_screen,
             eye_tracking_shared=session_logs.eye_tracking_preview,
+            pump_control=pump_control,
             task_label=config_name,
             subject=subject,
             current_trial_num=1,
@@ -562,7 +568,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
         def wait_between_pulses(pulse_num: int) -> bool:
             nonlocal task_end_status
             if wait_or_abort(
-                reward_settings.inter_pump_interval,
+                inter_pump_interval_s,
                 allow_manual_reward=False,
             ):
                 if task_end_status == "done":
@@ -622,6 +628,9 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     try:
         trial_num = 1
         while run_indefinitely or trial_num <= n_trials:
+            pump_pulse_time = pump_control.apply_pending(msg_logger)
+            if cfg.get("inter_pump_interval") is None:
+                inter_pump_interval_s = pump_pulse_time
             if experimenter_preview is not None:
                 experimenter_preview.set_trial_progress(trial_num, n_trials)
             if poll_controls():
@@ -747,7 +756,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                     gray_duration += reward_train_duration(
                         reward_settings.correct_num_pulse,
                         pump_pulse_time,
-                        reward_settings.inter_pump_interval,
+                        inter_pump_interval_s,
                     )
                 logger.log_frame_flip(
                     trial_num=trial_num,
@@ -788,6 +797,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
             chosen_shape, chosen_color, chosen_lum = _meta_values(space, chosen_stimulus)
             behavior_row: Dict[str, Any] = {
                 "trial_num": trial_num,
+                "pump_pulse_time": pump_pulse_time,
                 "initiation_task_time_ns": trial_meta.get("initiation_task_time_ns", ""),
                 "cue_shape": cue_shape,
                 "cue_color": cue_color,
@@ -886,13 +896,13 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
         except Exception:
             pass
         try:
-            msg_logger.log("INFO", f"session_end status={task_end_status}")
-            session_logs.close()
+            if experimenter_preview is not None:
+                experimenter_preview.close()
         except Exception:
             pass
         try:
-            if experimenter_preview is not None:
-                experimenter_preview.close()
+            msg_logger.log("INFO", f"session_end status={task_end_status}")
+            session_logs.close()
         except Exception:
             pass
         try:

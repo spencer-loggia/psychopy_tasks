@@ -1,7 +1,7 @@
 import types
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from bin.daqc2_outputs import DAQC2DigitalOutputs, PeriodicDOUTPulseController
 from bin.eye_tracking import EyeCalibration, EyeTrackerState
@@ -112,6 +112,172 @@ class DAQC2DigitalOutputsTests(unittest.TestCase):
                 interval_s=0.25,
                 pulse_duration_s=0.25,
             )
+
+    def test_duration_update_during_hardware_on_keeps_active_width_and_edge_history(self):
+        now = 0.0
+        writes = []
+
+        def wait(duration):
+            nonlocal now
+            now += duration
+            return now >= 2.5
+
+        def write(bit, active):
+            writes.append((active, now))
+            if active and len(writes) == 1:
+                controller.set_pulse_duration(0.3)
+
+        controller = PeriodicDOUTPulseController(
+            types.SimpleNamespace(validate_bit=int, write=write),
+            bit=0, interval_s=1, pulse_duration_s=0.1, clock=lambda: now,
+        )
+        controller._anchor_perf_s = 0
+        controller._stop_event = types.SimpleNamespace(wait=wait)
+        controller._run()
+        self.assertIsNone(controller.failure)
+        self.assertEqual([active for active, _ in writes], [True, False, True, False])
+        self.assertAlmostEqual(writes[1][1] - writes[0][1], 0.1)
+        self.assertAlmostEqual(writes[3][1] - writes[2][1], 0.3)
+        self.assertEqual([edge.pulse_duration_s for edge in controller.drain_edges() if edge.active], [0.1, 0.3])
+        for invalid in (0, -0.1, 1, float("nan"), float("inf")):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                controller.set_pulse_duration(invalid)
+        self.assertEqual(controller.pulse_duration_s, 0.3)
+
+    def test_timing_update_validates_pair_without_waiting_or_writing_hardware(self):
+        outputs = types.SimpleNamespace(validate_bit=int, write=Mock())
+        controller = PeriodicDOUTPulseController(
+            outputs, bit=0, interval_s=2, pulse_duration_s=0.25,
+            clock=lambda: 7,
+        )
+        controller._thread = Mock()
+        controller._stop_event = Mock()
+        # Both values must be published together: the old width would be too
+        # long for this interval, although the complete new pair is valid.
+        controller.set_timing(interval_s=0.1, pulse_duration_s=0.05)
+        self.assertEqual((controller.interval_s, controller.pulse_duration_s), (0.1, 0.05))
+        outputs.write.assert_not_called()
+        self.assertEqual(controller._thread.mock_calls, [])
+        self.assertEqual(controller._stop_event.mock_calls, [])
+
+        snapshot = controller._timing
+        for interval, width in (
+            (0, 0.01), (-1, 0.01), (float("nan"), 0.01),
+            (float("inf"), 0.01), (1, 0), (1, -0.01),
+            (1, float("nan")), (1, float("inf")), (1, 1), (1, 2),
+        ):
+            with self.subTest(interval=interval, width=width), self.assertRaises(ValueError):
+                controller.set_timing(interval, width)
+            self.assertIs(controller._timing, snapshot)
+
+    def test_interval_update_restarts_idle_deadline_without_catchup(self):
+        now = 0.0
+        changed = False
+        writes = []
+
+        def wait(seconds):
+            nonlocal now, changed
+            now = round(now + seconds, 9)
+            if now >= 0.2 and not changed:
+                changed = True
+                controller.set_timing(0.5, 0.1)
+            return now >= 1.35
+
+        controller = PeriodicDOUTPulseController(
+            types.SimpleNamespace(
+                validate_bit=int, write=lambda bit, active: writes.append((active, now)),
+            ),
+            bit=0, interval_s=1, pulse_duration_s=0.1, clock=lambda: now,
+        )
+        controller._anchor_perf_s = 0
+        controller._stop_event = types.SimpleNamespace(wait=wait)
+        controller._run()
+        self.assertIsNone(controller.failure)
+        self.assertEqual(writes, [(True, 0.7), (False, 0.8), (True, 1.2), (False, 1.3)])
+
+    def test_interval_revision_survives_changes_back_to_original_value(self):
+        now = 0.0
+        changed = False
+        writes = []
+
+        def wait(seconds):
+            nonlocal now, changed
+            now = round(now + seconds, 9)
+            if now >= 0.2 and not changed:
+                changed = True
+                controller.set_timing(0.5, 0.1)
+                controller.set_timing(1, 0.1)
+            return now >= 1.4
+
+        controller = PeriodicDOUTPulseController(
+            types.SimpleNamespace(
+                validate_bit=int, write=lambda bit, active: writes.append((active, now)),
+            ),
+            bit=0, interval_s=1, pulse_duration_s=0.1, clock=lambda: now,
+        )
+        controller._anchor_perf_s = 0
+        controller._stop_event = types.SimpleNamespace(wait=wait)
+        controller._run()
+        self.assertIsNone(controller.failure)
+        self.assertEqual(writes, [(True, 1.2), (False, 1.3)])
+
+    def test_interval_and_width_update_during_pulse_preserves_original_width(self):
+        now = 0.0
+        writes = []
+
+        def wait(seconds):
+            nonlocal now
+            now = round(now + seconds, 9)
+            return now >= 3.5
+
+        def write(bit, active):
+            writes.append((active, now))
+            if active and len(writes) == 1:
+                controller.set_timing(2, 0.3)
+
+        controller = PeriodicDOUTPulseController(
+            types.SimpleNamespace(validate_bit=int, write=write),
+            bit=0, interval_s=1, pulse_duration_s=0.1, clock=lambda: now,
+        )
+        controller._anchor_perf_s = 0
+        controller._stop_event = types.SimpleNamespace(wait=wait)
+        controller._run()
+        self.assertIsNone(controller.failure)
+        self.assertEqual(writes, [(True, 1), (False, 1.1), (True, 3), (False, 3.3)])
+        self.assertEqual(
+            [edge.pulse_duration_s for edge in controller.drain_edges() if edge.active],
+            [0.1, 0.3],
+        )
+
+    def test_interval_change_during_policy_check_discards_stale_reward(self):
+        now = 0.0
+        changed = False
+        writes = []
+
+        def wait(seconds):
+            nonlocal now
+            now = round(now + seconds, 9)
+            return now >= 3.3
+
+        def status(*, now_s):
+            nonlocal changed
+            if not changed:
+                changed = True
+                controller.set_timing(2, 0.1)
+            return types.SimpleNamespace(due=True)
+
+        controller = PeriodicDOUTPulseController(
+            types.SimpleNamespace(
+                validate_bit=int, write=lambda bit, active: writes.append((active, now)),
+            ),
+            bit=0, interval_s=1, pulse_duration_s=0.1, clock=lambda: now,
+            reward_policy=types.SimpleNamespace(status=status, reward_delivered=lambda **kwargs: None),
+        )
+        controller._anchor_perf_s = 0
+        controller._stop_event = types.SimpleNamespace(wait=wait)
+        controller._run()
+        self.assertIsNone(controller.failure)
+        self.assertEqual(writes, [(True, 3), (False, 3.1)])
 
     def run_fixation_pulses(self, *, misses=(), samples_end_ms=2300, stop_s=2.3):
         policy = ScreenAutoReward(

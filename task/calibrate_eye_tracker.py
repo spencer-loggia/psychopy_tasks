@@ -36,6 +36,7 @@ from bin.eye_tracking import (
     fraction_position_within_diameter,
     fraction_to_pixels,
 )
+from bin.pump_control import PumpPulseControl
 from bin.logger import SessionLogBundle
 from bin.screen import (
     ExperimenterPreview,
@@ -145,6 +146,7 @@ def run_task(
     x_scale_limits=(-0.02, 0.02),
     y_scale_limits=(-0.02, 0.02),
     fix_diameter=0.05,
+    fixation_radius=None,
     reward_interval=2.0,
     raspi=False,
     daq_address=0,
@@ -173,6 +175,12 @@ def run_task(
         raise ValueError("reward_interval must be positive and finite")
     if reward_interval <= pump_pulse_time_seconds:
         raise ValueError("reward_interval must be longer than pump_pulse_time_seconds")
+    # Legacy diameter configs retain their physical acceptance window.
+    fixation_radius = float(fix_diameter) / 2 if fixation_radius is None else float(fixation_radius)
+    pump_control = PumpPulseControl(
+        pump_pulse_time_seconds, reward_interval=reward_interval,
+        fixation_radius=fixation_radius, boundary="update", interval_label="Fix interval",
+    )
     for limits in (x_scale_limits, y_scale_limits):
         if (
             len(limits) != 2
@@ -208,6 +216,7 @@ def run_task(
         task_name="calibrate_eye_tracker",
         config_name=config_name,
         auto_flush=False,
+        live_settings=pump_control.settings if pump_control is not None else None,
     )
     logger, msg_logger = session_logs.event_logger, session_logs.message_logger
     main_win = preview = tracker = None
@@ -252,7 +261,9 @@ def run_task(
                 "calibration_points": [asdict(point) for point in point_fit.points],
                 "completion_status": "interrupted" if error else "complete",
                 "fixation_acceptance": {
-                    "fix_diameter": fix_diameter,
+                    "fix_diameter": 2 * fixation_radius,
+                    "fixation_radius": fixation_radius,
+                    "radius_units": "fraction_of_shorter_subject_scene_dimension",
                     "reward_interval": reward_interval,
                     "recent_duration_s": CalibrationAutoReward.RECENT_SECONDS,
                     "recent_fraction_threshold": CalibrationAutoReward.RECENT_THRESHOLD,
@@ -326,6 +337,7 @@ def run_task(
         preview = ExperimenterPreview(
             experimenter_screen,
             task_label=config_name,
+            pump_control=pump_control,
             update_interval_s=0.05,
             calibration_config={
                 "subject_size": subject_size,
@@ -347,7 +359,7 @@ def run_task(
         )
         auto_reward = CalibrationAutoReward(
             reward_interval=reward_interval, calibration=calibration,
-            fixation=fixation, screen_size=subject_size, fix_diameter=fix_diameter,
+            fixation=fixation, screen_size=subject_size, fixation_radius=fixation_radius,
             max_sample_age_s=uart_config.max_sample_age_s,
         )
         main_bg = utils.make_bg_rect(main_win, bg)
@@ -412,12 +424,19 @@ def run_task(
                 calibration_points=[point.target_fraction for point in point_fit.points],
             )
 
+        def apply_reward_settings(values, timestamp_ns):
+            return auto_reward.try_configure(
+                reward_interval=values["reward_interval"], fixation_radius=values["fixation_radius"],
+                now_s=timestamp_ns / 1e9,
+            ) is not None
+
         def reward():
+            pulse_duration_s = pump_control.settings.values["pump_pulse_time"]
             auto_reward.reward_delivered(now_s=time.perf_counter())
             _deliver_reward_pulse(
                 outputs=outputs,
                 pump_pin=pump_pin,
-                pulse_duration_s=pump_pulse_time_seconds,
+                pulse_duration_s=pulse_duration_s,
                 logger=logger,
                 should_exit=should_exit,
                 # Keep the attention movie moving during the software-timed
@@ -428,6 +447,10 @@ def run_task(
             # the reset at onset. Keep those new samples for the next reward.
 
         while not should_exit():
+            # UI edits are polled only between pulses, without waiting for the
+            # preview. A changed interval/radius starts fresh fixation history.
+            values = pump_control.settings.apply_pending(msg_logger, on_apply=apply_reward_settings)
+            reward_interval, fixation_radius = values["reward_interval"], values["fixation_radius"]
             latest_state = tracker.get_state()
             if gain_anchor_px is None and latest_state.valid:
                 # Hold one reference throughout slider drags. Capturing a point
@@ -535,7 +558,7 @@ def run_task(
             in_window = latest_state.valid and fraction_position_within_diameter(
                 eye_fraction,
                 fixation,
-                diameter_fraction=fix_diameter,
+                diameter_fraction=2 * fixation_radius,
                 screen_size=subject_size,
             )
             auto_count = int(controls.get("auto_reward_count", 0))
@@ -693,6 +716,7 @@ def main():
         x_scale_limits=cfg.get("x_scale_limits", (-0.02, 0.02)),
         y_scale_limits=cfg.get("y_scale_limits", (-0.02, 0.02)),
         fix_diameter=float(cfg.get("fix_diameter", 0.05)),
+        fixation_radius=(None if cfg.get("fixation_radius") is None else float(cfg["fixation_radius"])),
         reward_interval=float(cfg.get("reward_interval", cfg.get("fix_accept_time") or 2)),
         raspi=args.raspi if args.raspi is not None else cfg.get("raspi", False),
         daq_address=int(daq.get("address", cfg.get("daq_address", 0))),

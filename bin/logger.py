@@ -523,10 +523,12 @@ class SessionLogBundle:
         event_name_library_path: Optional[str | Path] = None,
         eye_tracking_config=None,
         on_eye_state=None,
+        live_settings=None,
     ):
         self.session_clock = TaskClock(started_at=when)
         block_start_perf_ns = time.perf_counter_ns()
         self._closed = False
+        self.live_settings = live_settings
         exact_session_dir = os.environ.get(EXACT_SESSION_DIR_ENV)
         if exact_session_dir:
             self.session_dir = Path(exact_session_dir).expanduser().resolve()
@@ -567,6 +569,8 @@ class SessionLogBundle:
             session_clock=self.session_clock,
             auto_flush=auto_flush,
         )
+        if self.live_settings is not None:
+            self.live_settings.log_initial(self.message_logger)
         self.behavior_logger = (
             BehaviorLogger(self.session_dir, fieldnames=behavior_fieldnames, auto_flush=auto_flush)
             if behavior_fieldnames
@@ -619,6 +623,8 @@ class SessionLogBundle:
     def flush(self) -> None:
         if self.eye_tracking is not None:
             self.eye_tracking.check_recording_error()
+        if self.live_settings is not None:
+            self.live_settings.log_requests(self.message_logger)
         self.event_logger.flush()
         self.message_logger.flush()
         if self.behavior_logger is not None:
@@ -634,6 +640,13 @@ class SessionLogBundle:
         block_end_perf_ns = time.perf_counter_ns()
         self._closed = True
         atexit.unregister(self.close)
+        settings_error = None
+        if self.live_settings is not None:
+            try:
+                self.live_settings.close(self.message_logger)
+            except Exception as exc:
+                settings_error = exc
+                self.message_logger.log("ERROR", f"live_setting_audit_incomplete error={exc}")
         self.event_logger.log_event(
             trial_num=None, event="block_end", event_type="lifecycle",
             timestamp_perf_ns=block_end_perf_ns,
@@ -656,3 +669,5 @@ class SessionLogBundle:
             table_logger.close()
         if eye_error is not None:
             raise eye_error
+        if settings_error is not None:
+            raise settings_error

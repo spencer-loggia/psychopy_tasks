@@ -9,14 +9,14 @@
   "num_afc": 4,
 
   "cue_time": 1,
-  "delay_time": 1,
+  "delay_time": 0,
   "choice_time": 5,
   "iti": 1.0,
   "isi": 0.0,
 
   "image_size": [128, 128],
   "win_size": [1200, 900],
-  "fullscreen": false,
+  "fullscreen": true,
   "fixed_positions": true,
   
 

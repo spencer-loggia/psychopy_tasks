@@ -493,6 +493,12 @@ fields:
   },
   "mask_main_inputs": true,
   "screen_mask_rgb": [174, 165, 163],
+  "sync_bar": {
+    "enabled": true,
+    "height": 20,
+    "interval_mean_seconds": 1.0,
+    "interval_variance_seconds": 0.2
+  },
   "main_touchscreen_xinput": "Exact XInput Touchscreen Name"
 }
 ```
@@ -500,6 +506,9 @@ fields:
 - `mask_main_inputs` defaults to `false` and must be a JSON boolean.
 - `screen_mask_rgb` sets the idle main-screen mask color using three integer RGB channels in 0–255;
   it defaults to `[0, 0, 0]` (black).
+- An enabled top-level `sync_bar` adds five static black/white rectangles to the mask at the
+  subject's visible top, using the same height and rotation as task bars. It stays in phase 0
+  between blocks for checking camera views, without scheduled transitions or GPIO output.
 - When `mask_main_inputs` is `true` and the resolved main and experimenter displays differ, `main_touchscreen_xinput` is required.
   It must be the exact stable device name reported by `xinput list --name-only`; numeric XInput IDs are rejected
   because they can change after reboot.
@@ -513,8 +522,8 @@ subprocess creates its main window, then emits a private readiness marker. The m
 maps the touchscreen to the resolved main RandR output with `xinput map-to-output`, enables it, and acknowledges
 release. The task waits for that acknowledgment and then activates its window before beginning timing-sensitive
 work.
-After every block—including errors and user exits—the manager disables the touchscreen again, restores the black
-window, and returns focus to the interface. Choosing **Desktop**, closing the interface window, or otherwise
+After every block—including errors and user exits—the manager disables the touchscreen again, restores the configured
+mask and static bar, and returns focus to the interface. Choosing **Desktop**, closing the interface window, or otherwise
 leaving the interface normally re-enables the touchscreen before exit.
 
 Experiment Quiet Mode
@@ -1439,6 +1448,14 @@ PsychoPy experiment tasks accept the following optional `sync_bar` block. Omitti
   "interval_variance_seconds": 0.2
 }
 ```
+
+The same `sync_bar` object can be set at the top level of an experiment launch config.
+When present, it replaces each block's entire `sync_bar` configuration, including values
+injected from experiment state. Omitted fields use the defaults above; `enabled: false`
+disables the bar for every block. The resolved settings are saved in every block's logged
+`config.json`. Without a launcher-level object, blocks retain their own settings.
+`config_files/interface/rpi_launch_config.json` enables the experiment-level bar with
+the default height and intervals, including its static version on the idle mask.
 
 The enabled bar contains five alternating black and white rectangles at the top of the
 subject's view, accounting for software rotation, and is also visible on the experimenter

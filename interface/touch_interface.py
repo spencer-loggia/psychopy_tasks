@@ -23,6 +23,7 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from bin import tk_dialogs as messagebox
+from bin.sync_bar import SyncBarConfig
 from bin.screen import (
     MAIN_SCREEN_ENV,
     SCREEN_ENV_OVERRIDE_ENV,
@@ -143,6 +144,7 @@ def load_launcher_config(path: Path) -> Dict[str, Any]:
 
     if not isinstance(cfg, dict):
         raise ValueError("Launcher config must contain a top-level JSON object")
+    SyncBarConfig.from_mapping(cfg.get("sync_bar"))
     return cfg
 
 

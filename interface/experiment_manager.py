@@ -13,11 +13,12 @@ import socket
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Optional
 
 from bin.task_clock import EXPERIMENT_ORIGIN_ENV, TaskClock
+from bin.sync_bar import SyncBarConfig
 from bin.config import load_config
 from bin.run_identity import BLOCK_ID_ENV, EXPERIMENT_ID_ENV, BLOCK_IDENTITY_FILENAME, new_run_id
 from bin.eye_tracking import (
@@ -215,6 +216,10 @@ class ExperimentManager:
         self.launch_config_path = Path(launch_config_path).resolve()
         self.config_dir = self.launch_config_path.parent
         self.launch_config = copy.deepcopy(dict(launch_config))
+        self.sync_bar = (
+            SyncBarConfig.from_mapping(self.launch_config["sync_bar"])
+            if "sync_bar" in self.launch_config else None
+        )
         self.subject_name = str(subject_name)
         self.subject_code = str(subject_code)
         self._perf_counter_ns = perf_counter_ns
@@ -401,6 +406,8 @@ class ExperimentManager:
         block_config["output_dir"] = str(output_dir)
         block_config["subject"] = self.subject_name
         block_config.update(injected)
+        if self.sync_bar is not None:
+            block_config["sync_bar"] = asdict(self.sync_bar)
         block_config["experiment_id"] = self.experiment_id
         block_config["block_id"] = block_id
         resolve_eye_tracking_paths(block_config, self.launch_config_path.parent)

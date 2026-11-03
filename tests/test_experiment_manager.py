@@ -51,6 +51,51 @@ class FakeClock:
 
 
 class ExperimentManagerTests(unittest.TestCase):
+    def test_experiment_sync_override_is_resolved_and_saved_in_every_block(self):
+        block_sync = {"enabled": True, "height": 44,
+                      "interval_mean_seconds": 3.0, "interval_variance_seconds": 0.8}
+        defaults = {"enabled": False, "height": 20,
+                    "interval_mean_seconds": 1.0, "interval_variance_seconds": 0.2}
+        for options in (None, {"enabled": True, "height": 31}, {"enabled": False},
+                        {"enabled": True, "height": 25,
+                         "interval_mean_seconds": 2.0, "interval_variance_seconds": 0.4}):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config, path = self._project(root)
+                source = root / "configs/demo.json"
+                payload = json.loads(source.read_text())
+                payload["sync_bar"] = block_sync
+                source.write_text(json.dumps(payload))
+                original = source.read_bytes()
+                if options is not None:
+                    config["sync_bar"] = options
+                    # A calibration/state injection cannot override experiment settings.
+                    config["initial_state"]["sync_bar"] = {"enabled": False, "height": 55}
+                path.write_text(json.dumps(config))
+                manager = ExperimentManager(working_dir=root, launch_config_path=path,
+                                            launch_config=config, subject_name="Yuri", subject_code="Y")
+                expected = block_sync if options is None else {**defaults, **options}
+                for _ in range(2):
+                    block = manager.prepare_block(task_name="demo", launch_value="task/demo.py",
+                                                  config_value="configs/demo.json")
+                    saved = json.loads(block.config_path.read_text())
+                    self.assertEqual(saved["sync_bar"], expected)
+                    manager.finish_block(block)
+                self.assertEqual(source.read_bytes(), original)
+                manager.finish()
+
+    def test_invalid_experiment_sync_fails_before_allocating_or_starting_a_run(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config, path = self._project(root)
+            config["sync_bar"] = {"enabled": True, "height": -1}
+            with patch("interface.experiment_manager.ExperimentEyeTracker") as tracker:
+                with self.assertRaisesRegex(ValueError, "sync_bar.height"):
+                    ExperimentManager(working_dir=root, launch_config_path=path, launch_config=config,
+                                      subject_name="Yuri", subject_code="Y")
+            tracker.assert_not_called()
+            self.assertFalse((root / "logs").exists())
+
     def test_unique_ids_persist_in_state_blocks_configs_and_uart_context(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

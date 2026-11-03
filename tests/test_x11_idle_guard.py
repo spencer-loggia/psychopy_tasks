@@ -1,4 +1,5 @@
 import subprocess
+import json
 import sys
 import tempfile
 import unittest
@@ -7,7 +8,7 @@ from unittest.mock import Mock, patch
 
 from bin.screen import ScreenGeometry
 from interface.experiment_manager import PreparedBlock
-from interface.touch_interface import TouchInterfaceApp
+from interface.touch_interface import TouchInterfaceApp, load_launcher_config
 from interface.x11_idle_guard import (
     ExperimentIdleGuard,
     MainScreenCurtain,
@@ -165,6 +166,71 @@ class X11IdleGuardTests(unittest.TestCase):
         window.focus_force.assert_called_once_with()
         window.update.assert_called_once_with()
         window.focus_displayof.assert_called_once_with()
+
+    def test_static_sync_bar_matches_subject_top_for_every_rotation(self):
+        expected = {
+            "right": lambda i: (200 * i, 0, 200 * (i + 1), 20),
+            "normal": lambda i: (983, 120 * i, 1003, 120 * (i + 1)),
+            "left": lambda i: (1003 - 200 * (i + 1), 582, 1003 - 200 * i, 602),
+            "inverted": lambda i: (0, 602 - 120 * (i + 1), 20, 602 - 120 * i),
+        }
+        for rotation, bounds in expected.items():
+            with self.subTest(rotation=rotation):
+                tk_module = Mock()
+                screen = ScreenGeometry(0, 1920, 100, 1003, 602, rotation=rotation)
+                curtain = MainScreenCurtain(
+                    Mock(), screen, tk_module=tk_module, screen_mask_rgb=(174, 165, 163),
+                    sync_bar={"enabled": True, "height": 20},
+                )
+                canvas = tk_module.Canvas.return_value
+                for index, call in enumerate(canvas.create_rectangle.call_args_list):
+                    self.assertEqual(call.args, bounds(index))
+                    self.assertEqual(call.kwargs["fill"], "#ffffff" if index % 2 else "#000000")
+                    self.assertEqual(call.kwargs["outline"], "")
+                self.assertEqual(tk_module.Canvas.call_args.kwargs["bg"], "#aea5a3")
+                for _ in range(3):
+                    curtain.show()
+                    curtain.hide()
+                self.assertEqual(canvas.create_rectangle.call_count, 5)
+                canvas.itemconfigure.assert_not_called()
+                canvas.after.assert_not_called()
+                curtain.window.after.assert_not_called()
+
+    def test_idle_mask_has_no_bar_when_sync_is_absent_or_disabled(self):
+        for config in (None, {"enabled": False}):
+            tk_module = Mock()
+            curtain = MainScreenCurtain(Mock(), self.main_screen, tk_module=tk_module, sync_bar=config)
+            curtain.show()
+            tk_module.Canvas.assert_not_called()
+
+    def test_oversized_bar_is_rejected_before_creating_the_mask_window(self):
+        tk_module = Mock()
+        with self.assertRaisesRegex(ValueError, "fit the oriented display"):
+            MainScreenCurtain(Mock(), self.main_screen, tk_module=tk_module,
+                              sync_bar={"enabled": True, "height": 3000})
+        tk_module.Toplevel.assert_not_called()
+
+    def test_idle_guard_uses_top_level_sync_settings(self):
+        config = {"enabled": True, "height": 27}
+        with patch("interface.x11_idle_guard.sys.platform", "linux"), patch.dict(
+            "os.environ", {"DISPLAY": ":0", "XDG_SESSION_TYPE": "x11"},
+        ), patch("interface.x11_idle_guard.XInputTouchscreen"), patch(
+            "interface.x11_idle_guard.MainScreenCurtain",
+        ) as curtain:
+            create_experiment_idle_guard(
+                Mock(), {"mask_main_inputs": True, "main_touchscreen_xinput": "Main Touch",
+                         "sync_bar": config}, self.main_screen, self.experimenter_screen,
+                tk_module=Mock(),
+            )
+        self.assertEqual(curtain.call_args.kwargs["sync_bar"], config)
+
+    def test_launcher_rejects_invalid_sync_even_when_masking_is_off(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "launch.json"
+            for options in (False, {"height": 0}, {"interval_mean_seconds": 0.1}):
+                with self.subTest(options=options), self.assertRaises(ValueError):
+                    path.write_text(json.dumps({"sync_bar": options, "mask_main_inputs": False}))
+                    load_launcher_config(path)
 
     def test_curtain_focus_barrier_rejects_ambiguous_active_display(self):
         root = Mock()

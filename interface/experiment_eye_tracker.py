@@ -79,13 +79,14 @@ def _shutdown_eye_tracker(uart, warnings):
 class ExperimentEyeTracker:
     def __init__(
         self, config, *, subject: str, started_at: dt.datetime,
-        directory: Path, experiment_number: int,
+        directory: Path, experiment_number: int, experiment_id: str | None = None,
     ):
         self.warnings = EyeTrackerWarnings()
         self.pending_path = directory / ".eye_tracker_start_pending"
         self.ready_path = directory / ".eye_tracker_experiment_ready"
         self.subject = subject
         self.experiment_number = experiment_number
+        self.experiment_id = experiment_id
         stamp = started_at.astimezone(dt.timezone.utc)
         delta = stamp - dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
         self.timestamp_ns = (
@@ -109,7 +110,9 @@ class ExperimentEyeTracker:
                 or self.start_timeout_s <= 0
             ):
                 raise ValueError("eye_tracker_experiment.start_timeout_s must be positive and finite")
-            self.pending_path.touch()
+            # Pass the launcher's actual START + UUID wait budget to task workers.
+            wait_s = 2 * self.uart.command_wait_s(state_timeout_s=self.start_timeout_s) + 2
+            self.pending_path.write_text(str(wait_s), encoding="ascii")
             self.start_future = _COMMANDS.submit(self._send, start=True, queued_at=time.monotonic())
         except Exception as exc:
             self.uart = None
@@ -144,6 +147,7 @@ class ExperimentEyeTracker:
                     controller.start_experiment(
                         self.subject, timestamp_ns=self.timestamp_ns,
                         experiment_number=self.experiment_number,
+                        experiment_id=self.experiment_id,
                     )
                     if start else controller.stop_experiment()
                 )

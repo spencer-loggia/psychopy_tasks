@@ -132,7 +132,7 @@ contains:
 
 - `launch_config.json`: a snapshot of the interface launch config.
 - `event_name_library.json`: a snapshot of the shared event-name/code library used by its blocks.
-- `state.json`: the current mutable experiment state plus launch-time Git commit, hostname, OS details, and Python version.
+- `state.json`: the unique `experiment_id` (UUID), current mutable experiment state, and launch-time Git commit, hostname, OS details, and Python version.
 - `blocks.tsv`: blocks in launch order, with human-readable start and end datetimes to the second.
 - `clock.json`: the experiment origin (`origin_perf_counter_ns`) and its local wall-clock datetime.
 - `blocks/[block_num]_[block_name]/`: the generated config and outputs for each block.
@@ -161,7 +161,10 @@ the cache. Their rows have status `imported`; missing summary fields remain blan
 provide only a lower bound on runtime. Experiments already removed locally before this log was introduced
 cannot be reconstructed from local files alone.
 
-`blocks.tsv` has the fields `block_name`, `block_num`, `subject`, `start_time`, `end_time`, and `out_dir`.
+`blocks.tsv` has the fields `block_name`, `block_num`, `block_id`, `experiment_id`, `subject`, `start_time`, `end_time`, and `out_dir`.
+Every experiment and prepared block receives a new UUID. Each block directory saves both IDs in
+`block.json` and the generated `config.json`, before acquisition starts. The UUIDs identify runs across
+devices; the existing sequential numbers and directory names remain unchanged.
 `block_name` is the task config's `config_name`, falling back to the interface button name for a task with no
 source config. A row is written with a blank `end_time` before the subprocess starts and is updated when it exits,
 so an interrupted or failed block remains visible in the experiment record. `start_time` and `end_time` use
@@ -187,6 +190,10 @@ command carries the local `block_num`, including calibration tasks and gaps from
 without eye tracking. For example, local `blocks/3_fixation/` corresponds to tracker
 `blocks/3/`. Directory names retain each device's format; the tracker uses the full subject
 name, UTC date and an additional start time in its experiment name.
+After each acknowledged start, the same UART connection sends `SET_EXPERIMENT_ID` (code 9)
+or `SET_BLOCK_ID` (code 10) with the matching UUID. Startup succeeds only after this packet is
+also acknowledged. This applies to explicit recording starts as well as tracking starts.
+The tracker saves the experiment UUID in `state.json` and both IDs in the block's `identity.json`.
 End Experiment or closing the launcher queues `STOP_EXPERIMENT`
 (code 7), which asks the tracker to flush recording and close its experiment. The tracker
 must run its `pi_tracker.py CONFIG` interface with permission to set its system clock;
@@ -194,12 +201,16 @@ standalone `run`/`preview` services do not implement these experiment commands. 
 names must match `[A-Za-z0-9][A-Za-z0-9_.-]{0,31}`; unsupported names produce a warning
 and are never silently rewritten.
 
-Use a tracker version supporting numbered starts: the number occupies little-endian
+Use the matching tracker version supporting numbered starts and UUID commands. The number occupies little-endian
 uint32 header bytes 12–15 of the existing 64-byte protocol v1 packet. Older trackers reject
 this field. An existing experiment number for the same subject and UTC day is rejected;
 a numbered tracking start replaces that block's directory on the tracker. Retries reuse
 the identical packet and sequence so a lost acknowledgement does not restart or replace
-the block again. Standalone task launches and launches with experiment synchronization
+the block again. An ID retry resends only the ID packet. UUID commands carry the 16 UUID bytes
+in canonical byte order at offsets 24–39, with zero padding at 40–59; packet size, version,
+subject capacity, and telemetry remain unchanged. Older receivers reject the new commands,
+so update the tracker before enabling acquisition with this client.
+Standalone task launches and launches with experiment synchronization
 disabled retain automatic tracker numbering. `uart.manage_tracking: false` remains poll-only.
 
 These commands run in order on a background worker. START is queued once the experiment's
@@ -208,12 +219,12 @@ take five seconds). State commands retry a missing/invalid acknowledgement after
 `uart.response_timeout_s` (0.25 s), plus a 0.02 s retry delay, using the identical packet.
 Only the final attempt waits the full action timeout: 15 seconds for experiment start
 (`eye_tracker_experiment.start_timeout_s`), or 10 seconds for other state commands
-(`uart.state_timeout_s`). With the default one retry, experiment start takes at most about
-15.27 seconds waiting on the transport, and a single dropped request can be resent after
+(`uart.state_timeout_s`). With the default one retry, each experiment start or ID command waits at most
+about 15.27 seconds on the transport, and a single dropped request can be resent after
 about 0.27 seconds instead of 15 seconds. When omitted, the start timeout is the greater of
 15 seconds and `uart.state_timeout_s`. `uart.state_retries` controls the number of retries;
 zero disables the short retry window and waits the full action timeout on the first attempt.
-The UART is closed after each command. Task eye acquisition waits for the experiment-start
+The UART is closed after each start/ID exchange or stop command. Task eye acquisition waits for the experiment-start
 handoff in its own worker, so the launcher and task rendering remain responsive.
 If experiment start is not confirmed, task eye acquisition stays off for that experiment
 to avoid writing numbered blocks into a previously active tracker experiment.
@@ -557,6 +568,7 @@ When run by the experiment manager, the same files are written directly into
 
 Each session directory contains the applicable files from this set:
 
+- `block.json`: the block UUID and enclosing experiment UUID (null for standalone tasks)
 - `event_log.tsv`
 - `message_log.tsv`
 - `behavior_log.tsv` when the task records trial-level behavior
@@ -587,12 +599,18 @@ nanosecond hardware accuracy. Camera timestamps retain their separate, unsynchro
 - `event_code`
 - `event_type`
 - `requested_duration`
+- `sync_transition_num`
+- `sync_phase`
 
 Common event-log rules:
 
 - `requested_task_time_ns` records when a refresh-locked flip or hardware change was submitted. For `sync_bar_flip`, it records the sampled target display time, preserving any deferral to protect task timing. It is blank for events that have no separate request time.
 - `task_time_ns` records the observed flip, interaction, or individual output write, in integer nanoseconds on the experiment clock.
 - `event_type` is one of `frame_flip`, `interaction`, `signal`, or `lifecycle`.
+- `sync_transition_num` starts at 1 for each block and increments on each displayed sync inversion,
+  across all trials and video clips. `sync_phase` records the resulting pattern: 0 is black/white/black/white/black;
+  1 is white/black/white/black/white, read left to right from the subject's perspective.
+  Both fields appear on the visual transition and its corresponding GPIO event, and are blank for other events.
 - The first data row is `block_start` (code 1), captured as the task opens its log bundle. The last is
   `block_end` (code 2), captured once when the task closes the bundle, before log draining and eye-tracker
   shutdown. Both use native `perf_counter_ns()` captures, type `lifecycle`, and a blank `trial_num`.
@@ -1435,7 +1453,9 @@ callback for each bar inversion, producing one electrical edge per inversion.
 Due inversions share ordinary video or trial frame flips. During static scenes the bar can
 swap independently, preserving both the visible scene and the prepared next scene on the
 GPU. Task deadlines reserve the preceding refresh; nearby sync-only swaps defer to the task
-flip. Input is sampled before optional sync swaps, and buffered touch timestamps and pending
+flip. The GPIO edge is deferred with the bar and sent in that actual flip's callback;
+reaching the original requested time never sends an edge on its own.
+Input is sampled before optional sync swaps, and buffered touch timestamps and pending
 input-reset callbacks are preserved. The experimenter preview mirrors the subject's phase
 asynchronously; it does not drive the GPIO clock. Use `sync_pin: null` for visual-only sync.
 

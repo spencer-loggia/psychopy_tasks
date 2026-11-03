@@ -19,6 +19,7 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Optional
 
 from bin.task_clock import EXPERIMENT_ORIGIN_ENV, TaskClock
 from bin.config import load_config
+from bin.run_identity import BLOCK_ID_ENV, EXPERIMENT_ID_ENV, BLOCK_IDENTITY_FILENAME, new_run_id
 from bin.eye_tracking import (
     EXPERIMENT_BLOCK_NUMBER_ENV,
     EXPERIMENT_UART_PENDING_ENV,
@@ -50,6 +51,8 @@ _EYE_CALIBRATION_COEFFICIENTS = (
 BLOCK_FIELDS = (
     "block_name",
     "block_num",
+    "block_id",
+    "experiment_id",
     "subject",
     "start_time",
     "end_time",
@@ -191,6 +194,7 @@ class PreparedBlock:
     launch_path: Path
     config_path: Path
     output_dir: Path
+    block_id: str
 
 
 class ExperimentManager:
@@ -231,6 +235,8 @@ class ExperimentManager:
                         milliseconds = entry.pop("set_time")
                         entry.setdefault("task_time_ns", round(float(milliseconds) * 1_000_000))
         self.state["subject"] = self.subject_name
+        self.experiment_id = new_run_id()
+        self.state["experiment_id"] = self.experiment_id
 
         self.logs_dir = self.working_dir / "logs"
         self.history = ExperimentHistory(self.logs_dir)
@@ -251,10 +257,12 @@ class ExperimentManager:
             "origin_perf_counter_ns": self.task_clock.origin_perf_ns,
             "origin_datetime": self.started_at.isoformat(timespec="microseconds"),
         })
+        self._write_state()
         self.eye_tracker = ExperimentEyeTracker(
             self.launch_config, subject=self.subject_name,
             started_at=self.started_at, directory=self.experiment_dir,
             experiment_number=self.experiment_number,
+            experiment_id=self.experiment_id,
         )
         try:
             # Start UART as soon as the experiment identity and required files
@@ -359,13 +367,14 @@ class ExperimentManager:
         raw_block_name = block_config.get("config_name") or task_name
         block_name = str(raw_block_name).strip() or str(task_name)
         block_num = len(self.blocks) + 1
+        block_id = new_run_id()
         output_dir = self.blocks_dir / f"{block_num}_{sanitize_filename_component(block_name)}"
         output_dir.mkdir(exist_ok=False)
 
         injected: dict[str, Any] = {}
 
         def _inject(key: str, value: Any, state_name: str) -> None:
-            if key in {"config_name", "output_dir", "subject"}:
+            if key in {"config_name", "output_dir", "subject", "experiment_id", "block_id"}:
                 raise ValueError(
                     f"Experiment state field '{state_name}' cannot inject reserved config key '{key}'"
                 )
@@ -377,7 +386,7 @@ class ExperimentManager:
             injected[key] = copy.deepcopy(value)
 
         for state_name, state_value in self.state.items():
-            if state_name in {"subject", "git_commit", "hostname", "os_details", "python_version"}:
+            if state_name in {"subject", "git_commit", "hostname", "os_details", "python_version", "experiment_id", "block_id"}:
                 continue
             if isinstance(state_value, list) and state_value and isinstance(state_value[-1], dict):
                 for key, value in state_value[-1].items():
@@ -392,6 +401,8 @@ class ExperimentManager:
         block_config["output_dir"] = str(output_dir)
         block_config["subject"] = self.subject_name
         block_config.update(injected)
+        block_config["experiment_id"] = self.experiment_id
+        block_config["block_id"] = block_id
         resolve_eye_tracking_paths(block_config, self.launch_config_path.parent)
         # History retains declared scalar fields and all affine eye coefficients.
         # Also reference the accepted source artifact so enabled eye tracking
@@ -422,11 +433,17 @@ class ExperimentManager:
 
         config_path = output_dir / BLOCK_CONFIG_FILENAME
         _write_json_atomic(config_path, block_config)
+        _write_json_atomic(output_dir / BLOCK_IDENTITY_FILENAME, {
+            "experiment_id": self.experiment_id, "block_id": block_id,
+            "block_num": block_num, "block_name": block_name,
+        })
         relative_output = output_dir.relative_to(self.experiment_dir)
         self.blocks.append(
             {
                 "block_name": block_name,
                 "block_num": block_num,
+                "block_id": block_id,
+                "experiment_id": self.experiment_id,
                 "subject": self.subject_name,
                 "start_time": self._block_datetime(),
                 "end_time": "",
@@ -440,6 +457,7 @@ class ExperimentManager:
             launch_path=launch_path,
             config_path=config_path,
             output_dir=output_dir,
+            block_id=block_id,
         )
 
     def subprocess_environment(self, block: PreparedBlock) -> dict[str, str]:
@@ -447,6 +465,8 @@ class ExperimentManager:
         environment[EXACT_SESSION_DIR_ENV] = str(block.output_dir)
         environment[EVENT_LIBRARY_ENV] = str(self.event_library_path)
         environment[EXPERIMENT_ORIGIN_ENV] = str(self.task_clock.origin_perf_ns)
+        environment[EXPERIMENT_ID_ENV] = self.experiment_id
+        environment[BLOCK_ID_ENV] = block.block_id
         for key in (EXPERIMENT_UART_PENDING_ENV, EXPERIMENT_UART_READY_ENV, EXPERIMENT_BLOCK_NUMBER_ENV):
             environment.pop(key, None)
         if self.eye_tracker.start_future is not None:

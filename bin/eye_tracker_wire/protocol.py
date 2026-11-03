@@ -4,6 +4,7 @@ import enum
 import re
 import struct
 from dataclasses import dataclass
+from uuid import UUID
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,8 @@ class CommandCode(enum.IntEnum):
     START_EXPERIMENT = 6
     STOP_EXPERIMENT = 7
     SHUTDOWN = 8
+    SET_EXPERIMENT_ID = 9
+    SET_BLOCK_ID = 10
 
 
 class StatusCode(enum.IntEnum):
@@ -86,6 +89,8 @@ class CommandPacket:
     subject: str | None = None
     experiment_number: int | None = None
     block_number: int | None = None
+    experiment_id: str | None = None
+    block_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -141,6 +146,17 @@ def validate_run_number(value: int | None) -> int | None:
     return value
 
 
+def validate_run_id(value: str) -> str:
+    """Require the same canonical nonzero UUID stored in experiment metadata."""
+    try:
+        parsed = UUID(value)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ValueError("Run ID must be a canonical nonzero UUID") from exc
+    if str(parsed) != value or parsed.int == 0:
+        raise ValueError("Run ID must be a canonical nonzero UUID")
+    return value
+
+
 def encode_command(command: CommandPacket) -> bytes:
     sequence = _checked_u32(command.sequence, "command sequence")
     if sequence == 0:
@@ -152,18 +168,29 @@ def encode_command(command: CommandPacket) -> bytes:
     subject_bytes = b""
     experiment_number = validate_run_number(command.experiment_number)
     block_number = validate_run_number(command.block_number)
-    if experiment_number is not None and command.code != CommandCode.START_EXPERIMENT:
-        raise ValueError("Only START_EXPERIMENT accepts an experiment number")
-    if block_number is not None and command.code not in (
-        CommandCode.START_TRACKING, CommandCode.START_RECORDING,
+    if experiment_number is not None and command.code not in (
+        CommandCode.START_EXPERIMENT, CommandCode.SET_EXPERIMENT_ID,
     ):
-        raise ValueError("Only START_TRACKING/START_RECORDING accept a block number")
+        raise ValueError("Only START_EXPERIMENT/SET_EXPERIMENT_ID accept an experiment number")
+    if block_number is not None and command.code not in (
+        CommandCode.START_TRACKING, CommandCode.START_RECORDING, CommandCode.SET_BLOCK_ID,
+    ):
+        raise ValueError("Only START_TRACKING/START_RECORDING/SET_BLOCK_ID accept a block number")
     if command.code == CommandCode.START_EXPERIMENT:
         if command.controller_timestamp_ns == 0:
             raise ValueError("START_EXPERIMENT requires a nonzero Unix UTC timestamp")
         subject_bytes = validate_subject_name(command.subject).encode("ascii")
     elif command.subject is not None:
         raise ValueError("Only START_EXPERIMENT accepts a subject")
+    identifier = None
+    for value, code in (
+        (command.experiment_id, CommandCode.SET_EXPERIMENT_ID),
+        (command.block_id, CommandCode.SET_BLOCK_ID),
+    ):
+        if command.code == code:
+            identifier = UUID(validate_run_id(value))
+        elif value is not None:
+            raise ValueError(f"Only {code.name} accepts this run ID")
     packet = bytearray(TRANSACTION_SIZE)
     _HEADER.pack_into(
         packet,
@@ -180,6 +207,8 @@ def encode_command(command: CommandPacket) -> bytes:
     if subject_bytes:
         packet[24] = len(subject_bytes)
         packet[25 : 25 + len(subject_bytes)] = subject_bytes
+    if identifier is not None:
+        packet[24:40] = identifier.bytes
     _CRC.pack_into(packet, TRANSACTION_SIZE - _CRC.size, crc32c(packet[:-4]))
     return bytes(packet)
 
@@ -209,9 +238,11 @@ def decode_command(packet: bytes) -> CommandPacket:
         raise ProtocolError("UNKNOWN_COMMAND") from exc
     if related and command_code not in (
         CommandCode.START_EXPERIMENT, CommandCode.START_TRACKING, CommandCode.START_RECORDING,
+        CommandCode.SET_EXPERIMENT_ID, CommandCode.SET_BLOCK_ID,
     ):
         raise ProtocolError("BAD_RESERVED")
     subject = None
+    identifier = None
     if command_code is CommandCode.START_EXPERIMENT:
         if timestamp_ns == 0:
             raise ProtocolError("BAD_TIMESTAMP")
@@ -224,6 +255,14 @@ def decode_command(packet: bytes) -> CommandPacket:
             raise ProtocolError("BAD_SUBJECT") from exc
         if any(packet[25 + subject_length : TRANSACTION_SIZE - _CRC.size]):
             raise ProtocolError("BAD_RESERVED")
+    elif command_code in (CommandCode.SET_EXPERIMENT_ID, CommandCode.SET_BLOCK_ID):
+        identifier = str(UUID(bytes=packet[24:40]))
+        try:
+            validate_run_id(identifier)
+        except ValueError as exc:
+            raise ProtocolError("BAD_RUN_ID") from exc
+        if any(packet[40:60]):
+            raise ProtocolError("BAD_RESERVED")
     elif any(packet[_HEADER.size : TRANSACTION_SIZE - _CRC.size]):
         raise ProtocolError("BAD_RESERVED")
     return CommandPacket(
@@ -233,9 +272,11 @@ def decode_command(packet: bytes) -> CommandPacket:
         flags=flags,
         subject=subject,
         experiment_number=(related or None)
-        if command_code is CommandCode.START_EXPERIMENT else None,
+        if command_code in (CommandCode.START_EXPERIMENT, CommandCode.SET_EXPERIMENT_ID) else None,
         block_number=(related or None)
-        if command_code in (CommandCode.START_TRACKING, CommandCode.START_RECORDING) else None,
+        if command_code in (CommandCode.START_TRACKING, CommandCode.START_RECORDING, CommandCode.SET_BLOCK_ID) else None,
+        experiment_id=identifier if command_code is CommandCode.SET_EXPERIMENT_ID else None,
+        block_id=identifier if command_code is CommandCode.SET_BLOCK_ID else None,
     )
 
 

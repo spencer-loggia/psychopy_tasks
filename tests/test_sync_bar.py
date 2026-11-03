@@ -78,6 +78,38 @@ class SyncGeometryTests(unittest.TestCase):
 
 
 class SyncTimingTests(unittest.TestCase):
+    def test_transition_numbers_and_phases_survive_flushes_and_restart_per_block(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for _ in range(2):
+                bundle = SessionLogBundle(output_root=tmpdir, task_name="active_foraging",
+                                          config_name="sync", auto_flush=False)
+                bar = SyncBar(
+                    self.window, SyncBarConfig(True, 20, 1, 0),
+                    event_logger=bundle.event_logger, gpio_module=self.gpio, gpio_chip=0,
+                    sync_pin=18, clock=lambda: self.now_ns,
+                    rect_factory=lambda *a, **k: Mock(),
+                )
+                bar.start()
+                for index in range(1, 4):
+                    target = bar.next_flip_perf_s
+                    bar.prepare_flip(target)
+                    self.assertEqual(bar.transition_num, index - 1)
+                    self.now_ns = round(target * 1e9)
+                    self.window.flip()
+                    bar.flush_events()
+                    bundle.flush()
+                bar.close()
+                bundle.close()
+                with bundle.event_logger.path.open() as handle:
+                    rows = list(csv.DictReader(handle, delimiter="\t"))
+                sync_rows = [row for row in rows if row["event"].startswith("sync_")]
+                self.assertEqual([row["sync_transition_num"] for row in sync_rows],
+                                 ["1", "1", "2", "2", "3", "3"])
+                self.assertEqual([row["sync_phase"] for row in sync_rows],
+                                 ["1", "1", "0", "0", "1", "1"])
+                self.assertTrue(all(row["sync_transition_num"] == row["sync_phase"] == ""
+                                    for row in rows if not row["event"].startswith("sync_")))
+
     def setUp(self):
         self.now_ns = 10_000_000_000
         self.window = FakeWindow()

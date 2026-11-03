@@ -39,7 +39,7 @@ def read_preview_gaze(shared, *, now_s=None):
 class TaskEyeTrackingSession:
     """Own an optional Eye 0 tracker, recorder, and calibrated preview mailbox."""
 
-    def __init__(self, settings, *, output_dir=None, task_clock=None, on_state=None):
+    def __init__(self, settings, *, output_dir=None, task_clock=None, on_state=None, block_id=None):
         self.settings = settings
         self._on_state = on_state
         self.preview_state = (
@@ -61,6 +61,7 @@ class TaskEyeTrackingSession:
             on_state=self._update_preview,
             on_measurement=self._record_measurement,
             task_clock=task_clock or TaskClock(),
+            block_id=block_id,
         )
         self.recorder = None
         try:

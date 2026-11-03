@@ -248,6 +248,7 @@ class X11IdleGuardTests(unittest.TestCase):
                 launch_path=Path(tmpdir) / "demo.py",
                 config_path=block_dir / "config.json",
                 output_dir=block_dir,
+                block_id="b0000000-0000-4000-8000-000000000001",
             )
             app = object.__new__(TouchInterfaceApp)
             app.python_cmd = "python"
@@ -314,6 +315,7 @@ class X11IdleGuardTests(unittest.TestCase):
                 launch_path=root / "demo.py",
                 config_path=block_dir / "config.json",
                 output_dir=block_dir,
+                block_id="b0000000-0000-4000-8000-000000000001",
             )
             app = object.__new__(TouchInterfaceApp)
             app.cfg = {
@@ -373,6 +375,7 @@ class X11IdleGuardTests(unittest.TestCase):
                 launch_path=root / "demo.py",
                 config_path=block_dir / "config.json",
                 output_dir=block_dir,
+                block_id="b0000000-0000-4000-8000-000000000001",
             )
             app = object.__new__(TouchInterfaceApp)
             app.cfg = {

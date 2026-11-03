@@ -12,11 +12,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from uuid import UUID
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from bin.logger import SessionLogBundle
 from bin.task_clock import EXPERIMENT_ORIGIN_ENV
+from bin.run_identity import BLOCK_ID_ENV, EXPERIMENT_ID_ENV
 from bin.eye_tracking import (
     EXPERIMENT_BLOCK_NUMBER_ENV,
     EXPERIMENT_UART_PENDING_ENV,
@@ -49,6 +51,44 @@ class FakeClock:
 
 
 class ExperimentManagerTests(unittest.TestCase):
+    def test_unique_ids_persist_in_state_blocks_configs_and_uart_context(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config, path = self._project(root)
+            config["initial_state"]["experiment_id"] = "stale"
+            identifiers = set()
+            for _ in range(2):
+                with patch("interface.experiment_manager.ExperimentEyeTracker") as tracker:
+                    def start(*args, **kwargs):
+                        state = json.loads((kwargs["directory"] / "state.json").read_text())
+                        self.assertEqual(state["experiment_id"], kwargs["experiment_id"])
+                        return Mock(start_future=None)
+
+                    tracker.side_effect = start
+                    manager = ExperimentManager(working_dir=root, launch_config_path=path,
+                                                launch_config=config, subject_name="Yuri", subject_code="Y")
+                self.assertEqual(UUID(manager.experiment_id).version, 4)
+                identifiers.add(manager.experiment_id)
+                for _ in range(2):
+                    block = manager.prepare_block(task_name="demo", launch_value="task/demo.py", config_value=None)
+                    self.assertEqual(UUID(block.block_id).version, 4)
+                    identifiers.add(block.block_id)
+                    for saved in (block.config_path, block.output_dir / "block.json"):
+                        identity = json.loads(saved.read_text())
+                        self.assertEqual(identity["experiment_id"], manager.experiment_id)
+                        self.assertEqual(identity["block_id"], block.block_id)
+                    environment = manager.subprocess_environment(block)
+                    self.assertEqual(environment[EXPERIMENT_ID_ENV], manager.experiment_id)
+                    self.assertEqual(environment[BLOCK_ID_ENV], block.block_id)
+                    manager.finish_block(block)
+                with manager.blocks_path.open() as handle:
+                    rows = list(csv.DictReader(handle, delimiter="\t"))
+                self.assertEqual([row["block_id"] for row in rows], [row["block_id"] for row in manager.blocks])
+                self.assertTrue(all(row["experiment_id"] == manager.experiment_id for row in rows))
+                manager.finish()
+                self.assertEqual(json.loads(manager.state_path.read_text())["experiment_id"], manager.experiment_id)
+            self.assertEqual(len(identifiers), 6)
+
     def test_subject_calibration_is_restored_after_all_experiment_folders_are_removed(self):
         from tests.test_subject_calibration import calibration
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -283,11 +323,12 @@ class ExperimentManagerTests(unittest.TestCase):
             packets.append(packet)
             command = decode_command(packet)
             # Lose the first ACK of both starts, then acknowledge identical retries.
-            if command.code in (CommandCode.START_EXPERIMENT, CommandCode.START_TRACKING):
+            if command.code in (CommandCode.START_EXPERIMENT, CommandCode.START_TRACKING,
+                                CommandCode.SET_EXPERIMENT_ID, CommandCode.SET_BLOCK_ID):
                 if packets.count(packet) == 1:
                     raise ResponseTimeout("lost ACK")
             flags = StatusFlag.EXPERIMENT_ACTIVE
-            if command.code == CommandCode.START_TRACKING:
+            if command.code in (CommandCode.START_TRACKING, CommandCode.SET_BLOCK_ID):
                 flags |= StatusFlag.TRACKING | StatusFlag.CONFIGURED | StatusFlag.RECORDING
                 task_tracker._stop.set()
             elif command.code == CommandCode.STOP_EXPERIMENT:
@@ -327,15 +368,22 @@ class ExperimentManagerTests(unittest.TestCase):
         commands = [decode_command(packet) for packet in packets]
         self.assertEqual([command.code for command in commands], [
             CommandCode.START_EXPERIMENT, CommandCode.START_EXPERIMENT,
+            CommandCode.SET_EXPERIMENT_ID, CommandCode.SET_EXPERIMENT_ID,
             CommandCode.START_TRACKING, CommandCode.START_TRACKING,
+            CommandCode.SET_BLOCK_ID, CommandCode.SET_BLOCK_ID,
             CommandCode.STOP_TRACKING, CommandCode.STOP_EXPERIMENT,
         ])
         self.assertEqual(commands[0].experiment_number, 2)
         self.assertEqual(commands[0].subject, "Yuri")
-        self.assertEqual(commands[2].block_number, 2)
+        self.assertEqual(commands[4].block_number, 2)
+        self.assertEqual(commands[2].experiment_id, manager.experiment_id)
+        self.assertEqual(commands[6].block_id, block.block_id)
+        self.assertEqual(commands[6].block_number, block.block_num)
         self.assertEqual(packets[0], packets[1])
         self.assertEqual(packets[2], packets[3])
-        for command in commands[4:]:
+        self.assertEqual(packets[4], packets[5])
+        self.assertEqual(packets[6], packets[7])
+        for command in commands[8:]:
             self.assertIsNone(command.experiment_number)
             self.assertIsNone(command.block_number)
 
@@ -351,7 +399,7 @@ class ExperimentManagerTests(unittest.TestCase):
                 )
                 tracker.assert_called_once_with(
                     config, subject="Yuri", started_at=started, directory=manager.experiment_dir,
-                    experiment_number=1,
+                    experiment_number=1, experiment_id=manager.experiment_id,
                 )
                 tracker.return_value.pending_path = manager.experiment_dir / ".pending"
                 tracker.return_value.ready_path = manager.experiment_dir / ".ready"

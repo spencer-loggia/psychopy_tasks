@@ -19,7 +19,10 @@ import time
 from typing import Optional, Sequence, Tuple
 
 from .task_clock import TaskClock
-from .eye_tracker_wire.controller import EyeTrackerController, ResponseTimeout, SerialPacketChannel
+from .run_identity import BLOCK_ID_ENV
+from .eye_tracker_wire.controller import (
+    DEFAULT_RETRY_DELAY_S, EyeTrackerController, ResponseTimeout, SerialPacketChannel,
+)
 from .eye_tracker_warnings import EyeTrackerWarnings
 from .eye_tracker_wire.protocol import (
     CommandCode,
@@ -68,6 +71,13 @@ class UARTEyeTrackerConfig:
             )
         if self.state_retries < 0:
             raise ValueError("uart.state_retries must be nonnegative")
+
+    def command_wait_s(self, *, state_timeout_s=None):
+        """Transport budget for short retries followed by the final full wait."""
+        timeout = self.state_timeout_s if state_timeout_s is None else state_timeout_s
+        return timeout + self.state_retries * (
+            min(self.response_timeout_s, timeout) + DEFAULT_RETRY_DELAY_S
+        )
 
 
 @dataclass(frozen=True)
@@ -352,7 +362,7 @@ class UARTEyeTracker:
     """Own the UART in one worker thread, leaving both screen loops responsive."""
 
     def __init__(self, *, uart_config=None, filter_config=None, on_state=None,
-                 on_measurement=None, task_clock=None):
+                 on_measurement=None, task_clock=None, block_id=None):
         self.config = uart_config or UARTEyeTrackerConfig()
         self.filter = EyePositionFilter(
             uart_config=self.config, filter_config=filter_config
@@ -361,6 +371,7 @@ class UARTEyeTracker:
         self._stop = threading.Event()
         self._thread = None
         self.task_clock = task_clock or TaskClock()
+        self.block_id = block_id
         self._on_measurement = on_measurement
         self._on_state = on_state
         self._callback_error = None
@@ -379,11 +390,8 @@ class UARTEyeTracker:
     def stop(self):
         self._stop.set()
         if self._thread is not None:
-            # A synchronous START already in progress may need its matching ACK
-            # before STOP can be sent. Both state commands have bounded retries.
-            timeout = (
-                2 * self.config.state_timeout_s * (self.config.state_retries + 1) + 2
-            )
+            # Finish an in-flight START and UUID acknowledgement before STOP.
+            timeout = 3 * self.config.command_wait_s() + 2
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():
                 self.warnings.warn("stop", "Eye UART worker did not stop; tracker shutdown is unconfirmed.")
@@ -420,7 +428,18 @@ class UARTEyeTracker:
         pending = os.environ.get(EXPERIMENT_UART_PENDING_ENV)
         if not pending:
             return
-        deadline = time.monotonic() + 2 * self.config.state_timeout_s * (self.config.state_retries + 1) + 2
+        timeout = 2 * self.config.command_wait_s(
+            state_timeout_s=max(15.0, self.config.state_timeout_s),
+        ) + 2
+        try:
+            budget = Path(pending).read_text(encoding="ascii").strip()
+        except FileNotFoundError:
+            budget = ""
+        if budget:
+            timeout = float(budget)
+            if not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError("Invalid experiment UART handoff timeout")
+        deadline = time.monotonic() + timeout
         while Path(pending).exists() and not self._stop.is_set():
             if time.monotonic() >= deadline:
                 raise TimeoutError("Experiment START_EXPERIMENT is still pending; task continues without eye tracking")
@@ -479,7 +498,9 @@ class UARTEyeTracker:
                     number = os.environ.get(EXPERIMENT_BLOCK_NUMBER_ENV)
                     block_number = validate_run_number(int(number)) if number is not None else None
                     start_attempted = True
-                    status = controller.start_tracking(block_number=block_number)
+                    block_id = self.block_id or os.environ.get(BLOCK_ID_ENV)
+                    identity = {"block_id": block_id} if block_id is not None else {}
+                    status = controller.start_tracking(block_number=block_number, **identity)
                     received_perf_ns = time.perf_counter_ns()
                     self._consume_measurement(status, received_perf_ns=received_perf_ns)
                     self._check_status(status)

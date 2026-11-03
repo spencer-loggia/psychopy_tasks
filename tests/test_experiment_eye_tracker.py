@@ -94,6 +94,7 @@ class ExperimentEyeTrackerTests(unittest.TestCase):
             kwargs.get("config", self.config), subject=kwargs.get("subject", "Yuri"),
             started_at=self.started_at, directory=self.directory,
             experiment_number=kwargs.get("experiment_number", 7),
+            experiment_id="a0000000-0000-4000-8000-000000000001",
         )
 
     def test_subject_utc_date_and_stop_share_configured_uart_and_release_it(self):
@@ -101,6 +102,7 @@ class ExperimentEyeTrackerTests(unittest.TestCase):
         tracker.start_future.result(timeout=2)
         self.controller.start_experiment.assert_called_once_with(
             "Yuri", timestamp_ns=1791988200123456000, experiment_number=7,
+            experiment_id="a0000000-0000-4000-8000-000000000001",
         )
         self.assertFalse(tracker.pending_path.exists())
         self.assertTrue(tracker.ready_path.is_file())
@@ -233,6 +235,37 @@ class ExperimentEyeTrackerTests(unittest.TestCase):
             finally:
                 task_tracker.stop()
         self.assertEqual(task_tracker.get_state().error, "no UART")
+
+    def test_handoff_allows_both_acknowledgements_with_custom_timeout_and_no_retries(self):
+        self.config["eye_tracker_experiment"].update(start_timeout_s=40)
+        self.config["eye_tracker_experiment"]["uart"]["state_retries"] = 0
+        budgets = []
+
+        def started(*args, **kwargs):
+            budgets.append((self.directory / ".eye_tracker_start_pending").read_text())
+            return Mock(flags=StatusFlag.EXPERIMENT_ACTIVE)
+
+        self.controller.start_experiment.side_effect = started
+        tracker = self.create()
+        tracker.start_future.result(timeout=2)
+        self.assertEqual(float(budgets[0]), 82)
+        tracker.pending_path.write_text(budgets[0])
+        now = [0.0]
+        task_tracker = UARTEyeTracker(uart_config=UARTEyeTrackerConfig(state_retries=0))
+
+        def progress(_timeout):
+            now[0] += 30
+            if now[0] == 60:
+                tracker.pending_path.unlink()
+
+        with patch.dict("os.environ", {
+            EXPERIMENT_UART_PENDING_ENV: str(tracker.pending_path),
+            EXPERIMENT_UART_READY_ENV: str(tracker.ready_path),
+        }), patch("bin.eye_tracking.time.monotonic", side_effect=lambda: now[0]), patch.object(
+            task_tracker._stop, "wait", side_effect=progress,
+        ):
+            task_tracker._wait_for_experiment_start()
+        self.assertEqual(now[0], 60)
 
 
 if __name__ == "__main__":

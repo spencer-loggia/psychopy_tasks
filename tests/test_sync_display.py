@@ -182,6 +182,68 @@ class SyncDisplayTests(unittest.TestCase):
         self.assertEqual(self.win.front, "currently visible scene")
         self.assertEqual(self.win.scene, "upcoming task scene")
 
+    def test_deferred_bar_and_gpio_edges_share_actual_task_transition(self):
+        now = [10_000_000_000]
+        writes = []
+        logger = Mock()
+
+        def gpio_write(chip, pin, level):
+            # FakeWindow publishes the scene before invoking flip callbacks.
+            self.assertEqual(self.win.front, f"task phase {level}")
+            writes.append((now[0], chip, pin, level))
+            now[0] += 500
+            return 0
+
+        bar = SyncBar(
+            self.win, SyncBarConfig(True, 20, 1, 0),
+            rect_factory=lambda *a, **k: Mock(), clock=lambda: now[0],
+            gpio_module=types.SimpleNamespace(gpio_write=gpio_write),
+            gpio_chip=0, sync_pin=18, event_logger=logger,
+        )
+        bar.start()
+        self.display.bar = bar
+
+        with patch("bin.sync_display.time.perf_counter", side_effect=lambda: now[0] / 1e9):
+            for requested_ns, actual_ns, level in (
+                (11_000_000_000, 11_100_000_000, 1),
+                (12_100_000_000, 12_200_000_000, 0),
+            ):
+                with self.subTest(level=level):
+                    self.assertEqual(round(bar.next_flip_perf_s * 1e9), requested_ns)
+                    self.win.scene = f"task phase {level}"
+                    previous_count = len(writes)
+                    # Reserve the next task refresh, including after the
+                    # original sync deadline has arrived.
+                    for poll_ns in (requested_ns - 40_000_000, requested_ns):
+                        now[0] = poll_ns
+                        self.display.service(deadline_perf_s=actual_ns / 1e9)
+                        self.assertEqual(len(writes), previous_count)
+                        self.assertEqual(logger.log_event.call_count, 2 * previous_count)
+                        self.assertEqual(bar.phase, level ^ 1)
+
+                    def task_swap():
+                        # Preparing/drawing the bar cannot send an early edge.
+                        self.assertEqual(len(writes), previous_count)
+                        now[0] = actual_ns
+                        return self.original_flip()
+
+                    self.display.original_flip = task_swap
+                    now[0] = actual_ns - 40_000_000
+                    self.win.flip()
+                    self.assertEqual(writes[-1], (actual_ns, 0, 18, level))
+                    self.assertEqual(len(writes), previous_count + 1)
+                    self.assertEqual(bar.phase, level)
+                    flip_event, signal_event = [
+                        call.kwargs for call in logger.log_event.call_args_list[-2:]
+                    ]
+                    self.assertEqual(flip_event["event"], "sync_bar_flip")
+                    self.assertEqual(flip_event["requested_timestamp_perf_ns"], requested_ns)
+                    self.assertEqual(flip_event["timestamp_perf_ns"], actual_ns)
+                    self.assertEqual(signal_event["event"], "sync_signal_on" if level else "sync_signal_off")
+                    self.assertEqual(signal_event["requested_timestamp_perf_ns"], actual_ns)
+                    self.assertEqual(signal_event["timestamp_perf_ns"], actual_ns + 500)
+        self.assertEqual(self.display.extra_flip_count, 0)
+
     def test_distant_task_refresh_allows_sync_only_swap(self):
         with patch("bin.sync_display.time.perf_counter", return_value=10.96):
             self.display.service(deadline_perf_s=11.2)

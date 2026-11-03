@@ -84,6 +84,8 @@ class EyeCalibrationTaskTests(unittest.TestCase):
             raise RuntimeError("display failed")
 
         def make_tracker(**kwargs):
+            identity_path, = Path(tmp).glob("*/block.json")
+            self.assertEqual(kwargs["block_id"], json.loads(identity_path.read_text())["block_id"])
             # A fast UART response before the reward controller exists is safe.
             tracker.start.side_effect = lambda: kwargs["on_state"](EyeTrackerState())
             return tracker

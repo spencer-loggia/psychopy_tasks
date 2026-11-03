@@ -13,6 +13,7 @@ import time
 from typing import Any, Iterable, Mapping, Optional
 
 from .task_clock import TaskClock
+from .run_identity import prepare_block_identity
 
 
 EVENT_LOG_FILENAME = "event_log.tsv"
@@ -303,6 +304,8 @@ class EventLogger:
                 "event_code",
                 "event_type",
                 "requested_duration",
+                "sync_transition_num",
+                "sync_phase",
             ]
         )
 
@@ -321,9 +324,18 @@ class EventLogger:
         requested_timestamp_perf_ns: Optional[int] = None,
         requested_timestamp_perf_s: Optional[float] = None,
         description: Optional[str] = None,
+        sync_transition_num: Optional[int] = None,
+        sync_phase: Optional[int] = None,
     ) -> None:
         if self._file.closed:
             raise ValueError("Event log is closed")
+        if (sync_transition_num is None) != (sync_phase is None):
+            raise ValueError("Sync transition number and phase must be supplied together")
+        if sync_transition_num is not None and (
+            type(sync_transition_num) is not int or sync_transition_num < 1
+            or type(sync_phase) is not int or sync_phase not in (0, 1)
+        ):
+            raise ValueError("Sync transition number must be positive and phase must be 0 or 1")
         if requested_duration is not None:
             requested_duration = float(requested_duration)
             if not math.isfinite(requested_duration) or requested_duration < 0:
@@ -348,6 +360,8 @@ class EventLogger:
             str(definition.code),
             definition.default_type,
             "" if requested_duration is None else f"{float(requested_duration):.9f}",
+            "" if sync_transition_num is None else str(sync_transition_num),
+            "" if sync_phase is None else str(sync_phase),
         ]
         if self.auto_flush:
             self._writer.writerow(row)
@@ -546,6 +560,7 @@ class SessionLogBundle:
                 config_name=config_name,
                 when=self.session_clock.started_at,
             )
+        self.identity = prepare_block_identity(self.session_dir)
         self.calibration_path = self.session_dir / CALIBRATION_FILENAME
         definitions, event_patterns = load_task_event_definitions(
             task_name=task_name,
@@ -598,6 +613,7 @@ class SessionLogBundle:
                     output_dir=self.session_dir,
                     task_clock=self.session_clock,
                     on_state=on_eye_state,
+                    block_id=self.identity["block_id"],
                 )
                 self.message_logger.log(
                     "INFO", f"eye_tracking_started eye_id=0 settings={json.dumps(asdict(eye_tracking_config))}"

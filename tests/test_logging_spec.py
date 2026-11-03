@@ -317,6 +317,8 @@ class LoggingSpecTests(unittest.TestCase):
                     "event_code",
                     "event_type",
                     "requested_duration",
+                    "sync_transition_num",
+                    "sync_phase",
                 ],
             )
             self.assertEqual(rows[0]["trial_num"], "1")

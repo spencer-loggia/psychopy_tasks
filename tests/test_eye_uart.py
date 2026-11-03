@@ -48,6 +48,61 @@ def status_bytes(*, sequence=42, code=0, edits=()):
 
 
 class UARTProtocolTests(unittest.TestCase):
+    def test_run_identity_packets_preserve_uuid_number_and_padding(self):
+        identifier = "00112233-4455-4677-8899-aabbccddeeff"
+        for code, field, number_field in (
+            (CommandCode.SET_EXPERIMENT_ID, "experiment_id", "experiment_number"),
+            (CommandCode.SET_BLOCK_ID, "block_id", "block_number"),
+        ):
+            with self.subTest(code=code):
+                command = CommandPacket(code, 17, **{field: identifier, number_field: 23})
+                packet = encode_command(command)
+                self.assertEqual(packet, bytes.fromhex(FIXTURE[field]))
+                self.assertEqual(len(packet), 64)
+                self.assertEqual(packet[24:40].hex(), identifier.replace("-", ""))
+                self.assertEqual(packet[40:60], bytes(20))
+                self.assertEqual(decode_command(packet), command)
+                for invalid in (None, "", "not-a-uuid", identifier.upper(), "0" * 32):
+                    with self.assertRaises(ValueError):
+                        encode_command(CommandPacket(code, 17, **{field: invalid}))
+                for offset in (40, 59):
+                    corrupt = bytearray(packet)
+                    corrupt[offset] = 1
+                    struct.pack_into("<I", corrupt, 60, crc32c(corrupt[:60]))
+                    with self.assertRaisesRegex(ProtocolError, "BAD_RESERVED"):
+                        decode_command(bytes(corrupt))
+                with self.assertRaises(ValueError):
+                    encode_command(CommandPacket(CommandCode.POLL, 17, **{field: identifier}))
+
+    def test_start_identity_ack_retries_do_not_repeat_start(self):
+        identifier = "00112233-4455-4677-8899-aabbccddeeff"
+        for method, arguments, identity_code in (
+            ("start_experiment", {"subject": "Yuri", "experiment_number": 4,
+                                  "experiment_id": identifier}, CommandCode.SET_EXPERIMENT_ID),
+            ("start_tracking", {"block_number": 7, "block_id": identifier}, CommandCode.SET_BLOCK_ID),
+            ("start_recording", {"block_number": 7, "block_id": identifier}, CommandCode.SET_BLOCK_ID),
+        ):
+            with self.subTest(method=method):
+                channel = Mock()
+                channel.exchange.side_effect = [status_bytes(), ResponseTimeout("lost ID ACK"),
+                                                status_bytes(sequence=43)]
+                controller = EyeTrackerController(channel, initial_sequence=42, retries=1, retry_delay_s=0)
+                getattr(controller, method)(**arguments)
+                packets = [call.args[0] for call in channel.exchange.call_args_list]
+                self.assertEqual(len(packets), 3)
+                self.assertEqual(packets[1], packets[2])
+                command = decode_command(packets[1])
+                self.assertEqual(command.code, identity_code)
+                self.assertEqual(command.experiment_id or command.block_id, identifier)
+                self.assertNotEqual(decode_command(packets[0]).code, identity_code)
+
+    def test_missing_id_ack_is_not_reported_as_successful_start(self):
+        channel = Mock()
+        channel.exchange.side_effect = [status_bytes(), ResponseTimeout("no ID ACK")]
+        controller = EyeTrackerController(channel, initial_sequence=42, retries=0)
+        with self.assertRaises(AcknowledgementTimeout):
+            controller.start_tracking(block_id="00112233-4455-4677-8899-aabbccddeeff")
+
     def test_close_preserves_binary_mode_releases_claim_and_does_not_echo_late_ack(self):
         master, slave = pty.openpty()
         try:
@@ -240,13 +295,14 @@ class UARTProtocolTests(unittest.TestCase):
     def test_numbers_are_rejected_on_other_commands(self):
         for code in CommandCode:
             for field, allowed in (
-                ("experiment_number", (CommandCode.START_EXPERIMENT,)),
-                ("block_number", (CommandCode.START_TRACKING, CommandCode.START_RECORDING)),
+                ("experiment_number", (CommandCode.START_EXPERIMENT, CommandCode.SET_EXPERIMENT_ID)),
+                ("block_number", (CommandCode.START_TRACKING, CommandCode.START_RECORDING, CommandCode.SET_BLOCK_ID)),
             ):
                 if code not in allowed:
                     with self.subTest(code=code, field=field), self.assertRaises(ValueError):
                         encode_command(CommandPacket(code, 42, 1, **{field: 7}))
-            if code not in (CommandCode.START_EXPERIMENT, CommandCode.START_TRACKING, CommandCode.START_RECORDING):
+            if code not in (CommandCode.START_EXPERIMENT, CommandCode.START_TRACKING, CommandCode.START_RECORDING,
+                            CommandCode.SET_EXPERIMENT_ID, CommandCode.SET_BLOCK_ID):
                 packet = bytearray(encode_command(CommandPacket(code, 42)))
                 struct.pack_into("<I", packet, 12, 7)
                 struct.pack_into("<I", packet, 60, crc32c(packet[:60]))

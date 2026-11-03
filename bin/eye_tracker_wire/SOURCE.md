@@ -45,3 +45,11 @@ records and ignore uncorrelated sequence-zero replies. UART close keeps raw mode
 to prevent late-ACK echo loops. Explicit `TIOCNXCL` release was brought over from
 the companion UART helper. Local launcher warnings now distinguish command outcome
 from the independent tracker-health ERROR flag.
+
+UUID metadata commands SET_EXPERIMENT_ID (9) and SET_BLOCK_ID (10) were added
+together with companion working-tree changes on 2026-11-03, based on HEAD
+`4a5c11986fe458e11f9e44e4bfbeaa32274857e7`. Start helpers send an acknowledged
+UUID packet after the original start ACK. Metadata retries do not resend starts.
+The fixture file records that codec's SHA-256 and both UUID command packets.
+Existing starts, sequence numbers, subject capacity, telemetry, packet size and
+version remain unchanged. Deploy both sides before sending these new commands.

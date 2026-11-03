@@ -310,6 +310,7 @@ def run_task(
             uart_config=uart_config, filter_config=filter_config,
             on_state=observe_eye_state,
             task_clock=session_logs.session_clock,
+            block_id=session_logs.identity["block_id"],
         )
         tracker.start()
         msg_logger.log(

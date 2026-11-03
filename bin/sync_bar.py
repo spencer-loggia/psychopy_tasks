@@ -81,6 +81,7 @@ class SyncFlipRecord:
     requested_perf_ns: int
     actual_perf_ns: int
     phase: int
+    transition_num: int
     gpio_perf_ns: int | None = None
     gpio_requested_perf_ns: int | None = None
 
@@ -122,6 +123,7 @@ class SyncBar:
         if gpio_module is not None and (gpio_chip is None or sync_pin is None):
             raise ValueError("sync GPIO requires a chip handle and sync_pin")
         self.phase = 0
+        self.transition_num = 0
         self._drawn_phase = None
         self._next_perf_ns = None
         self._pending = False
@@ -177,6 +179,8 @@ class SyncBar:
             self._pending = True
             # Draw-time work stays out of the display/GPIO callback.
             next_interval_ns = self._interval_ns()
+            # The GPIO edge belongs to this realized swap, including when the
+            # original requested deadline was deferred for a task transition.
             self.win.callOnFlip(self._on_flip, self._next_perf_ns, next_interval_ns)
         draw_phase = self.phase ^ int(self._pending)
         if draw_phase != self._drawn_phase:
@@ -205,8 +209,9 @@ class SyncBar:
             except Exception as error:
                 # Preserve the displayed event, then report outside the callback.
                 self._gpio_error = error
+        self.transition_num += 1
         self._records.append(SyncFlipRecord(
-            requested_ns, actual_ns, self.phase, gpio_ns, gpio_requested_ns,
+            requested_ns, actual_ns, self.phase, self.transition_num, gpio_ns, gpio_requested_ns,
         ))
         self._next_perf_ns = actual_ns + next_interval_ns
         self._pending = False
@@ -222,6 +227,8 @@ class SyncBar:
                     event_type="frame_flip",
                     requested_timestamp_perf_ns=record.requested_perf_ns,
                     timestamp_perf_ns=record.actual_perf_ns,
+                    sync_transition_num=record.transition_num,
+                    sync_phase=record.phase,
                 )
                 if record.gpio_perf_ns is not None:
                     self.event_logger.log_event(
@@ -230,6 +237,8 @@ class SyncBar:
                         event_type="signal",
                         requested_timestamp_perf_ns=record.gpio_requested_perf_ns,
                         timestamp_perf_ns=record.gpio_perf_ns,
+                        sync_transition_num=record.transition_num,
+                        sync_phase=record.phase,
                     )
             if self.preview_callback is not None:
                 self.preview_callback(record.phase)

@@ -11,8 +11,8 @@
     "sync_bar": {
         "enabled": true,
         "height": 20,
-        "interval_mean_seconds": 1.0,
-        "interval_variance_seconds": 0.2
+        "interval_mean_seconds": 1.5,
+        "interval_variance_seconds": 1.0
     },
     "record_experiment_video": false,
     "video_config": "config_files/video/config.json",

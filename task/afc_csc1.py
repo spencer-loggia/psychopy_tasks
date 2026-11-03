@@ -1,7 +1,6 @@
 """
 Delayed CSC1 AFC task.
 
-This version follows the same logging/timing style as the working tasks:
 ``SessionLogBundle`` creates event, message, and behavior logs; visual timing is
 planned to the nearest display frames; per-trial presentation is frame-locked
 and uses the active_foraging event vocabulary, plus ``delay_start``.
@@ -16,6 +15,12 @@ and the choices are shape outlines.  ``num_afc`` controls the number of choices;
 Every trial is self-initiated by clicking/touching the checkerboard onset-cue stimulus
 created by ``utils.make_onset_cue_stim``. The fixation cross is not drawn unless
 ``show_fixation`` is true.
+
+The task layout is rotated 90 degrees clockwise inside a landscape window.
+Positions are laid out on a virtual portrait canvas before rotation; the onset
+cue therefore appears at middle-left. Display mode and touch coordinates stay
+in the native landscape orientation. Shape images keep the original vertical
+flip and then rotate 90 degrees clockwise (to the right) during preloading.
 """
 from __future__ import annotations
 
@@ -31,6 +36,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+from PIL import Image
 from psychopy import core, logging as pylogging
 
 _project_root = Path(__file__).resolve().parents[1]
@@ -360,6 +366,12 @@ def _fixed_circle_positions(num_afc: int, radius_px: float) -> List[Tuple[float,
     ]
 
 
+def _rotate_position_clockwise(position: Tuple[float, float]) -> Tuple[float, float]:
+    """Map portrait coordinates to landscape: (x, y) -> (y, -x)."""
+    x, y = position
+    return float(y), -float(x)
+
+
 def _compute_positions(
     *,
     num_afc: int,
@@ -369,18 +381,26 @@ def _compute_positions(
     position_spacing: Optional[int],
     margin: int,
 ) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+    # Rotate layout positions into the native landscape window. The displayed
+    # artwork's footprint in portrait layout
+    # coordinates has the opposite width/height order to the displayed image.
+    layout_size = (effective_win_size[1], effective_win_size[0])
+    layout_stim_size = (stim_size[1], stim_size[0])
     if fixed_positions:
-        radius = float(position_spacing) if position_spacing is not None else min(effective_win_size) * 0.25
+        radius = float(position_spacing) if position_spacing is not None else min(layout_size) * 0.25
         sampled_positions = _fixed_circle_positions(num_afc, radius)
     else:
         sampled_positions = utils.sample_non_overlapping_positions(
             num_afc,
-            stim_size,
-            effective_win_size,
+            layout_stim_size,
+            layout_size,
             margin=margin,
         )
-    positions = utils.clamp_positions(sampled_positions, stim_size, effective_win_size, margin=margin)
-    return sampled_positions, positions
+    positions = utils.clamp_positions(sampled_positions, layout_stim_size, layout_size, margin=margin)
+    return (
+        [_rotate_position_clockwise(pos) for pos in sampled_positions],
+        [_rotate_position_clockwise(pos) for pos in positions],
+    )
 
 
 def _log_global_timing(msg_logger, fps: float, frame_dur: float, timings: Dict[str, float]) -> Dict[str, Tuple[int, float]]:
@@ -513,6 +533,7 @@ def run_task(
 
     print(f"INTENDED BACKGROUND RGB: {bg_rgb}")
 
+    colors = {int(cid) - 2: rgb for cid, rgb in colors.items()}
     shapes = utils.load_shape_definitions(Path(shapes_tsv))
     color_ids = [int(cid) for cid in colors.keys()]
     shape_ids = [int(sid) for sid in shapes.keys()]
@@ -644,7 +665,7 @@ def run_task(
             stroke_width_px=2.0,
             outline_only=True,
             flip=True
-        )
+        ).transpose(Image.Transpose.ROTATE_90)  # 90 degrees clockwise AFTER the vertical flip.
     for cid in color_ids:
         preloaded[("color_only", int(cid))] = utils.make_color_gaussian_image(
             color_rgb_255=colors[int(cid)],
@@ -719,7 +740,7 @@ def run_task(
 
         if fixation_size is None:
             fixation_size = 32
-        fix = utils.make_fixation_cross(win, size=int(fixation_size)) if bool(show_fixation) else None
+        fix = utils.make_fixation_cross(win, size=int(fixation_size), ori=90.0) if bool(show_fixation) else None
         bg_rect = utils.make_bg_rect(win, bg_rgb)
         pylogging.console.setLevel(pylogging.CRITICAL)
 
@@ -863,13 +884,14 @@ def run_task(
             highlight_box = None
             if trial_options_current and positions_current and trial_type_current:
                 cue_feature, choice_feature = _choice_mapping_for_preview(trial_type_current)
+                choice_image_size = image_size[::-1] if choice_feature == "shape" else image_size
                 if target_index_current is not None:
                     try:
                         target_pair = tuple(trial_options_current[int(target_index_current) - 1])
                         cue_obj = preloaded.get(_feature_key(target_pair, cue_feature))
                         cue_payload = serialize_preview_image(cue_obj) if cue_obj is not None else None
                         if cue_payload is not None:
-                            cue_w, cue_h = tuple(image_size)
+                            cue_w, cue_h = cue_obj.size
                             images.append(
                                 {
                                     "image_payload": cue_payload,
@@ -890,7 +912,7 @@ def run_task(
                         {
                             "image_payload": payload,
                             "pos": [float(pos[0]), float(pos[1])],
-                            "size": [float(image_size[0]), float(image_size[1])],
+                            "size": [float(choice_image_size[0]), float(choice_image_size[1])],
                         }
                     )
 
@@ -905,7 +927,7 @@ def run_task(
                         color = (220, 60, 60)
                     highlight_box = {
                         "pos": [float(hpos[0]), float(hpos[1])],
-                        "size": [float(image_size[0]) * 1.15, float(image_size[1]) * 1.15],
+                        "size": [float(choice_image_size[0]) * 1.15, float(choice_image_size[1]) * 1.15],
                         "color": list(color),
                         "line_width": 6.0,
                     }
@@ -1091,11 +1113,11 @@ def run_task(
             cells=36,
             sigma_frac=0.10,
             zero_threshold=0.5,
+            ori=90.0,
         )
 
-        onset_stim.pos = (
-            0.0,
-            -float(main_scene_size[1]) / 3.0
+        onset_stim.pos = _rotate_position_clockwise(
+            (0.0, -float(main_scene_size[0]) / 3.0)
         )
         msg_logger.log(
             "INFO",
@@ -1149,7 +1171,11 @@ def run_task(
                 ),
             )
 
-            stim_size = tuple(image_size)
+            stim_size = (
+                image_size[::-1]
+                if current_trial_type in ("color_to_shape", "shape_to_shape")
+                else image_size
+            )
             effective_win_size = resolve_scene_size(
                 main_screen,
                 fullscreen=bool(fullscreen),

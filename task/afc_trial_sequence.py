@@ -37,13 +37,16 @@ if str(_project_root) not in sys.path:
 
 from bin import utils
 from bin.frame_timing import flip_with_timestamps, plan_frame_duration, wait_until
+from bin.eye_tracking_config import load_eye_tracking_settings
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.config import load_config, validate_config
 from bin.screen import (
+    ExperimenterPreview,
     describe_screen,
     load_screen_config,
     resolve_scene_size,
+    software_stimulus_rotation,
 )
 
 
@@ -76,8 +79,7 @@ def parse_args():
     p.add_argument("--image_size", type=int, nargs=2, default=None, help="Raster draw size (W H)")
     p.add_argument("--debug", action="store_true", default=None, help="Enable debug outputs (write debug images to logs/)")
     p.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate (Hz); skip auto-detection if provided")
-    p.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi GPIO LED pulses for onset cues")
-    p.add_argument("--raspi_pin", type=int, default=None, help="GPIO pin to use for raspi LED pulses (BCM numbering)")
+    p.add_argument("--sync_pin", type=int, default=None, help="BCM GPIO pin for display sync pulses")
     p.add_argument("--main_screen", default=None, help="Main task screen index or output name")
     p.add_argument("--experimenter_screen", default=None, help="Experimenter screen index or output name")
     # svg_size removed; use --image_size for both rasters and SVG rasterization
@@ -108,10 +110,11 @@ def run_task(
     init_dot_color: Optional[Tuple[int, int, int]] = None,
     debug: bool = False,
     refresh_rate: Optional[float] = None,
-    raspi: bool = False,
-    raspi_pin: int = 18,
+    sync_pin: int = 18,
     config_name: Optional[str] = None,
     screen_config: Optional[Dict[str, Any]] = None,
+    eye_tracking_config=None,
+    sync_bar=None,
 ):
     # Configure debug behavior before any rasterization
     utils.set_debug(debug)
@@ -143,7 +146,7 @@ def run_task(
     preloaded = utils.load_image_assets(image_files, raster_size=image_size, bg_rgb_255=bg)
 
     # Window + background + fixation
-    win, main_screen, _ = utils.setup_task_window(
+    win, main_screen, experimenter_screen = utils.setup_task_window(
         screen_config,
         bg_rgb_255=bg,
         fullscreen=fullscreen,
@@ -164,11 +167,21 @@ def run_task(
         "main_display_max_transition_error_s",
     ]
     session_logs = SessionLogBundle(
+        eye_tracking_config=eye_tracking_config,
         output_root=output_dir,
         task_name="afc_trial_sequence",
         config_name=resolved_config_name,
         behavior_fieldnames=behavior_fieldnames,
+        auto_flush=False,
     )
+    effective_win_size = resolve_scene_size(
+        main_screen,
+        fullscreen=bool(fullscreen),
+        requested_size=win_size,
+        realized_size=tuple(win.size),
+    )
+    rotation = software_stimulus_rotation(main_screen.rotation)
+    session_logs.set_eye_tracking_screen(effective_win_size, rotation)
     logger = session_logs.event_logger
     msg_logger = session_logs.message_logger
     behavior_logger = session_logs.behavior_logger
@@ -181,24 +194,6 @@ def run_task(
     )
     msg_logger.log("INFO", f"resolved_screens main={describe_screen(main_screen)}")
 
-    # Initialize lgpio if requested
-    pigpio_pi = None  # naming kept for compatibility with presenter API
-    if raspi:
-        try:
-            import lgpio
-
-            chip = lgpio.gpiochip_open(0)  # 0 is the default chip for RPi5
-            # Claim the pin as output
-            lgpio.gpio_claim_output(chip, raspi_pin)
-            pigpio_pi = chip  # store chip handle
-            msg_logger.log("INFO", f"lgpio initialized on chip 0, pin {raspi_pin} claimed as output")
-        except Exception as e:
-            pigpio_pi = None
-            try:
-                msg_logger.log("WARN", f"lgpio not available or failed to initialize: {e}; raspi disabled")
-            except Exception:
-                pass
-
     # Detect or override frame rate once per task
     fps, frame_dur = utils.resolve_frame_rate(
         win,
@@ -206,6 +201,22 @@ def run_task(
         msg_logger=msg_logger,
         context="afc_trial_sequence",
     )
+    preview = None
+    if experimenter_screen is not None:
+        preview = ExperimenterPreview(
+            experimenter_screen, task_label=resolved_config_name, total_trials=n_trials,
+            eye_tracking_shared=session_logs.eye_tracking_preview,
+        )
+        utils.verify_task_window_vblank(win)
+    utils.configure_sync_bar(
+        win, sync_bar, sync_pin=sync_pin, event_logger=logger,
+        experimenter_preview=preview, rotation_degrees=rotation,
+        frame_duration_s=frame_dur, msg_logger=msg_logger,
+    )
+
+    def poll_exit():
+        return preview is not None and preview.poll()
+
     duration_plan = plan_frame_duration(duration, fps, minimum_frames=1)
     isi_plan = plan_frame_duration(isi, fps)
     choice_plan = plan_frame_duration(choice_time, fps, minimum_frames=1)
@@ -236,6 +247,8 @@ def run_task(
     # Main trial loop
     aborted_task = False
     for trial_num in range(1, n_trials + 1):
+        if preview is not None:
+            preview.set_trial_progress(trial_num, n_trials)
         if isi_fr > 0:
             bg_rect.draw()
             if fix is not None:
@@ -244,11 +257,18 @@ def run_task(
             logger.log_frame_flip(
                 trial_num=trial_num,
                 event="trial_cue",
-                timestamp_perf_s=cue_timing.actual_perf_s,
-                requested_timestamp_perf_s=cue_timing.requested_perf_s,
+                timestamp_perf_ns=cue_timing.actual_perf_ns,
+                requested_timestamp_perf_ns=cue_timing.requested_perf_ns,
                 requested_duration=isi,
             )
-            wait_until(cue_timing.actual_perf_s + isi_plan.scheduled_s)
+            if preview is not None:
+                preview.show_static_scene(
+                    bg_rgb_255=bg, main_size=effective_win_size,
+                    main_rotation_deg=rotation, fixation_size=32,
+                )
+            if not wait_until(cue_timing.actual_perf_s + isi_plan.scheduled_s, poll_callback=poll_exit):
+                aborted_task = True
+                break
 
         trial_options = trials[trial_num - 1]
         msg_logger.log("INFO", f"trial_loaded trial_num={trial_num} stimuli={[p.name for p in trial_options]}")
@@ -257,13 +277,6 @@ def run_task(
         first_p = trial_options[0]
         pil0 = preloaded[first_p]
         stim_size = pil0.size  # (W,H) in pixels
-
-        effective_win_size = resolve_scene_size(
-            main_screen,
-            fullscreen=bool(fullscreen),
-            requested_size=win_size,
-            realized_size=tuple(win.size),
-        )
 
         # Compute non-overlapping positions for all options in this trial.
         sampled_positions = utils.sample_non_overlapping_positions(
@@ -301,9 +314,9 @@ def run_task(
             bg_rgb_255=bg,
             msg_logger=msg_logger,
             fps=fps,
-            raspi=bool(raspi and pigpio_pi is not None),
-            pigpio_pi=pigpio_pi,
-            raspi_pin=raspi_pin,
+            experimenter_preview=preview,
+            external_abort_checker=poll_exit,
+            scene_main_size=effective_win_size,
             trial_meta=trial_meta,
         )
         if aborted:
@@ -316,9 +329,9 @@ def run_task(
             logger.log_frame_flip(
                 trial_num=trial_num,
                 event="gray_inter_trial_interval",
-                timestamp_perf_s=float(gray_start_perf),
-                requested_timestamp_perf_s=trial_meta.get(
-                    "gray_flip_requested_perf_s"
+                timestamp_perf_ns=trial_meta["gray_flip_perf_ns"],
+                requested_timestamp_perf_ns=trial_meta.get(
+                    "gray_flip_requested_perf_ns"
                 ),
                 requested_duration=iti if iti > 0.0 else None,
             )
@@ -358,12 +371,16 @@ def run_task(
         if iti_frames > 0:
             msg_logger.log("INFO", f"timing_quantization trial_num={trial_num} iti={iti:.6f}s-> {iti_frames}fr({iti_s:.6f}s)")
             if gray_start_perf is not None:
-                wait_until(float(gray_start_perf) + iti_plan.scheduled_s)
+                if not wait_until(float(gray_start_perf) + iti_plan.scheduled_s, poll_callback=poll_exit):
+                    aborted_task = True
+                    break
 
     # finished
     msg_logger.log("INFO", f"session_end status={'aborted' if aborted_task else 'done'}")
-    session_logs.close()
+    if preview is not None:
+        preview.close()
     utils.close_task_window(win)
+    session_logs.close()
     return aborted_task
 
 
@@ -423,6 +440,7 @@ def main():
 
     try:
         aborted_by_user = run_task(
+            eye_tracking_config=load_eye_tracking_settings(cfg),
             images_dir=images_dir,
             n_trials=n_trials,
             num_afc=num_afc,
@@ -442,8 +460,8 @@ def main():
             image_size=image_size,
             svg_size=svg_size,
             refresh_rate=refresh_rate,
-            raspi=_get("raspi", cfg.get("raspi", False)),
-            raspi_pin=_get("raspi_pin", cfg.get("raspi_pin", 18)),
+            sync_pin=_get("sync_pin", cfg.get("sync_pin", 18)),
+            sync_bar=cfg.get("sync_bar"),
             config_name=config_name,
             screen_config=screen_config,
         )

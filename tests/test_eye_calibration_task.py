@@ -1,0 +1,1002 @@
+"""Exercise calibration wiring and pump cleanup without PsychoPy or hardware."""
+
+import importlib.util
+import csv
+from dataclasses import replace
+import json
+import math
+from pathlib import Path
+import sys
+import tempfile
+import types
+import unittest
+from unittest.mock import Mock, patch
+
+import bin
+from bin.eye_tracking import EyeCalibration, EyeTrackerState, UARTEyeTrackerConfig
+from bin.eye_tracking_config import load_eye_tracking_settings
+from bin.screen import ScreenGeometry
+
+
+def load_task():
+    """Stub only display imports; use real geometry, config and session logging."""
+    psychopy = types.ModuleType("psychopy")
+    psychopy.core = types.SimpleNamespace(wait=lambda _: None)
+    psychopy.event = types.SimpleNamespace(getKeys=lambda *args, **kwargs: [])
+    psychopy.visual = types.SimpleNamespace(Circle=Mock())
+    psychopy.logging = types.SimpleNamespace(console=Mock(), CRITICAL=50)
+    utils = types.ModuleType("bin.utils")
+    for name in (
+        "setup_task_window",
+        "close_task_window",
+        "make_bg_rect",
+        "verify_task_window_vblank",
+        "configure_sync_bar",
+        "service_sync_bar",
+    ):
+        setattr(utils, name, Mock())
+    utils.resolve_frame_rate = Mock(return_value=(60.0, 1.0 / 60.0))
+    renderer = types.ModuleType("bin.eye_calibration_preview")
+    renderer._make_fixation_cross = Mock(return_value=[Mock(), Mock()])
+    renderer._draw_fixation_cross = Mock()
+    path = Path(__file__).resolve().parents[1] / "task/calibrate_eye_tracker.py"
+    spec = importlib.util.spec_from_file_location("_eye_calibration_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    with patch.dict(
+        sys.modules,
+        {
+            "psychopy": psychopy,
+            "bin.utils": utils,
+            "bin.eye_calibration_preview": renderer,
+        },
+    ), patch.object(bin, "utils", utils, create=True):
+        spec.loader.exec_module(module)
+    return module
+
+
+class EyeCalibrationTaskTests(unittest.TestCase):
+    def setUp(self):
+        self.task = load_task()
+
+    def test_static_reward_sync_polling_protects_the_pump_off_deadline(self):
+        task = self.task
+        now = [10.0]
+        win = object()
+        with patch.object(task.time, "perf_counter", side_effect=lambda: now[0]), patch.object(
+            task.time, "perf_counter_ns", side_effect=lambda: round(now[0] * 1e9),
+        ), patch.object(task.core, "wait", side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)):
+            task._deliver_reward_pulse(
+                outputs=Mock(), pump_pin=0, pulse_duration_s=0.25,
+                logger=Mock(), sync_window=win,
+            )
+        self.assertAlmostEqual(now[0], 10.25)
+        self.assertGreater(task.utils.service_sync_bar.call_count, 1)
+        for call in task.utils.service_sync_bar.call_args_list:
+            self.assertIs(call.args[0], win)
+            self.assertEqual(call.kwargs["deadline_perf_s"], 10.25)
+
+    def test_uart_starts_before_display_setup_and_stops_if_setup_fails(self):
+        task = self.task
+        tracker = Mock()
+
+        def setup(*args, **kwargs):
+            tracker.start.assert_called_once_with()
+            raise RuntimeError("display failed")
+
+        def make_tracker(**kwargs):
+            identity_path, = Path(tmp).glob("*/block.json")
+            self.assertEqual(kwargs["block_id"], json.loads(identity_path.read_text())["block_id"])
+            # A fast UART response before the reward controller exists is safe.
+            tracker.start.side_effect = lambda: kwargs["on_state"](EyeTrackerState())
+            return tracker
+
+        task.utils.setup_task_window.side_effect = setup
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            task, "UARTEyeTracker", side_effect=make_tracker,
+        ), self.assertRaisesRegex(RuntimeError, "display failed"):
+            task.run_task(output_dir=tmp, fullscreen=False)
+        tracker.stop.assert_called_once_with()
+
+    def test_points_fit_affine_sync_sliders_and_snap_back_after_manual_gain_edit(self):
+        task = self.task
+        win = Mock(size=(800, 600))
+        main = ScreenGeometry(0, 0, 0, 800, 600, rotation="normal")
+        secondary = ScreenGeometry(1, 800, 0, 800, 600)
+        task.utils.setup_task_window.return_value = win, main, secondary
+        preview, tracker = Mock(), Mock()
+        preview.poll.side_effect = lambda: win.flip.call_count >= 5
+        preview.consume_manual_reward_request.return_value = False
+        x_gain, y_gain = math.hypot(0.003, -0.001), math.hypot(0.004, 0.001)
+        frames = [
+            (0.005, -0.005, (0, 0), 1, (100, 100)),
+            (0.005, -0.005, (0.3, 0.1), 2, (200, 100)),
+            (0.003, -math.hypot(0.005, 0.001), (-0.1, 0.4), 3, (100, 200)),
+            (2 * x_gain, y_gain, (-0.1, 0.4), 3, (200, 200)),
+            (2 * x_gain, y_gain, (0.2, 0.5), 4, (200, 200)),
+        ]
+        preview.get_calibration_controls.side_effect = [
+            dict(x_scale=x, y_scale=y, fix_x=target[0], fix_y=target[1], revision=i + 1, zero_count=count)
+            for i, (x, y, target, count, raw) in enumerate(frames)
+        ]
+        tracker.get_state.side_effect = [
+            EyeTrackerState(valid=True, frame_sequence=i + 1, x_smooth_px=raw[0], y_smooth_px=raw[1])
+            for i, (_, _, _, _, raw) in enumerate(frames)
+        ]
+        marker_positions = []
+        marker = task.visual.Circle.return_value
+        marker.draw.side_effect = lambda: marker_positions.append(marker.pos)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            task, "ExperimenterPreview", return_value=preview
+        ), patch.object(task, "UARTEyeTracker", return_value=tracker):
+            path = task.run_task(output_dir=tmp, fullscreen=False)
+            saved = json.loads(path.read_text())["eye_tracker_calibration"]
+            calibration = load_eye_tracking_settings(
+                {"eye_tracking": {"enabled": True, "calibration_file": str(path)}}
+            ).calibration
+        for name, expected in dict(x_scale=0.003, x_cross=-0.001, y_cross=0.001, y_scale=0.004, x_offset=-0.2, y_offset=-0.5).items():
+            self.assertAlmostEqual(getattr(calibration, name), expected)
+        states = [call.kwargs for call in preview.show_calibration_state.call_args_list]
+        for actual, expected in zip(states[3]["eye_fraction"], (0.5, 0.5)):
+            self.assertAlmostEqual(actual, expected)
+        for actual, expected in zip(states[4]["eye_fraction"], (0.2, 0.5)):
+            self.assertAlmostEqual(actual, expected)
+        self.assertEqual([len(state["calibration_points"]) for state in states], [1, 2, 3, 3, 4])
+        self.assertEqual(len(saved["calibration_points"]), 4)
+        self.assertEqual(preview.set_calibration_gains.call_count, 4)
+        last = preview.set_calibration_gains.call_args.kwargs
+        self.assertAlmostEqual(last["x_scale"], x_gain)
+        self.assertAlmostEqual(last["y_scale"], y_gain)
+        self.assertEqual(task.visual.Circle.call_args.kwargs["fillColor"], (1, -1, -1))
+        self.assertEqual(marker_positions[-4:], [(0, 0), (80, -180), (320, 60), (400, -120)])
+
+    def test_delete_from_either_window_removes_point_and_restores_prior_mapping(self):
+        for source in ("main", "preview"):
+            with self.subTest(source=source):
+                task = load_task()
+                win = Mock(size=(800, 600))
+                task.utils.setup_task_window.return_value = (
+                    win, ScreenGeometry(0, 0, 0, 800, 600), ScreenGeometry(1, 800, 0, 800, 600),
+                )
+                preview, tracker = Mock(), Mock()
+                preview.poll.side_effect = lambda: win.flip.call_count >= 2
+                preview.consume_manual_reward_request.return_value = False
+                initial = dict(x_scale=0.005, y_scale=-0.005, fix_x=0.1, fix_y=0.2, revision=1, zero_count=1)
+                preview.get_calibration_controls.side_effect = [initial, {**initial, "delete_count": int(source == "preview")}]
+                tracker.get_state.return_value = EyeTrackerState(valid=True, x_smooth_px=100, y_smooth_px=50)
+                keys = iter([[], ["delete"] if source == "main" else []])
+                with tempfile.TemporaryDirectory() as tmp, patch.object(task, "ExperimenterPreview", return_value=preview), patch.object(
+                    task, "UARTEyeTracker", return_value=tracker
+                ), patch.object(task.event, "getKeys", side_effect=lambda names: next(keys) if "z" in names else []):
+                    path = task.run_task(output_dir=tmp, fullscreen=False)
+                    saved = json.loads(path.read_text())["eye_tracker_calibration"]
+                self.assertEqual(saved["calibration_points"], [])
+                self.assertEqual((saved["x_offset"], saved["y_offset"]), (0, 0))
+                self.assertEqual(task.visual.Circle.return_value.draw.call_count, 1)
+                self.assertEqual(preview.set_calibration_gains.call_count, 2)
+
+    def test_queued_point_edits_keep_order_and_capture_target_despite_delivery_delay(self):
+        task = self.task
+        win = Mock(size=(800, 600))
+        task.utils.setup_task_window.return_value = (
+            win, ScreenGeometry(0, 0, 0, 800, 600), ScreenGeometry(1, 800, 0, 800, 600),
+        )
+        preview, tracker = Mock(), Mock()
+        preview.poll.side_effect = lambda: win.flip.call_count >= 3
+        preview.consume_manual_reward_request.return_value = False
+        controls = dict(x_scale=0.005, y_scale=-0.005, fix_x=0.45, fix_y=0.4, revision=1, zero_count=1)
+        delayed = {**controls, "revision": 2, "zero_count": 2, "delete_count": 1}
+        preview.get_calibration_controls.side_effect = [
+            {**controls, "point_actions": [{"action": "add", "target_fraction": [0.1, 0.2]}]},
+            {**delayed, "point_actions": []},
+            {**delayed, "point_actions": [
+                {"action": "delete"}, {"action": "add", "target_fraction": [0.3, -0.1]},
+            ]},
+        ]
+        tracker.get_state.side_effect = [
+            EyeTrackerState(valid=True, x_smooth_px=x, y_smooth_px=y)
+            for x, y in [(100, 50), (200, 150), (200, 150)]
+        ]
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            task, "ExperimenterPreview", return_value=preview
+        ), patch.object(task, "UARTEyeTracker", return_value=tracker):
+            path = task.run_task(output_dir=tmp, fullscreen=False)
+            saved = json.loads(path.read_text())["eye_tracker_calibration"]
+        self.assertEqual(saved["calibration_points"], [
+            {"raw_px": [200, 150], "target_fraction": [0.3, -0.1]},
+        ])
+        states = [call.kwargs for call in preview.show_calibration_state.call_args_list]
+        self.assertEqual([len(state["calibration_points"]) for state in states], [1, 1, 1])
+        for actual, expected in zip(states[-1]["eye_fraction"], (0.3, -0.1)):
+            self.assertAlmostEqual(actual, expected)
+        self.assertEqual(preview.set_calibration_gains.call_count, 2)
+
+    def test_subject_window_delete_then_add_replaces_last_point(self):
+        task = self.task
+        win = Mock(size=(800, 600))
+        task.utils.setup_task_window.return_value = (
+            win, ScreenGeometry(0, 0, 0, 800, 600), ScreenGeometry(1, 800, 0, 800, 600),
+        )
+        preview, tracker = Mock(), Mock()
+        preview.poll.side_effect = lambda: win.flip.call_count >= 2
+        preview.consume_manual_reward_request.return_value = False
+        controls = dict(x_scale=0.005, y_scale=-0.005, fix_x=0.1, fix_y=0.2,
+                        revision=1, zero_count=0, point_actions=[])
+        preview.get_calibration_controls.side_effect = [
+            controls, {**controls, "revision": 2, "fix_x": 0.3, "fix_y": -0.1},
+        ]
+        tracker.get_state.side_effect = [
+            EyeTrackerState(valid=True, x_smooth_px=x, y_smooth_px=y)
+            for x, y in [(100, 50), (200, 150)]
+        ]
+        keys = iter([["z"], ["delete", "z"]])
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            task, "ExperimenterPreview", return_value=preview
+        ), patch.object(task, "UARTEyeTracker", return_value=tracker), patch.object(
+            task.event, "getKeys", side_effect=lambda names: next(keys) if "z" in names else [],
+        ):
+            path = task.run_task(output_dir=tmp, fullscreen=False)
+            saved = json.loads(path.read_text())["eye_tracker_calibration"]
+        self.assertEqual(saved["calibration_points"], [
+            {"raw_px": [200, 150], "target_fraction": [0.3, -0.1]},
+        ])
+        self.assertEqual((saved["x_scale"], saved["y_scale"]), (0.005, -0.005))
+
+    def test_reward_clears_dout_even_if_logger_raises(self):
+        outputs = Mock()
+        logger = Mock()
+        logger.log_signal.side_effect = RuntimeError("log failed")
+        with self.assertRaises(RuntimeError):
+            self.task._deliver_reward_pulse(
+                outputs=outputs, pump_pin=3, pulse_duration_s=0.2, logger=logger
+            )
+        self.assertEqual(
+            [call.args for call in outputs.write.call_args_list],
+            [(3, True), (3, False)],
+        )
+
+    def test_reward_exit_shortens_pulse_and_zero_duration_never_activates(self):
+        outputs, logger = Mock(), Mock()
+        self.task._deliver_reward_pulse(
+            outputs=outputs,
+            pump_pin=0,
+            pulse_duration_s=5,
+            logger=logger,
+            should_exit=lambda: True,
+        )
+        self.assertEqual(
+            [call.args for call in outputs.write.call_args_list],
+            [(0, True), (0, False)],
+        )
+        self.assertEqual(
+            [call.kwargs["event"] for call in logger.log_signal.call_args_list],
+            ["pump_on", "pump_off"],
+        )
+        outputs.reset_mock()
+        self.task._deliver_reward_pulse(
+            outputs=outputs, pump_pin=0, pulse_duration_s=0, logger=logger
+        )
+        outputs.write.assert_not_called()
+
+    def test_reward_keeps_drawing_video_and_clears_output_at_pulse_end(self):
+        task = self.task
+        now = [0.0]
+        frames = []
+        outputs, logger = Mock(), Mock()
+
+        def draw():
+            frames.append(now[0])
+            now[0] += 0.02
+
+        def wait(duration):
+            now[0] += duration
+
+        with patch.object(task.time, "perf_counter_ns", side_effect=lambda: round(now[0] * 1_000_000_000)), patch.object(task.time, "perf_counter", side_effect=lambda: now[0]), patch.object(
+            task.core, "wait", side_effect=wait,
+        ):
+            task._deliver_reward_pulse(
+                outputs=outputs, pump_pin=0, pulse_duration_s=0.09,
+                logger=logger, on_wait=draw,
+            )
+        self.assertEqual(len(frames), 3)
+        self.assertAlmostEqual(now[0], 0.09)
+        self.assertEqual([call.args for call in outputs.write.call_args_list], [(0, True), (0, False)])
+
+    def test_task_uses_shared_preview_windowed_rotation_and_uart_metadata(self):
+        task = self.task
+        win = Mock(size=(800, 600))
+        main = ScreenGeometry(
+            index=0, name="main", width=1920, height=1080, x=0, y=0, rotation="normal"
+        )
+        secondary = ScreenGeometry(
+            index=1, name="exp", width=1280, height=1024, x=1920, y=0
+        )
+        task.utils.setup_task_window.return_value = win, main, secondary
+        preview, tracker, outputs = Mock(), Mock(), Mock()
+        preview.poll.side_effect = [False, False, False, False, True]
+        preview.consume_manual_reward_request.return_value = False
+        first_controls = {
+            "x_scale": 0.005,
+            "y_scale": -0.005,
+            "fix_x": 0.25,
+            "fix_y": -0.25,
+            "revision": 1,
+            "zero_count": 1,
+        }
+        preview.get_calibration_controls.side_effect = [
+            first_controls,
+            {
+                **first_controls,
+                "revision": 2,
+                "attention_count": 1,
+                "fix_x": -0.2,
+                "fix_y": 0.2,
+                "x_scale": 0.01,
+                "y_scale": -0.015,
+            },
+            {
+                **first_controls,
+                "revision": 3,
+                "x_scale": 0,
+                "y_scale": 0,
+                "attention_count": 1,
+            },
+            {
+                **first_controls,
+                "revision": 4,
+                "x_scale": -0.01,
+                "y_scale": 0.01,
+                "attention_count": 1,
+            },
+        ]
+        outputs.validate_bit.return_value = 0
+        first_state = EyeTrackerState(
+            timestamp_perf_s=1,
+            frame_sequence=1,
+            valid=True,
+            x_smooth_px=100,
+            y_smooth_px=50,
+        )
+        tracker.get_state.side_effect = [first_state] + [
+            replace(
+                first_state,
+                x_smooth_px=110,
+                y_smooth_px=60,
+                frame_sequence=i,
+                timestamp_perf_s=1 + i * 0.01,
+            )
+            for i in (2, 3, 4)
+        ]
+        clock = [0.0]
+        f_keys = iter([["f"], [], [], []])
+
+        def get_keys(keys):
+            if "f" in keys:
+                clock[0] += 2
+                return next(f_keys)
+            return []
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            task, "ExperimenterPreview", return_value=preview
+        ) as preview_class, patch.object(
+            task, "UARTEyeTracker", return_value=tracker
+        ), patch.object(
+            task, "DAQC2DigitalOutputs", return_value=outputs
+        ), patch.object(
+            task.event, "getKeys", side_effect=get_keys
+        ), patch.object(
+            task.time, "perf_counter", side_effect=lambda: clock[0]
+        ), patch.object(task.time, "perf_counter_ns", side_effect=lambda: round(clock[0] * 1_000_000_000)):
+            result = task.run_task(
+                output_dir=tmp,
+                fullscreen=False,
+                win_size=(800, 600),
+                uart_config=UARTEyeTrackerConfig(simulate=True),
+                sync_bar={"enabled": True, "height": 24},
+                sync_pin=23,
+            )
+            saved = json.loads(result.read_text())["eye_tracker_calibration"]
+            reloaded = load_eye_tracking_settings(
+                {"eye_tracking": {"enabled": True, "calibration_file": str(result)}}
+            )
+        self.assertEqual(saved["main_screen_size_px"], [600, 800])
+        self.assertEqual(saved["main_native_size_px"], [800, 600])
+        self.assertEqual(saved["main_rotation_deg"], 90)
+        sync_call = task.utils.configure_sync_bar.call_args
+        self.assertEqual(sync_call.args[1], {"enabled": True, "height": 24})
+        self.assertEqual(sync_call.kwargs["sync_pin"], 23)
+        self.assertEqual(sync_call.kwargs["rotation_degrees"], 90)
+        self.assertIs(sync_call.kwargs["experimenter_preview"], preview)
+        self.assertEqual(saved["input_units"], "crop_local_pixels")
+        self.assertAlmostEqual(saved["x_offset"], 1.25)
+        self.assertAlmostEqual(saved["y_offset"], -0.75)
+        self.assertEqual(reloaded.gain_anchor_px, (100, 50))
+        # Moving the target, doubling gain, crossing zero and reversing sign
+        # must all preserve the previously zeroed position's mapping.
+        for call, expected in zip(
+            preview.show_calibration_state.call_args_list,
+            [(0.25, -0.25), (0.35, -0.4), (0.25, -0.25), (0.15, -0.15)],
+        ):
+            for actual, value in zip(call.kwargs["eye_fraction"], expected):
+                self.assertAlmostEqual(actual, value)
+        for actual, expected in zip(
+            reloaded.calibration.map_position(100, 50), (0.25, -0.25)
+        ):
+            self.assertAlmostEqual(actual, expected)
+        self.assertEqual(
+            preview_class.call_args.kwargs["calibration_config"]["subject_size"],
+            (600, 800),
+        )
+        self.assertEqual(
+            task._draw_fixation_cross.call_args_list[0].args[1], (-200, -150)
+        )
+        # Main-window F starts the cue; preview-window F restarts it. An
+        # unchanged request counter must not restart it on later frames.
+        for draw_calls in (
+            task._draw_fixation_cross.call_args_list,
+            preview.show_calibration_state.call_args_list,
+        ):
+            self.assertEqual(
+                [c.kwargs["attention_started_s"] for c in draw_calls],
+                [2.0, 4.0, 4.0, 4.0],
+            )
+        task.utils.verify_task_window_vblank.assert_called_once_with(win)
+        task.utils.close_task_window.assert_called_once_with(win)
+        tracker.stop.assert_called_once()
+        preview.close.assert_called_once()
+        self.assertEqual(outputs.write.call_args.args, (0, False))
+
+    def test_legacy_gpio_pin_rejected_before_opening_windows(self):
+        with self.assertRaisesRegex(ValueError, "DOUT bit"):
+            self.task.run_task(pump_pin=17)
+        self.task.utils.setup_task_window.assert_not_called()
+
+    def test_hotkeys_work_from_either_window_and_merge_simultaneous_requests(self):
+        for source in ("main", "preview", "both"):
+            for valid in (True, False):
+                with self.subTest(source=source, valid=valid):
+                    self._exercise_hotkeys(source, valid)
+
+    def test_a_toggles_periodic_reward_from_either_window_while_uart_runs_during_pulses(self):
+        for source in ("main", "preview", "both"):
+            with self.subTest(source=source):
+                self._exercise_auto_reward(source)
+
+    def _exercise_auto_reward(self, source):
+        task = self.task
+        win = Mock(size=(800, 600))
+        main = ScreenGeometry(index=0, name="main", width=800, height=600, x=0, y=0)
+        secondary = ScreenGeometry(index=1, name="exp", width=800, height=600, x=800, y=0)
+        task.utils.setup_task_window.return_value = win, main, secondary
+        preview, tracker, outputs = Mock(), Mock(), Mock()
+        outputs.validate_bit.return_value = 0
+        clock = [100.0]
+        current = [EyeTrackerState(
+            timestamp_perf_s=100, frame_sequence=1, valid=True, rejection_reason=None
+        )]
+        consumer = [None]
+
+        def advance(duration):
+            # Simulate acquisition independent of the main loop, including
+            # its 150 ms pump waits. Only 10 ms between distinct camera frames.
+            target = clock[0] + duration
+            while clock[0] < target:
+                clock[0] = min(target, clock[0] + 0.01)
+                current[0] = replace(
+                    current[0], timestamp_perf_s=clock[0],
+                    frame_sequence=current[0].frame_sequence + 1,
+                )
+                consumer[0](current[0])
+
+        def make_tracker(**kwargs):
+            consumer[0] = kwargs["on_state"]
+            tracker.start.side_effect = lambda: consumer[0](current[0])
+            tracker.get_state.side_effect = lambda: current[0]
+            return tracker
+
+        win.flip.side_effect = lambda: advance(0.01)
+        preview.poll.side_effect = lambda: clock[0] >= 101.4
+        preview.consume_manual_reward_request.return_value = False
+        toggle_times = [100.1, 101.05]
+
+        def get_keys(keys):
+            if ("a" in keys and source in ("main", "both")
+                    and toggle_times and clock[0] >= toggle_times[0]):
+                toggle_times.pop(0)
+                return ["a"]
+            return []
+
+        def controls():
+            return {
+                "x_scale": 0.005, "y_scale": -0.005,
+                "fix_x": 0, "fix_y": 0, "revision": 0, "zero_count": 0,
+                "auto_reward_count": (
+                    sum(clock[0] >= t for t in (100.1, 101.05))
+                    if source in ("preview", "both") else 0
+                ),
+            }
+
+        preview.get_calibration_controls.side_effect = controls
+        onsets = []
+        outputs.write.side_effect = lambda bit, active: onsets.append(clock[0]) if active else None
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            task, "ExperimenterPreview", return_value=preview
+        ), patch.object(task, "UARTEyeTracker", side_effect=make_tracker), patch.object(
+            task, "DAQC2DigitalOutputs", return_value=outputs
+        ), patch.object(task.time, "perf_counter_ns", side_effect=lambda: round(clock[0] * 1_000_000_000)), patch.object(task.time, "perf_counter", side_effect=lambda: clock[0]), patch.object(
+            task.event, "getKeys", side_effect=get_keys
+        ), patch.object(task.core, "wait", side_effect=advance):
+            path = task.run_task(
+                output_dir=tmp, fullscreen=False, raspi=True,
+                reward_interval=0.3, pump_pulse_time_seconds=0.15,
+            )
+            saved = json.loads(path.read_text())["eye_tracker_calibration"]
+        self.assertEqual(len(onsets), 3)
+        self.assertGreaterEqual(onsets[0], 100.4)
+        for first, second in zip(onsets, onsets[1:]):
+            self.assertAlmostEqual(second - first, 0.3, delta=0.021)
+        statuses = [c.kwargs["status_text"] for c in preview.show_calibration_state.call_args_list]
+        self.assertIn("auto OFF", statuses[0])
+        self.assertTrue(any("auto ON" in status for status in statuses))
+        self.assertIn("auto OFF", statuses[-1])
+        self.assertEqual(saved["fixation_acceptance"]["reward_interval"], 0.3)
+        self.assertEqual(saved["fixation_acceptance"]["fraction_basis"], "time")
+        self.assertEqual(saved["fixation_acceptance"]["interval_fraction_threshold"], 0.80)
+        self.assertEqual(saved["fixation_acceptance"]["window_mode"], "rolling")
+        self.assertTrue(saved["fixation_acceptance"]["reset_on_reward"])
+        tracker.stop.assert_called_once()
+
+    def test_invalid_auto_reward_interval_is_rejected_before_hardware_or_windows(self):
+        for interval in (0, -1, float("nan"), float("inf"), 0.25):
+            with self.subTest(interval=interval), self.assertRaisesRegex(ValueError, "reward_interval"):
+                self.task.run_task(reward_interval=interval)
+        self.task.utils.setup_task_window.assert_not_called()
+
+    def test_fixation_radius_overrides_legacy_diameter_and_falls_back_when_absent(self):
+        for radius, expected in ((None, 0.06), (0.03, 0.03)):
+            with self.subTest(radius=radius):
+                task = load_task()
+                win = Mock(size=(800, 600))
+                task.utils.setup_task_window.return_value = (
+                    win, ScreenGeometry(0, 0, 0, 800, 600), ScreenGeometry(1, 800, 0, 800, 600),
+                )
+                preview, tracker = Mock(), Mock()
+                preview.poll.side_effect = lambda: win.flip.call_count >= 1
+                preview.consume_manual_reward_request.return_value = False
+                preview.get_calibration_controls.return_value = dict(
+                    x_scale=0.005, y_scale=-0.005, fix_x=0, fix_y=0, revision=0, zero_count=0,
+                )
+                tracker.get_state.return_value = EyeTrackerState(valid=True)
+                with tempfile.TemporaryDirectory() as tmp, patch.object(
+                    task, "ExperimenterPreview", return_value=preview,
+                ), patch.object(task, "UARTEyeTracker", return_value=tracker):
+                    path = task.run_task(
+                        output_dir=tmp, fullscreen=False, fix_diameter=0.12, fixation_radius=radius,
+                    )
+                    saved = json.loads(path.read_text())["eye_tracker_calibration"]["fixation_acceptance"]
+                    control = task.ExperimenterPreview.call_args.kwargs["pump_control"]
+                self.assertEqual(saved["fixation_radius"], expected)
+                self.assertEqual(saved["fix_diameter"], 2 * expected)
+                self.assertEqual(saved["radius_units"], "fraction_of_shorter_subject_scene_dimension")
+                self.assertEqual(control.settings.values["fixation_radius"], expected)
+
+    def test_reward_edits_reset_history_change_radius_and_save_timestamped_changes(self):
+        task = self.task
+        win = Mock(size=(800, 600))
+        task.utils.setup_task_window.return_value = (
+            win, ScreenGeometry(0, 0, 0, 800, 600), ScreenGeometry(1, 800, 0, 800, 600),
+        )
+        preview, tracker = Mock(), Mock()
+        preview.poll.side_effect = lambda: win.flip.call_count >= 3
+        preview.consume_manual_reward_request.return_value = False
+        preview.get_calibration_controls.return_value = dict(
+            x_scale=0.005, y_scale=-0.005, fix_x=0, fix_y=0, revision=0, zero_count=0,
+        )
+        clock = [100.0]
+        current = [EyeTrackerState(timestamp_perf_s=100, frame_sequence=1, valid=True)]
+        tracker.get_state.side_effect = lambda: current[0]
+        consumer = [None]
+        policies = []
+
+        class RecordingPolicy(task.CalibrationAutoReward):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                policies.append(self)
+                self.toggle(now_s=100)
+
+        def make_tracker(**kwargs):
+            consumer[0] = kwargs["on_state"]
+            return tracker
+
+        def observe_window(start_s, duration_ms, sequence_start, x_px):
+            for ms in range(0, duration_ms + 1, 10):
+                current[0] = EyeTrackerState(
+                    timestamp_perf_s=start_s + ms / 1000,
+                    frame_sequence=sequence_start + ms, x_smooth_px=x_px, valid=True,
+                )
+                consumer[0](current[0])
+
+        def flip():
+            policy = policies[0]
+            control = task.ExperimenterPreview.call_args.kwargs["pump_control"]
+            if win.flip.call_count == 1:
+                observe_window(100, 1000, 1, 0)
+                self.assertTrue(policy.status(now_s=101).due)
+                # This location is outside the old acceptance circle but
+                # inside the requested larger radius on an 800 x 600 screen.
+                self.assertFalse(policy._in_window((0.05, 0)))
+                clock[0] = 101
+                control.settings.request("reward_interval", 0.4)
+                clock[0] = 101.01
+                control.settings.request("fixation_radius", 0.1)
+                self.assertEqual((policy.reward_interval, policy.fixation_radius), (1, 0.02))
+                clock[0] = 101.05
+            elif win.flip.call_count == 2:
+                self.assertEqual((policy.reward_interval, policy.fixation_radius), (0.4, 0.1))
+                self.assertFalse(policy.status(now_s=101.05).due)
+                task._deliver_reward_pulse.assert_not_called()
+                self.assertTrue(policy._in_window((0.05, 0)))
+                observe_window(101.05, 410, 2000, 10)
+                clock[0] = 101.46
+                self.assertTrue(policy.status(now_s=clock[0]).due)
+
+        win.flip.side_effect = flip
+        delivered = []
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            task, "ExperimenterPreview", return_value=preview,
+        ), patch.object(task, "UARTEyeTracker", side_effect=make_tracker), patch.object(
+            task, "CalibrationAutoReward", RecordingPolicy,
+        ), patch.object(task, "_deliver_reward_pulse", side_effect=lambda **kwargs: delivered.append(clock[0])), patch.object(
+            task.time, "perf_counter", side_effect=lambda: clock[0],
+        ), patch.object(task.time, "perf_counter_ns", side_effect=lambda: round(clock[0] * 1e9)):
+            path = task.run_task(
+                output_dir=tmp, fullscreen=False, reward_interval=1,
+                fixation_radius=0.02, pump_pulse_time_seconds=0.1,
+            )
+            saved = json.loads(path.read_text())["eye_tracker_calibration"]["fixation_acceptance"]
+            with (path.parent / "message_log.tsv").open() as stream:
+                rows = list(csv.DictReader(stream, delimiter="\t"))
+
+        self.assertEqual(delivered, [101.46])
+        self.assertEqual(saved["reward_interval"], 0.4)
+        self.assertEqual(saved["fixation_radius"], 0.1)
+        self.assertEqual(saved["fix_diameter"], 0.2)
+        self.assertIn("0.4s:", preview.show_calibration_state.call_args.kwargs["status_text"])
+        audits = [
+            (json.loads(row["message"].removeprefix("live_setting ")), int(row["task_time_ns"]))
+            for row in rows if row["message"].startswith("live_setting ")
+        ]
+        initial_time = next(timestamp for entry, timestamp in audits if entry["phase"] == "initial")
+        self.assertEqual(
+            [(entry["name"], entry["new_value"], timestamp - initial_time)
+             for entry, timestamp in audits if entry["phase"] == "confirmed"],
+            [("reward_interval", 0.4, 1_000_000_000), ("fixation_radius", 0.1, 1_010_000_000)],
+        )
+        self.assertEqual(
+            [(entry["name"], entry["new_value"], timestamp - initial_time)
+             for entry, timestamp in audits if entry["phase"] == "applied"],
+            [("reward_interval", 0.4, 1_050_000_000), ("fixation_radius", 0.1, 1_050_000_000)],
+        )
+
+    def _exercise_hotkeys(self, source, valid):
+        task = self.task
+        win = Mock(size=(800, 600))
+        main = ScreenGeometry(index=0, name="main", width=800, height=600, x=0, y=0)
+        secondary = ScreenGeometry(
+            index=1, name="exp", width=1280, height=1024, x=800, y=0
+        )
+        task.utils.setup_task_window.return_value = win, main, secondary
+        preview, tracker = Mock(), Mock()
+        # Reward polls for Escape while active; stop only after three rendered
+        # frames rather than consuming a fixed number of poll calls.
+        preview.poll.side_effect = lambda: win.flip.call_count >= 3
+        plate = Mock()
+        clock = [0.0]
+        on_times, off_times = [], []
+        plate.setDOUTbit.side_effect = lambda *args: on_times.append(clock[0])
+        plate.clrDOUTbit.side_effect = lambda *args: off_times.append(clock[0])
+        main_request = source in ("main", "both")
+        preview_request = source in ("preview", "both")
+        initial = EyeCalibration(
+            x_scale=0.003, y_scale=-0.004, x_offset=-0.2, y_offset=0.3
+        )
+        controls = {
+            "x_scale": initial.x_scale,
+            "y_scale": initial.y_scale,
+            "fix_x": 0.25,
+            "fix_y": -0.1,
+            "revision": 1,
+            "zero_count": 0,
+            "attention_count": 0,
+        }
+        requested = {
+            **controls,
+            "revision": 2 if preview_request else 1,
+            "zero_count": int(preview_request),
+            "attention_count": int(preview_request),
+        }
+        preview.get_calibration_controls.side_effect = [controls, requested, requested]
+        preview.consume_manual_reward_request.side_effect = [
+            False,
+            preview_request,
+            False,
+        ]
+        first = EyeTrackerState(
+            timestamp_perf_s=1,
+            frame_sequence=1,
+            valid=True,
+            x_smooth_px=100,
+            y_smooth_px=50,
+        )
+        tracker.get_state.side_effect = [
+            first,
+            replace(
+                first,
+                timestamp_perf_s=1.02,
+                frame_sequence=2,
+                valid=valid,
+                x_smooth_px=120,
+                y_smooth_px=60,
+            ),
+            replace(
+                first,
+                timestamp_perf_s=1.04,
+                frame_sequence=3,
+                x_smooth_px=130,
+                y_smooth_px=70,
+            ),
+        ]
+        key_frames = iter([
+            [], ["f", "z", "r", "right", "right", "up",
+                 "num_8", "num_8", "num_6", "num_2", "num_4", "num_6"]
+            if main_request else [], []
+        ])
+
+        def get_keys(keys):
+            return [key for key in next(key_frames) if key in keys] if "f" in keys else []
+
+        def wait(duration):
+            clock[0] += duration
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            task, "ExperimenterPreview", return_value=preview
+        ), patch.object(task, "UARTEyeTracker", return_value=tracker), patch.dict(
+            sys.modules, {"_calibration_test_plate": plate}
+        ), patch.object(
+            task.event, "getKeys", side_effect=get_keys
+        ), patch.object(task.time, "perf_counter_ns", side_effect=lambda: round(clock[0] * 1_000_000_000)), patch.object(task.time, "perf_counter", side_effect=lambda: clock[0]), patch.object(
+            task.core, "wait", side_effect=wait
+        ):
+            result = task.run_task(
+                output_dir=tmp, fullscreen=False, initial_calibration=initial,
+                raspi=True, daq_address=2, daq_module_name="_calibration_test_plate",
+                pump_pin=3, pump_pulse_time_seconds=0.25,
+            )
+            saved = load_eye_tracking_settings(
+                {"eye_tracking": {"enabled": True, "calibration_file": str(result)}}
+            )
+
+        # Z must work even when the preview's calibration revision never
+        # changes, and stale/invalid samples must still leave offsets alone.
+        self.assertEqual(saved.calibration.x_scale, 0.003)
+        self.assertEqual(saved.calibration.y_scale, -0.004)
+        if valid:
+            for actual, target in zip(
+                saved.calibration.map_position(120, 60), (0.25, -0.1)
+            ):
+                self.assertAlmostEqual(actual, target)
+            self.assertEqual(saved.gain_anchor_px, (120, 60))
+        else:
+            self.assertEqual(
+                (saved.calibration.x_offset, saved.calibration.y_offset), (-0.2, 0.3)
+            )
+            self.assertEqual(saved.gain_anchor_px, (100, 50))
+        # R fires once even if both sources report it in the same frame; F
+        # likewise starts once, without restarting on the following frame.
+        plate.setDOUTbit.assert_called_once_with(2, 3)
+        self.assertTrue(all(call.args == (2, 3) for call in plate.clrDOUTbit.call_args_list))
+        self.assertEqual(len(off_times), 3)  # Startup, pulse end, task cleanup.
+        self.assertAlmostEqual(off_times[1] - on_times[0], 0.25)
+        if main_request:
+            preview.request_calibration_scale_steps.assert_called_once_with(x_steps=2, y_steps=1)
+            preview.request_calibration_fixation_steps.assert_called_once_with(x_steps=1, y_steps=1)
+        else:
+            preview.request_calibration_scale_steps.assert_not_called()
+            preview.request_calibration_fixation_steps.assert_not_called()
+        starts = [
+            call.kwargs["attention_started_s"]
+            for call in preview.show_calibration_state.call_args_list
+        ]
+        self.assertIsNone(starts[0])
+        self.assertIsNotNone(starts[1])
+        self.assertEqual(starts[1], starts[2])
+
+    def test_preview_abort_recovers_settings_and_still_cleans_up(self):
+        task = self.task
+        win = Mock(size=(800, 600))
+        main = ScreenGeometry(index=0, name="main", width=800, height=600, x=0, y=0)
+        secondary = ScreenGeometry(
+            index=1, name="exp", width=1280, height=1024, x=800, y=0
+        )
+        task.utils.setup_task_window.return_value = win, main, secondary
+        preview, tracker, outputs = Mock(), Mock(), Mock()
+        crash = RuntimeError(
+            "Experimenter preview process exited unexpectedly with status -6"
+        )
+        preview.poll.side_effect = [False, crash]
+        preview.consume_manual_reward_request.return_value = False
+        preview.get_calibration_controls.return_value = {
+            "x_scale": 0.005,
+            "y_scale": -0.005,
+            "fix_x": 0.25,
+            "fix_y": -0.25,
+            "revision": 1,
+            "zero_count": 1,
+        }
+        outputs.validate_bit.return_value = 0
+        tracker.get_state.return_value = EyeTrackerState(
+            timestamp_perf_s=1,
+            frame_sequence=1,
+            valid=True,
+            x_smooth_px=100,
+            y_smooth_px=50,
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            task, "ExperimenterPreview", return_value=preview
+        ), patch.object(task, "UARTEyeTracker", return_value=tracker), patch.object(
+            task, "DAQC2DigitalOutputs", return_value=outputs
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                task.run_task(output_dir=tmp, fullscreen=False)
+            self.assertIs(raised.exception, crash)
+            # The manager must not silently import an interrupted calibration.
+            self.assertEqual(list(Path(tmp).rglob("calibration.json")), [])
+            (recovery,) = Path(tmp).rglob("calibration_recovery.json")
+            saved = json.loads(recovery.read_text())["eye_tracker_calibration"]
+            self.assertEqual(saved["completion_status"], "interrupted")
+            self.assertIn("status -6", saved["interruption_error"])
+            self.assertEqual(saved["gain_anchor_px"], [100, 50])
+            settings = load_eye_tracking_settings(
+                {"eye_tracking": {"calibration_file": str(recovery)}},
+                for_calibration=True,
+            )
+            self.assertEqual(settings.calibration.map_position(100, 50), (0.25, -0.25))
+            self.assertEqual(list(Path(tmp).rglob("*.tmp")), [])
+        self.assertEqual(outputs.write.call_args.args, (0, False))
+        tracker.stop.assert_called_once()
+        preview.close.assert_called_once()
+        task.utils.close_task_window.assert_called_once_with(win)
+
+    def test_v_from_either_window_moves_rotated_video_and_restores_cross(self):
+        for source in ("main", "preview", "both"):
+            with self.subTest(source=source):
+                task = load_task()
+                win = Mock(size=(800, 600))
+                main = ScreenGeometry(index=0, name="main", width=800, height=600, x=0, y=0, rotation="normal")
+                secondary = ScreenGeometry(index=1, name="exp", width=1280, height=1024, x=800, y=0)
+                task.utils.setup_task_window.return_value = win, main, secondary
+                preview, tracker = Mock(), Mock()
+                preview.poll.side_effect = lambda: win.flip.call_count >= 4
+                preview.consume_manual_reward_request.return_value = False
+                tracker.get_state.return_value = EyeTrackerState(
+                    timestamp_perf_s=1, frame_sequence=1, valid=True,
+                    x_smooth_px=100, y_smooth_px=50,
+                )
+                control_frames = [
+                    {
+                        "x_scale": 0.005, "y_scale": -0.005, "zero_count": 0,
+                        "revision": 1 if frame == 0 else 2,
+                        "fix_x": 0 if frame == 0 else 0.25,
+                        "fix_y": 0 if frame == 0 else -0.1,
+                        "video_toggle_count": (1 if frame < 2 else 2) if source != "main" else 0,
+                    }
+                    for frame in range(4)
+                ]
+                preview.get_calibration_controls.side_effect = control_frames
+                key_frames = iter([
+                    ["v"] if frame in (0, 2) and source != "preview" else []
+                    for frame in range(4)
+                ])
+                videos = Mock(enabled=False, error=None)
+
+                def toggle():
+                    videos.enabled = not videos.enabled
+                    return videos.enabled
+
+                videos.toggle.side_effect = toggle
+                videos.frame.side_effect = lambda: types.SimpleNamespace(
+                    sequence=1, rgb=object(), source_frame_index=0, source_pts_s=2.0,
+                    clip_number=1, path="attention.mp4",
+                ) if videos.enabled and win.flip.call_count > 0 else None
+                stim, publisher = Mock(), Mock(sequence=1)
+                publisher.descriptor.return_value = {"name": "video", "maximum_frame_bytes": 30000}
+                positions = []
+                stim.draw.side_effect = lambda: positions.append(stim.pos)
+                with tempfile.TemporaryDirectory() as tmp, patch.object(
+                    task, "ExperimenterPreview", return_value=preview
+                ), patch.object(task, "UARTEyeTracker", return_value=tracker), patch.object(
+                    task, "CalibrationVideoClips", return_value=videos
+                ), patch.object(task, "make_rgb_video_stim", return_value=stim) as make_stim, patch.object(
+                    task, "SharedVideoFrameBuffer", return_value=publisher
+                ), patch.object(task, "upload_rgb_texture") as upload, patch.object(
+                    task.event, "getKeys", side_effect=lambda keys: next(key_frames) if "v" in keys else []
+                ):
+                    task.run_task(output_dir=tmp, fullscreen=False, video_files=["attention.mp4"])
+                self.assertEqual(videos.toggle.call_count, 2)
+                self.assertEqual(positions, [(0, 0), (-80, -150)])
+                self.assertEqual(make_stim.call_args.args[1], (100, 100))
+                self.assertEqual(make_stim.call_args.kwargs["rotation"], 90)
+                upload.assert_called_once()
+                self.assertEqual(task._draw_fixation_cross.call_count, 2)
+                self.assertEqual([
+                    call.kwargs["video_visible"] for call in preview.show_calibration_state.call_args_list
+                ], [True, True, False, False])
+                videos.close.assert_called_once()
+                publisher.close.assert_called_once()
+
+    def test_main_accepts_null_calibration_values_from_experiment_manager(self):
+        task = self.task
+        args = types.SimpleNamespace(
+            config="generated.json",
+            output_dir=None,
+            fullscreen=None,
+            win_size=None,
+            main_screen=None,
+            experimenter_screen=None,
+            uart_device=None,
+            simulate_eye=None,
+            raspi=None,
+        )
+        config = {
+            "x_scale": None,
+            "y_scale": None,
+            "x_offset": None,
+            "y_offset": None,
+            "initial_x_scale": 0.003,
+            "initial_y_scale": -0.004,
+            "reward_interval": 1.5,
+            "fixation_radius": 0.07,
+            "video_files": ["attention.mp4"],
+            "video_size": [120, 80],
+            "clip_duration_seconds": 3.5,
+            "frame_rate": 24,
+        }
+        with patch.object(task, "parse_args", return_value=args), patch.object(
+            task, "load_config", return_value=config
+        ), patch.object(task, "run_task") as run, patch("builtins.print"):
+            with self.assertRaises(SystemExit):
+                task.main()
+        self.assertEqual(run.call_args.kwargs["video_files"], ["attention.mp4"])
+        self.assertEqual(run.call_args.kwargs["video_size"], [120, 80])
+        self.assertEqual(run.call_args.kwargs["clip_duration_seconds"], 3.5)
+        self.assertEqual(run.call_args.kwargs["frame_rate"], 24)
+        initial = run.call_args.kwargs["initial_calibration"]
+        self.assertEqual(run.call_args.kwargs["reward_interval"], 1.5)
+        self.assertEqual(run.call_args.kwargs["fixation_radius"], 0.07)
+        self.assertEqual(
+            (initial.x_scale, initial.y_scale, initial.x_offset, initial.y_offset),
+            (0.003, -0.004, 0.0, 0.0),
+        )
+
+    def test_launch_configs_enable_reward_on_pi_and_leave_desktop_disabled(self):
+        root = Path(__file__).resolve().parents[1]
+        for launcher, enabled in (
+            ("config_files/interface/rpi_launch_config.json", True),
+            ("test_configs/launch_config_rpi.json", True),
+            ("test_configs/launch_config_mac.json", False),
+        ):
+            with self.subTest(launcher=launcher):
+                config = json.loads((root / launcher).read_text())
+                entry = config["tasks"]["setup"]["calibrate_eye_tracker"]
+                argv = [entry["launch"], "--config", str(root / entry["config"])]
+                with patch.object(sys, "argv", argv), patch.object(
+                    self.task, "run_task"
+                ) as run, patch("builtins.print"):
+                    with self.assertRaises(SystemExit):
+                        self.task.main()
+                self.assertIs(run.call_args.kwargs["raspi"], enabled)
+                self.assertEqual(run.call_args.kwargs["pump_pin"], 0)
+                self.assertEqual(run.call_args.kwargs["pump_pulse_time_seconds"], 0.25)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import atexit
 import csv
 import datetime as dt
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import json
 import math
 import os
@@ -10,6 +11,9 @@ from pathlib import Path
 import re
 import time
 from typing import Any, Iterable, Mapping, Optional
+
+from .task_clock import TaskClock
+from .run_identity import prepare_block_identity
 
 
 EVENT_LOG_FILENAME = "event_log.tsv"
@@ -20,7 +24,7 @@ CALIBRATION_FILENAME = "calibration.json"
 EVENT_NAME_LIBRARY_FILENAME = "event_name_library.json"
 EXACT_SESSION_DIR_ENV = "NEURO_TASK_SESSION_DIR"
 EVENT_LIBRARY_ENV = "NEURO_EVENT_NAME_LIBRARY"
-ALLOWED_EVENT_TYPES = frozenset({"frame_flip", "interaction", "signal"})
+ALLOWED_EVENT_TYPES = frozenset({"frame_flip", "interaction", "signal", "lifecycle"})
 ALLOWED_MESSAGE_LEVELS = frozenset({"INFO", "WARN", "ERROR"})
 
 
@@ -193,14 +197,8 @@ def build_session_output_dir(
     return session_dir
 
 
-class SessionClock:
-    def __init__(self, started_at: Optional[dt.datetime] = None, start_perf_s: Optional[float] = None):
-        self.started_at = started_at or dt.datetime.now()
-        self.start_perf_s = float(start_perf_s) if start_perf_s is not None else time.perf_counter()
-
-    def seconds_since_start(self, timestamp_perf_s: Optional[float] = None) -> float:
-        now_perf = float(timestamp_perf_s) if timestamp_perf_s is not None else time.perf_counter()
-        return now_perf - self.start_perf_s
+# Kept as an import alias for existing callers; there is no block-local clock.
+SessionClock = TaskClock
 
 
 class EventCodeLibrary:
@@ -300,17 +298,19 @@ class EventLogger:
         self._writer.writerow(
             [
                 "trial_num",
-                "requested_time_since_session_start",
-                "time_since_session_start",
+                "requested_task_time_ns",
+                "task_time_ns",
                 "event",
                 "event_code",
                 "event_type",
                 "requested_duration",
+                "sync_transition_num",
+                "sync_phase",
             ]
         )
 
-    def seconds_since_session_start(self, timestamp_perf_s: Optional[float] = None) -> float:
-        return self._clock.seconds_since_start(timestamp_perf_s)
+    def task_time_ns(self, timestamp_perf_s=None, *, timestamp_perf_ns=None) -> int:
+        return self._clock.task_time_ns(timestamp_perf_s, timestamp_perf_ns=timestamp_perf_ns)
 
     def log_event(
         self,
@@ -320,9 +320,22 @@ class EventLogger:
         event_type: str,
         requested_duration: Optional[float] = None,
         timestamp_perf_s: Optional[float] = None,
+        timestamp_perf_ns: Optional[int] = None,
+        requested_timestamp_perf_ns: Optional[int] = None,
         requested_timestamp_perf_s: Optional[float] = None,
         description: Optional[str] = None,
+        sync_transition_num: Optional[int] = None,
+        sync_phase: Optional[int] = None,
     ) -> None:
+        if self._file.closed:
+            raise ValueError("Event log is closed")
+        if (sync_transition_num is None) != (sync_phase is None):
+            raise ValueError("Sync transition number and phase must be supplied together")
+        if sync_transition_num is not None and (
+            type(sync_transition_num) is not int or sync_transition_num < 1
+            or type(sync_phase) is not int or sync_phase not in (0, 1)
+        ):
+            raise ValueError("Sync transition number must be positive and phase must be 0 or 1")
         if requested_duration is not None:
             requested_duration = float(requested_duration)
             if not math.isfinite(requested_duration) or requested_duration < 0:
@@ -330,24 +343,25 @@ class EventLogger:
                     "requested_duration must be finite and non-negative when provided."
                 )
         definition = self._library.ensure(event, event_type=event_type, description=description)
-        timestamp_s = self.seconds_since_session_start(timestamp_perf_s)
-        requested_timestamp_s = (
-            None
-            if requested_timestamp_perf_s is None
-            else self.seconds_since_session_start(requested_timestamp_perf_s)
+        timestamp_ns = self.task_time_ns(timestamp_perf_s, timestamp_perf_ns=timestamp_perf_ns)
+        requested_ns = (
+            None if requested_timestamp_perf_s is None and requested_timestamp_perf_ns is None
+            else self.task_time_ns(requested_timestamp_perf_s, timestamp_perf_ns=requested_timestamp_perf_ns)
         )
         row = [
             "" if trial_num is None else str(int(trial_num)),
             (
                 ""
-                if requested_timestamp_s is None
-                else f"{requested_timestamp_s:.9f}"
+                if requested_ns is None
+                else str(requested_ns)
             ),
-            f"{timestamp_s:.9f}",
+            str(timestamp_ns),
             str(event).strip(),
             str(definition.code),
             definition.default_type,
             "" if requested_duration is None else f"{float(requested_duration):.9f}",
+            "" if sync_transition_num is None else str(sync_transition_num),
+            "" if sync_phase is None else str(sync_phase),
         ]
         if self.auto_flush:
             self._writer.writerow(row)
@@ -360,8 +374,10 @@ class EventLogger:
         *,
         trial_num: Optional[int],
         event: str,
-        timestamp_perf_s: Optional[float],
+        timestamp_perf_s: Optional[float] = None,
+        timestamp_perf_ns: Optional[int] = None,
         requested_timestamp_perf_s: Optional[float] = None,
+        requested_timestamp_perf_ns: Optional[int] = None,
         requested_duration: Optional[float] = None,
         description: Optional[str] = None,
     ) -> None:
@@ -371,7 +387,9 @@ class EventLogger:
             event_type="frame_flip",
             requested_duration=requested_duration,
             timestamp_perf_s=timestamp_perf_s,
+            timestamp_perf_ns=timestamp_perf_ns,
             requested_timestamp_perf_s=requested_timestamp_perf_s,
+            requested_timestamp_perf_ns=requested_timestamp_perf_ns,
             description=description,
         )
 
@@ -380,7 +398,8 @@ class EventLogger:
         *,
         trial_num: Optional[int],
         event: str,
-        timestamp_perf_s: Optional[float],
+        timestamp_perf_s: Optional[float] = None,
+        timestamp_perf_ns: Optional[int] = None,
         description: Optional[str] = None,
     ) -> None:
         self.log_event(
@@ -388,6 +407,7 @@ class EventLogger:
             event=event,
             event_type="interaction",
             timestamp_perf_s=timestamp_perf_s,
+            timestamp_perf_ns=timestamp_perf_ns,
             description=description,
         )
 
@@ -396,8 +416,10 @@ class EventLogger:
         *,
         trial_num: Optional[int],
         event: str,
-        timestamp_perf_s: Optional[float],
+        timestamp_perf_s: Optional[float] = None,
+        timestamp_perf_ns: Optional[int] = None,
         requested_timestamp_perf_s: Optional[float] = None,
+        requested_timestamp_perf_ns: Optional[int] = None,
         requested_duration: Optional[float] = None,
         description: Optional[str] = None,
     ) -> None:
@@ -407,7 +429,9 @@ class EventLogger:
             event_type="signal",
             requested_duration=requested_duration,
             timestamp_perf_s=timestamp_perf_s,
+            timestamp_perf_ns=timestamp_perf_ns,
             requested_timestamp_perf_s=requested_timestamp_perf_s,
+            requested_timestamp_perf_ns=requested_timestamp_perf_ns,
             description=description,
         )
 
@@ -438,11 +462,11 @@ class MessageLogger:
         self.auto_flush = bool(auto_flush)
         self._pending_rows: list[list[str]] = []
         self._clock = session_clock
-        self._writer.writerow(["time_since_session_start", "level", "message"])
+        self._writer.writerow(["task_time_ns", "level", "message"])
 
-    def log(self, level: str, message: str, *, timestamp_perf_s: Optional[float] = None) -> None:
+    def log(self, level: str, message: str, *, timestamp_perf_s=None, timestamp_perf_ns=None) -> None:
         normalized_level = _normalize_message_level(level)
-        timestr = f"{self._clock.seconds_since_start(timestamp_perf_s):.9f}"
+        timestr = str(self._clock.task_time_ns(timestamp_perf_s, timestamp_perf_ns=timestamp_perf_ns))
         row = [timestr, normalized_level, str(message)]
         if self.auto_flush:
             self._writer.writerow(row)
@@ -511,8 +535,14 @@ class SessionLogBundle:
         when: Optional[dt.datetime] = None,
         auto_flush: bool = True,
         event_name_library_path: Optional[str | Path] = None,
+        eye_tracking_config=None,
+        on_eye_state=None,
+        live_settings=None,
     ):
-        self.session_clock = SessionClock(started_at=when)
+        self.session_clock = TaskClock(started_at=when)
+        block_start_perf_ns = time.perf_counter_ns()
+        self._closed = False
+        self.live_settings = live_settings
         exact_session_dir = os.environ.get(EXACT_SESSION_DIR_ENV)
         if exact_session_dir:
             self.session_dir = Path(exact_session_dir).expanduser().resolve()
@@ -530,6 +560,7 @@ class SessionLogBundle:
                 config_name=config_name,
                 when=self.session_clock.started_at,
             )
+        self.identity = prepare_block_identity(self.session_dir)
         self.calibration_path = self.session_dir / CALIBRATION_FILENAME
         definitions, event_patterns = load_task_event_definitions(
             task_name=task_name,
@@ -542,11 +573,19 @@ class SessionLogBundle:
             event_library=self.event_library,
             auto_flush=auto_flush,
         )
+        self.event_logger.log_event(
+            trial_num=None, event="block_start", event_type="lifecycle",
+            timestamp_perf_ns=block_start_perf_ns,
+        )
+        # Persist the first row even when the task buffers its subsequent events.
+        self.event_logger.flush()
         self.message_logger = MessageLogger(
             self.session_dir,
             session_clock=self.session_clock,
             auto_flush=auto_flush,
         )
+        if self.live_settings is not None:
+            self.live_settings.log_initial(self.message_logger)
         self.behavior_logger = (
             BehaviorLogger(self.session_dir, fieldnames=behavior_fieldnames, auto_flush=auto_flush)
             if behavior_fieldnames
@@ -563,8 +602,45 @@ class SessionLogBundle:
                 filename=f"{safe_name}.tsv",
                 auto_flush=auto_flush,
             )
+        self.eye_tracking = None
+        atexit.register(self.close)
+        if eye_tracking_config is not None:
+            from .task_eye_tracking import TaskEyeTrackingSession
+
+            try:
+                self.eye_tracking = TaskEyeTrackingSession(
+                    eye_tracking_config,
+                    output_dir=self.session_dir,
+                    task_clock=self.session_clock,
+                    on_state=on_eye_state,
+                    block_id=self.identity["block_id"],
+                )
+                self.message_logger.log(
+                    "INFO", f"eye_tracking_started eye_id=0 settings={json.dumps(asdict(eye_tracking_config))}"
+                )
+            except Exception:
+                self.close()
+                raise
+
+    @property
+    def eye_tracking_preview(self):
+        return self.eye_tracking.preview_state if self.eye_tracking is not None else None
+
+    def set_eye_tracking_screen(self, native_size, rotation_degrees=0) -> None:
+        """Share task geometry once; eye sampling never depends on a window flip."""
+        if self.eye_tracking is not None:
+            self.eye_tracking.set_screen_geometry(native_size, rotation_degrees)
+            self.message_logger.log(
+                "INFO",
+                f"eye_recording_screen native_size={tuple(native_size)} "
+                f"rotation_deg={rotation_degrees} coordinates=centered_native_pixels",
+            )
 
     def flush(self) -> None:
+        if self.eye_tracking is not None:
+            self.eye_tracking.check_recording_error()
+        if self.live_settings is not None:
+            self.live_settings.log_requests(self.message_logger)
         self.event_logger.flush()
         self.message_logger.flush()
         if self.behavior_logger is not None:
@@ -573,6 +649,32 @@ class SessionLogBundle:
             table_logger.flush()
 
     def close(self) -> None:
+        if self._closed:
+            return
+        if self.eye_tracking is not None and self.eye_tracking.recorder is not None:
+            self.eye_tracking.recorder.stop_accepting()
+        block_end_perf_ns = time.perf_counter_ns()
+        self._closed = True
+        atexit.unregister(self.close)
+        settings_error = None
+        if self.live_settings is not None:
+            try:
+                self.live_settings.close(self.message_logger)
+            except Exception as exc:
+                settings_error = exc
+                self.message_logger.log("ERROR", f"live_setting_audit_incomplete error={exc}")
+        self.event_logger.log_event(
+            trial_num=None, event="block_end", event_type="lifecycle",
+            timestamp_perf_ns=block_end_perf_ns,
+        )
+        eye_error = None
+        if self.eye_tracking is not None:
+            try:
+                self.eye_tracking.close()
+            except Exception as exc:
+                eye_error = exc
+                self.message_logger.log("ERROR", f"eye_tracking_cleanup_failed error={exc}")
+            self.eye_tracking = None
         self.flush()
         self.event_library.export_used(self.session_dir / EVENT_CODE_LIBRARY_FILENAME)
         self.event_logger.close()
@@ -581,3 +683,7 @@ class SessionLogBundle:
             self.behavior_logger.close()
         for table_logger in self.table_loggers.values():
             table_logger.close()
+        if eye_error is not None:
+            raise eye_error
+        if settings_error is not None:
+            raise settings_error

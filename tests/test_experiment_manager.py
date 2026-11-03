@@ -2,20 +2,44 @@ import csv
 import datetime as dt
 import json
 import os
+import platform
 import random
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
 import tempfile
 import unittest
+from uuid import UUID
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from bin.logger import SessionLogBundle
+from bin.task_clock import EXPERIMENT_ORIGIN_ENV
+from bin.run_identity import BLOCK_ID_ENV, EXPERIMENT_ID_ENV
+from bin.eye_tracking import (
+    EXPERIMENT_BLOCK_NUMBER_ENV,
+    EXPERIMENT_UART_PENDING_ENV,
+    EXPERIMENT_UART_READY_ENV,
+    UARTEyeTracker,
+)
+from bin.eye_tracker_wire.controller import ResponseTimeout
+from bin.eye_tracker_wire.protocol import CommandCode, StatusFlag, crc32c, decode_command
+from bin.eye_tracking_config import load_eye_tracking_settings
 from interface.experiment_manager import (
     EVENT_LIBRARY_ENV,
     EXACT_SESSION_DIR_ENV,
     ExperimentManager,
+    _git_commit,
+    _runtime_metadata,
     task_run_sequence,
     task_variants,
 )
+from interface.experiment_history import HISTORY_FILENAME
+from interface.data_sync import ExperimentDataSync, SyncPlan
+from interface.subject_calibration import SubjectCalibrationStore
 
 
 class FakeClock:
@@ -27,6 +51,414 @@ class FakeClock:
 
 
 class ExperimentManagerTests(unittest.TestCase):
+    def test_experiment_sync_override_is_resolved_and_saved_in_every_block(self):
+        block_sync = {"enabled": True, "height": 44,
+                      "interval_mean_seconds": 3.0, "interval_variance_seconds": 0.8}
+        defaults = {"enabled": False, "height": 20,
+                    "interval_mean_seconds": 1.0, "interval_variance_seconds": 0.2}
+        for options in (None, {"enabled": True, "height": 31}, {"enabled": False},
+                        {"enabled": True, "height": 25,
+                         "interval_mean_seconds": 2.0, "interval_variance_seconds": 0.4}):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config, path = self._project(root)
+                source = root / "configs/demo.json"
+                payload = json.loads(source.read_text())
+                payload["sync_bar"] = block_sync
+                source.write_text(json.dumps(payload))
+                original = source.read_bytes()
+                if options is not None:
+                    config["sync_bar"] = options
+                    # A calibration/state injection cannot override experiment settings.
+                    config["initial_state"]["sync_bar"] = {"enabled": False, "height": 55}
+                path.write_text(json.dumps(config))
+                manager = ExperimentManager(working_dir=root, launch_config_path=path,
+                                            launch_config=config, subject_name="Yuri", subject_code="Y")
+                expected = block_sync if options is None else {**defaults, **options}
+                for _ in range(2):
+                    block = manager.prepare_block(task_name="demo", launch_value="task/demo.py",
+                                                  config_value="configs/demo.json")
+                    saved = json.loads(block.config_path.read_text())
+                    self.assertEqual(saved["sync_bar"], expected)
+                    manager.finish_block(block)
+                self.assertEqual(source.read_bytes(), original)
+                manager.finish()
+
+    def test_invalid_experiment_sync_fails_before_allocating_or_starting_a_run(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config, path = self._project(root)
+            config["sync_bar"] = {"enabled": True, "height": -1}
+            with patch("interface.experiment_manager.ExperimentEyeTracker") as tracker:
+                with self.assertRaisesRegex(ValueError, "sync_bar.height"):
+                    ExperimentManager(working_dir=root, launch_config_path=path, launch_config=config,
+                                      subject_name="Yuri", subject_code="Y")
+            tracker.assert_not_called()
+            self.assertFalse((root / "logs").exists())
+
+    def test_unique_ids_persist_in_state_blocks_configs_and_uart_context(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config, path = self._project(root)
+            config["initial_state"]["experiment_id"] = "stale"
+            identifiers = set()
+            for _ in range(2):
+                with patch("interface.experiment_manager.ExperimentEyeTracker") as tracker:
+                    def start(*args, **kwargs):
+                        state = json.loads((kwargs["directory"] / "state.json").read_text())
+                        self.assertEqual(state["experiment_id"], kwargs["experiment_id"])
+                        return Mock(start_future=None)
+
+                    tracker.side_effect = start
+                    manager = ExperimentManager(working_dir=root, launch_config_path=path,
+                                                launch_config=config, subject_name="Yuri", subject_code="Y")
+                self.assertEqual(UUID(manager.experiment_id).version, 4)
+                identifiers.add(manager.experiment_id)
+                for _ in range(2):
+                    block = manager.prepare_block(task_name="demo", launch_value="task/demo.py", config_value=None)
+                    self.assertEqual(UUID(block.block_id).version, 4)
+                    identifiers.add(block.block_id)
+                    for saved in (block.config_path, block.output_dir / "block.json"):
+                        identity = json.loads(saved.read_text())
+                        self.assertEqual(identity["experiment_id"], manager.experiment_id)
+                        self.assertEqual(identity["block_id"], block.block_id)
+                    environment = manager.subprocess_environment(block)
+                    self.assertEqual(environment[EXPERIMENT_ID_ENV], manager.experiment_id)
+                    self.assertEqual(environment[BLOCK_ID_ENV], block.block_id)
+                    manager.finish_block(block)
+                with manager.blocks_path.open() as handle:
+                    rows = list(csv.DictReader(handle, delimiter="\t"))
+                self.assertEqual([row["block_id"] for row in rows], [row["block_id"] for row in manager.blocks])
+                self.assertTrue(all(row["experiment_id"] == manager.experiment_id for row in rows))
+                manager.finish()
+                self.assertEqual(json.loads(manager.state_path.read_text())["experiment_id"], manager.experiment_id)
+            self.assertEqual(len(identifiers), 6)
+
+    def test_subject_calibration_is_restored_after_all_experiment_folders_are_removed(self):
+        from tests.test_subject_calibration import calibration
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config, path = self._project(root)
+            kwargs = dict(working_dir=root, launch_config_path=path, launch_config=config,
+                          subject_name="Subject One", subject_code="S1")
+            manager = ExperimentManager(**kwargs, now=dt.datetime(2026, 10, 20))
+            for value in (calibration(0.1), calibration(0.4)):
+                block = manager.prepare_block(task_name="demo", launch_value="task/demo.py",
+                                              config_value="configs/demo.json")
+                (block.output_dir / "calibration.json").write_text(
+                    json.dumps({"eye_tracker_calibration": value}))
+                manager.finish_block(block)
+            manager.finish()
+            shutil.rmtree(manager.experiment_dir)
+            current = ExperimentManager(**kwargs, now=dt.datetime(2026, 10, 21))
+            self.assertEqual(current.state["eye_tracker_calibration"][-1]["x_offset"], 0.4)
+            self.assertEqual(current.state["eye_tracker_calibration"][-1]["task_time_ns"], 0)
+            (root / "configs" / "demo.json").write_text(json.dumps({
+                "eye_tracking": {"enabled": True, "calibration_file": "obsolete.json"},
+                "initial_x_scale": 99,
+            }))
+            block = current.prepare_block(task_name="demo", launch_value="task/demo.py",
+                                          config_value="configs/demo.json")
+            generated = json.loads(block.config_path.read_text())
+            for for_calibration in (True, False):
+                settings = load_eye_tracking_settings(generated, for_calibration=for_calibration)
+                self.assertEqual(settings.calibration.x_offset, 0.4)
+                self.assertEqual(settings.calibration.x_cross, 0.001)
+                self.assertEqual(settings.gain_anchor_px, (100, 50))
+                self.assertEqual(settings.filter.ema_gamma, 0.2)
+            snapshot = Path(generated["eye_tracking"]["calibration_file"])
+            self.assertEqual(snapshot.parent, current.experiment_dir)
+            original = snapshot.read_bytes()
+            # A newer experiment/cache write cannot change this run's snapshot.
+            SubjectCalibrationStore(root / "logs").save(
+                subject="Subject One", experiment_name="exp_S1_20261022_001",
+                block_number=1, calibration=calibration(0.9))
+            self.assertEqual(snapshot.read_bytes(), original)
+            other = ExperimentManager(**{**kwargs, "subject_name": "Other", "subject_code": "S2"})
+            self.assertIsNone(other.state["eye_tracker_calibration"][-1]["x_scale"])
+
+    def test_launch_backfills_latest_local_calibration_without_promoting_uncalibrated_runs(self):
+        from tests.test_subject_calibration import calibration
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config, path = self._project(root)
+            older = root / "logs" / "exp_S1_20261020_001"
+            block = older / "blocks" / "12_calibrate"
+            block.mkdir(parents=True)
+            (older / "state.json").write_text(json.dumps({"subject": "Subject One"}))
+            (block / "calibration.json").write_text(json.dumps({"eye_tracker_calibration": calibration()}))
+            kwargs = dict(working_dir=root, launch_config_path=path, launch_config=config,
+                          subject_name="Subject One", subject_code="S1")
+            first = ExperimentManager(**kwargs, now=dt.datetime(2026, 10, 21))
+            self.assertEqual(first.state["eye_tracker_calibration"][-1]["x_offset"], 0.1)
+            shutil.rmtree(older)
+            second = ExperimentManager(**kwargs, now=dt.datetime(2026, 10, 22))
+            saved = SubjectCalibrationStore(root / "logs").load("Subject One")
+            self.assertEqual(saved["experiment_name"], older.name)
+            self.assertEqual(second.state["eye_tracker_calibration"][-1]["x_offset"], 0.1)
+
+    def test_uart_start_is_queued_before_metadata_probes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config, path = self._project(root)
+            with patch("interface.experiment_manager.ExperimentEyeTracker") as tracker:
+                def probe(*args):
+                    tracker.assert_called_once()
+                    directory = tracker.call_args.kwargs["directory"]
+                    self.assertTrue((directory / "event_name_library.json").is_file())
+                    return "commit"
+
+                with patch("interface.experiment_manager._git_commit", side_effect=probe), patch(
+                    "interface.experiment_manager._runtime_metadata",
+                    side_effect=lambda *args: {"hostname": probe()},
+                ):
+                    manager = ExperimentManager(
+                        working_dir=root, launch_config_path=path, launch_config=config,
+                        subject_name="Yuri", subject_code="Y",
+                    )
+                state = json.loads(manager.state_path.read_text())
+                self.assertEqual(state["git_commit"], "commit")
+                self.assertEqual(state["hostname"], "commit")
+                tracker.return_value.finish.assert_not_called()
+
+    def test_setup_failure_after_uart_start_queues_stop(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config, path = self._project(root)
+            with patch("interface.experiment_manager.ExperimentEyeTracker") as tracker, patch(
+                "interface.experiment_manager._runtime_metadata", side_effect=OSError("metadata failed"),
+            ), self.assertRaisesRegex(OSError, "metadata failed"):
+                ExperimentManager(
+                    working_dir=root, launch_config_path=path, launch_config=config,
+                    subject_name="Yuri", subject_code="Y",
+                )
+            tracker.assert_called_once()
+            tracker.return_value.finish.assert_called_once_with()
+
+    def test_launch_commit_is_from_working_checkout_and_survives_state_updates(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config, path = self._project(root)
+            config["initial_state"]["git_commit"] = "stale-config-value"
+            config["initial_state"].update(
+                hostname="old-host", os_details={"system": "old-os"}, python_version="old-python",
+            )
+            config["environment"] = {"python": sys.executable}
+
+            def git(*args):
+                return subprocess.run(
+                    ["git", "-C", str(root), *args],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip()
+
+            def commit(message):
+                git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                    "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", message)
+                return git("rev-parse", "HEAD")
+
+            git("init")
+            first_commit = commit("launch version")
+            kwargs = dict(
+                working_dir=root, launch_config_path=path, launch_config=config,
+                subject_name="Subject One", subject_code="S1",
+            )
+            manager = ExperimentManager(**kwargs)
+            state = json.loads(manager.state_path.read_text())
+            self.assertEqual(state["git_commit"], first_commit)
+            self.assertEqual(state["hostname"], socket.gethostname())
+            self.assertEqual(state["python_version"], sys.version)
+            self.assertEqual(state["os_details"]["system"], platform.system())
+            self.assertEqual(state["os_details"]["release"], platform.release())
+            self.assertEqual(state["os_details"]["version"], platform.version())
+            self.assertEqual(state["os_details"]["machine"], platform.machine())
+            self.assertEqual(state["os_details"]["platform"], platform.platform())
+            launch_metadata = {key: state[key] for key in (
+                "git_commit", "hostname", "os_details", "python_version",
+            )}
+            self.assertEqual(config["initial_state"]["git_commit"], "stale-config-value")
+
+            # A later HEAD change must not relabel an experiment's launch version.
+            second_commit = commit("next version")
+            self.assertNotEqual(first_commit, second_commit)
+            block = manager.prepare_block(
+                task_name="demo", launch_value="task/demo.py", config_value=None,
+            )
+            generated_config = json.loads(block.config_path.read_text())
+            for key in launch_metadata:
+                self.assertNotIn(key, generated_config)
+            (block.output_dir / "calibration.json").write_text(json.dumps({
+                "eye_tracker_calibration": {
+                    "x_scale": 1, "y_scale": 1, "x_offset": 0, "y_offset": 0,
+                },
+                "git_commit": "incorrect-calibration-value",
+            }))
+            manager.finish_block(block)
+            state = json.loads(manager.state_path.read_text())
+            self.assertEqual(len(state["eye_tracker_calibration"]), 2)
+            self.assertEqual(state["git_commit"], first_commit)
+            self.assertEqual({key: state[key] for key in launch_metadata}, launch_metadata)
+            next_manager = ExperimentManager(**kwargs)
+            self.assertEqual(json.loads(next_manager.state_path.read_text())["git_commit"], second_commit)
+
+    def test_unavailable_git_identity_is_explicitly_null(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config, path = self._project(root)
+            config["initial_state"]["git_commit"] = "stale-config-value"
+            manager = ExperimentManager(
+                working_dir=root, launch_config_path=path, launch_config=config,
+                subject_name="Subject One", subject_code="S1",
+            )
+            self.assertIsNone(json.loads(manager.state_path.read_text())["git_commit"])
+            for error in (FileNotFoundError("git"), subprocess.TimeoutExpired("git", 5)):
+                with self.subTest(error=type(error).__name__), patch(
+                    "interface.experiment_manager.subprocess.run", side_effect=error,
+                ):
+                    self.assertIsNone(_git_commit(root))
+                    self.assertIsNone(_runtime_metadata(root, "unavailable-python")["python_version"])
+
+    def test_subprocess_blocks_share_one_origin_and_exception_still_records_end(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config, path = self._project(root)
+            (root / "event_name_library.json").write_text(
+                (Path(__file__).resolve().parents[1] / "event_name_library.json").read_text()
+            )
+            manager = ExperimentManager(
+                working_dir=root, launch_config_path=path, launch_config=config,
+                subject_name="Test", subject_code="T",
+            )
+            boundaries = []
+            for index in range(2):
+                block = manager.prepare_block(task_name="demo", launch_value="task/demo.py", config_value=None)
+                environment = manager.subprocess_environment(block)
+                self.assertEqual(int(environment[EXPERIMENT_ORIGIN_ENV]), manager.task_clock.origin_perf_ns)
+                script = (
+                    "import os; from bin.logger import SessionLogBundle; "
+                    "logs = SessionLogBundle(output_root=os.environ['NEURO_TASK_SESSION_DIR'], "
+                    "task_name='active_foraging', config_name='test', auto_flush=False); "
+                    + ("logs.close()" if index == 0 else "raise RuntimeError('test task failure')")
+                )
+                result = subprocess.run([sys.executable, "-c", script], env=environment, capture_output=True)
+                self.assertEqual(result.returncode, index, result.stderr.decode())
+                manager.finish_block(block)
+                with (block.output_dir / "event_log.tsv").open() as handle:
+                    rows = list(csv.DictReader(handle, delimiter="\t"))
+                self.assertEqual([row["event"] for row in rows], ["block_start", "block_end"])
+                boundaries.extend(int(row["task_time_ns"]) for row in rows)
+            self.assertGreater(boundaries[0], 0)
+            self.assertEqual(boundaries, sorted(set(boundaries)))
+            metadata = json.loads((manager.experiment_dir / "clock.json").read_text())
+            self.assertEqual(metadata["origin_perf_counter_ns"], manager.task_clock.origin_perf_ns)
+            with manager.blocks_path.open() as handle:
+                for row in csv.DictReader(handle, delimiter="\t"):
+                    for field in ("start_time", "end_time"):
+                        parsed = dt.datetime.strptime(row[field], "%Y-%m-%d %H:%M:%S")
+                        self.assertEqual(parsed.microsecond, 0)
+
+    def test_numbered_experiment_and_skipped_block_reach_uart_with_identical_retries(self):
+        fixture = json.loads((Path(__file__).parent / "fixtures/eye_uart_v1.json").read_text())
+        packets = []
+        channel = Mock()
+        channel.__enter__ = Mock(return_value=channel)
+        channel.__exit__ = Mock(return_value=False)
+        task_tracker = UARTEyeTracker()
+
+        def exchange(packet, timeout_s):
+            packets.append(packet)
+            command = decode_command(packet)
+            # Lose the first ACK of both starts, then acknowledge identical retries.
+            if command.code in (CommandCode.START_EXPERIMENT, CommandCode.START_TRACKING,
+                                CommandCode.SET_EXPERIMENT_ID, CommandCode.SET_BLOCK_ID):
+                if packets.count(packet) == 1:
+                    raise ResponseTimeout("lost ACK")
+            flags = StatusFlag.EXPERIMENT_ACTIVE
+            if command.code in (CommandCode.START_TRACKING, CommandCode.SET_BLOCK_ID):
+                flags |= StatusFlag.TRACKING | StatusFlag.CONFIGURED | StatusFlag.RECORDING
+                task_tracker._stop.set()
+            elif command.code == CommandCode.STOP_EXPERIMENT:
+                flags = StatusFlag(0)
+            response = bytearray.fromhex(fixture["status"])
+            struct.pack_into("<H", response, 4, flags)
+            struct.pack_into("<I", response, 12, command.sequence)
+            struct.pack_into("<I", response, 60, crc32c(response[:60]))
+            return bytes(response)
+
+        channel.exchange.side_effect = exchange
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "interface.experiment_eye_tracker.SerialPacketChannel", return_value=channel
+        ), patch("bin.eye_tracking.SerialPacketChannel", return_value=channel), patch(
+            "bin.eye_tracker_warnings.show_eye_tracker_warning"
+        ) as warning:
+            root = Path(tmpdir)
+            config, path = self._project(root)
+            config["eye_tracker_experiment"] = {"enabled": True}
+            (root / "logs" / "exp_Y_20261019_001").mkdir(parents=True)
+            manager = ExperimentManager(
+                working_dir=root, launch_config_path=path, launch_config=config,
+                subject_name="Yuri", subject_code="Y",
+                now=dt.datetime(2026, 10, 19, 14, 30, tzinfo=dt.timezone.utc),
+            )
+            try:
+                manager.eye_tracker.start_future.result(timeout=2)
+                self.assertEqual(manager.experiment_dir.name, "exp_Y_20261019_002")
+                manager.prepare_block(task_name="no_tracking", launch_value="task/demo.py", config_value=None)
+                block = manager.prepare_block(task_name="tracking", launch_value="task/demo.py", config_value=None)
+                with patch.dict(os.environ, manager.subprocess_environment(block)):
+                    task_tracker._run()
+            finally:
+                manager.finish()
+                manager.eye_tracker.stop_future.result(timeout=2)
+            warning.assert_not_called()
+        commands = [decode_command(packet) for packet in packets]
+        self.assertEqual([command.code for command in commands], [
+            CommandCode.START_EXPERIMENT, CommandCode.START_EXPERIMENT,
+            CommandCode.SET_EXPERIMENT_ID, CommandCode.SET_EXPERIMENT_ID,
+            CommandCode.START_TRACKING, CommandCode.START_TRACKING,
+            CommandCode.SET_BLOCK_ID, CommandCode.SET_BLOCK_ID,
+            CommandCode.STOP_TRACKING, CommandCode.STOP_EXPERIMENT,
+        ])
+        self.assertEqual(commands[0].experiment_number, 2)
+        self.assertEqual(commands[0].subject, "Yuri")
+        self.assertEqual(commands[4].block_number, 2)
+        self.assertEqual(commands[2].experiment_id, manager.experiment_id)
+        self.assertEqual(commands[6].block_id, block.block_id)
+        self.assertEqual(commands[6].block_number, block.block_num)
+        self.assertEqual(packets[0], packets[1])
+        self.assertEqual(packets[2], packets[3])
+        self.assertEqual(packets[4], packets[5])
+        self.assertEqual(packets[6], packets[7])
+        for command in commands[8:]:
+            self.assertIsNone(command.experiment_number)
+            self.assertIsNone(command.block_number)
+
+    def test_lifecycle_uses_full_subject_start_time_and_exports_uart_handoff(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config, config_path = self._project(root)
+            started = dt.datetime(2026, 10, 14, 10, 30)
+            with patch("interface.experiment_manager.ExperimentEyeTracker") as tracker:
+                manager = ExperimentManager(
+                    working_dir=root, launch_config_path=config_path, launch_config=config,
+                    subject_name="Yuri", subject_code="Y", now=started,
+                )
+                tracker.assert_called_once_with(
+                    config, subject="Yuri", started_at=started, directory=manager.experiment_dir,
+                    experiment_number=1, experiment_id=manager.experiment_id,
+                )
+                tracker.return_value.pending_path = manager.experiment_dir / ".pending"
+                tracker.return_value.ready_path = manager.experiment_dir / ".ready"
+                block = manager.prepare_block(task_name="demo", launch_value="task/demo.py", config_value="configs/demo.json")
+                env = manager.subprocess_environment(block)
+                self.assertEqual(env["NEURO_EYE_TRACKER_EXPERIMENT_PENDING"], str(tracker.return_value.pending_path))
+                self.assertEqual(env[EXPERIMENT_UART_READY_ENV], str(tracker.return_value.ready_path))
+                self.assertEqual(env[EXPERIMENT_BLOCK_NUMBER_ENV], "1")
+                # Blocks with no tracking still consume their local number.
+                block = manager.prepare_block(task_name="demo", launch_value="task/demo.py", config_value="configs/demo.json")
+                self.assertEqual(manager.subprocess_environment(block)[EXPERIMENT_BLOCK_NUMBER_ENV], "2")
+                manager.finish()
+                tracker.return_value.finish.assert_called_once()
+
     def _project(self, root: Path):
         (root / "task").mkdir()
         (root / "configs").mkdir()
@@ -83,7 +515,7 @@ class ExperimentManagerTests(unittest.TestCase):
                 subject_name="Subject One",
                 subject_code="S1",
                 now=dt.datetime(2026, 8, 13, 9, 30),
-                perf_counter=clock,
+                perf_counter_ns=lambda: round(clock() * 1_000_000_000),
             )
 
             self.assertEqual(manager.experiment_dir.name, "exp_S1_20260813_001")
@@ -92,6 +524,8 @@ class ExperimentManagerTests(unittest.TestCase):
             self.assertFalse((manager.experiment_dir / "task_configs").exists())
             initial_state = json.loads(manager.state_path.read_text(encoding="utf-8"))
             self.assertEqual(initial_state["subject"], "Subject One")
+            self.assertEqual(initial_state["eye_tracker_calibration"][0]["task_time_ns"], 0)
+            self.assertNotIn("set_time", initial_state["eye_tracker_calibration"][0])
 
             # Each block config is based on the source file as it exists when the
             # block is prepared, even if it changed after experiment creation.
@@ -119,7 +553,7 @@ class ExperimentManagerTests(unittest.TestCase):
 
             with manager.blocks_path.open(encoding="utf-8") as handle:
                 block_rows = list(csv.DictReader(handle, delimiter="\t"))
-            self.assertEqual(block_rows[0]["start_time"], "125.000")
+            self.assertEqual(block_rows[0]["start_time"], "2026-08-13 09:30:00")
             self.assertEqual(block_rows[0]["end_time"], "")
             self.assertEqual(block_rows[0]["out_dir"], "blocks/1_changed_later")
 
@@ -132,6 +566,10 @@ class ExperimentManagerTests(unittest.TestCase):
                             "x_offset": 0.3,
                             "y_offset": -0.4,
                             "ignored_metadata": True,
+                            "input_units": "crop_local_pixels",
+                            "uart": {"device": "/dev/test-uart", "simulate": True},
+                            "filter": {"ema_gamma": 0.2},
+                            "gain_anchor_px": [100, 50],
                         }
                     }
                 ),
@@ -145,15 +583,17 @@ class ExperimentManagerTests(unittest.TestCase):
                 {key: latest[key] for key in ("x_scale", "y_scale", "x_offset", "y_offset")},
                 {"x_scale": 0.1, "y_scale": -0.2, "x_offset": 0.3, "y_offset": -0.4},
             )
-            self.assertEqual(latest["set_time"], 500.0)
+            self.assertEqual(latest["task_time_ns"], 500_000_000)
+            self.assertEqual((latest["x_cross"], latest["y_cross"]), (0.0, 0.0))
             self.assertNotIn("ignored_metadata", latest)
 
             with manager.blocks_path.open(encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle, delimiter="\t"))
-            self.assertEqual(rows[0]["end_time"], "500.000")
+            self.assertEqual(rows[0]["end_time"], "2026-08-13 09:30:00")
 
             (root / "configs" / "demo.json").write_text(
-                json.dumps({"config_name": "changed_again", "task_value": 1000}),
+                json.dumps({"config_name": "changed_again", "task_value": 1000,
+                            "eye_tracking": {"enabled": True, "calibration_file": "older.json"}}),
                 encoding="utf-8",
             )
             clock.value = 101.0
@@ -167,6 +607,78 @@ class ExperimentManagerTests(unittest.TestCase):
             self.assertEqual(second_config["task_value"], 1000)
             self.assertEqual(second_config["x_scale"], 0.1)
             self.assertEqual(second_config["y_scale"], -0.2)
+            settings = load_eye_tracking_settings(second_config)
+            self.assertEqual(settings.uart.device, "/dev/test-uart")
+            self.assertTrue(settings.uart.simulate)
+            self.assertEqual(settings.filter.ema_gamma, 0.2)
+            self.assertEqual(settings.gain_anchor_px, (100, 50))
+            self.assertEqual(settings.calibration.x_scale, 0.1)
+
+    def test_affine_calibration_survives_legacy_state_schema_and_block_injection(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            launch_config, launch_path = self._project(root)
+            manager = ExperimentManager(
+                working_dir=root, launch_config_path=launch_path,
+                launch_config=launch_config, subject_name="Subject One",
+                subject_code="S1", now=dt.datetime(2026, 8, 13),
+            )
+            # The launch history intentionally declares only the old four
+            # coefficients; the completed calibration adds both cross terms.
+            coefficients = {
+                "x_scale": 0.002, "y_scale": -0.004,
+                "x_offset": -0.2, "y_offset": 0.5,
+                "x_cross": 0.003, "y_cross": -0.001,
+            }
+            first = manager.prepare_block(
+                task_name="demo", launch_value="task/demo.py", config_value="configs/demo.json",
+            )
+            calibration_path = first.output_dir / "calibration.json"
+            calibration_path.write_text(json.dumps({"eye_tracker_calibration": {
+                **coefficients,
+                "input_units": "crop_local_pixels",
+                "uart": {"device": "/dev/affine-uart", "simulate": True},
+                "gain_anchor_px": [100, 50],
+            }}), encoding="utf-8")
+            manager.finish_block(first)
+            state = json.loads(manager.state_path.read_text(encoding="utf-8"))
+            latest = state["eye_tracker_calibration"][-1]
+            self.assertEqual({key: latest[key] for key in coefficients}, coefficients)
+
+            (root / "configs" / "demo.json").write_text(json.dumps({
+                "eye_tracking": {"enabled": True, "calibration_file": "obsolete.json"},
+                "x_cross": 99, "y_cross": 99,
+            }), encoding="utf-8")
+            second = manager.prepare_block(
+                task_name="demo", launch_value="task/demo.py", config_value="configs/demo.json",
+            )
+            generated = json.loads(second.config_path.read_text(encoding="utf-8"))
+            self.assertEqual({key: generated[key] for key in coefficients}, coefficients)
+            self.assertEqual(generated["eye_tracking"]["calibration_file"], str(calibration_path.resolve()))
+            settings = load_eye_tracking_settings(generated)
+            self.assertEqual(settings.uart.device, "/dev/affine-uart")
+            self.assertEqual(settings.gain_anchor_px, (100, 50))
+            self.assertAlmostEqual(settings.calibration.map_position(120, 60)[0], 0.22)
+            self.assertAlmostEqual(settings.calibration.map_position(120, 60)[1], 0.14)
+
+            # A later four-coefficient artifact must still import after the
+            # history gained cross fields, and clear the old affine cross terms.
+            legacy = {key: value for key, value in coefficients.items() if "cross" not in key}
+            legacy_path = second.output_dir / "calibration.json"
+            legacy_path.write_text(json.dumps({"eye_tracker_calibration": legacy}), encoding="utf-8")
+            manager.finish_block(second)
+            state = json.loads(manager.state_path.read_text(encoding="utf-8"))
+            latest = state["eye_tracker_calibration"][-1]
+            self.assertEqual(len(state["eye_tracker_calibration"]), 3)
+            self.assertEqual((latest["x_cross"], latest["y_cross"]), (0.0, 0.0))
+            third = manager.prepare_block(
+                task_name="demo", launch_value="task/demo.py", config_value="configs/demo.json",
+            )
+            generated = json.loads(third.config_path.read_text(encoding="utf-8"))
+            self.assertEqual((generated["x_cross"], generated["y_cross"]), (0.0, 0.0))
+            self.assertEqual(generated["eye_tracking"]["calibration_file"], str(legacy_path.resolve()))
+            settings = load_eye_tracking_settings(generated)
+            self.assertEqual((settings.calibration.x_cross, settings.calibration.y_cross), (0.0, 0.0))
 
     def test_generated_block_persists_launcher_screen_selection(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -231,6 +743,131 @@ class ExperimentManagerTests(unittest.TestCase):
             second = ExperimentManager(**kwargs)
             self.assertEqual(first.experiment_dir.name, "exp_S1_20260813_001")
             self.assertEqual(second.experiment_dir.name, "exp_S1_20260813_002")
+            self.assertEqual(first.experiment_number, 1)
+            self.assertEqual(second.experiment_number, 2)
+
+    def test_experiment_ids_keep_increasing_after_sync_prunes_earlier_runs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config, path = self._project(root)
+            kwargs = dict(
+                working_dir=root, launch_config_path=path, launch_config=config,
+                subject_name="Subject One", subject_code="S1", now=dt.datetime(2026, 10, 21),
+            )
+            first = ExperimentManager(**kwargs)
+            first.finish()  # No blocks.
+            second = ExperimentManager(**kwargs)
+            second.finish()
+            sync = ExperimentDataSync(root / "logs", None)
+            sync.prune(SyncPlan(
+                root / "logs", (first.experiment_dir, second.experiment_dir),
+                second.experiment_dir, root / "unused-remote",
+            ))
+            self.assertFalse(first.experiment_dir.exists())
+            third = ExperimentManager(**kwargs)
+            self.assertEqual(third.experiment_number, 3)
+            with (root / "logs" / HISTORY_FILENAME).open() as handle:
+                rows = list(csv.DictReader(handle, delimiter="\t"))
+            self.assertEqual([row["experiment_number"] for row in rows], ["1", "2", "3"])
+            self.assertEqual([row["block_count"] for row in rows], ["0", "0", "0"])
+
+    def test_history_tracks_blocks_runtime_and_idempotent_experiment_end(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config, path = self._project(root)
+            clock = FakeClock()
+            manager = ExperimentManager(
+                working_dir=root, launch_config_path=path, launch_config=config,
+                subject_name="Subject One", subject_code="S1", now=dt.datetime(2026, 10, 21, 9),
+                perf_counter_ns=lambda: round(clock() * 1_000_000_000),
+            )
+
+            def summary():
+                with manager.history.path.open() as handle:
+                    return next(csv.DictReader(handle, delimiter="\t"))
+
+            self.assertEqual(summary()["runtime_seconds"], "0.000000")
+            clock.value = 102.5
+            block = manager.prepare_block(task_name="demo", launch_value="task/demo.py", config_value=None)
+            row = summary()
+            self.assertEqual(row["block_count"], "1")
+            self.assertEqual(row["completed_block_count"], "0")
+            self.assertEqual(row["runtime_seconds"], "2.500000")
+            self.assertEqual(row["end_time"], "")
+            clock.value = 110
+            manager.finish_block(block)
+            self.assertEqual(summary()["completed_block_count"], "1")
+            self.assertEqual(summary()["runtime_seconds"], "10.000000")
+            clock.value = 115
+            manager.finish()
+            row = summary()
+            self.assertEqual(row["runtime_seconds"], "15.000000")
+            self.assertEqual(row["status"], "ended")
+            self.assertEqual(row["end_time"], "2026-10-21T09:00:15.000000")
+            clock.value = 130
+            manager.finish()
+            self.assertEqual(summary(), row)
+
+    def test_killed_experiments_keep_numbers_and_unfinished_summaries(self):
+        script = """
+import datetime as dt
+import json
+import os
+import signal
+import sys
+from pathlib import Path
+from interface.experiment_manager import ExperimentManager
+root = Path(sys.argv[1])
+manager = ExperimentManager(
+    working_dir=root, launch_config_path=root / 'launch.json',
+    launch_config=json.loads((root / 'launch.json').read_text()),
+    subject_name='Subject One', subject_code='S1', now=dt.datetime(2026, 10, 21))
+if sys.argv[2] == 'block':
+    manager.prepare_block(task_name='demo', launch_value='task/demo.py', config_value=None)
+os.kill(os.getpid(), signal.SIGKILL)
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config, path = self._project(root)
+            for phase in ("start", "block"):
+                result = subprocess.run(
+                    [sys.executable, "-c", script, str(root), phase],
+                    cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=15,
+                )
+                self.assertEqual(result.returncode, -signal.SIGKILL, result.stderr)
+            manager = ExperimentManager(
+                working_dir=root, launch_config_path=path, launch_config=config,
+                subject_name="Subject One", subject_code="S1", now=dt.datetime(2026, 10, 21),
+            )
+            self.assertEqual(manager.experiment_number, 3)
+            with manager.history.path.open() as handle:
+                rows = list(csv.DictReader(handle, delimiter="\t"))
+            self.assertEqual([row["block_count"] for row in rows], ["0", "1", "0"])
+            for row in rows:
+                self.assertEqual(row["status"], "open")
+                self.assertEqual(row["end_time"], "")
+                self.assertEqual(row["completed_block_count"], "0")
+
+    def test_disabled_and_simulated_sync_clear_inherited_uart_context(self):
+        for options in ({}, {"enabled": False}, {"enabled": True, "uart": {"simulate": True}}):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                config, path = self._project(root)
+                config["eye_tracker_experiment"] = options
+                manager = ExperimentManager(
+                    working_dir=root, launch_config_path=path, launch_config=config,
+                    subject_name="Yuri", subject_code="Y",
+                )
+                block = manager.prepare_block(task_name="demo", launch_value="task/demo.py", config_value=None)
+                inherited = {
+                    EXPERIMENT_UART_PENDING_ENV: "/old/pending",
+                    EXPERIMENT_UART_READY_ENV: "/old/ready",
+                    EXPERIMENT_BLOCK_NUMBER_ENV: "99",
+                }
+                with patch.dict(os.environ, inherited):
+                    env = manager.subprocess_environment(block)
+                for key in inherited:
+                    self.assertNotIn(key, env)
 
     def test_loop_sequences_validate_and_obey_iteration_policy(self):
         loop = {

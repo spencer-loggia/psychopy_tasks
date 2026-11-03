@@ -1,0 +1,183 @@
+"""Best-effort experiment commands, ordered independently of the launcher UI."""
+
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+import datetime as dt
+import logging
+import math
+from pathlib import Path
+import time
+
+from bin.eye_tracking import UARTEyeTrackerConfig
+from bin.eye_tracker_warnings import EyeTrackerWarnings
+from bin.eye_tracker_wire.controller import EyeTrackerController, SerialPacketChannel
+from bin.eye_tracker_wire.protocol import StatusFlag
+
+
+# Preserve START/STOP ordering even if a new experiment is opened immediately.
+_COMMANDS = ThreadPoolExecutor(max_workers=1, thread_name_prefix="experiment-uart")
+_LOG = logging.getLogger(__name__)
+
+
+def _experiment_uart(config):
+    options = config.get("eye_tracker_experiment", {})
+    if not isinstance(options, dict):
+        raise ValueError("eye_tracker_experiment must be a JSON object")
+    enabled = options.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("eye_tracker_experiment.enabled must be true or false")
+    if not enabled:
+        return None
+    uart = options.get("uart", {})
+    if not isinstance(uart, dict):
+        raise ValueError("eye_tracker_experiment.uart must be a JSON object")
+    return UARTEyeTrackerConfig(**uart)
+
+
+def request_eye_tracker_shutdown(config):
+    """Queue power-off after prior experiment commands, even from the root menu.
+
+    The caller waits asynchronously for the returned future before local power-off.
+    Tracker failures warn but never veto local shutdown.
+    """
+    warnings = EyeTrackerWarnings()
+    try:
+        uart = _experiment_uart(config)
+        if uart is None or uart.simulate:
+            return None
+        return _COMMANDS.submit(_shutdown_eye_tracker, uart, warnings)
+    except Exception as exc:
+        warnings.warn("shutdown", f"Could not request eye tracker shutdown: {exc}")
+        return None
+
+
+def _shutdown_eye_tracker(uart, warnings):
+    try:
+        with SerialPacketChannel(uart.device, baud=uart.baud) as channel:
+            controller = EyeTrackerController(
+                channel,
+                response_timeout_s=uart.response_timeout_s,
+                state_timeout_s=uart.state_timeout_s,
+                retries=uart.state_retries,
+            )
+            status = controller.shutdown()
+            if not status.flags & StatusFlag.SHUTTING_DOWN:
+                warnings.warn(
+                    "shutdown", "The eye tracker did not confirm SHUTTING_DOWN. Local shutdown will continue."
+                )
+            elif status.flags & StatusFlag.ERROR:
+                warnings.warn(
+                    "health", "The eye tracker acknowledged shutdown but also reports a tracker health error."
+                )
+    except Exception as exc:
+        warnings.warn(
+            "shutdown", f"Eye tracker shutdown could not be confirmed: {exc}. Local shutdown will continue."
+        )
+
+
+class ExperimentEyeTracker:
+    def __init__(
+        self, config, *, subject: str, started_at: dt.datetime,
+        directory: Path, experiment_number: int, experiment_id: str | None = None,
+    ):
+        self.warnings = EyeTrackerWarnings()
+        self.pending_path = directory / ".eye_tracker_start_pending"
+        self.ready_path = directory / ".eye_tracker_experiment_ready"
+        self.subject = subject
+        self.experiment_number = experiment_number
+        self.experiment_id = experiment_id
+        stamp = started_at.astimezone(dt.timezone.utc)
+        delta = stamp - dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+        self.timestamp_ns = (
+            (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
+        ) * 1000
+        self.uart = None
+        self._finished = False
+        self.start_future = None
+        self.stop_future = None
+        try:
+            self.uart = _experiment_uart(config)
+            if self.uart is None or self.uart.simulate:
+                return
+            self.start_timeout_s = config["eye_tracker_experiment"].get(
+                "start_timeout_s", max(15.0, self.uart.state_timeout_s)
+            )
+            if (
+                isinstance(self.start_timeout_s, bool)
+                or not isinstance(self.start_timeout_s, (int, float))
+                or not math.isfinite(self.start_timeout_s)
+                or self.start_timeout_s <= 0
+            ):
+                raise ValueError("eye_tracker_experiment.start_timeout_s must be positive and finite")
+            # Pass the launcher's actual START + UUID wait budget to task workers.
+            wait_s = 2 * self.uart.command_wait_s(state_timeout_s=self.start_timeout_s) + 2
+            self.pending_path.write_text(str(wait_s), encoding="ascii")
+            self.start_future = _COMMANDS.submit(self._send, start=True, queued_at=time.monotonic())
+        except Exception as exc:
+            self.uart = None
+            self.warnings.warn("config", f"Experiment synchronization is unavailable: {exc}")
+
+    def finish(self):
+        if self._finished:
+            return
+        self._finished = True
+        if self.uart is not None and not self.uart.simulate:
+            try:
+                self.stop_future = _COMMANDS.submit(self._send, start=False, queued_at=time.monotonic())
+            except Exception as exc:
+                self.warnings.warn("end", f"Could not queue STOP_EXPERIMENT: {exc}")
+
+    def _send(self, *, start: bool, queued_at: float):
+        action = "start" if start else "end"
+        _LOG.info(
+            "Eye UART %s queue wait %.3fs; opening %s",
+            "START_EXPERIMENT" if start else "STOP_EXPERIMENT",
+            time.monotonic() - queued_at, self.uart.device,
+        )
+        try:
+            with SerialPacketChannel(self.uart.device, baud=self.uart.baud) as channel:
+                controller = EyeTrackerController(
+                    channel,
+                    response_timeout_s=self.uart.response_timeout_s,
+                    state_timeout_s=self.start_timeout_s if start else self.uart.state_timeout_s,
+                    retries=self.uart.state_retries,
+                )
+                status = (
+                    controller.start_experiment(
+                        self.subject, timestamp_ns=self.timestamp_ns,
+                        experiment_number=self.experiment_number,
+                        experiment_id=self.experiment_id,
+                    )
+                    if start else controller.stop_experiment()
+                )
+                problems = {}
+                if start and not status.flags & StatusFlag.EXPERIMENT_ACTIVE:
+                    problems[action] = "The eye tracker did not report an active experiment after START_EXPERIMENT."
+                elif start:
+                    # Numbered starts can replace remote blocks. Release them
+                    # only after the intended experiment was acknowledged.
+                    self.ready_path.touch()
+                elif not start and status.flags & (
+                    StatusFlag.EXPERIMENT_ACTIVE | StatusFlag.TRACKING
+                    | StatusFlag.RECORDING | StatusFlag.CALIBRATING
+                ):
+                    problems[action] = "The eye tracker is still active after STOP_EXPERIMENT; recording may not have been flushed."
+                if status.flags & StatusFlag.ERROR:
+                    # The controller already checked this command's matching OK
+                    # ACK. ERROR is independent service health, not failed UART
+                    # delivery; do not withhold the confirmed experiment handoff.
+                    problems["health"] = (
+                        f"The eye tracker acknowledged the experiment {action} command "
+                        "but also reports a tracker health error. Check the tracker display/logs."
+                    )
+                self.warnings.warn_many(problems)
+        except Exception as exc:
+            self.warnings.warn(action, f"Could not confirm the eye tracker experiment {action} for {self.subject}: {exc}")
+        finally:
+            if start:
+                # Task UART workers wait here, never the task's rendering thread.
+                try:
+                    self.pending_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    self.warnings.warn("handoff", f"Could not release the eye tracker startup marker: {exc}")

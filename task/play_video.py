@@ -23,20 +23,20 @@ from bin.config import load_config, validate_config
 from bin.daqc2_outputs import DAQC2DigitalOutputs, PeriodicDOUTPulseController
 from bin.buffered_video import DEFAULT_BUFFER_BYTES
 from bin.frame_timing import plan_frame_duration
+from bin.eye_tracking_config import load_eye_tracking_settings
+from bin.fixation_reward import ScreenAutoReward
+from bin.pump_control import PumpPulseControl
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.video_playback import (
-    RandomFramePulseSchedule,
     SharedVideoFrameBuffer,
     center_crop_bounds,
     is_raspberry_pi,
-    parse_frame_rate,
     plan_video_refresh_cadence,
     probe_video_stream,
     select_random_video_clip,
-    validate_hevc_stream,
-    video_duration_seconds,
-    video_time_origin_seconds,
+    resolve_video_files as _resolve_video_files,
+    validate_video_source,
 )
 from bin.screen import (
     ExperimenterPreview,
@@ -46,25 +46,6 @@ from bin.screen import (
     resolve_scene_size,
     software_stimulus_rotation,
 )
-
-
-def _resolve_video_files(video_files: Sequence[str]) -> list[Path]:
-    if isinstance(video_files, (str, bytes)) or not isinstance(video_files, Sequence):
-        raise ValueError("video_files must be a JSON list of video file paths")
-    if not video_files:
-        raise ValueError("video_files must contain at least one video file path")
-
-    resolved: list[Path] = []
-    for index, value in enumerate(video_files):
-        if not isinstance(value, (str, Path)) or not str(value).strip():
-            raise ValueError(f"video_files[{index}] must be a non-empty path")
-        path = Path(value).expanduser()
-        if not path.is_absolute():
-            path = path.absolute()
-        if not path.is_file():
-            raise FileNotFoundError(f"Video file not found: {path}")
-        resolved.append(path)
-    return resolved
 
 
 def parse_args():
@@ -83,16 +64,14 @@ def parse_args():
     parser.add_argument("--frame_rate", type=float, default=None, help="Authoritative video presentation and clip-selection rate (Hz)")
     parser.add_argument("--video_buffer_megabytes", type=float, default=None, help="Maximum shared-memory budget for prepared RGB video chunks")
     parser.add_argument("--ffprobe", default=None, help="Path to ffprobe for codec probing")
-    parser.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi frame-sync GPIO and pump behavior")
+    parser.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi DAQC2 pump behavior")
     parser.add_argument("--no_raspi", action="store_false", dest="raspi", help="Disable Raspberry Pi hardware behavior")
-    parser.add_argument("--sync_pin", type=int, default=None, help="BCM GPIO pin for frame-locked video sync pulses")
-    parser.add_argument("--sync_interval_frames", type=int, nargs=2, default=None, metavar=("MIN", "MAX"), help="Inclusive randomized interval between sync-pulse onsets, in video presentation frames")
-    parser.add_argument("--sync_pulse_frames", type=int, default=None, help="Sync pulse width in video presentation frames")
+    parser.add_argument("--sync_pin", type=int, default=None, help="BCM GPIO pin for display-synchronized sync bar signals")
     parser.add_argument("--daq_address", type=int, default=None, help="Pi-Plates DAQC2plate address (0-7)")
     parser.add_argument("--daq_module", default=None, help="Python module for the DAQC2plate driver")
     parser.add_argument("--pump_pin", type=int, default=None, help="DAQC2 DOUT bit for the periodic pump pulse (0-7)")
     parser.add_argument("--pump_pulse_time_seconds", type=float, default=None, help="Duration of each pump pulse")
-    parser.add_argument("--pump_interval", type=float, default=None, help="Seconds between periodic pump onsets")
+    parser.add_argument("--reward_interval", type=float, default=None, help="Seconds between reward onsets; requires on-screen fixation when eye tracking is enabled")
     parser.add_argument("--main_screen", default=None, help="Main task screen index or output name")
     parser.add_argument("--experimenter_screen", default=None, help="Experimenter screen index or output name")
     return parser.parse_args()
@@ -112,17 +91,17 @@ def run_task(
     ffprobe_bin: str = "ffprobe",
     screen_config=None,
     raspi: bool = False,
-    sync_pin: int = 18,
-    sync_interval_frames: Tuple[int, int] = (100, 300),
-    sync_pulse_frames: int = 1,
+    sync_pin: Optional[int] = 18,
+    sync_bar: Optional[dict] = None,
     seek_timeout_seconds: float = 30.0,
     daq_address: int = 0,
     daq_module_name: str = "piplates.DAQC2plate",
     pump_pin: int = 0,
     pump_pulse_time_seconds: Optional[float] = None,
-    pump_interval: Optional[float] = None,
+    reward_interval: Optional[float] = None,
     frame_rate: float = 30.0,
     video_buffer_megabytes: float = DEFAULT_BUFFER_BYTES / (1024 * 1024),
+    eye_tracking_config=None,
 ):
     if isinstance(num_clips, bool) or not isinstance(num_clips, int) or num_clips <= 0:
         raise ValueError("num_clips must be a positive integer")
@@ -145,28 +124,12 @@ def run_task(
         raise ValueError("video_buffer_megabytes must be positive and finite")
     video_buffer_bytes = int(round(video_buffer_megabytes * 1024 * 1024))
     selection_rng = random.Random(seed)
-    sync_rng = random.Random(None if seed is None else int(seed) + 0x51A7)
-    if len(sync_interval_frames) != 2:
-        raise ValueError("sync_interval_frames must contain exactly MIN and MAX")
-    sync_interval_min = int(sync_interval_frames[0])
-    sync_interval_max = int(sync_interval_frames[1])
-    sync_pulse_frames = int(sync_pulse_frames)
-    sync_pin = int(sync_pin)
     daq_address = DAQC2DigitalOutputs.validate_address(int(daq_address))
     pump_pin = DAQC2DigitalOutputs.validate_bit(int(pump_pin))
     if raspi:
-        # Validate all timing parameters before opening windows or GPIO.
-        RandomFramePulseSchedule(
-            sync_interval_min,
-            sync_interval_max,
-            pulse_width_frames=sync_pulse_frames,
-            rng=random.Random(0),
-        )
-        if sync_pin < 0:
-            raise ValueError("sync_pin must be a non-negative BCM GPIO number")
-        if pump_interval is None or pump_pulse_time_seconds is None:
+        if reward_interval is None or pump_pulse_time_seconds is None:
             raise ValueError(
-                "pump_interval and pump_pulse_time_seconds are required when raspi=true"
+                "reward_interval and pump_pulse_time_seconds are required when raspi=true"
             )
 
     resolved_video_files = _resolve_video_files(video_files)
@@ -176,97 +139,42 @@ def run_task(
         stream = probe_video_stream(video_path, ffprobe_bin=ffprobe_bin)
         if not stream:
             raise RuntimeError(f"Could not probe video stream: {video_path}")
-        validate_hevc_stream(
-            video_path,
-            stream,
-            require_pi5_compatible=bool(raspi),
+        validate_video_source(
+            video_path, stream, clip_duration_seconds=clip_duration_seconds,
+            frame_rate=frame_rate, require_pi5_compatible=bool(raspi),
         )
-        source_duration_s = video_duration_seconds(stream)
-        source_time_origin_s = video_time_origin_seconds(stream)
-        if source_duration_s <= 0.0:
-            raise ValueError(f"Video duration is missing or invalid: {video_path}")
-        if source_duration_s + 1e-9 < clip_duration_seconds:
-            raise ValueError(
-                f"Video is shorter than clip_duration_seconds: {video_path} "
-                f"({source_duration_s:.6f}s < {clip_duration_seconds:.6f}s)"
-            )
-        stream["start_time"] = source_time_origin_s
-        probed_rate = parse_frame_rate(
-            stream.get("avg_frame_rate") or stream.get("r_frame_rate")
-        )
-        if probed_rate <= 0.0:
-            raise ValueError(f"Video frame rate is missing or invalid: {video_path}")
-        if abs(probed_rate - frame_rate) > 0.001:
-            raise ValueError(
-                f"Video frame rate {probed_rate:.6f} does not match configured "
-                f"frame_rate {frame_rate:.6f}: {video_path}. Normalize the "
-                "source offline or use its exact configured rate."
-            )
-        average_rate = parse_frame_rate(stream.get("avg_frame_rate"))
-        nominal_rate = parse_frame_rate(stream.get("r_frame_rate"))
-        if (
-            average_rate > 0.0
-            and nominal_rate > 0.0
-            and abs(average_rate - nominal_rate) > 0.001
-        ):
-            raise ValueError(
-                f"Video reports inconsistent average/nominal frame rates "
-                f"({average_rate:.6f}/{nominal_rate:.6f}): {video_path}. "
-                "Normalize it to exact CFR during preprocessing."
-            )
         video_streams[video_path] = stream
 
-    win, main_screen, experimenter_screen = utils.setup_task_window(
-        screen_config,
-        bg_rgb_255=bg,
-        fullscreen=fullscreen,
-        size=win_size,
-        allow_same_screen=True,
-    )
-    bg_rect = utils.make_bg_rect(win, bg)
-    mouse = event.Mouse(win=win)
+    win = None
     experimenter_preview = None
     frame_publisher = None
-    sync_lgpio = None
-    sync_gpio_chip = None
     pump_outputs = None
     pump_controller = None
-    native_main_size = resolve_scene_size(
-        main_screen,
-        fullscreen=bool(fullscreen),
-        requested_size=win_size,
-        realized_size=tuple(win.size),
+    pump_control = (
+        PumpPulseControl(pump_pulse_time_seconds, allow_zero=False, reward_interval=float(reward_interval),
+                         boundary="clip", interval_label="Fix interval" if eye_tracking_config is not None else "Reward interval")
+        if raspi else None
     )
-    main_rotation_deg = software_stimulus_rotation(main_screen.rotation)
-    subject_main_size = oriented_size(native_main_size, main_rotation_deg)
-    maximum_frame_bytes = 0
-    minimum_runtime_crop_fraction = 1.0
-    for stream in video_streams.values():
-        source_size = (int(stream["width"]), int(stream["height"]))
-        crop_bounds = center_crop_bounds(
-            source_size,
-            subject_main_size,
-            alignment=2,
+    screen_reward = (
+        ScreenAutoReward(
+            reward_interval=float(reward_interval),
+            calibration=eye_tracking_config.calibration,
+            max_sample_age_s=eye_tracking_config.uart.max_sample_age_s,
         )
-        cropped_width = crop_bounds[2] - crop_bounds[0]
-        cropped_height = crop_bounds[3] - crop_bounds[1]
-        maximum_frame_bytes = max(
-            maximum_frame_bytes,
-            cropped_width * cropped_height * 3,
-        )
-        minimum_runtime_crop_fraction = min(
-            minimum_runtime_crop_fraction,
-            (cropped_width * cropped_height)
-            / float(source_size[0] * source_size[1]),
-        )
-
+        if raspi and eye_tracking_config is not None
+        else None
+    )
     resolved_config_name = str(config_name).strip() if config_name else "play_video"
     session_logs = SessionLogBundle(
+        eye_tracking_config=eye_tracking_config,
+        on_eye_state=screen_reward.observe if screen_reward is not None else None,
         output_root=output_dir,
         task_name="play_video",
         config_name=resolved_config_name,
         behavior_fieldnames=[
             "trial_num",
+            "pump_pulse_time",
+            "reward_interval",
             "source_video_path",
             "source_video_name",
             "source_duration_seconds",
@@ -278,8 +186,8 @@ def run_task(
             "scheduled_video_frames",
             "actual_source_start_seconds",
             "actual_source_last_frame_seconds",
-            "first_frame_time_since_session_start",
-            "last_frame_end_time_since_session_start",
+            "first_frame_task_time_ns",
+            "last_frame_end_task_time_ns",
             "displayed_duration_seconds",
             "display_frames",
             "aborted",
@@ -299,7 +207,6 @@ def run_task(
             "main_vblank_delta_sbc",
             "main_vblank_expected_delta_sbc",
             "scheduled_video_slots_skipped",
-            "sync_pulses",
         ],
         additional_table_fieldnames={
             "video_frame_timing": [
@@ -309,9 +216,9 @@ def run_task(
                 "expected_source_time_seconds",
                 "source_pts_error_seconds",
                 "expected_time_since_video_start_seconds",
-                "requested_time_since_session_start",
-                "expected_time_since_session_start",
-                "actual_time_since_session_start",
+                "requested_task_time_ns",
+                "expected_task_time_ns",
+                "task_time_ns",
                 "timing_error_seconds",
                 "planned_hold_refreshes",
                 "realized_hold_refreshes",
@@ -320,7 +227,62 @@ def run_task(
             ]
         },
         auto_flush=False,
+        live_settings=pump_control.settings if pump_control is not None else None,
     )
+    # Session creation starts the UART worker. Display setup can take seconds,
+    # especially on the first block, and must not postpone START_TRACKING.
+    def close_main_window():
+        nonlocal win
+        if win is None:
+            return None
+        closing, win = win, None
+        return utils.close_task_window(closing)
+
+    try:
+        win, main_screen, experimenter_screen = utils.setup_task_window(
+            screen_config,
+            bg_rgb_255=bg,
+            fullscreen=fullscreen,
+            size=win_size,
+            allow_same_screen=True,
+        )
+        bg_rect = utils.make_bg_rect(win, bg)
+        mouse = event.Mouse(win=win)
+        native_main_size = resolve_scene_size(
+            main_screen,
+            fullscreen=bool(fullscreen),
+            requested_size=win_size,
+            realized_size=tuple(win.size),
+        )
+        main_rotation_deg = software_stimulus_rotation(main_screen.rotation)
+        subject_main_size = oriented_size(native_main_size, main_rotation_deg)
+        maximum_frame_bytes = 0
+        minimum_runtime_crop_fraction = 1.0
+        for stream in video_streams.values():
+            source_size = (int(stream["width"]), int(stream["height"]))
+            crop_bounds = center_crop_bounds(
+                source_size,
+                subject_main_size,
+                alignment=2,
+            )
+            cropped_width = crop_bounds[2] - crop_bounds[0]
+            cropped_height = crop_bounds[3] - crop_bounds[1]
+            maximum_frame_bytes = max(
+                maximum_frame_bytes,
+                cropped_width * cropped_height * 3,
+            )
+            minimum_runtime_crop_fraction = min(
+                minimum_runtime_crop_fraction,
+                (cropped_width * cropped_height)
+                / float(source_size[0] * source_size[1]),
+            )
+        session_logs.set_eye_tracking_screen(native_main_size, main_rotation_deg)
+    except BaseException:
+        try:
+            close_main_window()
+        finally:
+            session_logs.close()
+        raise
     logger = session_logs.event_logger
     msg_logger = session_logs.message_logger
     behavior_logger = session_logs.behavior_logger
@@ -343,10 +305,10 @@ def run_task(
             logger.log_signal(
                 trial_num=None,
                 event="pump_on" if edge.active else "pump_off",
-                timestamp_perf_s=edge.actual_perf_s,
-                requested_timestamp_perf_s=edge.requested_perf_s,
+                timestamp_perf_ns=edge.actual_perf_ns,
+                requested_timestamp_perf_ns=edge.requested_perf_ns,
                 requested_duration=(
-                    float(pump_pulse_time_seconds) if edge.active else None
+                    edge.pulse_duration_s if edge.active else None
                 ),
             )
         if pump_controller.failure is not None and not pump_failure_logged:
@@ -366,20 +328,20 @@ def run_task(
     ) -> None:
         playback = dict(playback_info or {})
         first_frame_time = (
-            logger.seconds_since_session_start(playback["start_flip_perf_s"])
-            if playback.get("start_flip_perf_s") is not None
+            logger.task_time_ns(timestamp_perf_ns=playback["start_flip_perf_ns"])
+            if playback.get("start_flip_perf_ns") is not None
             else None
         )
         last_frame_end_time = (
-            logger.seconds_since_session_start(
-                playback["last_frame_end_perf_s"]
-            )
-            if playback.get("last_frame_end_perf_s") is not None
+            logger.task_time_ns(timestamp_perf_ns=playback["last_frame_end_perf_ns"])
+            if playback.get("last_frame_end_perf_ns") is not None
             else None
         )
         behavior_logger.writerow(
             {
                 "trial_num": int(trial_num),
+                "pump_pulse_time": pump_pulse_time_seconds if pump_control is not None else "",
+                "reward_interval": reward_interval if pump_control is not None else "",
                 "source_video_path": str(
                     playback.get("video_path", chosen_video)
                 ),
@@ -415,13 +377,13 @@ def run_task(
                     if playback.get("actual_source_last_frame_s") is not None
                     else ""
                 ),
-                "first_frame_time_since_session_start": (
-                    f"{float(first_frame_time):.9f}"
+                "first_frame_task_time_ns": (
+                    str(first_frame_time)
                     if first_frame_time is not None
                     else ""
                 ),
-                "last_frame_end_time_since_session_start": (
-                    f"{float(last_frame_end_time):.9f}"
+                "last_frame_end_task_time_ns": (
+                    str(last_frame_end_time)
                     if last_frame_end_time is not None
                     else ""
                 ),
@@ -502,7 +464,6 @@ def run_task(
                     "scheduled_video_slots_skipped",
                     "",
                 ),
-                "sync_pulses": playback.get("sync_pulses", ""),
             }
         )
 
@@ -537,14 +498,14 @@ def run_task(
                         if video_fps > 0.0
                         else ""
                     ),
-                    "requested_time_since_session_start": (
-                        f"{logger.seconds_since_session_start(float(record['flip_requested_perf_s'])):.9f}"
+                    "requested_task_time_ns": (
+                        str(logger.task_time_ns(timestamp_perf_ns=record['flip_requested_perf_ns']))
                     ),
-                    "expected_time_since_session_start": (
-                        f"{logger.seconds_since_session_start(float(record['expected_flip_perf_s'])):.9f}"
+                    "expected_task_time_ns": (
+                        str(logger.task_time_ns(float(record['expected_flip_perf_s'])))
                     ),
-                    "actual_time_since_session_start": (
-                        f"{logger.seconds_since_session_start(float(record['actual_flip_perf_s'])):.9f}"
+                    "task_time_ns": (
+                        str(logger.task_time_ns(timestamp_perf_ns=record['actual_flip_perf_ns']))
                     ),
                     "timing_error_seconds": (
                         f"{float(record['timing_error_s']):.9f}"
@@ -572,24 +533,6 @@ def run_task(
 
     try:
         if raspi:
-            import lgpio
-
-            sync_lgpio = lgpio
-            sync_gpio_chip = lgpio.gpiochip_open(0)
-            if isinstance(sync_gpio_chip, int) and sync_gpio_chip < 0:
-                raise RuntimeError(
-                    f"Could not open GPIO chip 0; lgpio={sync_gpio_chip}"
-                )
-            claim_result = lgpio.gpio_claim_output(sync_gpio_chip, sync_pin)
-            if isinstance(claim_result, int) and claim_result < 0:
-                raise RuntimeError(
-                    f"Could not claim sync GPIO {sync_pin}; lgpio={claim_result}"
-                )
-            write_result = lgpio.gpio_write(sync_gpio_chip, sync_pin, 0)
-            if isinstance(write_result, int) and write_result < 0:
-                raise RuntimeError(
-                    f"Could not initialize sync GPIO {sync_pin} low; lgpio={write_result}"
-                )
             pump_outputs = DAQC2DigitalOutputs(
                 address=daq_address,
                 module_name=daq_module_name,
@@ -597,8 +540,9 @@ def run_task(
             pump_controller = PeriodicDOUTPulseController(
                 pump_outputs,
                 bit=pump_pin,
-                interval_s=float(pump_interval),
+                interval_s=float(reward_interval),
                 pulse_duration_s=float(pump_pulse_time_seconds),
+                reward_policy=screen_reward,
             )
 
         msg_logger.log(
@@ -635,17 +579,29 @@ def run_task(
             msg_logger.log("WARN", f"cpu_affinity_unavailable {affinity_plan.get('reason')}")
 
         if pump_controller is not None:
-            pump_controller.start(anchor_perf_s=time.perf_counter())
+            reward_anchor_s = time.perf_counter()
+            if screen_reward is not None:
+                screen_reward.toggle(now_s=reward_anchor_s)
+            pump_controller.start(anchor_perf_s=reward_anchor_s)
             msg_logger.log(
                 "INFO",
                 (
                     f"periodic_pump_started daq_module={daq_module_name} "
                     f"daq_address={daq_address} pump_dout={pump_pin} "
-                    f"pump_interval_s={float(pump_interval):.6f} "
+                    f"reward_interval_s={float(reward_interval):.6f} "
                     f"pulse_duration_s={float(pump_pulse_time_seconds):.6f} "
-                    "schedule=absolute_onset skip_missed_intervals=1"
+                    f"schedule={'screen_fixation' if screen_reward is not None else 'absolute_onset'} "
+                    "skip_missed_intervals=1"
                 ),
             )
+            if screen_reward is not None:
+                msg_logger.log(
+                    "INFO",
+                    "reward_fixation area=subject_screen window_mode=rolling reset_on_reward=1 "
+                    f"recent_seconds={screen_reward.RECENT_SECONDS} "
+                    f"recent_fraction_gt={screen_reward.RECENT_THRESHOLD} "
+                    f"interval_fraction_gt={screen_reward.INTERVAL_THRESHOLD}",
+                )
 
         msg_logger.log(
             "INFO",
@@ -699,8 +655,7 @@ def run_task(
                 "INFO",
                 (
                     "pi5_video_mode decoder=ffpyplayer "
-                    f"sync_pin={sync_pin} interval_frames={sync_interval_min}-{sync_interval_max} "
-                    f"pulse_width_frames={sync_pulse_frames} pump_dout={pump_pin}"
+                    f"sync_pin={sync_pin} pump_dout={pump_pin}"
                 ),
             )
         msg_logger.log(
@@ -715,7 +670,7 @@ def run_task(
                 f"realized_win_size={tuple(win.size)}"
             ),
         )
-        fps, _ = utils.resolve_frame_rate(
+        fps, frame_duration = utils.resolve_frame_rate(
             win,
             refresh_rate,
             msg_logger=msg_logger,
@@ -768,6 +723,8 @@ def run_task(
             frame_publisher = SharedVideoFrameBuffer(maximum_frame_bytes)
             experimenter_preview = ExperimenterPreview(
                 experimenter_screen,
+                eye_tracking_shared=session_logs.eye_tracking_preview,
+                pump_control=pump_control,
                 task_label=resolved_config_name,
                 start_perf_s=time.perf_counter(),
                 update_interval_s=0.1,
@@ -789,6 +746,12 @@ def run_task(
                 ),
             )
 
+        utils.configure_sync_bar(
+            win, sync_bar, sync_pin=sync_pin, event_logger=logger,
+            experimenter_preview=experimenter_preview,
+            rotation_degrees=main_rotation_deg,
+            frame_duration_s=frame_duration, msg_logger=msg_logger,
+        )
         main_vblank = utils.verify_task_window_vblank(win)
         primary_lease = main_vblank.primary_lease
         main_vblank_status = (
@@ -867,7 +830,27 @@ def run_task(
                 return "experimenter_exit"
             return False
 
+        def apply_reward_settings(values, timestamp_ns):
+            def publish_timing():
+                pump_controller.set_timing(
+                    interval_s=values["reward_interval"], pulse_duration_s=values["pump_pulse_time"],
+                )
+
+            if screen_reward is not None:
+                # Never wait for the gaze worker. Publish timing only after
+                # acquiring its policy without blocking, then reset history.
+                return screen_reward.try_configure(
+                    reward_interval=values["reward_interval"], now_s=timestamp_ns / 1e9,
+                    before_update=publish_timing,
+                ) is not None
+            publish_timing()
+            return True
+
         while played_videos < num_clips:
+            utils.service_sync_bar(win)
+            if pump_control is not None:
+                values = pump_control.settings.apply_pending(msg_logger, on_apply=apply_reward_settings)
+                pump_pulse_time_seconds, reward_interval = values["pump_pulse_time"], values["reward_interval"]
             _drain_pump_edges()
             if pump_controller is not None and pump_controller.failed:
                 raise RuntimeError(
@@ -906,16 +889,6 @@ def run_task(
                     main_size=native_main_size,
                     main_rotation_deg=main_rotation_deg,
                 )
-            sync_schedule = (
-                RandomFramePulseSchedule(
-                    sync_interval_min,
-                    sync_interval_max,
-                    pulse_width_frames=sync_pulse_frames,
-                    rng=sync_rng,
-                )
-                if raspi
-                else None
-            )
             try:
                 try:
                     playback_info = utils.play_video_fill_screen(
@@ -932,10 +905,6 @@ def run_task(
                         trial_num=played_videos + 1,
                         stream_info=chosen_stream,
                         frame_publisher=frame_publisher,
-                        sync_schedule=sync_schedule,
-                        sync_gpio_module=sync_lgpio,
-                        sync_gpio_chip=sync_gpio_chip,
-                        sync_pin=sync_pin,
                         frame_publish_interval_s=0.1,
                         clip_start_s=selected_clip.start_s,
                         clip_duration_s=selected_clip.duration_s,
@@ -1026,15 +995,6 @@ def run_task(
             except Exception as exc:
                 msg_logger.log("ERROR", f"periodic_pump_cleanup_failed error={exc}")
             _drain_pump_edges()
-        if sync_lgpio is not None and sync_gpio_chip is not None:
-            try:
-                sync_lgpio.gpio_write(sync_gpio_chip, sync_pin, 0)
-            except Exception:
-                pass
-            try:
-                sync_lgpio.gpiochip_close(sync_gpio_chip)
-            except Exception:
-                pass
         if experimenter_preview is not None:
             try:
                 experimenter_preview.close()
@@ -1046,7 +1006,7 @@ def run_task(
             except Exception:
                 pass
         try:
-            restore_detail = utils.close_task_window(win)
+            restore_detail = close_main_window()
             msg_logger.log(
                 "INFO",
                 f"main_vblank_reference_restored detail={restore_detail}",
@@ -1098,6 +1058,7 @@ def main():
 
     try:
         stop_reason = run_task(
+            eye_tracking_config=load_eye_tracking_settings(cfg),
             video_files=_get("video_files", []),
             clip_duration_seconds=_get("clip_duration_seconds", None),
             output_dir=_get("output_dir", "./logs"),
@@ -1121,17 +1082,8 @@ def main():
             ffprobe_bin=_get("ffprobe", cfg.get("ffprobe", "ffprobe")),
             screen_config=screen_config,
             raspi=bool(_get("raspi", is_raspberry_pi())),
-            sync_pin=int(_get("sync_pin", cfg.get("sync_pin", 18))),
-            sync_interval_frames=tuple(
-                int(value)
-                for value in _get(
-                    "sync_interval_frames",
-                    cfg.get("sync_interval_frames", (100, 300)),
-                )
-            ),
-            sync_pulse_frames=int(
-                _get("sync_pulse_frames", cfg.get("sync_pulse_frames", 1))
-            ),
+            sync_pin=_get("sync_pin", 18),
+            sync_bar=cfg.get("sync_bar"),
             seek_timeout_seconds=float(
                 _get("seek_timeout_seconds", cfg.get("seek_timeout_seconds", 30.0))
             ),
@@ -1149,7 +1101,7 @@ def main():
             ),
             pump_pin=int(_get("pump_pin", cfg.get("pump_pin", 0))),
             pump_pulse_time_seconds=_optional_float("pump_pulse_time_seconds"),
-            pump_interval=_optional_float("pump_interval"),
+            reward_interval=_optional_float("reward_interval"),
         )
         if stop_reason != "done":
             sys.exit(USER_EXIT_CODE)

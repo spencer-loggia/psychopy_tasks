@@ -9,6 +9,11 @@
     },
     "mask_main_inputs": false,
     "experiment_quiet_mode": true,
+    "eye_tracker_experiment": {
+        "enabled": true,
+        "start_timeout_s": 15.0,
+        "uart": {"device": "/dev/ttyAMA10", "baud": 460800}
+    },
     "subjects": {
         "Yuri": "Y",
         "Debug": "D"
@@ -35,7 +40,7 @@
         "setup": {
             "calibrate_eye_tracker": {
                 "launch": "task/calibrate_eye_tracker.py",
-                "config": "test_configs/eye_calibration_config.json"
+                "config": "config_files/eye_tracking/calibration_rpi.json"
             },
             "prime_pump": {
                 "launch": "task/pulse_pump.py"
@@ -53,7 +58,7 @@
                 "y_scale": null,
                 "x_offset": null,
                 "y_offset": null,
-                "set_time": 0.0
+                "task_time_ns": 0
             }
         ]
     }

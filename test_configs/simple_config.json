@@ -9,5 +9,11 @@
   "fullscreen": false,
   "win_size": [1024, 768],
   "fixation_size": 48,
-  "image_size": [512, 512]
+  "image_size": [512, 512],
+  "sync_bar": {
+    "enabled": false,
+    "height": 20,
+    "interval_mean_seconds": 1.0,
+    "interval_variance_seconds": 0.2
+  }
 }

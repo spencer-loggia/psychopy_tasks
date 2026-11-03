@@ -16,7 +16,7 @@
 
   "pump_pin": 23,
   "buzz_pin": 24,
-  "trial_start_pin": 18,
+  "sync_pin": 18,
 
   "seed": 42,
   "output_dir": "./logs",
@@ -46,5 +46,11 @@
   "fixed_positions": true,
   "sequential": false,
   "is_memory": false,
-  "raspi": true
+  "raspi": true,
+  "sync_bar": {
+    "enabled": false,
+    "height": 20,
+    "interval_mean_seconds": 1.0,
+    "interval_variance_seconds": 0.2
+  }
 }

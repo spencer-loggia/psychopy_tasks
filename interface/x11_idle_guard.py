@@ -1,4 +1,4 @@
-"""X11 input and blackout lifecycle for the experiment manager."""
+"""X11 input and screen-mask lifecycle for the experiment manager."""
 from __future__ import annotations
 
 import os
@@ -9,7 +9,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
-from bin.screen import ScreenGeometry, set_tk_window_fullscreen
+from bin.screen import (
+    ScreenGeometry, oriented_size, set_tk_window_fullscreen, software_stimulus_rotation,
+)
+from bin.sync_bar import SyncBarConfig, sync_bar_rectangles
 
 
 class XInputControlError(RuntimeError):
@@ -122,9 +125,29 @@ class XInputTouchscreen:
 
 
 class MainScreenCurtain:
-    """Borderless black Tk window covering the main subject display."""
+    """Subject-screen mask with an optional static phase-zero sync bar."""
 
-    def __init__(self, root, screen_info: ScreenGeometry, *, tk_module) -> None:
+    def __init__(
+        self, root, screen_info: ScreenGeometry, *, tk_module,
+        screen_mask_rgb=(0, 0, 0), sync_bar=None,
+    ) -> None:
+        if (
+            not isinstance(screen_mask_rgb, (list, tuple))
+            or len(screen_mask_rgb) != 3
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 255
+                for value in screen_mask_rgb
+            )
+        ):
+            raise ValueError("Config field 'screen_mask_rgb' must contain three integers in [0, 255]")
+        background = "#{:02x}{:02x}{:02x}".format(*screen_mask_rgb)
+        sync_config = SyncBarConfig.from_mapping(sync_bar)
+        rectangles = (
+            sync_bar_rectangles(
+                (screen_info.width, screen_info.height), sync_config.height,
+                software_stimulus_rotation(screen_info.rotation),
+            ) if sync_config.enabled else []
+        )
         self.root = root
         self.screen_info = screen_info
         self.window = tk_module.Toplevel(root)
@@ -133,7 +156,24 @@ class MainScreenCurtain:
         # on the experimenter window until it is withdrawn leaves the window
         # manager's active monitor undefined and can send a new managed
         # fullscreen window to either output.
-        self.window.configure(bg="black", cursor="none", takefocus=True)
+        self.window.configure(bg=background, cursor="none", takefocus=True)
+        if rectangles:
+            canvas = tk_module.Canvas(
+                self.window, bg=background, highlightthickness=0, borderwidth=0,
+                width=screen_info.width, height=screen_info.height, takefocus=False,
+            )
+            canvas.pack(fill="both", expand=True)
+            for index, rectangle in enumerate(rectangles):
+                # Share task geometry; Tk uses a top-left origin and y-down pixels.
+                width, height = oriented_size(
+                    (rectangle["width"], rectangle["height"]), rectangle["ori"],
+                )
+                x = screen_info.width / 2 + rectangle["pos"][0]
+                y = screen_info.height / 2 - rectangle["pos"][1]
+                canvas.create_rectangle(
+                    x - width / 2, y - height / 2, x + width / 2, y + height / 2,
+                    fill="#ffffff" if index % 2 else "#000000", outline="", width=0,
+                )
         set_tk_window_fullscreen(self.window, self.screen_info)
         try:
             self.window.attributes("-topmost", True)
@@ -178,7 +218,7 @@ class MainScreenCurtain:
 
 
 class ExperimentIdleGuard:
-    """Coordinate the main touchscreen and blackout window around tasks."""
+    """Coordinate the main touchscreen and screen-mask window around tasks."""
 
     def __init__(self, root, touchscreen: XInputTouchscreen, curtain: MainScreenCurtain):
         self.root = root
@@ -282,7 +322,11 @@ def create_experiment_idle_guard(
         output_name=output_name,
     )
     touchscreen.validate()
-    curtain = MainScreenCurtain(root, main_screen, tk_module=tk_module)
+    curtain = MainScreenCurtain(
+        root, main_screen, tk_module=tk_module,
+        screen_mask_rgb=cfg.get("screen_mask_rgb", (0, 0, 0)),
+        sync_bar=cfg.get("sync_bar"),
+    )
     return ExperimentIdleGuard(root, touchscreen, curtain)
 
 

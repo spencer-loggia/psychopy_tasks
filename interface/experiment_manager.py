@@ -6,14 +6,27 @@ import csv
 import datetime as dt
 import json
 import os
+import platform
 import random
 import shutil
+import socket
+import subprocess
+import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Optional
 
+from bin.task_clock import EXPERIMENT_ORIGIN_ENV, TaskClock
+from bin.sync_bar import SyncBarConfig
 from bin.config import load_config
+from bin.run_identity import BLOCK_ID_ENV, EXPERIMENT_ID_ENV, BLOCK_IDENTITY_FILENAME, new_run_id
+from bin.eye_tracking import (
+    EXPERIMENT_BLOCK_NUMBER_ENV,
+    EXPERIMENT_UART_PENDING_ENV,
+    EXPERIMENT_UART_READY_ENV,
+)
+from bin.eye_tracking_config import resolve_eye_tracking_paths
 from bin.logger import (
     CALIBRATION_FILENAME,
     EVENT_LIBRARY_ENV,
@@ -25,14 +38,22 @@ from bin.screen import (
     SCREEN_ENV_OVERRIDE_ENV,
     SECONDARY_SCREEN_ENV,
 )
+from interface.experiment_eye_tracker import ExperimentEyeTracker
+from interface.experiment_history import ExperimentHistory
+from interface.subject_calibration import SubjectCalibrationStore, validate_eye_calibration
 
 
 BLOCKS_FILENAME = "blocks.tsv"
 STATE_FILENAME = "state.json"
 BLOCK_CONFIG_FILENAME = "config.json"
+_EYE_CALIBRATION_COEFFICIENTS = (
+    "x_scale", "y_scale", "x_offset", "y_offset", "x_cross", "y_cross",
+)
 BLOCK_FIELDS = (
     "block_name",
     "block_num",
+    "block_id",
+    "experiment_id",
     "subject",
     "start_time",
     "end_time",
@@ -44,6 +65,51 @@ def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     temp_path = path.with_name(f".{path.name}.tmp")
     temp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     os.replace(temp_path, path)
+
+
+def _git_commit(working_dir: Path) -> Optional[str]:
+    """Read the launch checkout's full HEAD identity once, without modifying it."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(working_dir), "rev-parse", "--verify", "HEAD^{commit}"],
+            check=True, capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # Source archives and machines without Git can still run experiments.
+        return None
+    return result.stdout.strip() or None
+
+
+def _runtime_metadata(working_dir: Path, python_command: str = "") -> dict[str, Any]:
+    """Snapshot the host and configured task interpreter at experiment launch."""
+    os_details: dict[str, Any] = {
+        "system": platform.system(),
+        "release": platform.release(),
+        "version": platform.version(),
+        "machine": platform.machine(),
+        "platform": platform.platform(),
+    }
+    if os_details["system"] == "Linux":
+        try:
+            os_details["distribution"] = platform.freedesktop_os_release()
+        except (AttributeError, OSError):
+            pass
+
+    python_version: Optional[str] = sys.version
+    if python_command:
+        try:
+            result = subprocess.run(
+                [python_command, "-c", "import sys; print(sys.version)"],
+                cwd=working_dir, check=True, capture_output=True, text=True, timeout=5,
+            )
+            python_version = result.stdout.strip() or None
+        except (OSError, subprocess.SubprocessError):
+            python_version = None
+    return {
+        "hostname": socket.gethostname(),
+        "os_details": os_details,
+        "python_version": python_version,
+    }
 
 
 def _resolve_path(path_value: str | Path, search_roots: Iterable[Path]) -> Path:
@@ -129,6 +195,7 @@ class PreparedBlock:
     launch_path: Path
     config_path: Path
     output_dir: Path
+    block_id: str
 
 
 class ExperimentManager:
@@ -143,27 +210,42 @@ class ExperimentManager:
         subject_name: str,
         subject_code: str,
         now: Optional[dt.datetime] = None,
-        perf_counter: Callable[[], float] = time.perf_counter,
+        perf_counter_ns: Callable[[], int] = time.perf_counter_ns,
     ):
         self.working_dir = Path(working_dir).resolve()
         self.launch_config_path = Path(launch_config_path).resolve()
         self.config_dir = self.launch_config_path.parent
         self.launch_config = copy.deepcopy(dict(launch_config))
+        self.sync_bar = (
+            SyncBarConfig.from_mapping(self.launch_config["sync_bar"])
+            if "sync_bar" in self.launch_config else None
+        )
         self.subject_name = str(subject_name)
         self.subject_code = str(subject_code)
-        self._perf_counter = perf_counter
-        self.started_perf_s = float(perf_counter())
+        self._perf_counter_ns = perf_counter_ns
+        self.task_clock = TaskClock(origin_perf_ns=perf_counter_ns())
         self.started_at = now or dt.datetime.now()
         self.blocks: list[dict[str, Any]] = []
+        self._eye_calibration_path: Optional[Path] = None
 
         initial_state = self.launch_config.get("initial_state")
         if not isinstance(initial_state, dict):
             raise ValueError("Launcher config field 'initial_state' must be a JSON object")
         self.state = copy.deepcopy(initial_state)
+        # Normalize legacy calibration-history timestamps at the config boundary.
+        for history in self.state.values():
+            if isinstance(history, list):
+                for entry in history:
+                    if isinstance(entry, dict) and "set_time" in entry:
+                        milliseconds = entry.pop("set_time")
+                        entry.setdefault("task_time_ns", round(float(milliseconds) * 1_000_000))
         self.state["subject"] = self.subject_name
+        self.experiment_id = new_run_id()
+        self.state["experiment_id"] = self.experiment_id
 
         self.logs_dir = self.working_dir / "logs"
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.history = ExperimentHistory(self.logs_dir)
+        self.subject_calibrations = SubjectCalibrationStore(self.logs_dir)
         self.experiment_dir = self._create_experiment_dir()
         self.blocks_dir = self.experiment_dir / "blocks"
         self.blocks_dir.mkdir()
@@ -176,26 +258,85 @@ class ExperimentManager:
         if not source_event_library.is_file():
             raise FileNotFoundError(f"Event library not found: {source_event_library}")
         shutil.copy2(source_event_library, self.event_library_path)
+        _write_json_atomic(self.experiment_dir / "clock.json", {
+            "origin_perf_counter_ns": self.task_clock.origin_perf_ns,
+            "origin_datetime": self.started_at.isoformat(timespec="microseconds"),
+        })
         self._write_state()
-        self._write_blocks()
+        self.eye_tracker = ExperimentEyeTracker(
+            self.launch_config, subject=self.subject_name,
+            started_at=self.started_at, directory=self.experiment_dir,
+            experiment_number=self.experiment_number,
+            experiment_id=self.experiment_id,
+        )
+        try:
+            # Start UART as soon as the experiment identity and required files
+            # exist. Git/interpreter probes can each take five seconds; neither
+            # is needed to send START_EXPERIMENT.
+            self._restore_subject_calibration()
+            self.state["git_commit"] = _git_commit(self.working_dir)
+            python_command = str(
+                (self.launch_config.get("environment") or {}).get("python") or ""
+            ).strip()
+            self.state.update(_runtime_metadata(self.working_dir, python_command))
+            self._write_state()
+            self._write_blocks()
+        except BaseException:
+            # An aborted local setup must close the experiment already queued
+            # on the tracker, preserving START/STOP ordering in its worker.
+            self.eye_tracker.finish()
+            raise
+
+    def finish(self) -> None:
+        """Save the final local summary and request remote recording closure."""
+        try:
+            self._update_history(ended=True)
+        finally:
+            self.eye_tracker.finish()
+
+    def _restore_subject_calibration(self) -> None:
+        self.subject_calibrations.remember_experiments(
+            self.logs_dir.iterdir(), subject=self.subject_name,
+        )
+        saved = self.subject_calibrations.load(self.subject_name)
+        if saved is None:
+            return
+        candidate = validate_eye_calibration(saved["eye_tracker_calibration"])
+        history = self.state.get("eye_tracker_calibration")
+        template = (history[-1] if isinstance(history, list) and history
+                    and isinstance(history[-1], dict) else {})
+        fields = list(dict.fromkeys([*template, *_EYE_CALIBRATION_COEFFICIENTS]))
+        entry = {key: copy.deepcopy(candidate.get(key, template.get(key)))
+                 for key in fields if key not in {"set_time", "task_time_ns"}}
+        entry["task_time_ns"] = 0
+        self.state["eye_tracker_calibration"] = [entry]
+        # A run owns its starting snapshot; later subject-cache updates cannot
+        # change metadata underneath this experiment's block configurations.
+        self._eye_calibration_path = self.experiment_dir / "initial_eye_calibration.json"
+        _write_json_atomic(self._eye_calibration_path, saved)
 
     def _create_experiment_dir(self) -> Path:
-        safe_code = sanitize_filename_component(self.subject_code)
-        prefix = f"exp_{safe_code}_{self.started_at:%Y%m%d}_"
-        used_ids: set[int] = set()
-        for candidate in self.logs_dir.glob(f"{prefix}*"):
-            suffix = candidate.name[len(prefix):]
-            if suffix.isdigit():
-                used_ids.add(int(suffix))
-        experiment_id = 1
-        while experiment_id in used_ids:
-            experiment_id += 1
-        experiment_dir = self.logs_dir / f"{prefix}{experiment_id:03d}"
+        experiment_dir, self.experiment_number = self.history.reserve(
+            subject=self.subject_name, subject_code=self.subject_code, started_at=self.started_at,
+        )
         experiment_dir.mkdir(exist_ok=False)
         return experiment_dir
 
-    def milliseconds_since_start(self) -> float:
-        return (float(self._perf_counter()) - self.started_perf_s) * 1000.0
+    def _update_history(self, *, ended: bool = False) -> None:
+        self.history.update(
+            self.experiment_dir.name, block_count=len(self.blocks),
+            completed_block_count=sum(bool(block["end_time"]) for block in self.blocks),
+            elapsed_ns=self.task_time_ns(), ended=ended,
+        )
+
+    def task_time_ns(self) -> int:
+        return self.task_clock.task_time_ns(timestamp_perf_ns=self._perf_counter_ns())
+
+    def _block_datetime(self) -> str:
+        # Derive human-readable times from the same experiment origin, so wall
+        # clock adjustments during a run cannot change elapsed block timing.
+        when = self.started_at + dt.timedelta(microseconds=self.task_time_ns() // 1000)
+        return when.isoformat(sep=" ", timespec="seconds")
 
     def _write_state(self) -> None:
         _write_json_atomic(self.state_path, self.state)
@@ -207,6 +348,7 @@ class ExperimentManager:
             writer.writeheader()
             writer.writerows(self.blocks)
         os.replace(temp_path, self.blocks_path)
+        self._update_history()
 
     def prepare_block(
         self,
@@ -230,13 +372,14 @@ class ExperimentManager:
         raw_block_name = block_config.get("config_name") or task_name
         block_name = str(raw_block_name).strip() or str(task_name)
         block_num = len(self.blocks) + 1
+        block_id = new_run_id()
         output_dir = self.blocks_dir / f"{block_num}_{sanitize_filename_component(block_name)}"
         output_dir.mkdir(exist_ok=False)
 
         injected: dict[str, Any] = {}
 
         def _inject(key: str, value: Any, state_name: str) -> None:
-            if key in {"config_name", "output_dir", "subject"}:
+            if key in {"config_name", "output_dir", "subject", "experiment_id", "block_id"}:
                 raise ValueError(
                     f"Experiment state field '{state_name}' cannot inject reserved config key '{key}'"
                 )
@@ -248,11 +391,11 @@ class ExperimentManager:
             injected[key] = copy.deepcopy(value)
 
         for state_name, state_value in self.state.items():
-            if state_name == "subject":
+            if state_name in {"subject", "git_commit", "hostname", "os_details", "python_version", "experiment_id", "block_id"}:
                 continue
             if isinstance(state_value, list) and state_value and isinstance(state_value[-1], dict):
                 for key, value in state_value[-1].items():
-                    if key != "set_time":
+                    if key not in {"set_time", "task_time_ns"}:
                         _inject(key, value, state_name)
             elif not isinstance(state_value, list):
                 _inject(state_name, state_value, state_name)
@@ -263,6 +406,21 @@ class ExperimentManager:
         block_config["output_dir"] = str(output_dir)
         block_config["subject"] = self.subject_name
         block_config.update(injected)
+        if self.sync_bar is not None:
+            block_config["sync_bar"] = asdict(self.sync_bar)
+        block_config["experiment_id"] = self.experiment_id
+        block_config["block_id"] = block_id
+        resolve_eye_tracking_paths(block_config, self.launch_config_path.parent)
+        # History retains declared scalar fields and all affine eye coefficients.
+        # Also reference the accepted source artifact so enabled eye tracking
+        # inherits UART/filter settings, units and the gain anchor losslessly.
+        if self._eye_calibration_path is not None:
+            eye_options = block_config.setdefault("eye_tracking", {})
+            if isinstance(eye_options, dict):
+                # Match the metadata to the same latest history entry whose
+                # coefficients were injected above, even if the source task
+                # config originally referenced an older calibration file.
+                eye_options["calibration_file"] = str(self._eye_calibration_path)
         block_config["fullscreen"] = True
         runtime_screen_override = str(
             os.environ.get(SCREEN_ENV_OVERRIDE_ENV, "")
@@ -282,13 +440,19 @@ class ExperimentManager:
 
         config_path = output_dir / BLOCK_CONFIG_FILENAME
         _write_json_atomic(config_path, block_config)
+        _write_json_atomic(output_dir / BLOCK_IDENTITY_FILENAME, {
+            "experiment_id": self.experiment_id, "block_id": block_id,
+            "block_num": block_num, "block_name": block_name,
+        })
         relative_output = output_dir.relative_to(self.experiment_dir)
         self.blocks.append(
             {
                 "block_name": block_name,
                 "block_num": block_num,
+                "block_id": block_id,
+                "experiment_id": self.experiment_id,
                 "subject": self.subject_name,
-                "start_time": f"{self.milliseconds_since_start():.3f}",
+                "start_time": self._block_datetime(),
                 "end_time": "",
                 "out_dir": str(relative_output),
             }
@@ -300,18 +464,28 @@ class ExperimentManager:
             launch_path=launch_path,
             config_path=config_path,
             output_dir=output_dir,
+            block_id=block_id,
         )
 
     def subprocess_environment(self, block: PreparedBlock) -> dict[str, str]:
         environment = os.environ.copy()
         environment[EXACT_SESSION_DIR_ENV] = str(block.output_dir)
         environment[EVENT_LIBRARY_ENV] = str(self.event_library_path)
+        environment[EXPERIMENT_ORIGIN_ENV] = str(self.task_clock.origin_perf_ns)
+        environment[EXPERIMENT_ID_ENV] = self.experiment_id
+        environment[BLOCK_ID_ENV] = block.block_id
+        for key in (EXPERIMENT_UART_PENDING_ENV, EXPERIMENT_UART_READY_ENV, EXPERIMENT_BLOCK_NUMBER_ENV):
+            environment.pop(key, None)
+        if self.eye_tracker.start_future is not None:
+            environment[EXPERIMENT_UART_PENDING_ENV] = str(self.eye_tracker.pending_path)
+            environment[EXPERIMENT_UART_READY_ENV] = str(self.eye_tracker.ready_path)
+            environment[EXPERIMENT_BLOCK_NUMBER_ENV] = str(block.block_num)
         return environment
 
     def finish_block(self, block: PreparedBlock) -> None:
         if not self.blocks or int(self.blocks[-1]["block_num"]) != block.block_num:
             raise ValueError(f"Block {block.block_num} is not the active block")
-        self.blocks[-1]["end_time"] = f"{self.milliseconds_since_start():.3f}"
+        self.blocks[-1]["end_time"] = self._block_datetime()
         self._write_blocks()
         self._import_calibration(block.output_dir / CALIBRATION_FILENAME)
 
@@ -329,12 +503,30 @@ class ExperimentManager:
             candidate = payload.get(state_name)
             if not isinstance(candidate, dict):
                 continue
-            required_fields = [key for key in history[-1] if key != "set_time"]
+            required_fields = [key for key in history[-1] if key not in {"set_time", "task_time_ns"}]
+            if state_name == "eye_tracker_calibration":
+                # Older launch configs declare only diagonal gains and offsets.
+                # Keep fitted cross terms in state so block-level overrides do
+                # not silently reduce a full affine calibration to that schema.
+                # A later legacy calibration must explicitly clear cross terms
+                # from the previous fit, rather than inheriting stale values.
+                candidate = {"x_cross": 0.0, "y_cross": 0.0, **candidate}
+                required_fields = list(dict.fromkeys(
+                    [*required_fields, *_EYE_CALIBRATION_COEFFICIENTS]
+                ))
             if not all(field in candidate for field in required_fields):
                 continue
+            if state_name == "eye_tracker_calibration":
+                candidate = validate_eye_calibration(candidate)
+                self.subject_calibrations.save(
+                    subject=self.subject_name, experiment_name=self.experiment_dir.name,
+                    block_number=len(self.blocks), calibration=candidate,
+                )
             entry = {field: copy.deepcopy(candidate[field]) for field in required_fields}
-            entry["set_time"] = self.milliseconds_since_start()
+            entry["task_time_ns"] = self.task_time_ns()
             history.append(entry)
+            if state_name == "eye_tracker_calibration":
+                self._eye_calibration_path = calibration_path.resolve()
             changed = True
         if changed:
             self._write_state()

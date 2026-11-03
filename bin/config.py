@@ -32,6 +32,12 @@ def load_config(path: str) -> Dict[str, Any]:
             raise ValueError(f"Error parsing JSON config '{path}': {e.msg} (line {e.lineno} col {e.colno})") from e
     if not isinstance(cfg, dict):
         raise ValueError("Config file must contain a top-level JSON object")
+    from .sync_bar import SyncBarConfig, validate_sync_pin
+    SyncBarConfig.from_mapping(cfg.get("sync_bar"))
+    validate_sync_pin(cfg.get("sync_pin"))
+    from .eye_tracking_config import resolve_eye_tracking_paths
+
+    resolve_eye_tracking_paths(cfg, p.parent)
     return cfg
 
 
@@ -86,6 +92,9 @@ def validate_config(
 
     Returns cfg (unchanged) or raises an error.
     """
+    from .sync_bar import SyncBarConfig, validate_sync_pin
+    SyncBarConfig.from_mapping(cfg.get("sync_bar"))
+    validate_sync_pin(cfg.get("sync_pin"))
     if required is None:
         required = []
     for k in required:

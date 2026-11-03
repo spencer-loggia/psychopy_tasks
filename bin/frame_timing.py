@@ -8,6 +8,27 @@ import time
 from typing import Any, Callable, Iterable, Mapping, Optional
 
 
+# One subject display runs per task process. Its optional sync presenter also
+# services sparse waits; the experimenter window lives in a separate process.
+_background_presenter = None
+_wait_deadline_perf_s = None
+
+
+def set_background_presenter(presenter) -> None:
+    global _background_presenter
+    _background_presenter = presenter
+
+
+def service_background_presenter(*, deadline_perf_s=None) -> None:
+    if _background_presenter is not None:
+        if _wait_deadline_perf_s is not None:
+            deadline_perf_s = (
+                _wait_deadline_perf_s if deadline_perf_s is None
+                else min(deadline_perf_s, _wait_deadline_perf_s)
+            )
+        _background_presenter.service(deadline_perf_s=deadline_perf_s)
+
+
 @dataclass(frozen=True)
 class FrameDurationPlan:
     """Nearest refresh-locked representation of a requested duration."""
@@ -88,36 +109,55 @@ class FlipTimestamps:
     psychopy_s: Any
     requested_perf_s: float
     actual_perf_s: float
+    requested_perf_ns: Optional[int] = None
+    actual_perf_ns: Optional[int] = None
+
+    def __post_init__(self):
+        # Float-only construction remains useful for schedule tests/callers.
+        if self.requested_perf_ns is None:
+            object.__setattr__(self, "requested_perf_ns", round(self.requested_perf_s * 1_000_000_000))
+        if self.actual_perf_ns is None:
+            object.__setattr__(self, "actual_perf_ns", round(self.actual_perf_s * 1_000_000_000))
 
 
-def capture_perf_counter_on_flip(target: dict[str, float]) -> None:
+def capture_perf_counter_on_flip(target: dict[str, int]) -> None:
     """Capture a PsychoPy flip callback time on the performance clock."""
 
-    target["actual_perf_s"] = time.perf_counter()
+    target["actual_perf_ns"] = time.perf_counter_ns()
+
+
+def arm_flip_timestamp(win: Any) -> dict:
+    """Queue the clock capture before any task hardware callbacks on this flip."""
+    capture = getattr(win, "_neuro_tasks_flip_capture", None)
+    if isinstance(capture, dict):
+        return capture
+    capture = {}
+    call_on_flip = getattr(win, "callOnFlip", None)
+    if callable(call_on_flip):
+        call_on_flip(capture_perf_counter_on_flip, capture)
+    win._neuro_tasks_flip_capture = capture
+    return capture
 
 
 def flip_with_timestamps(win: Any) -> FlipTimestamps:
     """Request a flip and capture submission and realized swap timestamps.
 
-    PsychoPy's ``callOnFlip`` is used when available so ``actual_perf_s`` is
+    PsychoPy's ``callOnFlip`` is used when available so ``actual_perf_ns`` is
     sampled at the swap rather than after the blocking ``flip`` call returns.
     """
 
-    flip_capture: dict[str, float] = {}
-    call_on_flip = getattr(win, "callOnFlip", None)
-    if callable(call_on_flip):
-        try:
-            call_on_flip(capture_perf_counter_on_flip, flip_capture)
-        except Exception:
-            pass
-    requested_perf_s = time.perf_counter()
+    flip_capture = arm_flip_timestamp(win)
+    win._neuro_tasks_flip_capture = None
+    requested_perf_ns = time.perf_counter_ns()
     psychopy_s = win.flip()
-    flip_return_perf_s = time.perf_counter()
-    actual_perf_s = flip_capture.get("actual_perf_s", flip_return_perf_s)
+    flip_return_perf_ns = time.perf_counter_ns()
+    actual_perf_ns = flip_capture.get("actual_perf_ns", flip_return_perf_ns)
     return FlipTimestamps(
         psychopy_s=psychopy_s,
-        requested_perf_s=requested_perf_s,
-        actual_perf_s=actual_perf_s,
+        requested_perf_s=requested_perf_ns / 1_000_000_000,
+        actual_perf_s=actual_perf_ns / 1_000_000_000,
+        requested_perf_ns=requested_perf_ns,
+        actual_perf_ns=actual_perf_ns,
     )
 
 
@@ -169,17 +209,26 @@ def wait_until(
         raise ValueError("poll_interval_s must be a positive finite value")
     sleeper = time.sleep if wait_fn is None else wait_fn
 
-    while True:
-        if poll_callback is not None and poll_callback():
-            return False
-        remaining_s = deadline - time.perf_counter()
-        if remaining_s <= 0.0:
-            return True
-        sleeper(
-            remaining_s
-            if poll_callback is None
-            else min(interval, remaining_s)
-        )
+    global _wait_deadline_perf_s
+    previous_deadline = _wait_deadline_perf_s
+    _wait_deadline_perf_s = (
+        deadline if previous_deadline is None else min(deadline, previous_deadline)
+    )
+    try:
+        while True:
+            if poll_callback is not None and poll_callback():
+                return False
+            service_background_presenter()
+            remaining_s = deadline - time.perf_counter()
+            if remaining_s <= 0.0:
+                return True
+            sleeper(
+                remaining_s
+                if poll_callback is None and _background_presenter is None
+                else min(interval, remaining_s)
+            )
+    finally:
+        _wait_deadline_perf_s = previous_deadline
 
 
 def wait_until_flip_submission(

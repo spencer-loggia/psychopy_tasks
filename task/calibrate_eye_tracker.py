@@ -1,420 +1,322 @@
 #!/usr/bin/env python3
-"""
-Eye-tracker calibration task.
-
-Reads two analog channels from a Pi-Plates DAQC2plate, maps voltage to
-main-screen centered screen-fraction coordinates, and lets the experimenter
-adjust x/y scale and offsets interactively.
-"""
+"""Calibrate Eye 0 from the Pi 5 UART with a separate experimenter display."""
 from __future__ import annotations
 
 import argparse
-from collections import deque
+from dataclasses import asdict, replace
 from datetime import datetime
 import json
+import math
 from pathlib import Path
 import sys
 import time
-from typing import Any, Dict, Optional, Sequence, Tuple
-
-from psychopy import core, event, logging as pylogging, visual
 
 _project_root = Path(__file__).resolve().parents[1]
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
+from psychopy import core, event, visual, logging as pylogging
 from bin import utils
 from bin.config import load_config
+from bin.daqc2_outputs import DAQC2DigitalOutputs
+from bin.eye_calibration_keys import CALIBRATION_KEYS, fixation_key_steps
+from bin.eye_calibration_fit import AffineCalibrationFit
+from bin.eye_calibration_preview import _make_fixation_cross, _draw_fixation_cross
+from bin.eye_calibration_reward import CalibrationAutoReward
+from bin.eye_calibration_video import CalibrationVideoClips
+from bin.buffered_video import DEFAULT_BUFFER_BYTES
+from bin.video_playback import SharedVideoFrameBuffer, make_rgb_video_stim, upload_rgb_texture
+from bin.eye_tracking_config import load_eye_tracking_settings
 from bin.eye_tracking import (
-    AnalogEyeTracker,
-    DAQC2AnalogConfig,
+    UARTEyeTracker,
+    UARTEyeTrackerConfig,
     EyeCalibration,
     EyeFilterConfig,
     calibration_payload,
-    clamp_fraction,
     fraction_position_within_diameter,
     fraction_to_pixels,
 )
+from bin.pump_control import PumpPulseControl
 from bin.logger import SessionLogBundle
-from bin.task_lifecycle import USER_EXIT_CODE
 from bin.screen import (
-    compute_centered_aspect_fit,
+    ExperimenterPreview,
     describe_screen,
     load_screen_config,
+    oriented_size,
     resolve_scene_size,
+    rotate_centered_point,
+    set_window_mouse_visible,
+    software_stimulus_rotation,
 )
-
-
-class Slider:
-    def __init__(
-        self,
-        win,
-        *,
-        orientation: str,
-        pos: Tuple[float, float],
-        length: float,
-        value_min: float,
-        value_max: float,
-        value: float,
-        label: str,
-    ):
-        self.win = win
-        self.orientation = orientation
-        self.pos = (float(pos[0]), float(pos[1]))
-        self.length = max(1.0, float(length))
-        self.value_min = float(value_min)
-        self.value_max = float(value_max)
-        self.value = float(value)
-        self.label = str(label)
-        self.track = visual.Rect(
-            win,
-            width=self.length if self.orientation == "horizontal" else 6.0,
-            height=6.0 if self.orientation == "horizontal" else self.length,
-            pos=self.pos,
-            fillColor=utils.rgb255_to_psychopy((70, 70, 70)),
-            fillColorSpace="rgb",
-            lineColor=utils.rgb255_to_psychopy((210, 210, 210)),
-            lineColorSpace="rgb",
-            units="pix",
-        )
-        self.knob = visual.Rect(
-            win,
-            width=24.0,
-            height=24.0,
-            pos=self._knob_pos(),
-            fillColor=utils.rgb255_to_psychopy((245, 245, 245)),
-            fillColorSpace="rgb",
-            lineColor=utils.rgb255_to_psychopy((30, 30, 30)),
-            lineColorSpace="rgb",
-            units="pix",
-        )
-        self.text = visual.TextStim(
-            win,
-            text="",
-            units="pix",
-            height=18.0,
-            color=utils.rgb255_to_psychopy((245, 245, 245)),
-            colorSpace="rgb",
-            pos=(0, 0),
-        )
-
-    def _fraction(self) -> float:
-        span = self.value_max - self.value_min
-        if span == 0:
-            return 0.5
-        return max(0.0, min(1.0, (float(self.value) - self.value_min) / span))
-
-    def _knob_pos(self) -> Tuple[float, float]:
-        frac = self._fraction()
-        if self.orientation == "horizontal":
-            return (self.pos[0] - (self.length * 0.5) + (frac * self.length), self.pos[1])
-        return (self.pos[0], self.pos[1] - (self.length * 0.5) + (frac * self.length))
-
-    def contains(self, point: Sequence[float]) -> bool:
-        px, py = float(point[0]), float(point[1])
-        kx, ky = self._knob_pos()
-        if abs(px - kx) <= 24.0 and abs(py - ky) <= 24.0:
-            return True
-        if self.orientation == "horizontal":
-            return abs(py - self.pos[1]) <= 18.0 and abs(px - self.pos[0]) <= self.length * 0.5
-        return abs(px - self.pos[0]) <= 18.0 and abs(py - self.pos[1]) <= self.length * 0.5
-
-    def set_from_pos(self, point: Sequence[float]) -> None:
-        if self.orientation == "horizontal":
-            frac = (float(point[0]) - (self.pos[0] - self.length * 0.5)) / self.length
-        else:
-            frac = (float(point[1]) - (self.pos[1] - self.length * 0.5)) / self.length
-        frac = max(0.0, min(1.0, frac))
-        self.value = self.value_min + (frac * (self.value_max - self.value_min))
-
-    def draw(self) -> None:
-        self.knob.pos = self._knob_pos()
-        self.track.draw()
-        self.knob.draw()
-        self.text.text = f"{self.label} {self.value:.4f}"
-        if self.orientation == "horizontal":
-            self.text.pos = (self.pos[0], self.pos[1] + 30.0)
-        else:
-            self.text.pos = (self.pos[0] + 54.0, self.pos[1])
-        self.text.draw()
+from bin.task_lifecycle import USER_EXIT_CODE
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Calibrate eye-tracker analog voltage mapping")
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", help="Path to JSON config file")
-    parser.add_argument("--output_dir", default=None, help="Output directory for logs/calibration JSON")
-    parser.add_argument("--fullscreen", action="store_true", default=None, help="Use fullscreen PsychoPy windows")
-    parser.add_argument("--win_size", type=int, nargs=2, default=None, help="Main window size when not fullscreen")
-    parser.add_argument("--main_screen", default=None, help="Main task screen index or output name")
-    parser.add_argument("--experimenter_screen", default=None, help="Experimenter screen index or output name")
-    parser.add_argument("--simulate_eye", action="store_true", default=None, help="Use zero-voltage simulated DAQ input")
-    parser.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi GPIO pump output")
+    parser.add_argument("--output_dir", default=None)
+    parser.add_argument("--fullscreen", action="store_true", default=None)
+    parser.add_argument("--win_size", type=int, nargs=2, default=None)
+    parser.add_argument("--main_screen", default=None)
+    parser.add_argument("--experimenter_screen", default=None)
+    parser.add_argument("--video_files", nargs="+", default=None)
+    parser.add_argument("--video_size", type=int, nargs=2, default=None)
+    parser.add_argument("--clip_duration_seconds", type=float, default=None)
+    parser.add_argument("--frame_rate", type=float, default=None)
+    parser.add_argument("--seek_timeout_seconds", type=float, default=None)
+    parser.add_argument("--video_buffer_megabytes", type=float, default=None)
+    parser.add_argument("--ffprobe", default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--uart_device", default=None, help="Pi 5 3-pin UART: /dev/ttyAMA10"
+    )
+    parser.add_argument(
+        "--simulate_eye",
+        action="store_true",
+        default=None,
+        help="Simulate centered eye data without UART",
+    )
+    parser.add_argument(
+        "--raspi", action="store_true", default=None, help="Enable DAQC2 reward output"
+    )
     return parser.parse_args()
 
 
-def _get_nested(cfg: Dict[str, Any], section: str, key: str, default: Any = None) -> Any:
-    nested = cfg.get(section, {})
-    if isinstance(nested, dict) and key in nested:
-        return nested[key]
-    return cfg.get(key, default)
-
-
-def _as_rgb(value: Any, default: Tuple[int, int, int]) -> Tuple[int, int, int]:
-    if value is None:
-        return default
-    if not isinstance(value, (list, tuple)) or len(value) != 3:
-        return default
-    return tuple(max(0, min(255, int(v))) for v in value)
-
-
-def _make_fixation_cross(win, *, size: float, weight: float, color_rgb: Sequence[int]):
-    size = max(1.0, float(size))
-    weight = max(1.0, min(size, float(weight)))
-    color = utils.rgb255_to_psychopy(tuple(int(v) for v in color_rgb))
-    horizontal = visual.Rect(
-        win,
-        width=size,
-        height=weight,
-        fillColor=color,
-        fillColorSpace="rgb",
-        lineColor=None,
-        units="pix",
-    )
-    vertical = visual.Rect(
-        win,
-        width=weight,
-        height=size,
-        fillColor=color,
-        fillColorSpace="rgb",
-        lineColor=None,
-        units="pix",
-    )
-    return (horizontal, vertical)
-
-
-def _draw_fixation_cross(parts, pos: Sequence[float]) -> None:
-    for part in parts:
-        part.pos = (float(pos[0]), float(pos[1]))
-        part.draw()
-
-
-def _make_button(win, *, text: str, pos: Tuple[float, float], size: Tuple[float, float], color_rgb):
-    rect = visual.Rect(
-        win,
-        width=float(size[0]),
-        height=float(size[1]),
-        pos=pos,
-        fillColor=utils.rgb255_to_psychopy(color_rgb),
-        fillColorSpace="rgb",
-        lineColor=utils.rgb255_to_psychopy((20, 20, 20)),
-        lineColorSpace="rgb",
-        units="pix",
-    )
-    label = visual.TextStim(
-        win,
-        text=text,
-        units="pix",
-        height=max(18.0, min(float(size[0]), float(size[1])) * 0.45),
-        pos=pos,
-        color=utils.rgb255_to_psychopy((255, 255, 255)),
-        colorSpace="rgb",
-    )
-    return rect, label
-
-
-def _draw_button(button) -> None:
-    rect, label = button
-    rect.draw()
-    label.draw()
-
-
-def _compute_preview_layout(exp_size: Sequence[int], main_size: Sequence[int]) -> dict:
-    exp_w, exp_h = max(float(exp_size[0]), 1.0), max(float(exp_size[1]), 1.0)
-    fit = compute_centered_aspect_fit((exp_w, exp_h), main_size)
-    box_center = fit["box_center"]
-    box_size = fit["box_size"]
-    box_left = float(box_center[0]) - (float(box_size[0]) * 0.5)
-    box_right = float(box_center[0]) + (float(box_size[0]) * 0.5)
-    box_top = float(box_center[1]) + (float(box_size[1]) * 0.5)
-    box_bottom = float(box_center[1]) - (float(box_size[1]) * 0.5)
-    return {
-        "box_center": box_center,
-        "box_size": box_size,
-        "left_margin": fit["left_margin"],
-        "right_margin": fit["right_margin"],
-        "top_margin": fit["top_margin"],
-        "bottom_margin": fit["bottom_margin"],
-        "box_left": box_left,
-        "box_right": box_right,
-        "box_top": box_top,
-        "box_bottom": box_bottom,
-    }
-
-
-def _real_screen_size(screen_info, fallback_size: Sequence[int]) -> Tuple[int, int]:
-    if screen_info is not None and int(screen_info.width) > 0 and int(screen_info.height) > 0:
-        return (int(screen_info.width), int(screen_info.height))
-    return (max(int(fallback_size[0]), 1), max(int(fallback_size[1]), 1))
-
-
-def _fraction_to_preview(
-    fraction_pos: Sequence[float],
-    *,
-    box_center: Sequence[float],
-    box_size: Sequence[float],
-    clamp: bool = True,
-) -> Tuple[float, float]:
-    fx = float(fraction_pos[0])
-    fy = float(fraction_pos[1])
-    if clamp:
-        fx = clamp_fraction(fx)
-        fy = clamp_fraction(fy)
-    return (
-        float(box_center[0]) + (fx * float(box_size[0])),
-        float(box_center[1]) + (fy * float(box_size[1])),
-    )
-
-
-def _preview_to_fraction(
-    point: Sequence[float],
-    *,
-    box_center: Sequence[float],
-    box_size: Sequence[float],
-) -> Tuple[float, float]:
-    return (
-        clamp_fraction((float(point[0]) - float(box_center[0])) / max(float(box_size[0]), 1.0)),
-        clamp_fraction((float(point[1]) - float(box_center[1])) / max(float(box_size[1]), 1.0)),
-    )
-
-
-def _open_pump_gpio(raspi: bool, pump_pin: int, msg_logger):
-    if not raspi:
-        msg_logger.log("INFO", "raspi=False; reward button will log pump events without GPIO output")
-        return None, None
-    try:
-        import lgpio
-
-        chip = lgpio.gpiochip_open(0)
-        lgpio.gpio_claim_output(chip, int(pump_pin))
-        msg_logger.log("INFO", f"lgpio initialized on chip 0, pump_pin={int(pump_pin)}")
-        return lgpio, chip
-    except Exception as exc:
-        msg_logger.log("WARN", f"lgpio not available or failed to initialize pump pin: {exc}; reward events logged only")
-        return None, None
-
-
 def _deliver_reward_pulse(
-    *,
-    lgpio_module,
-    gpio_chip,
-    pump_pin: int,
-    pulse_duration_s: float,
-    logger,
-    msg_logger,
-) -> float:
-    duration_s = max(0.0, float(pulse_duration_s))
-    start_perf = time.perf_counter()
-    if lgpio_module is not None and gpio_chip is not None:
-        try:
-            lgpio_module.gpio_write(gpio_chip, int(pump_pin), 1)
-        except Exception as exc:
-            msg_logger.log("ERROR", f"Failed to set pump_pin high: {exc}")
-    logger.log_signal(
-        trial_num=None,
-        event="pump_on",
-        timestamp_perf_s=start_perf,
-        requested_duration=duration_s,
+    *, outputs, pump_pin, pulse_duration_s, logger, should_exit=lambda: False,
+    on_wait=None, sync_window=None,
+):
+    """Use DAQC2 logical on/off semantics and log actual software-timed edges.
+
+    Clear the output even if logging or the wait raises. Poll the separate UI
+    during the pulse so Exit can shorten a manual or fixation reward.
+    """
+    duration_s = float(pulse_duration_s)
+    if not math.isfinite(duration_s) or duration_s < 0:
+        raise ValueError("pump_pulse_time_seconds must be finite and nonnegative")
+    if duration_s == 0:
+        return time.perf_counter()
+    poll_interval_s = (
+        0.002 if sync_window is not None
+        and getattr(sync_window, "_neuro_tasks_sync_display", None) is not None else 0.01
     )
-
-    used_hardware_timing = False
-    if lgpio_module is not None and gpio_chip is not None and duration_s > 0:
-        try:
-            result = lgpio_module.tx_pulse(gpio_chip, int(pump_pin), 0, int(duration_s * 1_000_000), 0, 1)
-            if result < 0:
-                raise RuntimeError(f"tx_pulse failed with code {result}")
-            used_hardware_timing = True
-        except Exception as exc:
-            msg_logger.log("WARN", f"hardware_timed_pump_pulse_failed error={exc}; falling back to blocking wait")
-
-    if used_hardware_timing:
+    requested_ns = time.perf_counter_ns()
+    try:
+        outputs.write(pump_pin, True)
+        start_ns = time.perf_counter_ns()
+        start_s = start_ns / 1_000_000_000
+        logger.log_signal(
+            trial_num=None,
+            event="pump_on",
+            timestamp_perf_ns=start_ns,
+            requested_timestamp_perf_ns=requested_ns,
+            requested_duration=duration_s,
+        )
+        deadline = start_s + duration_s
+        while time.perf_counter() < deadline:
+            if should_exit():
+                break
+            if on_wait is not None:
+                on_wait()
+            elif sync_window is not None:
+                utils.service_sync_bar(sync_window, deadline_perf_s=deadline)
+            core.wait(min(poll_interval_s, max(0, deadline - time.perf_counter())))
+    finally:
+        requested_off_ns = time.perf_counter_ns()
+        outputs.write(pump_pin, False)
+        off_ns = time.perf_counter_ns()
         logger.log_signal(
             trial_num=None,
             event="pump_off",
-            timestamp_perf_s=start_perf + duration_s,
+            timestamp_perf_ns=off_ns,
+            requested_timestamp_perf_ns=requested_off_ns,
         )
-    else:
-        core.wait(duration_s)
-        if lgpio_module is not None and gpio_chip is not None:
-            try:
-                lgpio_module.gpio_write(gpio_chip, int(pump_pin), 0)
-            except Exception as exc:
-                msg_logger.log("ERROR", f"Failed to set pump_pin low: {exc}")
-        logger.log_signal(
-            trial_num=None,
-            event="pump_off",
-            timestamp_perf_s=time.perf_counter(),
-        )
-    return start_perf + duration_s
+    return time.perf_counter()
 
 
 def run_task(
     *,
-    output_dir: str = "logs",
-    config_name: str = "calibrate_eye_tracker",
-    fullscreen: bool = True,
-    win_size: Optional[Tuple[int, int]] = None,
-    experimenter_win_size: Optional[Tuple[int, int]] = None,
-    screen_config: Optional[Dict[str, Any]] = None,
-    bg: Tuple[int, int, int] = (128, 128, 128),
-    fixation_color: Tuple[int, int, int] = (0, 0, 0),
-    fixation_cross_size: float = 40.0,
-    fixation_cross_weight: float = 6.0,
-    daq_config: Optional[DAQC2AnalogConfig] = None,
-    filter_config: Optional[EyeFilterConfig] = None,
-    initial_calibration: Optional[EyeCalibration] = None,
-    x_scale_limits: Tuple[float, float] = (-0.20, 0.20),
-    y_scale_limits: Tuple[float, float] = (-0.20, 0.20),
-    fix_diameter: float = 0.05,
-    fix_accept_percent: float = 0.95,
-    fix_accept_time: float = 2.0,
-    raspi: bool = False,
-    pump_pin: int = 17,
-    pump_pulse_time_seconds: float = 0.25,
+    output_dir="logs",
+    config_name="calibrate_eye_tracker",
+    fullscreen=True,
+    win_size=None,
+    screen_config=None,
+    bg=(128, 128, 128),
+    fixation_color=(0, 0, 0),
+    fixation_cross_size=40.0,
+    fixation_cross_weight=6.0,
+    uart_config=None,
+    filter_config=None,
+    initial_calibration=None,
+    initial_gain_anchor_px=None,
+    x_scale_limits=(-0.02, 0.02),
+    y_scale_limits=(-0.02, 0.02),
+    fix_diameter=0.05,
+    fixation_radius=None,
+    reward_interval=2.0,
+    raspi=False,
+    daq_address=0,
+    daq_module_name="piplates.DAQC2plate",
+    pump_pin=0,
+    pump_pulse_time_seconds=0.25,
+    video_files=(),
+    video_size=(100, 100),
+    clip_duration_seconds=5.0,
+    frame_rate=30.0,
+    seek_timeout_seconds=30.0,
+    video_buffer_megabytes=DEFAULT_BUFFER_BYTES / (1024 * 1024),
+    ffprobe_bin="ffprobe",
+    seed=None,
+    sync_bar=None,
+    sync_pin=18,
 ) -> Path:
-    resolved_config_name = str(config_name or "calibrate_eye_tracker")
-    output_root = Path(output_dir)
-    output_root.mkdir(parents=True, exist_ok=True)
-
-    session_logs = SessionLogBundle(
-        output_root=output_root,
-        task_name="calibrate_eye_tracker",
-        config_name=resolved_config_name,
-        auto_flush=False,
-    )
-    logger = session_logs.event_logger
-    msg_logger = session_logs.message_logger
-    msg_logger.log("INFO", f"session_start task=calibrate_eye_tracker config_name={resolved_config_name}")
-
-    main_win = None
-    exp_win = None
-    tracker = None
-    gpio_chip = None
-    lgpio_module = None
-    calibration_path = session_logs.calibration_path
-
-    calibration = initial_calibration or EyeCalibration()
-    daq_config = daq_config or DAQC2AnalogConfig()
+    uart_config = uart_config or UARTEyeTrackerConfig()
     filter_config = filter_config or EyeFilterConfig()
-    fixation_window_diameter = max(0.0, float(fix_diameter))
-    fixation_accept_fraction = float(fix_accept_percent)
-    if fixation_accept_fraction > 1.0:
-        fixation_accept_fraction = fixation_accept_fraction / 100.0
-    fixation_accept_fraction = max(0.0, min(1.0, fixation_accept_fraction))
-    fixation_accept_time_s = max(0.0, float(fix_accept_time))
-    fixation_fraction = [0.0, 0.0]
+    calibration = initial_calibration or EyeCalibration()
+    for name, value in (
+        ("fix_diameter", fix_diameter),
+        ("pump_pulse_time_seconds", pump_pulse_time_seconds),
+    ):
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be finite and nonnegative")
+    if not math.isfinite(reward_interval) or reward_interval <= 0:
+        raise ValueError("reward_interval must be positive and finite")
+    if reward_interval <= pump_pulse_time_seconds:
+        raise ValueError("reward_interval must be longer than pump_pulse_time_seconds")
+    # Legacy diameter configs retain their physical acceptance window.
+    fixation_radius = float(fix_diameter) / 2 if fixation_radius is None else float(fixation_radius)
+    pump_control = PumpPulseControl(
+        pump_pulse_time_seconds, reward_interval=reward_interval,
+        fixation_radius=fixation_radius, boundary="update", interval_label="Fix interval",
+    )
+    for limits in (x_scale_limits, y_scale_limits):
+        if (
+            len(limits) != 2
+            or not all(math.isfinite(v) for v in limits)
+            or not limits[0] < limits[1]
+        ):
+            raise ValueError(
+                "Scale limits must contain two finite numbers in increasing order"
+            )
+    if not all(math.isfinite(value) for value in asdict(calibration).values()):
+        raise ValueError("Calibration values must be finite")
+    # An automatic fit may exceed the original manual slider range. Reopening
+    # that calibration must preserve it and keep both gains reachable.
+    x_scale_limits = (min(x_scale_limits[0], calibration.x_gain), max(x_scale_limits[1], calibration.x_gain))
+    y_scale_limits = (min(y_scale_limits[0], calibration.y_gain), max(y_scale_limits[1], calibration.y_gain))
+    point_fit = AffineCalibrationFit(calibration)
+    point_anchors = []
+    videos = CalibrationVideoClips(
+        video_files=video_files, video_size=video_size,
+        clip_duration_seconds=clip_duration_seconds, frame_rate=frame_rate,
+        seek_timeout_seconds=seek_timeout_seconds, video_buffer_megabytes=video_buffer_megabytes,
+        ffprobe_bin=ffprobe_bin, seed=seed, raspi=raspi,
+    )
+
+    # Validate DOUT addressing even in simulation, so a legacy GPIO pin (17)
+    # cannot silently become an invalid plate output when the rig is enabled.
+    outputs = DAQC2DigitalOutputs(
+        address=daq_address, module_name=daq_module_name, enabled=raspi
+    )
+    pump_pin = outputs.validate_bit(pump_pin)
+    session_logs = SessionLogBundle(
+        output_root=Path(output_dir),
+        task_name="calibrate_eye_tracker",
+        config_name=config_name,
+        auto_flush=False,
+        live_settings=pump_control.settings if pump_control is not None else None,
+    )
+    logger, msg_logger = session_logs.event_logger, session_logs.message_logger
+    main_win = preview = tracker = None
+    output_opened = False
+    fixation = (0.0, 0.0)
+    auto_reward = None
+    last_revision = last_zero_count = 0
+    last_delete_count = 0
+    last_control_gains = (calibration.x_gain, calibration.y_gain)
+    last_attention_count = 0
+    last_auto_reward_count = 0
+    last_video_toggle_count = 0
+    video_publisher = video_stim = None
+    video_sequence = video_clip_number = 0
+    last_video_error = None
+    status = ""
+    attention_started_s = None
+    last_error = None
     latest_state = None
+    gain_anchor_px = initial_gain_anchor_px
+    exit_requested = False
+    interrupted_error = None
+
+    def save_calibration(path, *, error=None):
+        # This is called only after setup has produced a sample, or on normal
+        # exit. Geometry and calibration both belong to the main process, so
+        # an aborted preview cannot prevent recovering the applied settings.
+        payload = calibration_payload(
+            calibration,
+            uart_config=uart_config,
+            filter_config=filter_config,
+            main_screen_size=subject_size,
+            fixation_fraction=fixation,
+            latest_state=latest_state,
+        )
+        payload["eye_tracker_calibration"].update(
+            {
+                "saved_at": datetime.now().isoformat(timespec="seconds"),
+                "main_native_size_px": list(main_size),
+                "main_rotation_deg": rotation,
+                "gain_anchor_px": gain_anchor_px,
+                "calibration_points": [asdict(point) for point in point_fit.points],
+                "completion_status": "interrupted" if error else "complete",
+                "fixation_acceptance": {
+                    "fix_diameter": 2 * fixation_radius,
+                    "fixation_radius": fixation_radius,
+                    "radius_units": "fraction_of_shorter_subject_scene_dimension",
+                    "reward_interval": reward_interval,
+                    "recent_duration_s": CalibrationAutoReward.RECENT_SECONDS,
+                    "recent_fraction_threshold": CalibrationAutoReward.RECENT_THRESHOLD,
+                    "interval_fraction_threshold": CalibrationAutoReward.INTERVAL_THRESHOLD,
+                    "threshold_comparison": "strictly_greater",
+                    "fraction_basis": "time",
+                    "window_mode": "rolling",
+                    "reset_on_reward": True,
+                    "diameter_units": "fraction_of_shorter_subject_scene_dimension",
+                },
+            }
+        )
+        if error:
+            payload["eye_tracker_calibration"]["interruption_error"] = error
+        temporary = path.with_name(f".{path.name}.tmp")
+        temporary.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        temporary.replace(path)
+        msg_logger.log("INFO", f"eye_calibration_saved path={path}")
+
+    def observe_eye_state(state):
+        # Acquisition can start before display geometry and reward gating exist.
+        if auto_reward is not None:
+            auto_reward.observe(state)
 
     try:
+        outputs.open()
+        output_opened = True
+        outputs.write(pump_pin, False)
+        msg_logger.log(
+            "INFO",
+            f"DAQC2 reward address={daq_address} pump_dout={pump_pin} enabled={int(raspi)}",
+        )
+        tracker = UARTEyeTracker(
+            uart_config=uart_config, filter_config=filter_config,
+            on_state=observe_eye_state,
+            task_clock=session_logs.session_clock,
+            block_id=session_logs.identity["block_id"],
+        )
+        tracker.start()
+        msg_logger.log(
+            "INFO",
+            f"eye_uart_started eye_id=0 config={asdict(uart_config)} filter={asdict(filter_config)}",
+        )
         main_win, main_screen, experimenter_screen = utils.setup_task_window(
             screen_config,
             bg_rgb_255=bg,
@@ -423,534 +325,426 @@ def run_task(
             allow_same_screen=False,
         )
         if experimenter_screen is None:
-            raise RuntimeError("calibrate_eye_tracker requires a configured or detected experimenter screen")
+            raise RuntimeError(
+                "Eye calibration requires a separate experimenter screen for its controls"
+            )
         msg_logger.log(
             "INFO",
             f"resolved_screens main={describe_screen(main_screen)} experimenter={describe_screen(experimenter_screen)}",
         )
-
-        exp_win = utils.setup_window(
-            bg_rgb_255=(30, 30, 30),
+        set_window_mouse_visible(main_win, False)
+        # Use the same realized scene and software rotation as active_foraging,
+        # including windowed mode. Fractions refer to what the subject sees.
+        main_size = resolve_scene_size(
+            main_screen,
             fullscreen=fullscreen,
-            size=experimenter_win_size,
-            screen_info=experimenter_screen,
-            sync_to_refresh=False,
+            requested_size=win_size,
+            realized_size=tuple(main_win.size),
+        )
+        rotation = software_stimulus_rotation(main_screen.rotation)
+        subject_size = oriented_size(main_size, rotation)
+        preview = ExperimenterPreview(
+            experimenter_screen,
+            task_label=config_name,
+            pump_control=pump_control,
+            update_interval_s=0.05,
+            calibration_config={
+                "subject_size": subject_size,
+                "bg": bg,
+                "fixation_color": fixation_color,
+                "fixation_cross_size": fixation_cross_size,
+                "fixation_cross_weight": fixation_cross_weight,
+                "calibration": asdict(calibration),
+                "x_scale_limits": x_scale_limits,
+                "y_scale_limits": y_scale_limits,
+                "video_size": video_size,
+            },
         )
         utils.verify_task_window_vblank(main_win)
+        _, sync_frame_duration_s = utils.resolve_frame_rate(
+            main_win, None, msg_logger=msg_logger, context="calibrate_eye_tracker",
+        )
+        utils.configure_sync_bar(
+            main_win, sync_bar, sync_pin=sync_pin, event_logger=logger,
+            experimenter_preview=preview, rotation_degrees=rotation,
+            frame_duration_s=sync_frame_duration_s, msg_logger=msg_logger,
+        )
         pylogging.console.setLevel(pylogging.CRITICAL)
-        try:
-            main_win.mouseVisible = False
-        except Exception:
-            pass
-
-        main_size = _real_screen_size(main_screen, tuple(main_win.size))
-        exp_size = resolve_scene_size(
-            experimenter_screen,
-            fullscreen=bool(fullscreen),
-            requested_size=experimenter_win_size,
-            realized_size=tuple(exp_win.size),
-        )
-        layout = _compute_preview_layout(exp_size, main_size)
-        box_center = layout["box_center"]
-        box_size = layout["box_size"]
         msg_logger.log(
             "INFO",
-            (
-                f"eye_calibration_geometry main_size={main_size[0]}x{main_size[1]} "
-                f"experimenter_size={exp_size[0]}x{exp_size[1]} "
-                f"preview_box_center=({box_center[0]:.1f},{box_center[1]:.1f}) "
-                f"preview_box_size=({box_size[0]:.1f},{box_size[1]:.1f})"
-            ),
+            f"calibration_geometry native={main_size} subject={subject_size} rotation={rotation}",
         )
-        msg_logger.log(
-            "INFO",
-            (
-                f"fixation_acceptance fix_diameter={fixation_window_diameter:.9f} "
-                f"fix_accept_percent={fixation_accept_fraction:.6f} "
-                f"fix_accept_time={fixation_accept_time_s:.6f}"
-            ),
+        auto_reward = CalibrationAutoReward(
+            reward_interval=reward_interval, calibration=calibration,
+            fixation=fixation, screen_size=subject_size, fixation_radius=fixation_radius,
+            max_sample_age_s=uart_config.max_sample_age_s,
         )
-
-        tracker = AnalogEyeTracker(
-            daq_config=daq_config,
-            calibration=calibration,
-            filter_config=filter_config,
-        )
-        tracker.start()
-        msg_logger.log(
-            "INFO",
-            (
-                f"daq_sampler_started address={daq_config.address} "
-                f"x_channel={daq_config.x_channel} y_channel={daq_config.y_channel} "
-                f"sample_rate_hz={float(daq_config.sample_rate_hz):.3f} "
-                f"ema_gamma={float(filter_config.ema_gamma):.6f} "
-                f"simulate={int(daq_config.simulate)}"
-            ),
-        )
-
-        lgpio_module, gpio_chip = _open_pump_gpio(bool(raspi), int(pump_pin), msg_logger)
-
         main_bg = utils.make_bg_rect(main_win, bg)
-        exp_bg = utils.make_bg_rect(exp_win, (30, 30, 30))
-        preview_box = visual.Rect(
-            exp_win,
-            width=box_size[0],
-            height=box_size[1],
-            pos=box_center,
-            fillColor=utils.rgb255_to_psychopy(bg),
-            fillColorSpace="rgb",
-            lineColor=utils.rgb255_to_psychopy((150, 150, 150)),
-            lineColorSpace="rgb",
-            lineWidth=2,
-            units="pix",
-        )
-        main_cross = _make_fixation_cross(
+        cross = _make_fixation_cross(
             main_win,
             size=fixation_cross_size,
             weight=fixation_cross_weight,
             color_rgb=fixation_color,
         )
-        exp_cross = _make_fixation_cross(
-            exp_win,
-            size=max(6.0, float(fixation_cross_size) * (float(box_size[0]) / max(float(main_size[0]), 1.0))),
-            weight=max(2.0, float(fixation_cross_weight) * (float(box_size[0]) / max(float(main_size[0]), 1.0))),
-            color_rgb=fixation_color,
-        )
-        eye_dot = visual.Circle(
-            exp_win,
-            radius=max(4.0, min(float(exp_size[0]), float(exp_size[1])) * 0.008),
-            fillColor=utils.rgb255_to_psychopy((40, 120, 255)),
-            fillColorSpace="rgb",
-            lineColor=utils.rgb255_to_psychopy((255, 255, 255)),
-            lineColorSpace="rgb",
-            units="pix",
+        for part in cross:
+            part.ori = rotation
+        calibration_dot = visual.Circle(
+            main_win, radius=5, fillColor=(1, -1, -1), lineColor=None,
+            units="pix", autoLog=False,
         )
 
-        exp_w, exp_h = max(float(exp_size[0]), 1.0), max(float(exp_size[1]), 1.0)
-        screen_left = -exp_w * 0.5
-        screen_right = exp_w * 0.5
-        screen_top = exp_h * 0.5
-        screen_bottom = -exp_h * 0.5
-        box_left = float(layout["box_left"])
-        box_top = float(layout["box_top"])
-        box_bottom = float(layout["box_bottom"])
-        left_margin = float(layout["left_margin"])
-        right_margin = float(layout["right_margin"])
-        top_margin = float(layout["top_margin"])
-        bottom_margin = float(layout["bottom_margin"])
-        control_margin = max(12.0, min(exp_w, exp_h) * 0.018)
-
-        button_w = max(68.0, min(150.0, exp_w * 0.08))
-        button_h = max(42.0, min(66.0, exp_h * 0.07))
-        if left_margin >= button_w + (2.0 * control_margin) and right_margin >= button_w + (2.0 * control_margin):
-            reward_pos = (screen_left + (left_margin * 0.5), screen_top - control_margin - (button_h * 0.5))
-            exit_pos = (screen_right - (right_margin * 0.5), screen_top - control_margin - (button_h * 0.5))
-            zero_pos = (screen_left + (left_margin * 0.5), screen_bottom + control_margin + 26.0)
-        elif top_margin >= button_h + (2.0 * control_margin):
-            y_pos = box_top + (top_margin * 0.5)
-            reward_pos = (screen_left + control_margin + (button_w * 0.5), y_pos)
-            exit_pos = (screen_right - control_margin - (button_w * 0.5), y_pos)
-            zero_pos = (screen_left + control_margin + 26.0, screen_bottom + control_margin + 26.0)
-        elif bottom_margin >= button_h + (2.0 * control_margin):
-            y_pos = screen_bottom + (bottom_margin * 0.5)
-            reward_pos = (screen_left + control_margin + (button_w * 0.5), y_pos)
-            exit_pos = (screen_right - control_margin - (button_w * 0.5), y_pos)
-            zero_pos = (screen_left + control_margin + 26.0, y_pos)
-        else:
-            reward_pos = (screen_left + control_margin + (button_w * 0.5), screen_top - control_margin - (button_h * 0.5))
-            exit_pos = (screen_right - control_margin - (button_w * 0.5), screen_top - control_margin - (button_h * 0.5))
-            zero_pos = (screen_left + control_margin + 26.0, screen_bottom + control_margin + 26.0)
-
-        if bottom_margin >= 74.0:
-            x_slider_pos = (box_center[0], screen_bottom + (bottom_margin * 0.5))
-        else:
-            x_slider_pos = (box_center[0], box_bottom + 34.0)
-        if left_margin >= 82.0:
-            y_slider_pos = (screen_left + (left_margin * 0.5), box_center[1])
-        else:
-            y_slider_pos = (box_left + 38.0, box_center[1])
-        if top_margin >= 36.0:
-            status_pos = (box_center[0], box_top + (top_margin * 0.5))
-        elif bottom_margin >= 36.0:
-            status_pos = (box_center[0], screen_bottom + (bottom_margin * 0.5))
-        else:
-            status_pos = (box_center[0], screen_top - button_h - 28.0)
-
-        reward_button = _make_button(
-            exp_win,
-            text="reward",
-            pos=reward_pos,
-            size=(button_w, button_h),
-            color_rgb=(50, 150, 80),
-        )
-        exit_button = _make_button(
-            exp_win,
-            text="exit",
-            pos=exit_pos,
-            size=(button_w, button_h),
-            color_rgb=(200, 55, 55),
-        )
-        zero_button = _make_button(
-            exp_win,
-            text="x",
-            pos=zero_pos,
-            size=(52.0, 52.0),
-            color_rgb=(75, 75, 75),
-        )
-
-        x_slider = Slider(
-            exp_win,
-            orientation="horizontal",
-            pos=x_slider_pos,
-            length=box_size[0],
-            value_min=x_scale_limits[0],
-            value_max=x_scale_limits[1],
-            value=calibration.x_scale,
-            label="x scale",
-        )
-        y_slider = Slider(
-            exp_win,
-            orientation="vertical",
-            pos=y_slider_pos,
-            length=box_size[1],
-            value_min=y_scale_limits[0],
-            value_max=y_scale_limits[1],
-            value=calibration.y_scale,
-            label="y scale",
-        )
-        status_text = visual.TextStim(
-            exp_win,
-            text="",
-            units="pix",
-            height=18.0,
-            pos=status_pos,
-            color=utils.rgb255_to_psychopy((245, 245, 245)),
-            colorSpace="rgb",
-        )
-
-        mouse = event.Mouse(win=exp_win)
-        last_mouse_down = False
-        dragging_slider: Optional[Slider] = None
-        reward_cooldown_until_s = 0.0
-        last_sample_error = None
-        exit_requested = False
-        fixation_history = deque()
-        auto_reward_armed = True
-        last_fix_acceptance = 0.0
-
-        while not exit_requested:
-            if event.getKeys(["escape"]):
-                msg_logger.log("INFO", "exit_requested_by_escape")
-                break
-
-            latest_state = tracker.get_state()
-            if latest_state.error and latest_state.error != last_sample_error:
-                msg_logger.log("WARN", f"daq_sample_error sample_index={latest_state.sample_index} error={latest_state.error}")
-                last_sample_error = latest_state.error
-            elif latest_state.error is None and last_sample_error is not None:
-                msg_logger.log("INFO", "daq_sample_error_cleared")
-                last_sample_error = None
-
-            calibration = tracker.update_calibration(
-                x_scale=float(x_slider.value),
-                y_scale=float(y_slider.value),
+        def should_exit():
+            nonlocal exit_requested
+            exit_requested = (
+                exit_requested or preview.poll() or bool(event.getKeys(["escape"]))
             )
-            eye_fraction = calibration.map_voltages(
-                latest_state.x_smooth_voltage,
-                latest_state.y_smooth_voltage,
-            )
-            main_fix_pos = fraction_to_pixels(fixation_fraction, main_size)
-            exp_fix_pos = _fraction_to_preview(fixation_fraction, box_center=box_center, box_size=box_size)
-            exp_eye_pos = _fraction_to_preview(eye_fraction, box_center=box_center, box_size=box_size)
-            now_s = time.perf_counter()
-            eye_in_fix_window = fraction_position_within_diameter(
-                eye_fraction,
-                fixation_fraction,
-                diameter_fraction=fixation_window_diameter,
-                screen_size=main_size,
-            )
-            fixation_history.append((now_s, bool(eye_in_fix_window)))
-            cutoff_s = now_s - fixation_accept_time_s
-            while len(fixation_history) > 1 and fixation_history[1][0] <= cutoff_s:
-                fixation_history.popleft()
-            if fixation_history and fixation_accept_time_s > 0.0:
-                window_age_s = fixation_history[-1][0] - fixation_history[0][0]
-                fixation_sample_count = len(fixation_history)
-                fixation_hit_count = sum(1 for _sample_s, in_window in fixation_history if in_window)
-                last_fix_acceptance = fixation_hit_count / float(fixation_sample_count)
-                fixation_window_ready = window_age_s >= fixation_accept_time_s
+            return exit_requested
+
+        def draw_scene():
+            nonlocal video_stim, video_publisher, video_sequence, video_clip_number
+            position = rotate_centered_point(fraction_to_pixels(fixation, subject_size), rotation)
+            frame = videos.frame()
+            main_bg.draw()
+            if videos.enabled:
+                if video_stim is None:
+                    video_stim = make_rgb_video_stim(main_win, video_size, rotation=rotation)
+                    video_publisher = SharedVideoFrameBuffer(video_size[0] * video_size[1] * 3)
+                if frame is not None and frame.sequence != video_sequence:
+                    upload_rgb_texture(video_stim, frame.rgb)
+                    video_publisher.publish_rgb(
+                        frame.rgb, source_frame_index=frame.source_frame_index,
+                        source_media_time_s=frame.source_pts_s,
+                    )
+                    video_sequence = frame.sequence
+                    if frame.clip_number != video_clip_number:
+                        video_clip_number = frame.clip_number
+                        msg_logger.log(
+                            "INFO", f"calibration_video clip={frame.clip_number} file={frame.path} "
+                            f"source_pts_s={frame.source_pts_s:.6f} duration_s={clip_duration_seconds}",
+                        )
+                video_stim.pos = position
+                video_stim.draw()
             else:
-                fixation_sample_count = 0
-                fixation_hit_count = 0
-                last_fix_acceptance = 0.0
-                fixation_window_ready = False
-            fixation_accepted = fixation_window_ready and last_fix_acceptance >= fixation_accept_fraction
-            if fixation_accepted and auto_reward_armed and now_s >= reward_cooldown_until_s:
-                reward_cooldown_until_s = _deliver_reward_pulse(
-                    lgpio_module=lgpio_module,
-                    gpio_chip=gpio_chip,
-                    pump_pin=int(pump_pin),
-                    pulse_duration_s=float(pump_pulse_time_seconds),
-                    logger=logger,
-                    msg_logger=msg_logger,
+                _draw_fixation_cross(cross, position, attention_started_s=attention_started_s)
+            for point in point_fit.points:
+                calibration_dot.pos = rotate_centered_point(
+                    fraction_to_pixels(point.target_fraction, subject_size), rotation,
                 )
-                auto_reward_armed = False
+                calibration_dot.draw()
+            main_win.flip()
+            preview.show_calibration_state(
+                eye_fraction=eye_fraction, eye_valid=latest_state.valid,
+                status_text=status, attention_started_s=attention_started_s,
+                video_visible=videos.enabled,
+                video_descriptor=video_publisher.descriptor() if video_publisher else None,
+                video_sequence=video_publisher.sequence if video_publisher else 0,
+                calibration_points=[point.target_fraction for point in point_fit.points],
+            )
+
+        def apply_reward_settings(values, timestamp_ns):
+            return auto_reward.try_configure(
+                reward_interval=values["reward_interval"], fixation_radius=values["fixation_radius"],
+                now_s=timestamp_ns / 1e9,
+            ) is not None
+
+        def reward():
+            pulse_duration_s = pump_control.settings.values["pump_pulse_time"]
+            auto_reward.reward_delivered(now_s=time.perf_counter())
+            _deliver_reward_pulse(
+                outputs=outputs,
+                pump_pin=pump_pin,
+                pulse_duration_s=pulse_duration_s,
+                logger=logger,
+                should_exit=should_exit,
+                # Keep the attention movie moving during the software-timed
+                # pulse; the UART observation worker is already independent.
+                on_wait=draw_scene if videos.enabled else None,
+                sync_window=main_win,
+            )
+            # The UART callback builds fresh history during the pulse, after
+            # the reset at onset. Keep those new samples for the next reward.
+
+        while not should_exit():
+            # UI edits are polled only between pulses, without waiting for the
+            # preview. A changed interval/radius starts fresh fixation history.
+            values = pump_control.settings.apply_pending(msg_logger, on_apply=apply_reward_settings)
+            reward_interval, fixation_radius = values["reward_interval"], values["fixation_radius"]
+            latest_state = tracker.get_state()
+            if gain_anchor_px is None and latest_state.valid:
+                # Hold one reference throughout slider drags. Capturing a point
+                # replaces it; moving the fixation target must not replace it.
+                gain_anchor_px = latest_state.smoothed_position
+            if latest_state.error != last_error:
+                msg_logger.log(
+                    "WARN" if latest_state.error else "INFO",
+                    f"eye_uart_error={latest_state.error or 'cleared'}",
+                )
+                last_error = latest_state.error
+            controls = preview.get_calibration_controls()
+            # Each window owns its keyboard events. Merge subject-window keys
+            # with the preview's requests before applying any action, so both
+            # focus paths share point capture, attention and reward behavior. Gain and
+            # target steps go to the UI owner and return as a normal revision.
+            main_keys = event.getKeys(CALIBRATION_KEYS)
+            x_steps = main_keys.count("right") - main_keys.count("left")
+            y_steps = main_keys.count("up") - main_keys.count("down")
+            if x_steps or y_steps:
+                preview.request_calibration_scale_steps(
+                    x_steps=x_steps, y_steps=y_steps
+                )
+            fix_x_steps, fix_y_steps = fixation_key_steps(main_keys)
+            if fix_x_steps or fix_y_steps:
+                preview.request_calibration_fixation_steps(
+                    x_steps=fix_x_steps, y_steps=fix_y_steps
+                )
+            video_count = int(controls.get("video_toggle_count", 0))
+            toggles = max(main_keys.count("v"), video_count - last_video_toggle_count)
+            last_video_toggle_count = video_count
+            if toggles % 2:
+                enabled = videos.toggle()
+                msg_logger.log("INFO", f"calibration_video enabled={int(enabled)}")
+            attention_count = controls.get("attention_count", 0)
+            attention_requested = (
+                "f" in main_keys or attention_count != last_attention_count
+            )
+            last_attention_count = attention_count
+            controls_changed = controls["revision"] != last_revision
+            delete_count = int(controls.get("delete_count", 0))
+            main_point_actions = [
+                {"action": "add" if key == "z" else "delete"}
+                for key in main_keys if key in ("z", "delete", "backspace")
+            ]
+            if "point_actions" in controls:
+                # Preview events carry the target at keypress time. The queue
+                # preserves Delete/Z ordering even when several keys arrive
+                # between polls, or the live target has since moved.
+                point_actions = [*controls["point_actions"], *main_point_actions]
+            else:
+                # Accept older control snapshots without double-counting a key
+                # reported by both focus paths. Current previews use the queue.
+                extra_adds = max(0, int(controls["zero_count"]) - last_zero_count - main_keys.count("z"))
+                extra_deletes = max(0, delete_count - last_delete_count - main_keys.count("delete") - main_keys.count("backspace"))
+                point_actions = (
+                    [{"action": "add"}] * extra_adds
+                    + [{"action": "delete"}] * extra_deletes
+                    + main_point_actions
+                )
+            if controls_changed or point_actions:
+                if controls_changed:
+                    gains = (controls["x_scale"], controls["y_scale"])
+                    if gains != last_control_gains:
+                        calibration.set_gains(
+                            x_scale=gains[0], y_scale=gains[1],
+                            anchor_px=gain_anchor_px or (0.0, 0.0),
+                        )
+                    last_control_gains = gains
+                    fixation = (controls["fix_x"], controls["fix_y"])
+                points_changed = False
+                for action in point_actions:
+                    if action["action"] == "add":
+                        if latest_state.valid:
+                            point_anchors.append(gain_anchor_px)
+                            point_fit.add_point(
+                                raw_px=latest_state.smoothed_position,
+                                target_fraction=action.get("target_fraction", fixation),
+                            )
+                            gain_anchor_px = latest_state.smoothed_position
+                            points_changed = True
+                        else:
+                            msg_logger.log(
+                                "WARN", "calibration_point_ignored: Eye 0 sample is invalid"
+                            )
+                    elif action["action"] == "delete" and point_fit.remove_last_point() is not None:
+                        gain_anchor_px = point_anchors.pop()
+                        points_changed = True
+                if points_changed:
+                    last_control_gains = (calibration.x_gain, calibration.y_gain)
+                    preview.set_calibration_gains(
+                        x_scale=calibration.x_gain, y_scale=calibration.y_gain,
+                    )
+                last_revision, last_zero_count = (
+                    controls["revision"],
+                    controls["zero_count"],
+                )
+                last_delete_count = delete_count
+                auto_reward.set_mapping(calibration, fixation, now_s=time.perf_counter())
                 msg_logger.log(
                     "INFO",
-                    (
-                        f"auto_fixation_reward acceptance={last_fix_acceptance:.6f} "
-                        f"hits={fixation_hit_count} samples={fixation_sample_count} "
-                        f"fix_x_fraction={fixation_fraction[0]:.9f} fix_y_fraction={fixation_fraction[1]:.9f}"
-                    ),
+                    f"calibration_controls fixation={fixation} calibration={asdict(calibration)}",
                 )
-            elif not eye_in_fix_window and not fixation_accepted:
-                auto_reward_armed = True
-
-            try:
-                mouse_down = bool(mouse.getPressed()[0])
-            except Exception:
-                mouse_down = False
-            mouse_pos = mouse.getPos()
-
-            if mouse_down:
-                if not last_mouse_down:
-                    if exit_button[0].contains(mouse_pos):
-                        msg_logger.log("INFO", "exit_requested_by_button")
-                        exit_requested = True
-                    elif reward_button[0].contains(mouse_pos):
-                        if now_s >= reward_cooldown_until_s:
-                            reward_cooldown_until_s = _deliver_reward_pulse(
-                                lgpio_module=lgpio_module,
-                                gpio_chip=gpio_chip,
-                                pump_pin=int(pump_pin),
-                                pulse_duration_s=float(pump_pulse_time_seconds),
-                                logger=logger,
-                                msg_logger=msg_logger,
-                            )
-                    elif zero_button[0].contains(mouse_pos):
-                        calibration = tracker.set_offsets_for_fixation(fixation_fraction, state=latest_state)
-                        fixation_history.clear()
-                        auto_reward_armed = True
-                        last_fix_acceptance = 0.0
-                        msg_logger.log(
-                            "INFO",
-                            (
-                                f"eye_calibration_offset_set x_offset={calibration.x_offset:.9f} "
-                                f"y_offset={calibration.y_offset:.9f} "
-                                f"x_smooth_voltage={latest_state.x_smooth_voltage:.6f} "
-                                f"y_smooth_voltage={latest_state.y_smooth_voltage:.6f}"
-                            ),
-                        )
-                    elif x_slider.contains(mouse_pos):
-                        dragging_slider = x_slider
-                        dragging_slider.set_from_pos(mouse_pos)
-                        fixation_history.clear()
-                        auto_reward_armed = True
-                        last_fix_acceptance = 0.0
-                    elif y_slider.contains(mouse_pos):
-                        dragging_slider = y_slider
-                        dragging_slider.set_from_pos(mouse_pos)
-                        fixation_history.clear()
-                        auto_reward_armed = True
-                        last_fix_acceptance = 0.0
-                    elif preview_box.contains(mouse_pos):
-                        fx, fy = _preview_to_fraction(mouse_pos, box_center=box_center, box_size=box_size)
-                        fixation_fraction = [fx, fy]
-                        fixation_history.clear()
-                        auto_reward_armed = True
-                        last_fix_acceptance = 0.0
-                        msg_logger.log("INFO", f"fixation_position_set x_fraction={fx:.9f} y_fraction={fy:.9f}")
-                elif dragging_slider is not None:
-                    dragging_slider.set_from_pos(mouse_pos)
-                    fixation_history.clear()
-                    auto_reward_armed = True
-                    last_fix_acceptance = 0.0
-            else:
-                dragging_slider = None
-            last_mouse_down = mouse_down
-
-            main_bg.draw()
-            _draw_fixation_cross(main_cross, main_fix_pos)
-
-            exp_bg.draw()
-            preview_box.draw()
-            _draw_fixation_cross(exp_cross, exp_fix_pos)
-            eye_dot.pos = exp_eye_pos
-            eye_dot.draw()
-            x_slider.draw()
-            y_slider.draw()
-            _draw_button(reward_button)
-            _draw_button(exit_button)
-            _draw_button(zero_button)
-            status_text.text = (
-                f"eye ({latest_state.x_smooth_voltage:.3f} V, {latest_state.y_smooth_voltage:.3f} V)  "
-                f"mapped ({eye_fraction[0]:.4f}, {eye_fraction[1]:.4f})  "
-                f"fix {last_fix_acceptance * 100.0:.1f}%"
+            eye_fraction = calibration.map_position(*latest_state.smoothed_position)
+            in_window = latest_state.valid and fraction_position_within_diameter(
+                eye_fraction,
+                fixation,
+                diameter_fraction=2 * fixation_radius,
+                screen_size=subject_size,
             )
-            if latest_state.last_rejected:
-                status_text.text += f"  rejected {latest_state.rejection_reason}"
-            elif latest_state.error:
-                status_text.text += "  daq error"
-            status_text.draw()
+            auto_count = int(controls.get("auto_reward_count", 0))
+            toggle_count = max(main_keys.count("a"), auto_count - last_auto_reward_count)
+            last_auto_reward_count = auto_count
+            if toggle_count % 2:
+                enabled = auto_reward.toggle(now_s=time.perf_counter())
+                msg_logger.log(
+                    "INFO", f"auto_reward enabled={int(enabled)} reward_interval={reward_interval}"
+                )
+            auto_status = auto_reward.status(now_s=time.perf_counter())
+            # Drain both sources every frame; simultaneous requests produce
+            # one pulse rather than leaving a second queued keyboard reward.
+            manual_reward = preview.consume_manual_reward_request() or "r" in main_keys
+            if manual_reward or (auto_status.due and in_window):
+                msg_logger.log(
+                    "INFO",
+                    f"reward source={'manual' if manual_reward else 'auto'} "
+                    f"fixation_recent={auto_status.recent_fraction:.6f} "
+                    f"fixation_interval={auto_status.interval_fraction:.6f}",
+                )
+                reward()
+            if attention_requested:
+                # Start with the next draw (after any reward pulse). A fresh F
+                # request restarts the one-second cue rather than queuing it.
+                attention_started_s = time.perf_counter()
+                msg_logger.log(
+                    "INFO", "fixation_attention duration_s=1 frequency_hz=7 scale=2 colors=rainbow"
+                )
+            status = (
+                f"Eye 0 ({latest_state.x_smooth_px:.2f}, {latest_state.y_smooth_px:.2f}) px  "
+                f"auto {'ON' if auto_status.enabled else 'OFF'} (A)\n"
+                f"fix 100ms: {auto_status.recent_fraction * 100:.1f}%  "
+                f"{reward_interval:g}s: {auto_status.interval_fraction * 100:.1f}%"
+            )
+            if not latest_state.valid:
+                status += f"\n{latest_state.error or latest_state.rejection_reason}"
+            if not raspi:
+                status += "\nReward output disabled (raspi: false)"
+            status += f"\nVideo {'ON' if videos.enabled else 'OFF'} (V)"
+            status += f"\nCalibration points: {len(point_fit.points)} (Z add, Delete undo)"
+            if videos.error:
+                status += f": {videos.error}"
+            if videos.error != last_video_error:
+                last_video_error = videos.error
+                if last_video_error:
+                    msg_logger.log("WARN", f"calibration_video_error: {last_video_error}")
+            draw_scene()
 
-            main_win.flip()
-            exp_win.flip()
-
-        calibration = tracker.get_calibration()
-        payload = calibration_payload(
-            calibration,
-            daq_config=daq_config,
-            filter_config=filter_config,
-            main_screen_size=main_size,
-            fixation_fraction=fixation_fraction,
-            latest_state=latest_state,
-        )
-        eye_tracker_calibration = payload["eye_tracker_calibration"]
-        eye_tracker_calibration["saved_at"] = datetime.now().isoformat(timespec="seconds")
-        eye_tracker_calibration["fixation_acceptance"] = {
-            "fix_diameter": fixation_window_diameter,
-            "fix_accept_percent": fixation_accept_fraction,
-            "fix_accept_time": fixation_accept_time_s,
-            "diameter_units": "fraction_of_shorter_main_screen_dimension",
-        }
-        calibration_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        msg_logger.log("INFO", f"eye_calibration_saved path={calibration_path}")
-        return calibration_path
+        save_calibration(session_logs.calibration_path)
+        return session_logs.calibration_path
+    except Exception as exc:
+        interrupted_error = f"{type(exc).__name__}: {exc}"
+        raise
     finally:
+        # Reward is off before potentially slow camera/recording shutdown. Each
+        # cleanup is independent so a UART failure cannot strand either window.
+        if output_opened:
+            try:
+                outputs.write(pump_pin, False)
+            except Exception as exc:
+                msg_logger.log("ERROR", f"pump_cleanup_failed: {exc}")
+        if interrupted_error is not None and latest_state is not None:
+            # Preserve work without importing an interrupted run as a completed
+            # calibration. It can be explicitly reloaded via calibration_file.
+            try:
+                recovery_path = session_logs.calibration_path.with_name(
+                    "calibration_recovery.json"
+                )
+                save_calibration(recovery_path, error=interrupted_error)
+            except Exception as exc:
+                msg_logger.log("ERROR", f"eye_calibration_recovery_failed: {exc}")
         if tracker is not None:
-            tracker.stop()
-        if lgpio_module is not None and gpio_chip is not None:
             try:
-                lgpio_module.gpio_write(gpio_chip, int(pump_pin), 0)
-                lgpio_module.gpiochip_close(gpio_chip)
-            except Exception:
-                pass
+                tracker.stop()
+            except Exception as exc:
+                msg_logger.log("ERROR", f"eye_uart_cleanup_failed: {exc}")
         try:
-            session_logs.flush()
-            session_logs.close()
-        except Exception:
-            pass
-        if exp_win is not None:
+            videos.close()
+        except Exception as exc:
+            msg_logger.log("ERROR", f"calibration_video_cleanup_failed: {exc}")
+        try:
+            if preview is not None:
+                preview.close()
+        finally:
             try:
-                exp_win.close()
-            except Exception:
-                pass
-        if main_win is not None:
-            try:
-                utils.close_task_window(main_win)
-            except Exception:
-                pass
+                try:
+                    if video_publisher is not None:
+                        video_publisher.close()
+                finally:
+                    if main_win is not None:
+                        utils.close_task_window(main_win)
+            finally:
+                session_logs.close()
 
 
 def main():
     args = parse_args()
-    cfg: Dict[str, Any] = {}
-    if args.config:
-        cfg = load_config(args.config)
-
-    screen_config = load_screen_config(
-        cfg,
-        cli_main=args.main_screen,
-        cli_experimenter=args.experimenter_screen,
-    )
-
-    output_dir = args.output_dir if args.output_dir is not None else cfg.get("output_dir", "logs")
-    fullscreen = bool(args.fullscreen if args.fullscreen is not None else cfg.get("fullscreen", True))
-    win_size = args.win_size if args.win_size is not None else cfg.get("win_size")
-    experimenter_win_size = cfg.get("experimenter_win_size")
-    simulate_eye = bool(args.simulate_eye if args.simulate_eye is not None else _get_nested(cfg, "daq", "simulate", False))
-    raspi = bool(args.raspi if args.raspi is not None else cfg.get("raspi", False))
-
-    daq_config = DAQC2AnalogConfig(
-        address=int(_get_nested(cfg, "daq", "address", cfg.get("daq_address", 0))),
-        x_channel=int(
-            _get_nested(
-                cfg,
-                "daq",
-                "x_channel",
-                _get_nested(cfg, "daq", "eye_pos_x_channel", cfg.get("eye_pos_x_channel", 0)),
-            )
-        ),
-        y_channel=int(
-            _get_nested(
-                cfg,
-                "daq",
-                "y_channel",
-                _get_nested(cfg, "daq", "eye_pos_y_channel", cfg.get("eye_pos_y_channel", 1)),
-            )
-        ),
-        sample_rate_hz=float(_get_nested(cfg, "daq", "sample_rate_hz", 240.0)),
-        voltage_min=float(_get_nested(cfg, "daq", "voltage_min", -10.0)),
-        voltage_max=float(_get_nested(cfg, "daq", "voltage_max", 10.0)),
-        module_name=str(_get_nested(cfg, "daq", "module_name", "piplates.DAQC2plate")),
-        simulate=simulate_eye,
-    )
-    max_voltage_step = _get_nested(
-        cfg,
-        "eye_filter",
-        "max_voltage_step",
-        _get_nested(cfg, "filter", "max_voltage_step", cfg.get("blink_max_voltage_step", 8.0)),
-    )
-    filter_config = EyeFilterConfig(
-        ema_gamma=float(
-            _get_nested(
-                cfg,
-                "eye_filter",
-                "ema_gamma",
-                _get_nested(cfg, "filter", "ema_gamma", cfg.get("ema_gamma", 0.98)),
-            )
-        ),
-        reject_blink_artifacts=bool(
-            _get_nested(
-                cfg,
-                "eye_filter",
-                "reject_blink_artifacts",
-                _get_nested(cfg, "filter", "reject_blink_artifacts", cfg.get("reject_blink_artifacts", True)),
-            )
-        ),
-        max_voltage_step=None if max_voltage_step is None else float(max_voltage_step),
-    )
-
-    def _calibration_value(state_key: str, legacy_key: str, default: float) -> float:
-        value = cfg.get(state_key)
-        if value is None:
-            value = cfg.get(legacy_key, default)
-        return float(default if value is None else value)
-
-    calibration = EyeCalibration(
-        x_scale=_calibration_value("x_scale", "initial_x_scale", 0.05),
-        y_scale=_calibration_value("y_scale", "initial_y_scale", 0.05),
-        x_offset=_calibration_value("x_offset", "initial_x_offset", 0.0),
-        y_offset=_calibration_value("y_offset", "initial_y_offset", 0.0),
-    )
-
-    x_scale_limits = tuple(cfg.get("x_scale_limits", [-0.20, 0.20]))
-    y_scale_limits = tuple(cfg.get("y_scale_limits", [-0.20, 0.20]))
-    if len(x_scale_limits) != 2 or len(y_scale_limits) != 2:
-        raise ValueError("x_scale_limits and y_scale_limits must each contain two numbers")
-
+    cfg = load_config(args.config) if args.config else {}
+    daq = cfg.get("daq", {})
+    if any(
+        key in daq
+        for key in (
+            "x_channel",
+            "y_channel",
+            "voltage_min",
+            "voltage_max",
+            "sample_rate_hz",
+        )
+    ):
+        raise ValueError(
+            "Analog eye input config is obsolete; use uart and recalibrate in crop-local pixels"
+        )
+    settings = load_eye_tracking_settings(cfg, for_calibration=True)
+    # Apply CLI overrides after loading, including inherited UART settings.
+    overrides = {}
+    if args.uart_device is not None:
+        overrides["device"] = args.uart_device
+    if args.simulate_eye is not None:
+        overrides["simulate"] = args.simulate_eye
+    uart_config = replace(settings.uart, **overrides)
+    video_options = {}
+    for name, default in (
+        ("video_files", ()), ("video_size", (100, 100)), ("clip_duration_seconds", 5.0),
+        ("frame_rate", 30.0), ("seek_timeout_seconds", 30.0),
+        ("video_buffer_megabytes", DEFAULT_BUFFER_BYTES / (1024 * 1024)),
+        ("ffprobe", "ffprobe"), ("seed", None),
+    ):
+        value = getattr(args, name, None)
+        video_options["ffprobe_bin" if name == "ffprobe" else name] = (
+            value if value is not None else cfg.get(name, default)
+        )
     path = run_task(
-        output_dir=str(output_dir),
-        config_name=str(cfg.get("config_name", "calibrate_eye_tracker")),
-        fullscreen=fullscreen,
-        win_size=tuple(win_size) if win_size is not None else None,
-        experimenter_win_size=tuple(experimenter_win_size) if experimenter_win_size is not None else None,
-        screen_config=screen_config,
-        bg=_as_rgb(cfg.get("bg"), (128, 128, 128)),
-        fixation_color=_as_rgb(cfg.get("fixation_color"), (0, 0, 0)),
-        fixation_cross_size=float(cfg.get("fixation_cross_size", cfg.get("fixation_size", 40.0))),
-        fixation_cross_weight=float(cfg.get("fixation_cross_weight", 6.0)),
-        daq_config=daq_config,
-        filter_config=filter_config,
-        initial_calibration=calibration,
-        x_scale_limits=(float(x_scale_limits[0]), float(x_scale_limits[1])),
-        y_scale_limits=(float(y_scale_limits[0]), float(y_scale_limits[1])),
+        output_dir=args.output_dir or cfg.get("output_dir", "logs"),
+        config_name=cfg.get("config_name", "calibrate_eye_tracker"),
+        fullscreen=(
+            args.fullscreen
+            if args.fullscreen is not None
+            else cfg.get("fullscreen", True)
+        ),
+        win_size=args.win_size or cfg.get("win_size"),
+        screen_config=load_screen_config(
+            cfg, cli_main=args.main_screen, cli_experimenter=args.experimenter_screen
+        ),
+        bg=tuple(cfg.get("bg", (128, 128, 128))),
+        fixation_color=tuple(cfg.get("fixation_color", (0, 0, 0))),
+        fixation_cross_size=float(
+            cfg.get("fixation_cross_size", cfg.get("fixation_size", 40))
+        ),
+        fixation_cross_weight=float(cfg.get("fixation_cross_weight", 6)),
+        uart_config=uart_config,
+        filter_config=settings.filter,
+        initial_calibration=settings.calibration,
+        initial_gain_anchor_px=settings.gain_anchor_px,
+        x_scale_limits=cfg.get("x_scale_limits", (-0.02, 0.02)),
+        y_scale_limits=cfg.get("y_scale_limits", (-0.02, 0.02)),
         fix_diameter=float(cfg.get("fix_diameter", 0.05)),
-        fix_accept_percent=float(cfg.get("fix_accept_percent", 0.95)),
-        fix_accept_time=float(cfg.get("fix_accept_time", 2.0)),
-        raspi=raspi,
-        pump_pin=int(cfg.get("pump_pin", 17)),
+        fixation_radius=(None if cfg.get("fixation_radius") is None else float(cfg["fixation_radius"])),
+        reward_interval=float(cfg.get("reward_interval", cfg.get("fix_accept_time") or 2)),
+        raspi=args.raspi if args.raspi is not None else cfg.get("raspi", False),
+        daq_address=int(daq.get("address", cfg.get("daq_address", 0))),
+        daq_module_name=daq.get(
+            "module_name", cfg.get("daq_module_name", "piplates.DAQC2plate")
+        ),
+        pump_pin=int(cfg.get("pump_pin", 0)),
         pump_pulse_time_seconds=float(cfg.get("pump_pulse_time_seconds", 0.25)),
+        sync_bar=cfg.get("sync_bar"), sync_pin=cfg.get("sync_pin", 18),
+        **video_options,
     )
     print(f"Saved eye calibration to {path}")
     sys.exit(USER_EXIT_CODE)

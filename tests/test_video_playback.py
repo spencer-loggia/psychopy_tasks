@@ -1,6 +1,7 @@
 from collections import deque
 import ctypes
 import importlib.util
+import json
 import math
 from multiprocessing import shared_memory
 import queue
@@ -23,8 +24,9 @@ from bin.buffered_video import (
     copy_ffpyplayer_rgb24,
     plan_video_chunks,
 )
+from bin.eye_tracking import EyeTrackerState
+from bin.eye_tracking_config import EyeTrackingSettings
 from bin.video_playback import (
-    RandomFramePulseSchedule,
     SharedVideoFrameBuffer,
     SharedVideoFrameReader,
     center_crop_bounds,
@@ -39,6 +41,14 @@ from bin.video_playback import (
 
 
 class VideoPlaybackTests(unittest.TestCase):
+    def test_abort_checker_propagates_sync_presenter_failures(self):
+        failure = RuntimeError("sync GPIO write failed")
+        checker = Mock(side_effect=failure)
+        with self.assertRaises(RuntimeError) as raised:
+            BufferedVideoFrameStream._abort_reason(checker)
+        self.assertIs(raised.exception, failure)
+        checker.assert_called_once_with()
+
     def test_video_probe_uses_container_duration_fallback(self):
         probe_result = types.SimpleNamespace(
             stdout=(
@@ -344,6 +354,12 @@ class VideoPlaybackTests(unittest.TestCase):
         )
 
     def test_decode_worker_seeks_before_consuming_and_discards_stale_pts(self):
+        self._exercise_decode_worker((0, 0, 2, 2), "crop=2:2:0:0")
+
+    def test_decode_worker_scales_calibration_frames_before_shared_memory(self):
+        self._exercise_decode_worker((0, 0, 4, 4), "crop=4:4:0:0,scale=2:2")
+
+    def _exercise_decode_worker(self, crop_bounds, expected_filter):
         layout = plan_video_chunks(
             (2, 2),
             frame_count=3,
@@ -439,7 +455,7 @@ class VideoPlaybackTests(unittest.TestCase):
                     video_path="unused.mp4",
                     shared_memory_name=owner.name,
                     layout=layout,
-                    crop_bounds=(0, 0, 2, 2),
+                    crop_bounds=crop_bounds,
                     clip_start_s=10.0,
                     seek_timeout_s=1.0,
                     free_slots=free_slots,
@@ -479,7 +495,7 @@ class VideoPlaybackTests(unittest.TestCase):
             player_options = media_player_factory.call_args.kwargs["ff_opts"]
             self.assertEqual(
                 player_options["vf"],
-                ["crop=2:2:0:0"],
+                [expected_filter],
             )
             self.assertEqual(
                 messages,
@@ -487,7 +503,7 @@ class VideoPlaybackTests(unittest.TestCase):
                     (
                         "info",
                         {
-                            "video_filter": "crop=2:2:0:0",
+                            "video_filter": expected_filter,
                             "pixel_format": "rgb24",
                         },
                     ),
@@ -596,26 +612,6 @@ class VideoPlaybackTests(unittest.TestCase):
             "non-contiguous prepared chunk starts at 1; expected 0",
         ):
             stream.next_frame()
-
-    def test_random_frame_pulses_have_frame_locked_edges(self):
-        schedule = RandomFramePulseSchedule(
-            100,
-            300,
-            pulse_width_frames=1,
-            rng=random.Random(7),
-        )
-        edges = []
-        for frame_index in range(700):
-            edges.extend(schedule.edges_for_frame(frame_index))
-
-        on_edges = [edge for edge in edges if edge.level == 1]
-        off_edges = [edge for edge in edges if edge.level == 0]
-        self.assertGreaterEqual(len(on_edges), 2)
-        self.assertEqual(len(off_edges), len(on_edges))
-        for on_edge, off_edge in zip(on_edges, off_edges):
-            self.assertGreaterEqual(on_edge.interval_frames, 100)
-            self.assertLessEqual(on_edge.interval_frames, 300)
-            self.assertEqual(off_edge.frame_index, on_edge.frame_index + 1)
 
     def test_shared_frame_buffer_publishes_latest_rgb_without_decoding(self):
         width, height = 4, 3
@@ -781,21 +777,6 @@ class VideoPlaybackTests(unittest.TestCase):
             target_stimulus.current_frame = frame_index
             uploaded_frames.append(frame_index)
 
-        class FakeGPIO:
-            def __init__(self):
-                self.writes = []
-
-            def gpio_write(self, chip, pin, level):
-                self.writes.append((win.refresh_index, chip, pin, level))
-                return 0
-
-        gpio = FakeGPIO()
-        sync_schedule = RandomFramePulseSchedule(
-            2,
-            2,
-            pulse_width_frames=1,
-            rng=random.Random(0),
-        )
         frame_publisher = Mock()
         event_logger = Mock()
         message_logger = Mock()
@@ -827,6 +808,8 @@ class VideoPlaybackTests(unittest.TestCase):
                 "perf_counter",
                 side_effect=clock.perf_counter,
             ),
+            patch.object(video_utils.time, "perf_counter_ns",
+                         side_effect=lambda: round(clock.perf_counter() * 1_000_000_000)),
             patch.object(
                 video_utils.time,
                 "sleep",
@@ -866,10 +849,6 @@ class VideoPlaybackTests(unittest.TestCase):
                     "height": 2,
                 },
                 frame_publisher=frame_publisher,
-                sync_schedule=sync_schedule,
-                sync_gpio_module=gpio,
-                sync_gpio_chip="chip",
-                sync_pin=18,
                 frame_publish_interval_s=0.0,
                 clip_start_s=0.0,
                 clip_duration_s=0.125,
@@ -979,16 +958,8 @@ class VideoPlaybackTests(unittest.TestCase):
                 call.kwargs["main_display_flip_perf_s"]
                 for call in publish_calls
             ],
-            [flip_time(3), flip_time(7), flip_time(8)],
+            [round(flip_time(i) * 1_000_000_000) / 1_000_000_000 for i in (3, 7, 8)],
         )
-
-        # The pulse begins on source frame 2's boundary. The unchanged front
-        # buffer holds it through the intervening VBLs, then clear forces low.
-        self.assertEqual(
-            gpio.writes,
-            [(8, "chip", 18, 1), (11, "chip", 18, 0)],
-        )
-        self.assertEqual(result["sync_pulses"], 1)
 
         end_flip_call = next(
             call
@@ -996,15 +967,17 @@ class VideoPlaybackTests(unittest.TestCase):
             if call.kwargs["event"] == "video_clip_end"
         )
         self.assertAlmostEqual(
-            end_flip_call.kwargs["requested_timestamp_perf_s"],
+            end_flip_call.kwargs["requested_timestamp_perf_ns"] / 1_000_000_000,
             flip_time(3)
             + 3.0 / 24.0
             - 0.49 / measured_refresh_rate,
         )
         self.assertAlmostEqual(
-            end_flip_call.kwargs["timestamp_perf_s"],
+            end_flip_call.kwargs["timestamp_perf_ns"] / 1_000_000_000,
             flip_time(11),
         )
+        self.assertEqual(result["last_frame_end_perf_ns"], end_flip_call.kwargs["timestamp_perf_ns"])
+        self.assertEqual(result["start_flip_perf_ns"], round(flip_time(3) * 1_000_000_000))
 
     @staticmethod
     def _load_utils_without_psychopy_runtime():
@@ -1179,6 +1152,8 @@ class PlayVideoTaskTests(unittest.TestCase):
             return_value=(win, main_screen, None)
         )
         fake_utils.make_bg_rect = Mock(return_value=object())
+        fake_utils.configure_sync_bar = Mock()
+        fake_utils.service_sync_bar = Mock()
         fake_utils.resolve_frame_rate = Mock(
             return_value=(float(monitor_rate), 1.0 / float(monitor_rate))
         )
@@ -1203,13 +1178,14 @@ class PlayVideoTaskTests(unittest.TestCase):
         messages = []
         session_logs = types.SimpleNamespace(
             event_logger=types.SimpleNamespace(
-                seconds_since_session_start=lambda timestamp: timestamp
+                task_time_ns=lambda timestamp=None, timestamp_perf_ns=None: timestamp_perf_ns if timestamp_perf_ns is not None else timestamp
             ),
             message_logger=types.SimpleNamespace(
-                log=lambda level, message: messages.append((level, message))
+                log=Mock(side_effect=lambda level, message, **kwargs: messages.append((level, message)))
             ),
             behavior_logger=types.SimpleNamespace(writerow=Mock()),
             session_dir=Path("test-session"),
+            set_eye_tracking_screen=Mock(),
             flush=Mock(),
             close=Mock(),
         )
@@ -1249,6 +1225,29 @@ class PlayVideoTaskTests(unittest.TestCase):
         fake_utils.setup_task_window.assert_not_called()
         fake_utils.play_video_fill_screen.assert_not_called()
 
+    def test_eye_tracking_session_starts_before_display_and_closes_on_setup_failure(self):
+        module, fake_utils, _ = self._make_validation_harness(
+            source_rate="30/1", monitor_rate=60.0,
+        )
+        settings = object()
+
+        def setup(*args, **kwargs):
+            module.SessionLogBundle.assert_called_once()
+            self.assertIs(module.SessionLogBundle.call_args.kwargs["eye_tracking_config"], settings)
+            raise RuntimeError("display failed")
+
+        fake_utils.setup_task_window.side_effect = setup
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "clip.mp4"
+            path.touch()
+            with self.assertRaisesRegex(RuntimeError, "display failed"):
+                module.run_task(
+                    video_files=[str(path)], clip_duration_seconds=2.0,
+                    output_dir=tmpdir, num_clips=1, frame_rate=30.0,
+                    eye_tracking_config=settings,
+                )
+        module.SessionLogBundle.return_value.close.assert_called_once_with()
+
     def test_run_task_accepts_noninteger_monitor_cadence_without_drift(self):
         module, fake_utils, messages = self._make_validation_harness(
             source_rate="30/1",
@@ -1260,7 +1259,6 @@ class PlayVideoTaskTests(unittest.TestCase):
             "aborted": False,
             "abort_reason": "",
             "dropped_frames": 0,
-            "sync_pulses": 0,
         }
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1285,6 +1283,280 @@ class PlayVideoTaskTests(unittest.TestCase):
                 for level, message in messages
             )
         )
+
+    def test_reward_interval_config_and_cli_override_reach_task(self):
+        module, _, _ = self._make_validation_harness(
+            source_rate="30/1", monitor_rate=60,
+        )
+        module.load_config = Mock(return_value={
+            "config_name": "video", "output_dir": "unused", "video_files": ["clip.mp4"],
+            "clip_duration_seconds": 2, "num_clips": 1, "reward_interval": 4,
+        })
+        module.run_task = Mock(return_value="done")
+        for extra_args, expected in (([], 4), (["--reward_interval", "2.5"], 2.5)):
+            with self.subTest(extra_args=extra_args), patch.object(
+                sys, "argv", ["play_video", "--config", "video.json", *extra_args],
+            ):
+                module.main()
+                self.assertEqual(module.run_task.call_args.kwargs["reward_interval"], expected)
+
+    def test_sync_config_and_pin_cli_override_reach_task(self):
+        module, _, _ = self._make_validation_harness(source_rate="30/1", monitor_rate=60)
+        sync_config = {"enabled": True, "height": 24}
+        module.load_config = Mock(return_value={
+            "config_name": "video", "output_dir": "unused", "video_files": ["clip.mp4"],
+            "clip_duration_seconds": 2, "num_clips": 1,
+            "sync_pin": 18, "sync_bar": sync_config,
+        })
+        module.run_task = Mock(return_value="done")
+        for configured_pin, extra_args, expected_pin in ((18, [], 18), (18, ["--sync_pin", "23"], 23), (None, [], None)):
+            module.load_config.return_value["sync_pin"] = configured_pin
+            with self.subTest(extra_args=extra_args), patch.object(
+                sys, "argv", ["play_video", "--config", "video.json", *extra_args],
+            ):
+                module.main()
+                self.assertEqual(module.run_task.call_args.kwargs["sync_pin"], expected_pin)
+                self.assertEqual(module.run_task.call_args.kwargs["sync_bar"], sync_config)
+
+    def test_video_abort_poll_does_not_consume_a_source_refresh(self):
+        module, utils, _ = self._make_validation_harness(source_rate="30/1", monitor_rate=60)
+
+        def play(**kwargs):
+            sync_calls = utils.service_sync_bar.call_count
+            self.assertFalse(kwargs["external_abort_checker"]())
+            self.assertEqual(utils.service_sync_bar.call_count, sync_calls)
+            return {"video_name": "clip.mp4", "aborted": False}
+
+        utils.play_video_fill_screen.side_effect = play
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "clip.mp4"
+            path.touch()
+            self.assertEqual(module.run_task(
+                video_files=[str(path)], clip_duration_seconds=2, num_clips=1,
+                output_dir=tmp,
+            ), "done")
+        self.assertEqual(utils.service_sync_bar.call_count, 1)
+
+    def test_enabled_eye_tracking_connects_acquisition_to_pump_gate_without_preview(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                module, fake_utils, messages = self._make_validation_harness(
+                    source_rate="30/1", monitor_rate=60,
+                )
+                settings = EyeTrackingSettings(show_preview=False) if enabled else None
+                controller = Mock(failed=False, failure=None)
+                controller.drain_edges.return_value = []
+                module.PeriodicDOUTPulseController = Mock(return_value=controller)
+                fake_utils.play_video_fill_screen.return_value = {
+                    "video_name": "clip.mp4", "aborted": False,
+                }
+
+                def start(*, anchor_perf_s):
+                    policy = module.PeriodicDOUTPulseController.call_args.kwargs["reward_policy"]
+                    observe = module.SessionLogBundle.call_args.kwargs["on_eye_state"]
+                    if not enabled:
+                        self.assertIsNone(policy)
+                        self.assertIsNone(observe)
+                        return
+                    self.assertTrue(policy.status(now_s=anchor_perf_s).enabled)
+                    self.assertFalse(policy.status(now_s=anchor_perf_s + 1).due)
+                    # The same UART observer updates the actual pump's gate.
+                    for ms in range(1001):
+                        observe(EyeTrackerState(
+                            timestamp_perf_s=anchor_perf_s + ms / 1000,
+                            frame_sequence=ms + 1, valid=True,
+                        ))
+                    self.assertTrue(policy.status(now_s=anchor_perf_s + 1).due)
+                    observe(EyeTrackerState(
+                        timestamp_perf_s=anchor_perf_s + 1, frame_sequence=1001,
+                        valid=False, rejection_reason="uart_error",
+                    ))
+                    self.assertFalse(policy.status(now_s=anchor_perf_s + 1).due)
+
+                controller.start.side_effect = start
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    path = Path(tmpdir) / "clip.mp4"
+                    path.touch()
+                    self.assertEqual(module.run_task(
+                        video_files=[str(path)], clip_duration_seconds=2,
+                        output_dir=tmpdir, num_clips=1, raspi=True,
+                        reward_interval=1, pump_pulse_time_seconds=0.1,
+                        eye_tracking_config=settings,
+                    ), "done")
+                controller.stop.assert_called_once()
+                self.assertEqual(module.PeriodicDOUTPulseController.call_args.kwargs["interval_s"], 1)
+                schedule = "screen_fixation" if enabled else "absolute_onset"
+                self.assertTrue(any(f"schedule={schedule}" in message for _, message in messages))
+
+    def test_pulse_edit_updates_next_clip_controller_and_behavior_row(self):
+        from bin.pump_control import PumpPulseControl
+
+        module, utils, _ = self._make_validation_harness(source_rate="30/1", monitor_rate=60)
+        control = PumpPulseControl(0.1, allow_zero=False, reward_interval=1, boundary="clip")
+        self.addCleanup(control.settings.close, module.SessionLogBundle.return_value.message_logger)
+        module.PumpPulseControl = Mock(return_value=control)
+        controller = Mock(failed=False, failure=None)
+        controller.drain_edges.return_value = []
+        module.PeriodicDOUTPulseController = Mock(return_value=controller)
+        durations = []
+
+        def play(*args, **kwargs):
+            durations.append(control.snapshot()[0])
+            control.request(0.2)
+            return {"video_name": "clip.mp4", "aborted": False}
+
+        utils.play_video_fill_screen.side_effect = play
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "clip.mp4"
+            path.touch()
+            self.assertEqual(module.run_task(
+                video_files=[str(path)], clip_duration_seconds=2, num_clips=2,
+                output_dir=tmp, raspi=True, reward_interval=1, pump_pulse_time_seconds=0.1,
+            ), "done")
+        self.assertEqual(durations, [0.1, 0.2])
+        self.assertEqual([call.kwargs for call in controller.set_timing.call_args_list], [
+            {"interval_s": 1, "pulse_duration_s": 0.2},
+        ])
+        rows = module.SessionLogBundle.return_value.behavior_logger.writerow.call_args_list
+        self.assertEqual([call.args[0]["pump_pulse_time"] for call in rows], [0.1, 0.2])
+
+    def test_grouped_reward_edits_apply_next_clip_and_reset_screen_fixation_history(self):
+        from bin.pump_control import PumpPulseControl
+
+        module, utils, _ = self._make_validation_harness(source_rate="30/1", monitor_rate=60)
+        control = PumpPulseControl(0.4, allow_zero=False, reward_interval=1, boundary="clip")
+        logger = module.SessionLogBundle.return_value.message_logger
+        self.addCleanup(control.settings.close, logger)
+        module.PumpPulseControl = Mock(return_value=control)
+        controller = Mock(failed=False, failure=None)
+        controller.drain_edges.return_value = []
+        module.PeriodicDOUTPulseController = Mock(return_value=controller)
+        clock = [100.0]
+        clip_values = []
+        update_order = []
+
+        def policy():
+            return module.PeriodicDOUTPulseController.call_args.kwargs["reward_policy"]
+
+        def observe_window(start_s, duration_ms, sequence_start):
+            observe = module.SessionLogBundle.call_args.kwargs["on_eye_state"]
+            for ms in range(duration_ms + 1):
+                observe(EyeTrackerState(
+                    timestamp_perf_s=start_s + ms / 1000,
+                    frame_sequence=sequence_start + ms, valid=True,
+                ))
+
+        def set_timing(**timing):
+            # The pump receives the complete new pair before the separate
+            # fixation policy is reset. The old width cannot fit the new
+            # interval, making separate partial timing writes unsafe.
+            update_order.append((timing, policy().reward_interval))
+
+        controller.set_timing.side_effect = set_timing
+
+        def play(*args, **kwargs):
+            clip_values.append(control.settings.values)
+            if len(clip_values) == 1:
+                observe_window(100, 1000, 1)
+                self.assertTrue(policy().status(now_s=101).due)
+                clock[0] = 101
+                control.settings.request("pump_pulse_time", 0.1)
+                clock[0] = 101.05
+                control.settings.request("reward_interval", 0.2)
+                controller.set_timing.assert_not_called()
+                self.assertEqual(policy().reward_interval, 1)
+                self.assertEqual(control.settings.values, clip_values[0])
+                clock[0] = 102
+            else:
+                self.assertEqual(policy().reward_interval, 0.2)
+                self.assertFalse(policy().status(now_s=102).due)
+                observe_window(101, 1000, 2000)
+                self.assertFalse(policy().status(now_s=102).due)
+                observe_window(102, 210, 4000)
+                self.assertTrue(policy().status(now_s=102.21).due)
+            return {"video_name": "clip.mp4", "aborted": False}
+
+        utils.play_video_fill_screen.side_effect = play
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            module.time, "perf_counter", side_effect=lambda: clock[0],
+        ), patch.object(module.time, "perf_counter_ns", side_effect=lambda: round(clock[0] * 1e9)):
+            path = Path(tmp) / "clip.mp4"
+            path.touch()
+            self.assertEqual(module.run_task(
+                video_files=[str(path)], clip_duration_seconds=2, num_clips=2,
+                output_dir=tmp, raspi=True, reward_interval=1, pump_pulse_time_seconds=0.4,
+                eye_tracking_config=EyeTrackingSettings(show_preview=False),
+            ), "done")
+            control.settings.log_requests(logger, finish=True)
+
+        self.assertEqual(clip_values, [
+            {"pump_pulse_time": 0.4, "reward_interval": 1},
+            {"pump_pulse_time": 0.1, "reward_interval": 0.2},
+        ])
+        self.assertEqual(update_order, [({"interval_s": 0.2, "pulse_duration_s": 0.1}, 1)])
+        rows = [call.args[0] for call in module.SessionLogBundle.return_value.behavior_logger.writerow.call_args_list]
+        self.assertEqual([row["pump_pulse_time"] for row in rows], [0.4, 0.1])
+        self.assertEqual([row["reward_interval"] for row in rows], [1, 0.2])
+        audits = [
+            (json.loads(call.args[1].removeprefix("live_setting ")), call.kwargs["timestamp_perf_ns"])
+            for call in logger.log.call_args_list if call.args[1].startswith("live_setting ")
+        ]
+        self.assertEqual(
+            [(item["name"], item["new_value"], timestamp) for item, timestamp in audits if item["phase"] == "confirmed"],
+            [("pump_pulse_time", 0.1, 101_000_000_000), ("reward_interval", 0.2, 101_050_000_000)],
+        )
+        self.assertEqual(
+            [(item["name"], item["new_value"], timestamp) for item, timestamp in audits if item["phase"] == "applied"],
+            [("pump_pulse_time", 0.1, 102_000_000_000), ("reward_interval", 0.2, 102_000_000_000)],
+        )
+
+    def test_busy_fixation_policy_defers_entire_edit_without_waiting_for_acquisition(self):
+        from bin.pump_control import PumpPulseControl
+
+        module, utils, _ = self._make_validation_harness(source_rate="30/1", monitor_rate=60)
+        control = PumpPulseControl(0.1, allow_zero=False, reward_interval=1, boundary="clip")
+        self.addCleanup(control.settings.close, module.SessionLogBundle.return_value.message_logger)
+        module.PumpPulseControl = Mock(return_value=control)
+        controller = Mock(failed=False, failure=None)
+        controller.drain_edges.return_value = []
+        module.PeriodicDOUTPulseController = Mock(return_value=controller)
+        values_by_clip = []
+        policy_lock = []
+
+        class BusyAcquisitionLock:
+            def acquire(self, blocking=True):
+                if blocking:
+                    raise AssertionError("The clip boundary must not wait for eye acquisition")
+                return False
+
+        def play(*args, **kwargs):
+            policy = module.PeriodicDOUTPulseController.call_args.kwargs["reward_policy"]
+            values_by_clip.append(control.settings.values["reward_interval"])
+            if len(values_by_clip) == 1:
+                control.settings.request("reward_interval", 0.5)
+                policy_lock.append(policy._lock)
+                policy._lock = BusyAcquisitionLock()
+            elif len(values_by_clip) == 2:
+                controller.set_timing.assert_not_called()
+                self.assertEqual(policy.reward_interval, 1)
+                policy._lock = policy_lock.pop()
+            else:
+                self.assertEqual(policy.reward_interval, 0.5)
+            return {"video_name": "clip.mp4", "aborted": False}
+
+        utils.play_video_fill_screen.side_effect = play
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "clip.mp4"
+            path.touch()
+            self.assertEqual(module.run_task(
+                video_files=[str(path)], clip_duration_seconds=2, num_clips=3,
+                output_dir=tmp, raspi=True, reward_interval=1, pump_pulse_time_seconds=0.1,
+                eye_tracking_config=EyeTrackingSettings(show_preview=False),
+            ), "done")
+        self.assertEqual(values_by_clip, [1, 1, 0.5])
+        controller.set_timing.assert_called_once_with(interval_s=0.5, pulse_duration_s=0.1)
+        rows = module.SessionLogBundle.return_value.behavior_logger.writerow.call_args_list
+        self.assertEqual([call.args[0]["reward_interval"] for call in rows], [1, 1, 0.5])
 
     def test_run_task_propagates_native_geometry_and_clockwise_rotation(self):
         mouse = types.SimpleNamespace(
@@ -1373,7 +1645,9 @@ class PlayVideoTaskTests(unittest.TestCase):
         )
         playback_result = {
             "start_flip_perf_s": 10.0,
+                    "start_flip_perf_ns": 10000000000,
             "last_frame_end_perf_s": 12.0,
+                    "last_frame_end_perf_ns": 12000000000,
             "video_path": Path("clip.mp4"),
             "video_name": "clip.mp4",
             "source_duration_s": 60.0,
@@ -1387,7 +1661,6 @@ class PlayVideoTaskTests(unittest.TestCase):
             "aborted": False,
             "abort_reason": "",
             "dropped_frames": 0,
-            "sync_pulses": 0,
         }
         play_video_fill_screen = Mock(return_value=playback_result)
         fake_utils = types.ModuleType("bin.utils")
@@ -1395,6 +1668,8 @@ class PlayVideoTaskTests(unittest.TestCase):
             return_value=(win, main_screen, experimenter_screen)
         )
         fake_utils.make_bg_rect = Mock(return_value=object())
+        fake_utils.configure_sync_bar = Mock()
+        fake_utils.service_sync_bar = Mock()
         fake_utils.resolve_frame_rate = Mock(return_value=(60.0, 1.0 / 60.0))
         fake_utils.play_video_fill_screen = play_video_fill_screen
         fake_utils.verify_task_window_vblank = Mock(
@@ -1438,8 +1713,8 @@ class PlayVideoTaskTests(unittest.TestCase):
 
         class FakeEventLogger:
             @staticmethod
-            def seconds_since_session_start(timestamp):
-                return timestamp
+            def task_time_ns(timestamp=None, timestamp_perf_ns=None):
+                return timestamp_perf_ns if timestamp_perf_ns is not None else timestamp
 
         class FakeBehaviorLogger:
             def __init__(self):
@@ -1456,12 +1731,15 @@ class PlayVideoTaskTests(unittest.TestCase):
                 self.messages.append((level, message))
 
         class FakeSessionLogs:
+            eye_tracking_preview = None
+
             def __init__(self):
                 self.event_logger = FakeEventLogger()
                 self.message_logger = FakeMessageLogger()
                 self.behavior_logger = FakeBehaviorLogger()
                 self.session_dir = Path("test-session")
                 self.closed = False
+                self.set_eye_tracking_screen = Mock()
 
             def flush(self):
                 pass
@@ -1503,6 +1781,7 @@ class PlayVideoTaskTests(unittest.TestCase):
         )
         software_stimulus_rotation.assert_called_once_with("normal")
         oriented_size.assert_called_once_with((2560, 1600), 90)
+        session_logs.set_eye_tracking_screen.assert_called_once_with((2560, 1600), 90)
 
         self.assertEqual(play_video_fill_screen.call_count, 2)
         playback_kwargs = play_video_fill_screen.call_args.kwargs

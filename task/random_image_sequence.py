@@ -34,10 +34,14 @@ from bin.frame_timing import (
     plan_frame_duration,
     wait_until,
 )
+from bin.eye_tracking_config import load_eye_tracking_settings
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.config import load_config, validate_config
-from bin.screen import describe_screen, load_screen_config
+from bin.screen import (
+    ExperimenterPreview, describe_screen, load_screen_config, resolve_scene_size,
+    serialize_preview_image, software_stimulus_rotation,
+)
 
 
 def parse_args():
@@ -79,6 +83,9 @@ def run_task(
     refresh_rate: Optional[float] = None,
     config_name: Optional[str] = None,
     screen_config: Optional[Dict[str, Any]] = None,
+    eye_tracking_config=None,
+    sync_bar=None,
+    sync_pin=18,
 ):
     # Enable or disable debug outputs (writing debug PNGs)
     utils.set_debug(debug)
@@ -106,7 +113,7 @@ def run_task(
     preloaded = utils.load_image_assets(chosen_paths, raster_size=image_size, bg_rgb_255=bg)
 
     # Resolve and verify the same physical main output used by other tasks.
-    win, main_screen, _ = utils.setup_task_window(
+    win, main_screen, experimenter_screen = utils.setup_task_window(
         screen_config,
         bg_rgb_255=bg,
         fullscreen=fullscreen,
@@ -121,11 +128,19 @@ def run_task(
 
     resolved_config_name = str(config_name).strip() if config_name else "random_image_sequence"
     session_logs = SessionLogBundle(
+        eye_tracking_config=eye_tracking_config,
         output_root=output_dir,
         task_name="random_image_sequence",
         config_name=resolved_config_name,
         behavior_fieldnames=["trial_num", "stimulus_name", "requested_duration"],
+        auto_flush=False,
     )
+    scene_size = resolve_scene_size(
+        main_screen, fullscreen=bool(fullscreen), requested_size=win_size,
+        realized_size=tuple(win.size),
+    )
+    rotation = software_stimulus_rotation(main_screen.rotation)
+    session_logs.set_eye_tracking_screen(scene_size, rotation)
     logger = session_logs.event_logger
     msg_logger = session_logs.message_logger
     behavior_logger = session_logs.behavior_logger
@@ -145,6 +160,27 @@ def run_task(
         msg_logger=msg_logger,
         context="random_image_sequence",
     )
+    preview = None
+    if experimenter_screen is not None:
+        preview = ExperimenterPreview(
+            experimenter_screen, task_label=resolved_config_name, total_trials=n,
+            eye_tracking_shared=session_logs.eye_tracking_preview,
+        )
+        utils.verify_task_window_vblank(win)
+    utils.configure_sync_bar(
+        win, sync_bar, sync_pin=sync_pin, event_logger=logger,
+        experimenter_preview=preview, rotation_degrees=rotation,
+        frame_duration_s=frame_dur, msg_logger=msg_logger,
+    )
+
+    def show_preview(images=(), trial_num=None):
+        if preview is not None:
+            if trial_num is not None:
+                preview.set_trial_progress(trial_num, n)
+            preview.show_static_scene(
+                bg_rgb_255=bg, main_size=scene_size, main_rotation_deg=rotation,
+                images=list(images), fixation_size=fixation_size,
+            )
     # Plan each requested duration to its nearest refresh-locked presentation.
     stim_plan = plan_frame_duration(duration, fps, minimum_frames=1)
     isi_plan = plan_frame_duration(isi, fps)
@@ -171,6 +207,7 @@ def run_task(
 
     # Convert preloaded PIL images to ImageStim (do NOT pass bg_rgb_255: preserve transparency)
     image_stims = []
+    preview_images = []
     for p in chosen_paths:
         pil_img = preloaded.get(p)
         if pil_img is None:
@@ -179,6 +216,11 @@ def run_task(
         # Draw at native pixel size to avoid double-scaling.
         stim = utils.make_image_stim_from_array(win, pil_img, size=None, bg_rgb_255=None)
         image_stims.append((p.name, stim))
+        if preview is not None:
+            preview_images.append({
+                "image_payload": serialize_preview_image(pil_img),
+                "pos": tuple(stim.pos), "size": tuple(stim.size), "ori": float(stim.ori),
+            })
 
     # Pre-sequence ISI: show the gray background for `isi` seconds before the
     # first stimulus. This implements the requested sequence: gray(ISI) ->
@@ -189,11 +231,12 @@ def run_task(
         if fix is not None:
             fix.draw()
         isi_timing = flip_with_timestamps(win)
+        show_preview()
         logger.log_frame_flip(
             trial_num=None,
             event="gray_pre_sequence",
-            timestamp_perf_s=isi_timing.actual_perf_s,
-            requested_timestamp_perf_s=isi_timing.requested_perf_s,
+            timestamp_perf_ns=isi_timing.actual_perf_ns,
+            requested_timestamp_perf_ns=isi_timing.requested_perf_ns,
             requested_duration=isi,
         )
         next_visual_target_perf_s = transition_scheduler.target_after(
@@ -205,7 +248,7 @@ def run_task(
 
     def _poll_escape() -> bool:
         nonlocal aborted
-        if not event.getKeys(["escape"]):
+        if not event.getKeys(["escape"]) and not (preview is not None and preview.poll()):
             return False
         aborted = True
         return True
@@ -227,11 +270,12 @@ def run_task(
             )
             if stim_timing is None:
                 break
+        show_preview([preview_images[idx - 1]] if preview is not None else [], idx)
         logger.log_frame_flip(
             trial_num=idx,
             event="stimulus_on",
-            timestamp_perf_s=stim_timing.actual_perf_s,
-            requested_timestamp_perf_s=stim_timing.requested_perf_s,
+            timestamp_perf_ns=stim_timing.actual_perf_ns,
+            requested_timestamp_perf_ns=stim_timing.requested_perf_ns,
             requested_duration=duration,
         )
         msg_logger.log(
@@ -255,6 +299,7 @@ def run_task(
             )
             if gray_timing is None:
                 break
+            show_preview(trial_num=idx)
             logger.log_frame_flip(
                 trial_num=idx,
                 event=(
@@ -262,8 +307,8 @@ def run_task(
                     if is_last_stimulus
                     else "gray_inter_stimulus"
                 ),
-                timestamp_perf_s=gray_timing.actual_perf_s,
-                requested_timestamp_perf_s=gray_timing.requested_perf_s,
+                timestamp_perf_ns=gray_timing.actual_perf_ns,
+                requested_timestamp_perf_ns=gray_timing.requested_perf_ns,
                 requested_duration=1.0 if is_last_stimulus else isi,
             )
             next_visual_target_perf_s = transition_scheduler.target_after(
@@ -300,8 +345,10 @@ def run_task(
         ),
     )
     msg_logger.log("INFO", f"session_end status={'aborted' if aborted else 'done'}")
-    session_logs.close()
+    if preview is not None:
+        preview.close()
     utils.close_task_window(win)
+    session_logs.close()
     print(f"Finished; logs written to {session_logs.session_dir.resolve()}")
     return aborted
 
@@ -339,6 +386,7 @@ def main():
 
     try:
         aborted_by_user = run_task(
+            eye_tracking_config=load_eye_tracking_settings(cfg),
             images_dir=_get("images_dir", cfg.get("images_dir")),
             n=int(_get("n", cfg.get("n", 10))),
             duration=float(_get("duration", cfg.get("duration"))),
@@ -355,6 +403,7 @@ def main():
             refresh_rate=_get("refresh_rate", cfg.get("refresh_rate", cfg.get("refrech_rate", None))),
             config_name=cfg.get("config_name", "random_image_sequence"),
             screen_config=screen_config,
+            sync_bar=cfg.get("sync_bar"), sync_pin=cfg.get("sync_pin", 18),
         )
         if aborted_by_user:
             sys.exit(USER_EXIT_CODE)

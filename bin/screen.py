@@ -7,6 +7,7 @@ import atexit
 from contextlib import contextmanager
 from dataclasses import dataclass
 import io
+import math
 import multiprocessing as mp
 import os
 import queue
@@ -19,6 +20,7 @@ from typing import Any, Callable, Dict, Optional, Sequence, Union
 
 import numpy as np
 from PIL import Image
+from .preview_text import set_preview_text
 
 try:
     from screeninfo import get_monitors
@@ -1517,6 +1519,16 @@ def compute_aspect_cover_size(
     return (content_w * scale, content_h * scale)
 
 
+def compute_preview_aspect_fit(container_size, content_size, *, settings_height=0.0):
+    """Fit the complete subject scene above the optional settings strip."""
+    width, height = map(float, container_size)
+    settings_height = min(max(float(settings_height), 0.0), max(0.0, height - 1))
+    layout = compute_centered_aspect_fit((width, height - settings_height), content_size)
+    layout["box_center"] = (0.0, settings_height / 2)
+    layout["bottom_margin"] += settings_height
+    return layout
+
+
 def scale_scene_length(value: float, main_size: Sequence[float], preview_size: Sequence[float]) -> float:
     main_w = max(float(main_size[0]), 1.0)
     main_h = max(float(main_size[1]), 1.0)
@@ -1774,6 +1786,13 @@ def _experimenter_preview_process(
     video_start_perf_shared,
     stop_event,
     startup_sender,
+    calibration_config=None,
+    calibration_controls_shared=None,
+    eye_tracking_shared=None,
+    calibration_actions_queue=None,
+    pump_control=None,
+    live_settings=None,
+    sync_bar_shared=None,
 ) -> None:
     startup_reported = False
 
@@ -1803,9 +1822,51 @@ def _experimenter_preview_process(
             }
         )
         raise
+    from .live_settings_ui import SETTINGS_STRIP_HEIGHT, SettingsPanel
+
+    if live_settings is None and pump_control is not None:
+        live_settings = pump_control.settings
     preview_canvas_size = resolve_screen_canvas_size(screen_info)
+    settings_height = SETTINGS_STRIP_HEIGHT if live_settings is not None else 0.0
     outside_bg_rgb = (30, 30, 30)
     preview_outline_rgb = (150, 150, 150)
+    sync_rectangles = []
+    sync_layout_key = None
+    sync_drawn_phase = None
+
+    def _draw_sync_bar(layout=None):
+        nonlocal sync_rectangles, sync_layout_key, sync_drawn_phase
+        if sync_bar_shared is None or sync_bar_shared[0] <= 0:
+            return
+        height, source_width, source_height, phase = sync_bar_shared
+        if layout is None:
+            layout = compute_preview_aspect_fit(
+                preview_canvas_size, (source_width, source_height),
+                settings_height=settings_height,
+            )
+        box_width, box_height = layout["box_size"]
+        center_x, center_y = layout["box_center"]
+        scale = box_width / source_width
+        key = (height, source_width, source_height, box_width, box_height, center_x, center_y)
+        if key != sync_layout_key:
+            width = (int(source_width) // 5) * scale
+            sync_rectangles = [
+                visual.Rect(
+                    win, width=width, height=height * scale, units="pix",
+                    pos=(center_x - box_width / 2 + (index + .5) * width,
+                         center_y + box_height / 2 - height * scale / 2),
+                    lineColor=None, autoLog=False,
+                ) for index in range(5)
+            ]
+            sync_layout_key = key
+            sync_drawn_phase = None
+        if phase != sync_drawn_phase:
+            for index, rectangle in enumerate(sync_rectangles):
+                level = 2 * ((index + int(phase)) % 2) - 1
+                rectangle.fillColor = (level, level, level)
+            sync_drawn_phase = phase
+        for rectangle in sync_rectangles:
+            rectangle.draw()
 
     def _make_bg_rect(bg_rgb_255: Sequence[int]):
         return visual.Rect(
@@ -1816,6 +1877,7 @@ def _experimenter_preview_process(
             fillColorSpace="rgb",
             lineColor=None,
             units="pix",
+            autoLog=False,
         )
 
     def _release_movie() -> None:
@@ -1839,9 +1901,10 @@ def _experimenter_preview_process(
             payload.get("main_rotation_deg", 0)
         )
         oriented_main_size = oriented_size(main_size, scene_rotation_deg)
-        layout = compute_centered_aspect_fit(
+        layout = compute_preview_aspect_fit(
             preview_canvas_size,
             oriented_main_size,
+            settings_height=settings_height,
         )
         preview_size = layout["box_size"]
         box_center = layout["box_center"]
@@ -1855,6 +1918,7 @@ def _experimenter_preview_process(
             fillColorSpace="rgb",
             lineColor=None,
             units="pix",
+            autoLog=False,
         )
         preview_outline_rect = visual.Rect(
             win,
@@ -1866,6 +1930,7 @@ def _experimenter_preview_process(
             lineColorSpace="rgb",
             lineWidth=2,
             units="pix",
+            autoLog=False,
         )
 
         def _map_pos(pos: Sequence[float]) -> tuple[float, float]:
@@ -1913,6 +1978,7 @@ def _experimenter_preview_process(
                 lineColor=None,
                 units="pix",
                 pos=_map_pos(item.get("pos", (0, 0))),
+                autoLog=False,
             )
             dots.append(dot)
 
@@ -1938,6 +2004,7 @@ def _experimenter_preview_process(
                     fillColor=None,
                     units="pix",
                     ori=_map_ori(item),
+                    autoLog=False,
                 )
             )
 
@@ -1959,6 +2026,7 @@ def _experimenter_preview_process(
                 color=_preview_rgb255_to_psychopy(payload.get("fixation_color", (0, 0, 0))),
                 colorSpace="rgb",
                 pos=_map_pos((0, 0)),
+                autoLog=False,
             )
 
         highlight_box = None
@@ -1987,6 +2055,7 @@ def _experimenter_preview_process(
                 fillColor=None,
                 units="pix",
                 ori=_map_ori(highlight_payload),
+                autoLog=False,
             )
 
         return {
@@ -2010,13 +2079,15 @@ def _experimenter_preview_process(
 
     def _place_overlay_controls(layout: Optional[Dict[str, Any]]) -> None:
         if not layout:
-            layout = compute_centered_aspect_fit(preview_canvas_size, preview_canvas_size)
+            layout = compute_preview_aspect_fit(
+                preview_canvas_size, preview_canvas_size, settings_height=settings_height,
+            )
         canvas_w = float(preview_canvas_size[0])
         canvas_h = float(preview_canvas_size[1])
         canvas_left = -canvas_w * 0.5
         canvas_right = canvas_w * 0.5
         canvas_top = canvas_h * 0.5
-        canvas_bottom = -canvas_h * 0.5
+        canvas_bottom = -canvas_h * 0.5 + settings_height
         margin = max(10.0, min(canvas_w, canvas_h) * 0.018)
         box_center = layout.get("box_center", (0.0, 0.0))
         box_size = layout.get("box_size", preview_canvas_size)
@@ -2107,44 +2178,51 @@ def _experimenter_preview_process(
     def _draw_overlay(layout: Optional[Dict[str, Any]] = None) -> None:
         _place_overlay_controls(layout or static_scene.get("layout"))
         elapsed = time.perf_counter() - float(start_perf_s)
-        system_time_text.text = time.strftime("%H:%M:%S")
+        set_preview_text(system_time_text, time.strftime("%H:%M:%S"))
         system_time_text.draw()
-        timer_text.text = format_elapsed_hms(elapsed)
+        set_preview_text(timer_text, format_elapsed_hms(elapsed))
         timer_text.draw()
         video_start_perf_s = float(video_start_perf_shared.value)
         if shared_movie_active and np.isfinite(video_start_perf_s):
-            video_timer_text.text = (
-                f"Video: "
-                f"{format_elapsed_hms(time.perf_counter() - video_start_perf_s)}"
+            set_preview_text(
+                video_timer_text,
+                f"Video: {format_elapsed_hms(time.perf_counter() - video_start_perf_s)}",
             )
             video_timer_text.draw()
         status_counts = static_scene.get("status_counts")
         reward_counts = static_scene.get("reward_counts")
         if status_counts is not None:
-            reward_counts_text.text = "\n".join(
-                f"{label}: {count}" for label, count in status_counts.items()
+            set_preview_text(
+                reward_counts_text,
+                "\n".join(f"{label}: {count}" for label, count in status_counts.items()),
             )
             reward_counts_text.draw()
         elif reward_counts is not None:
-            reward_counts_text.text = (
+            set_preview_text(
+                reward_counts_text,
                 f"R0: {reward_counts.get(0, 0)}\n"
                 f"R1: {reward_counts.get(1, 0)}\n"
                 f"R2: {reward_counts.get(2, 0)}\n"
-                f"R3: {reward_counts.get(3, 0)}"
+                f"R3: {reward_counts.get(3, 0)}",
             )
             reward_counts_text.draw()
         if task_label_text is not None:
-            task_label_text.text = format_experimenter_label(
-                task_label,
-                subject=static_scene.get("subject"),
-                current_trial_num=static_scene.get("current_trial_num"),
-                total_trials=static_scene.get("total_trials"),
+            set_preview_text(
+                task_label_text,
+                format_experimenter_label(
+                    task_label,
+                    subject=static_scene.get("subject"),
+                    current_trial_num=static_scene.get("current_trial_num"),
+                    total_trials=static_scene.get("total_trials"),
+                ),
             )
             task_label_text.draw()
         reward_button_rect.draw()
         reward_button_text.draw()
         exit_button_rect.draw()
         exit_button_text.draw()
+        if settings_panel is not None:
+            settings_panel.draw()
 
     try:
         win = open_psychopy_window(
@@ -2174,7 +2252,82 @@ def _experimenter_preview_process(
     last_cursor_apply_s = 0.0
     if mouse_visible is not None:
         set_window_mouse_visible(win, bool(mouse_visible))
+    if calibration_config is not None:
+        # Calibration needs interactive scale/target controls, but uses exactly
+        # the same verified, non-vsync secondary window and process lifecycle
+        # as task previews. Keep its renderer out of the general scene code.
+        controls = None
+        try:
+            from .eye_calibration_preview import EyeCalibrationControls
+
+            controls = EyeCalibrationControls(
+                win,
+                preview_canvas_size,
+                calibration_config,
+                calibration_controls_shared,
+                reward_event,
+                exit_event,
+                actions_queue=calibration_actions_queue,
+                pump_control=pump_control,
+                live_settings=live_settings,
+            )
+            payload = {}
+            controls.draw(payload)
+            win.flip()
+            _report_startup({
+                "ok": True,
+                "placement": getattr(
+                    win, "_neuro_tasks_screen_placement", describe_screen(screen_info)
+                ),
+            })
+            while not stop_event.is_set():
+                latest = _get_latest_preview_command(command_queue)
+                if latest is not None:
+                    payload = latest
+                controls.poll_controls()
+                controls.draw(payload)
+                _draw_sync_bar()
+                win.flip()
+                core.wait(max(0.02, update_interval_ms / 1000.0))
+        except Exception as exc:
+            _report_startup({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            raise
+        finally:
+            try:
+                if controls is not None:
+                    controls.close()
+            finally:
+                win.close()
+        return
     mouse = event.Mouse(win=win)
+    settings_panel = SettingsPanel(win, live_settings, visual=visual) if live_settings is not None else None
+    if settings_panel is not None:
+        settings_panel.layout_strip(preview_canvas_size)
+    gaze_dot = None
+    last_gaze_redraw_s = 0.0
+    if eye_tracking_shared is not None:
+        from .task_eye_tracking import read_preview_gaze
+
+        gaze_dot = visual.Circle(
+            win, radius=5, units="pix", autoLog=False,
+            fillColor=_preview_rgb255_to_psychopy((40, 120, 255)),
+            lineColor=_preview_rgb255_to_psychopy((255, 255, 255)),
+        )
+
+    def _draw_gaze(layout):
+        # UART calibration already returns fractions of the subject-oriented
+        # scene. Apply that scene's fitted box once, with no second rotation.
+        if gaze_dot is None or layout is None:
+            return
+        fraction = read_preview_gaze(eye_tracking_shared)
+        if fraction is not None:
+            gaze_dot.pos = tuple(
+                center + value * size for center, value, size in zip(
+                    layout["box_center"], fraction, layout["box_size"]
+                )
+            )
+            gaze_dot.draw()
+
     last_mouse_down = False
     last_bg_rgb = (0, 0, 0)
     current_reward_counts = None
@@ -2218,6 +2371,7 @@ def _experimenter_preview_process(
                 pos=(0.0, -float(preview_canvas_size[1]) * 0.44),
                 color=_preview_rgb255_to_psychopy((230, 230, 230)),
                 colorSpace="rgb",
+                autoLog=False,
             )
 
         task_label_height = max(18.0, min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.032)
@@ -2238,6 +2392,7 @@ def _experimenter_preview_process(
             anchorHoriz="left",
             color=_preview_rgb255_to_psychopy((210, 210, 210)),
             colorSpace="rgb",
+            autoLog=False,
         )
         timer_text = visual.TextStim(
             win,
@@ -2249,6 +2404,7 @@ def _experimenter_preview_process(
             anchorHoriz="left",
             color=_preview_rgb255_to_psychopy((255, 255, 255)),
             colorSpace="rgb",
+            autoLog=False,
         )
         video_timer_text = visual.TextStim(
             win,
@@ -2260,6 +2416,7 @@ def _experimenter_preview_process(
             anchorHoriz="left",
             color=_preview_rgb255_to_psychopy((255, 224, 128)),
             colorSpace="rgb",
+            autoLog=False,
         )
         reward_counts_text = visual.TextStim(
             win,
@@ -2271,6 +2428,7 @@ def _experimenter_preview_process(
             anchorHoriz="left",
             color=_preview_rgb255_to_psychopy((255, 255, 255)),
             colorSpace="rgb",
+            autoLog=False,
         )
         reward_button_width = max(84.0, min(140.0, float(preview_canvas_size[0]) * 0.08))
         reward_button_height = max(44.0, min(64.0, float(preview_canvas_size[1]) * 0.065))
@@ -2288,6 +2446,7 @@ def _experimenter_preview_process(
             fillColorSpace="rgb",
             lineColor=None,
             units="pix",
+            autoLog=False,
         )
         reward_button_text = visual.TextStim(
             win,
@@ -2297,6 +2456,7 @@ def _experimenter_preview_process(
             pos=reward_button_rect.pos,
             color=_preview_rgb255_to_psychopy((255, 255, 255)),
             colorSpace="rgb",
+            autoLog=False,
         )
         exit_button_rect = visual.Rect(
             win,
@@ -2307,6 +2467,7 @@ def _experimenter_preview_process(
             fillColorSpace="rgb",
             lineColor=None,
             units="pix",
+            autoLog=False,
         )
         exit_button_text = visual.TextStim(
             win,
@@ -2316,6 +2477,7 @@ def _experimenter_preview_process(
             pos=exit_button_rect.pos,
             color=_preview_rgb255_to_psychopy((255, 255, 255)),
             colorSpace="rgb",
+            autoLog=False,
         )
 
         # The parent may begin timing immediately after construction returns.
@@ -2338,7 +2500,10 @@ def _experimenter_preview_process(
         )
 
         while not stop_event.is_set():
-            redraw_requested = False
+            redraw_requested = bool(
+                sync_bar_shared is not None and sync_bar_shared[0] > 0
+                and sync_bar_shared[3] != sync_drawn_phase
+            )
             if mouse_visible is not None and time.perf_counter() - last_cursor_apply_s >= 0.5:
                 set_window_mouse_visible(win, bool(mouse_visible))
                 last_cursor_apply_s = time.perf_counter()
@@ -2398,9 +2563,10 @@ def _experimenter_preview_process(
                             current_main_size,
                             current_main_rotation_deg,
                         )
-                        movie_layout = compute_centered_aspect_fit(
+                        movie_layout = compute_preview_aspect_fit(
                             preview_canvas_size,
                             shared_movie_target_size,
+                            settings_height=settings_height,
                         )
                         movie_bg_rect = _make_bg_rect(outside_bg_rgb)
                         movie_subject_bg_rect = visual.Rect(
@@ -2412,6 +2578,7 @@ def _experimenter_preview_process(
                             fillColorSpace="rgb",
                             lineColor=None,
                             units="pix",
+                            autoLog=False,
                         )
                         movie_outline_rect = visual.Rect(
                             win,
@@ -2423,6 +2590,7 @@ def _experimenter_preview_process(
                             lineColorSpace="rgb",
                             lineWidth=2,
                             units="pix",
+                            autoLog=False,
                         )
                         descriptor = dict(payload["shared_frame_buffer"])
                         if (
@@ -2474,9 +2642,16 @@ def _experimenter_preview_process(
                 except Exception:
                     continue
 
+            editing_this_frame = settings_panel is not None and settings_panel.editing
             try:
-                if event.getKeys(keyList=["r"]):
+                keys = event.getKeys()
+                if settings_panel is not None:
+                    redraw_requested = redraw_requested or bool(keys)
+                    keys = settings_panel.handle_keys(keys)
+                if "r" in keys:
                     reward_event.set()
+                if "escape" in keys:
+                    exit_event.set()
             except Exception:
                 pass
 
@@ -2492,7 +2667,9 @@ def _experimenter_preview_process(
                         else static_scene.get("layout")
                     )
                     mouse_pos = mouse.getPos()
-                    if reward_button_rect.contains(mouse_pos):
+                    if editing_this_frame or (settings_panel is not None and settings_panel.click(mouse_pos)):
+                        redraw_requested = True
+                    elif reward_button_rect.contains(mouse_pos):
                         reward_event.set()
                     elif exit_button_rect.contains(mouse_pos):
                         exit_event.set()
@@ -2538,7 +2715,11 @@ def _experimenter_preview_process(
                                 shared_movie_stim,
                                 shared_frame.rgb,
                             )
-                    if not shared_frame_updated and not redraw_requested:
+                    gaze_redraw_due = (
+                        gaze_dot is not None
+                        and time.perf_counter() - last_gaze_redraw_s >= float(update_interval_ms) / 1000.0
+                    )
+                    if not shared_frame_updated and not redraw_requested and not gaze_redraw_due:
                         # Published video arrives at most every 100 ms. A
                         # 2-ms mailbox poll woke this worker about 500 times/s
                         # and competed with ffpyplayer on the Pi cores for no
@@ -2555,7 +2736,10 @@ def _experimenter_preview_process(
                     if movie_outline_rect is not None:
                         movie_outline_rect.draw()
                     _draw_overlay(movie_layout)
+                    _draw_gaze(movie_layout)
+                    _draw_sync_bar(movie_layout)
                     win.flip()
+                    last_gaze_redraw_s = time.perf_counter()
                     continue
 
                 static_scene["canvas_bg_rect"].draw()
@@ -2572,6 +2756,8 @@ def _experimenter_preview_process(
                     static_scene["highlight_box"].draw()
                 static_scene["preview_outline_rect"].draw()
                 _draw_overlay()
+                _draw_gaze(static_scene.get("layout"))
+                _draw_sync_bar(static_scene.get("layout"))
                 win.flip()
             except Exception:
                 static_scene = _build_static_scene(
@@ -2623,6 +2809,10 @@ class ExperimenterPreview:
         update_interval_s: float = 0.1,
         mouse_visible: Optional[bool] = True,
         startup_timeout_s: float = 10.0,
+        calibration_config: Optional[Dict[str, Any]] = None,
+        eye_tracking_shared=None,
+        pump_control=None,
+        live_settings=None,
     ):
         self.screen_info = screen_info
         self.task_label = task_label
@@ -2634,6 +2824,10 @@ class ExperimenterPreview:
         self.update_interval_s = max(0.05, float(update_interval_s))
         self.exit_requested = False
         self._closed = False
+        self._live_settings = (
+            live_settings if live_settings is not None else
+            pump_control.settings if pump_control is not None else None
+        )
         self._preview_reward_counts = None
         self._preview_highlight_box = None
         self._preview_bg_rgb_255 = None
@@ -2641,6 +2835,9 @@ class ExperimenterPreview:
         self._preview_main_rotation_deg = 0
         self._preview_command_sequence = 0
         self._ctx = mp.get_context("spawn")
+        # Geometry is set once before enabling; only the phase changes on the
+        # subject side. No queue or lock enters the display callback path.
+        self._sync_bar_shared = self._ctx.Array("d", [0.0] * 4, lock=False)
         # The process queue and local outbox are both single-slot. A sender
         # thread absorbs multiprocessing's feeder-thread handoff without ever
         # blocking the timing-critical task thread; newer snapshots replace a
@@ -2652,6 +2849,23 @@ class ExperimenterPreview:
         self._reward_event = self._ctx.Event()
         self._exit_event = self._ctx.Event()
         self._stop_event = self._ctx.Event()
+        self._calibration_controls = None
+        self._calibration_actions = None
+        if calibration_config is not None:
+            from .eye_tracking import EyeCalibration
+
+            initial = EyeCalibration(**calibration_config["calibration"])
+            self._calibration_controls = self._ctx.Array(
+                "d",
+                # Slots 0:7, 9, 12 and 13 are preview controls/counters.
+                # Slots 7:9 (gain) and 10:12 (target) accumulate subject-window
+                # steps until consumed; scene mailbox drops cannot lose keys.
+                # Slots 14:18 hold fitted gains, request token, applied token.
+                [initial.x_gain, initial.y_gain] + [0] * 16,
+                lock=True,
+            )
+            # Point edits are ordered events, not latest-only scene state.
+            self._calibration_actions = self._ctx.Queue()
         self._video_start_perf_shared = self._ctx.Value(
             "d",
             float("nan"),
@@ -2676,6 +2890,13 @@ class ExperimenterPreview:
                 self._video_start_perf_shared,
                 self._stop_event,
                 startup_sender,
+                calibration_config,
+                self._calibration_controls,
+                eye_tracking_shared,
+                self._calibration_actions,
+                pump_control,
+                self._live_settings,
+                self._sync_bar_shared,
             ),
             daemon=True,
         )
@@ -2685,6 +2906,7 @@ class ExperimenterPreview:
             startup_sender.close()
             startup_receiver.close()
             self._queue.close()
+            self._close_calibration_actions()
             self._closed = True
             raise RuntimeError(
                 f"Experimenter preview process could not start: "
@@ -2713,6 +2935,7 @@ class ExperimenterPreview:
                 self._process.terminate()
             self._process.join(timeout=1.0)
             self._queue.close()
+            self._close_calibration_actions()
             self._closed = True
             raise RuntimeError(
                 f"Experimenter preview failed to realize on "
@@ -2732,6 +2955,14 @@ class ExperimenterPreview:
                 "Experimenter preview mailbox could not start: "
                 f"{type(exc).__name__}: {str(exc).strip()}"
             ) from exc
+
+    def configure_sync_bar(self, height, native_size, rotation_degrees=0) -> None:
+        width, screen_height = oriented_size(native_size, rotation_degrees)
+        self._sync_bar_shared[1:] = (width, screen_height, 0)
+        self._sync_bar_shared[0] = height
+
+    def set_sync_bar_phase(self, phase: int) -> None:
+        self._sync_bar_shared[3] = phase
 
     def poll(self) -> bool:
         if self.exit_requested:
@@ -2759,6 +2990,86 @@ class ExperimenterPreview:
             return False
         self._reward_event.clear()
         return True
+
+    def get_calibration_controls(self) -> dict:
+        """Read calibration values and keyboard request counters atomically."""
+        if self._calibration_controls is None:
+            raise RuntimeError("Preview was not opened with calibration controls")
+        with self._calibration_controls.get_lock():
+            values = list(self._calibration_controls[:])
+        if values[16] != values[17]:
+            # The task may poll again before the UI consumes a fitted gain.
+            # Never let that stale UI snapshot revert the fitted transform.
+            values[:2] = values[14:16]
+        fields = (
+            "x_scale", "y_scale", "fix_x", "fix_y", "revision", "zero_count",
+            "attention_count",
+        )
+        snapshot = {
+            **dict(zip(fields, values)), "auto_reward_count": values[9],
+            "video_toggle_count": values[12],
+            "delete_count": values[13],
+        }
+        actions_queue = getattr(self, "_calibration_actions", None)
+        if actions_queue is not None:
+            # Always expose the list, even while the Queue feeder is pending:
+            # consumers must not replay legacy counters during that delay.
+            snapshot["point_actions"] = []
+            while True:
+                try:
+                    snapshot["point_actions"].append(actions_queue.get_nowait())
+                except queue.Empty:
+                    break
+        return snapshot
+
+    def _close_calibration_actions(self) -> None:
+        actions_queue = getattr(self, "_calibration_actions", None)
+        if actions_queue is not None:
+            actions_queue.cancel_join_thread()
+            actions_queue.close()
+
+    def set_calibration_gains(self, *, x_scale: float, y_scale: float) -> None:
+        """Synchronize fitted gains without moving the target or losing UI keys."""
+        if self._calibration_controls is None:
+            raise RuntimeError("Preview was not opened with calibration controls")
+        gains = (float(x_scale), float(y_scale))
+        if not all(math.isfinite(value) for value in gains):
+            raise ValueError("Calibration gains must be finite")
+        with self._calibration_controls.get_lock():
+            self._calibration_controls[14:16] = gains
+            self._calibration_controls[16] += 1
+
+    def request_calibration_scale_steps(self, *, x_steps: int = 0, y_steps: int = 0) -> None:
+        """Queue arrow steps for the process that owns the calibration sliders."""
+        self._request_calibration_steps(7, x_steps, y_steps)
+
+    def request_calibration_fixation_steps(self, *, x_steps: int = 0, y_steps: int = 0) -> None:
+        """Queue keypad steps for the process that owns the fixation target."""
+        self._request_calibration_steps(10, x_steps, y_steps)
+
+    def _request_calibration_steps(self, slot: int, x_steps: int, y_steps: int) -> None:
+        if self._calibration_controls is None:
+            raise RuntimeError("Preview was not opened with calibration controls")
+        with self._calibration_controls.get_lock():
+            self._calibration_controls[slot] += x_steps
+            self._calibration_controls[slot + 1] += y_steps
+
+    def show_calibration_state(
+        self, *, eye_fraction, eye_valid, status_text, attention_started_s=None,
+        video_visible=False, video_descriptor=None, video_sequence=0,
+        calibration_points=(),
+    ) -> None:
+        self._send({
+            "type": "calibration",
+            "eye_fraction": list(eye_fraction),
+            "eye_valid": bool(eye_valid),
+            "status_text": str(status_text),
+            "attention_started_s": attention_started_s,
+            "video_visible": bool(video_visible),
+            "video_descriptor": video_descriptor,
+            "video_sequence": int(video_sequence),
+            "calibration_points": [list(point) for point in calibration_points],
+        })
 
     def set_trial_progress(self, current_trial_num: int, total_trials: Optional[int]) -> None:
         self.current_trial_num = int(current_trial_num)
@@ -3008,8 +3319,19 @@ class ExperimenterPreview:
         except Exception:
             pass
         try:
-            if self._process.is_alive():
-                self._process.join(timeout=1.0)
+            settings = getattr(self, "_live_settings", None)
+            join_deadline = time.monotonic() + 1.0
+            while self._process.is_alive():
+                # Queue producers wait for their feeder thread at process
+                # exit. Drain confirmations while joining so a full pipe
+                # cannot make a healthy renderer look hung and lose edits.
+                # This path is shutdown-only; it performs no disk logging.
+                if settings is not None:
+                    settings.collect_requests()
+                remaining = join_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._process.join(timeout=min(0.025, remaining))
         except Exception:
             pass
         try:
@@ -3022,7 +3344,17 @@ class ExperimenterPreview:
         except Exception:
             pass
         try:
+            settings = getattr(self, "_live_settings", None)
+            if settings is not None:
+                settings.collect_requests()
+        except Exception:
+            pass
+        try:
             self._queue.cancel_join_thread()
             self._queue.close()
+        except Exception:
+            pass
+        try:
+            self._close_calibration_actions()
         except Exception:
             pass

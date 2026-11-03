@@ -4,8 +4,112 @@ Repository layout
 
 - `bin/`: shared presentation, timing, hardware, screen, and TSV logging helpers.
 - `task/`: runnable tasks, including `active_foraging.py`, `match2cue.py`, `afc_csc1.py`, `afc_trial_sequence.py`, standalone image/video stimulus tasks, and hardware setup utilities.
+- `task/trainings/`: behavior-shaping tasks (touch-and-hold, and future action/fixation training) whose sessions are not experimental data.
 - `config_files/`: deployment configurations.
 - `test_configs/` and `tests/`: development configurations and automated tests.
+
+Live reward and fixation controls
+---------------------------------
+The experimenter preview offers compact numeric controls shared by all reward tasks:
+
+| Control | Tasks | Units |
+| --- | --- | --- |
+| Pump | All juice-reward tasks | Pulse duration in seconds |
+| Hold interval | Touch-and-hold | Seconds of continuous contact between rewards |
+| Fix interval | Eye calibration and video with eye tracking/reward enabled | Fixation reward interval in seconds |
+| Reward interval | Video with reward output but no eye tracking | Seconds between reward onsets |
+| Fix radius | Eye calibration | Radius as a fraction of the shorter subject-scene dimension |
+
+Click a control to edit; typing replaces the value, Enter confirms, and Esc cancels
+without exiting the task. Invalid values leave the editor open with an explanation.
+Pump duration and reward interval are validated together: the pulse must remain
+shorter than the interval, including when several edits are pending. The display
+shows the applied value and a `Next` value until the edit takes effect. Controls and
+text entry stay in a reserved 60-pixel bottom strip, or the calibration preview's
+existing side gutter, outside the subject-scene image. Video fixation remains fixed
+to the full screen and has no radius control.
+
+Trial-based tasks apply changes at the next trial boundary (next clip for video);
+touch-and-hold can apply them while waiting for a fresh initiation touch. All pulses
+within that trial use the same configured settings. Calibration and continuous
+training apply changes between pulses. A changed interval or fixation radius clears
+old acceptance history and requires a fresh full interval; a pump-only edit preserves
+that history. No edit truncates a pulse already in progress. An explicit
+`inter_pump_interval` stays fixed; its omitted default in active foraging and
+match-to-cue follows the pump duration.
+
+Every trial behavior row contains `pump_pulse_time` in seconds; touch-and-hold and
+reward-enabled video also record `reward_interval`. A video block without reward
+output leaves these columns blank. Calibration and continuous training have no trial
+rows. Their pulse events still record the requested pulse width.
+
+All tasks, including pump-only tasks, write `live_setting` JSON records in
+`message_log.tsv`: `initial`, `confirmed`, and `applied` phases. Records identify the
+setting, units, old/new values and request ID. The normal `task_time_ns` column records
+the original confirmation or effective application time in the experiment clock;
+application records also retain `requested_perf_ns`. Superseded or unapplied edits
+remain in the confirmation history. Buffered records may be written out of timestamp
+order: sort by `task_time_ns` when reconstructing changes. Edits affect the running
+block and do not rewrite its source config; saved calibration metadata contains the
+last applied interval and radius.
+
+The reusable implementation is `bin/live_settings.py` (`SettingSpec`, `LiveSettings`,
+and the `reward_settings` factory) plus `bin/live_settings_ui.py` (`SettingsPanel`).
+New tasks supply specs/initial values, pass the model as `live_settings` to
+`ExperimenterPreview` and `SessionLogBundle`, and call
+`apply_pending(message_logger, on_apply=...)` at an appropriate boundary. The callback
+receives the complete setting snapshot and effective performance timestamp; the
+returned snapshot supplies behavior-log values. Stop the preview before closing logs.
+`PumpPulseControl` remains a compatibility facade for the common reward specs.
+
+Input and rendering run exclusively in the separate preview process. The task tries
+the settings lock once without waiting; a busy editor defers the update. Application
+performs no preview IPC wait, hardware write, or disk flush. Change confirmations use
+a separate ordered queue and are drained at existing log flush points and shutdown,
+so the preview's latest-scene mailbox cannot lose them. Trial display deadlines and
+in-flight pulse deadlines remain intact.
+
+Touch-and-hold training
+-----------------------
+Select `trainings` → `touch_and_hold` in the Raspberry Pi interface, or run:
+
+```bash
+python task/trainings/touch_and_hold.py --config config_files/trainings/touch_and_hold.json
+```
+
+The initial config uses the same checker initiation cue, `[300, -480]` subject-centered
+position, palette background, cue size, Gaussian mask, and pressed feedback as
+`config_files/csc2/yuri_headfix_train_noseq_nomem_20260930.json`. Position conversion,
+software screen rotation, and cue construction are shared with active foraging.
+
+- `duration`: trial length in seconds from the first cue touch; `null` removes the time limit.
+- `end_on_release`: when `true`, lifting off or moving outside the cue immediately ends the
+  trial, including when `duration` is `null`. There is no release grace period.
+- `iti`: seconds with the cue hidden after a trial ends, measured from cue removal.
+  A fresh touch is required after the cue reappears; holding through ITI does not start a trial.
+- `reward_interval`: seconds of uninterrupted cue contact before the first reward and between
+  subsequent rewards. Release resets this timer. When `end_on_release` is `false`, recontact
+  can earn rewards within the original trial duration.
+- With `duration: null` and `end_on_release: false`, the cue remains continuously present,
+  there are no trial boundaries or ITIs, and `n` is ignored.
+- `n`: number of completed trials; `null` runs until Exit/Escape. The initial config uses
+  100 trials, `duration: 5.0`, `reward_interval: 1.0`, `iti: 0.2`, and `end_on_release: true`.
+- `pump_pulse_time_seconds`: pulse width (initially 0.275), which must be positive and shorter
+  than `reward_interval`. Automatic pulses stop on release or trial end. Reward timing and
+  release detection continue during pulses; missed intervals do not produce catch-up rewards.
+
+The simplified active-foraging experimenter preview shows the cue and gaze, subject/trial
+progress, completed trials, and automatic/manual reward counts. The shared `rew.` / `r`
+manual reward and Exit/Escape controls are available. Eye tracking uses the same settings
+and calibration loader as active foraging; it monitors gaze without gating touch rewards.
+The initial config enables eye tracking, so standalone runs need a saved calibration or
+explicit calibration coefficients; the interface supplies the subject's calibration.
+
+Standalone diagnostic logs default to `logs/trainings/`. Interface runs use their assigned
+experiment block directory. Each session includes `training.json` with
+`"session_type": "training"` and `"experimental_data": false`, plus event/message logs
+and the eye recording when enabled. Bounded trials also have a behavior log with their
+pump pulse durations, hold reward intervals, and end reasons. These remain training records, not experimental data.
 
 Experiment Manager
 ------------------
@@ -28,14 +132,144 @@ contains:
 
 - `launch_config.json`: a snapshot of the interface launch config.
 - `event_name_library.json`: a snapshot of the shared event-name/code library used by its blocks.
-- `state.json`: the current mutable experiment state.
-- `blocks.tsv`: blocks in launch order, including start and end times in milliseconds from experiment start.
+- `state.json`: the unique `experiment_id` (UUID), current mutable experiment state, and launch-time Git commit, hostname, OS details, and Python version.
+- `blocks.tsv`: blocks in launch order, with human-readable start and end datetimes to the second.
+- `clock.json`: the experiment origin (`origin_perf_counter_ns`) and its local wall-clock datetime.
 - `blocks/[block_num]_[block_name]/`: the generated config and outputs for each block.
 
-`blocks.tsv` has the fields `block_name`, `block_num`, `subject`, `start_time`, `end_time`, and `out_dir`.
+The permanent local log `logs/experiment_history.tsv` sits alongside these experiment directories. It is
+excluded from data synchronization and is never removed by cache cleanup. Each row records the experiment
+directory name, subject, subject code, local date, experiment number, start/last-update/end times, block count,
+completed block count, runtime in seconds, and status. Numbers increase independently for each subject code
+and local start date, using one more than the highest recorded number rather than reusing gaps.
+
+Selecting a subject durably reserves its number in this log **before** creating the experiment directory or
+starting the tracker. Zero-block experiments, interrupted startup, and unexpected launcher exits therefore
+consume their numbers even if their experiment directories are later removed. Updates use a process lock,
+atomic file replacement, and file/directory `fsync`; an unreadable history or failed reservation stops startup
+instead of silently resetting the counter. Keep this file and its `.experiment_history.lock` sidecar locally.
+
+Summaries are saved at experiment creation, block preparation, block exit, and experiment end, outside the
+task's trial loop. Runtime includes time between blocks. `completed_block_count` counts blocks with a recorded
+exit, including failed or aborted blocks; `block_count` includes prepared/attempted blocks. `ended` means a
+clean experiment end was recorded. `open` means no clean end was recorded and may represent a running,
+interrupted, or partially initialized experiment. After an abrupt shutdown, its end time remains blank and
+runtime is only the elapsed time through the last saved update, not an inferred shutdown time.
+
+Existing local experiment directories are imported automatically before allocating a new number or pruning
+the cache. Their rows have status `imported`; missing summary fields remain blank and available block times
+provide only a lower bound on runtime. Experiments already removed locally before this log was introduced
+cannot be reconstructed from local files alone.
+
+`blocks.tsv` has the fields `block_name`, `block_num`, `block_id`, `experiment_id`, `subject`, `start_time`, `end_time`, and `out_dir`.
+Every experiment and prepared block receives a new UUID. Each block directory saves both IDs in
+`block.json` and the generated `config.json`, before acquisition starts. The UUIDs identify runs across
+devices; the existing sequential numbers and directory names remain unchanged.
 `block_name` is the task config's `config_name`, falling back to the interface button name for a task with no
 source config. A row is written with a blank `end_time` before the subprocess starts and is updated when it exits,
-so an interrupted or failed block remains visible in the experiment record.
+so an interrupted or failed block remains visible in the experiment record. `start_time` and `end_time` use
+`YYYY-MM-DD HH:MM:SS` (with a UTC offset when the origin is timezone-aware), derived from the experiment
+origin. These describe launcher preparation and subprocess exit; precise task boundaries are in each block
+event log.
+
+Both Raspberry Pi launch configs also synchronize experiment boundaries with the tracker Pi:
+
+```json
+"eye_tracker_experiment": {
+  "enabled": true,
+  "start_timeout_s": 15.0,
+  "uart": {"device": "/dev/ttyAMA10", "baud": 460800}
+}
+```
+
+Selecting a subject queues UART `START_EXPERIMENT` (code 6) with the selected full name
+(for example, `Yuri`, not its directory code `Y`), the numeric ID allocated for the local
+experiment directory (`007` sends number `7`), and the experiment start datetime converted
+to Unix UTC nanoseconds. When a task block starts eye tracking, its `START_TRACKING`
+command carries the local `block_num`, including calibration tasks and gaps from blocks
+without eye tracking. For example, local `blocks/3_fixation/` corresponds to tracker
+`blocks/3/`. Directory names retain each device's format; the tracker uses the full subject
+name, UTC date and an additional start time in its experiment name.
+After each acknowledged start, the same UART connection sends `SET_EXPERIMENT_ID` (code 9)
+or `SET_BLOCK_ID` (code 10) with the matching UUID. Startup succeeds only after this packet is
+also acknowledged. This applies to explicit recording starts as well as tracking starts.
+The tracker saves the experiment UUID in `state.json` and both IDs in the block's `identity.json`.
+End Experiment or closing the launcher queues `STOP_EXPERIMENT`
+(code 7), which asks the tracker to flush recording and close its experiment. The tracker
+must run its `pi_tracker.py CONFIG` interface with permission to set its system clock;
+standalone `run`/`preview` services do not implement these experiment commands. Subject
+names must match `[A-Za-z0-9][A-Za-z0-9_.-]{0,31}`; unsupported names produce a warning
+and are never silently rewritten.
+
+Use the matching tracker version supporting numbered starts and UUID commands. The number occupies little-endian
+uint32 header bytes 12–15 of the existing 64-byte protocol v1 packet. Older trackers reject
+this field. An existing experiment number for the same subject and UTC day is rejected;
+a numbered tracking start replaces that block's directory on the tracker. Retries reuse
+the identical packet and sequence so a lost acknowledgement does not restart or replace
+the block again. An ID retry resends only the ID packet. UUID commands carry the 16 UUID bytes
+in canonical byte order at offsets 24–39, with zero padding at 40–59; packet size, version,
+subject capacity, and telemetry remain unchanged. Older receivers reject the new commands,
+so update the tracker before enabling acquisition with this client.
+Standalone task launches and launches with experiment synchronization
+disabled retain automatic tracker numbering. `uart.manage_tracking: false` remains poll-only.
+
+These commands run in order on a background worker. START is queued once the experiment's
+number and required files exist, before Git and interpreter metadata probes (which can each
+take five seconds). State commands retry a missing/invalid acknowledgement after
+`uart.response_timeout_s` (0.25 s), plus a 0.02 s retry delay, using the identical packet.
+Only the final attempt waits the full action timeout: 15 seconds for experiment start
+(`eye_tracker_experiment.start_timeout_s`), or 10 seconds for other state commands
+(`uart.state_timeout_s`). With the default one retry, each experiment start or ID command waits at most
+about 15.27 seconds on the transport, and a single dropped request can be resent after
+about 0.27 seconds instead of 15 seconds. When omitted, the start timeout is the greater of
+15 seconds and `uart.state_timeout_s`. `uart.state_retries` controls the number of retries;
+zero disables the short retry window and waits the full action timeout on the first attempt.
+The UART is closed after each start/ID exchange or stop command. Task eye acquisition waits for the experiment-start
+handoff in its own worker, so the launcher and task rendering remain responsive.
+If experiment start is not confirmed, task eye acquisition stays off for that experiment
+to avoid writing numbered blocks into a previously active tracker experiment.
+Missing hardware, rejected commands, unexpected status flags, or recording failures show
+nonmodal warning dialogs and write warnings to stderr; experiments and tasks continue.
+Command acknowledgement requires a checksum-valid reply with the exact request sequence
+and status `OK`. The `ERROR` flag separately reports tracker health: it does not undo a
+successful command acknowledgement. An acknowledged active experiment releases task
+startup even if a health warning is present; unsafe gaze still remains invalid. Missing
+ACKs are reported as unconfirmed outcomes, since the remote action may already have run.
+Noise, damaged/truncated replies, late duplicate ACKs, and uncorrelated sequence-zero
+errors are skipped while waiting for the matching reply, within the transaction timeout.
+The UART stays in raw, non-echoing mode between owners so a late reply cannot echo back
+to the tracker. Closing explicitly releases exclusive ownership before the next task.
+An isolated lost telemetry reply invalidates gaze immediately and is retried; three
+consecutive failed polls produce a communication warning (non-transient errors warn
+immediately). Any successful poll resets that consecutive-failure count.
+Repeated warnings of the same kind are suppressed within each session. Missing recording
+does not invalidate otherwise valid gaze, but stopped, unconfigured, calibrating, stale,
+or error telemetry is unusable. Local eye CSV failures also warn without aborting the task.
+
+For latency diagnosis, enable Python INFO logging for `interface.experiment_eye_tracker`
+and `bin.eye_tracker_wire.controller`. State commands report executor queue wait, submission
+of all 64 bytes to the local tty, retries, and time until the response. Submission is not proof
+of remote receipt or completion; only a matching successful acknowledgement confirms the
+action. POLL traffic is not logged. The tty uses nonblocking writes and raw 8-N-1 with no
+flow control or deliberate pre-send sleep. Quiet-mode preparation and experiment-number
+reservation still precede experiment creation; pending earlier STOP commands must finish
+before the next START. Task recording uses START_TRACKING and the tracker's
+`record_on_tracking` setting, rather than a separate START_RECORDING command.
+
+Experiment synchronization defaults to disabled when this launcher section is absent;
+set `enabled` to `false` (or `uart.simulate` to `true`) for hardware-free operation.
+With synchronization enabled, the interface's **Shutdown** button also sends binary UART
+`SHUTDOWN` (code 8), even after End Experiment has returned to the root menu. It runs
+after data cleanup is accepted and after any queued experiment commands. The interface
+stays responsive while awaiting the matching `SHUTTING_DOWN` acknowledgement or the
+configured timeout/retries, then requests local power-off. Tracker failures show a warning
+and still allow local shutdown; cancelling data cleanup sends no shutdown command.
+The tracker acknowledgement confirms application cleanup and acceptance of the request,
+not that its operating system has finished powering off. The tracker process must have
+permission to request system power-off.
+The launcher UART device/baud must match the task's UART settings and physical wiring.
+Experiment start opens the tracker session; each eye-enabled task still controls tracking
+through `START_TRACKING` / `STOP_TRACKING`.
 
 ### `config_name` convention
 
@@ -51,8 +285,23 @@ those variants with their specific config fields (for example `sequential`, `is_
 combined with the existing family. Config filenames and interface menu labels can remain specific and descriptive.
 
 The launch config must contain `subjects`, `tasks`, and `initial_state` objects. `initial_state` is copied into
-`state.json`, then its `subject` field is set to the selected full subject name. Eye calibration uses this state
-shape:
+`state.json`, then its `subject` field is set to the selected full subject name. The manager also sets
+`git_commit` to the full Git `HEAD` commit ID from the launcher's working directory at experiment creation
+(for example, `99a093fc8a4d9e392a63f53da7472f82b4fe3f4e`). This value remains fixed through block and
+calibration updates; it identifies the commit, not uncommitted edits. It is `null` if Git or a committed
+checkout is unavailable. Existing experiment records are not backfilled with today's commit.
+
+The manager also captures these launch-time fields once and preserves them through state updates:
+
+- `hostname`: the local machine's hostname.
+- `os_details`: `system`, kernel `release` and `version`, `machine` architecture, and a human-readable
+  `platform` string. Linux also includes `distribution` fields from `/etc/os-release` (or its system fallback)
+  when available.
+- `python_version`: the full `sys.version` string, including build/compiler details, from the task
+  interpreter configured by `environment.python`. If no interpreter is configured, it uses the launcher's
+  version. If the configured interpreter cannot be queried within five seconds, the field is `null`.
+
+Eye calibration uses this initial state shape:
 
 ```json
 {
@@ -63,7 +312,7 @@ shape:
       "y_scale": null,
       "x_offset": null,
       "y_offset": null,
-      "set_time": 0.0
+      "task_time_ns": 0
     }
   ]
 }
@@ -71,14 +320,30 @@ shape:
 
 After every block, the manager checks its directory for `calibration.json`. For each top-level field that also
 names a list-valued state field, the calibration object must contain all fields in that state's most recent entry
-except `set_time`. The manager then appends those values and supplies `set_time` in milliseconds from experiment
-start. Extra calibration metadata is ignored. This generic matching rule allows future calibration histories to be
-added to `initial_state` without adding task-specific manager code.
+except `task_time_ns`. The manager then appends those values and supplies `task_time_ns` in integer nanoseconds
+from experiment start. Extra calibration metadata is ignored. This generic matching rule allows future calibration
+histories to be added to `initial_state` without adding task-specific manager code.
+
+Accepted gaze calibrations are also saved locally per full subject name in
+`logs/.subject_calibrations/`. This cache is excluded from data sync and experiment deletion.
+Each new experiment starts with that subject's latest accepted calibration, selected by experiment
+date/number and then block number. It preserves all six affine coefficients and the complete saved
+metadata, including the gain anchor and axis directions. The experiment keeps its own
+`initial_eye_calibration.json` snapshot, so later calibration updates cannot change its starting settings.
+Subjects without a saved calibration continue to use the launch config's initial values.
+
+Existing local block calibrations are imported into this cache on experiment startup and before sync
+cleanup. Interrupted `calibration_recovery.json` files and runs without a completed calibration do not
+replace the last accepted calibration. A cache-write failure prevents cleanup from deleting experiments.
+Calibrations whose experiment folders were already deleted before this feature was installed must be
+restored from their archived experiment folders or recalibrated. This cache stores the task Pi's gaze
+mapping; the tracker Pi manages its pupil-image calibration separately.
 
 Before each block, the manager creates its output directory and writes `config.json` there. It copies the task
 config from its original source at block launch time, sets `config_name`, `output_dir`, and the full-name `subject`, copies
-other non-list state fields, and flattens the newest entry from every list-valued state field into top-level config
-fields, excluding `set_time`. It never injects the calibration-history lists themselves. The task subprocess is
+other non-list state fields except the experiment's `git_commit`, `hostname`, `os_details`, and `python_version`
+metadata, and flattens the newest entry from every list-valued state field into top-level config fields, excluding
+history timestamps. It never injects the calibration-history lists themselves. The task subprocess is
 then launched with `--config` pointing to this generated file.
 
 Interface task entries can be nested into menu pages. A normal leaf has one launch script and an optional config:
@@ -109,6 +374,9 @@ current block and its loop immediately.
 The subject and task option area scrolls with a mouse wheel (including X11 Button-4/5 wheel events) or by dragging
 vertically with one finger. A touch drag must move at least 12 pixels before it becomes a scroll, so a normal tap
 still activates its button while a swipe does not accidentally launch it.
+All menus also support the Up and Down arrow keys to move the blue selection outline and Enter to activate the
+selected button. Selection wraps at the ends of the menu and scrolls into view automatically, including on subject
+selection and nested task pages. Mouse and touch controls remain available.
 
 The root menu and top-level task menu both have a Shell button. On the Raspberry Pi it opens a new LXTerminal on
 the experimenter display, starts in `environment.working_dir`, and activates the virtual environment containing
@@ -119,21 +387,42 @@ Data synchronization
 --------------------
 
 The interface config's `remote_data_url` is the NFS-backed storage root. The contents of the local `logs`
-directory are copied into `remote_data_url/experiments/`, not directly into the storage root. Cleanup runs at
-startup, when **End Experiment** is pressed, and before shutdown; it does not run after individual tasks or blocks.
-Cleanup first verifies that the configured root exists on an NFS filesystem and contains at least one file or
-directory. If either check fails, it prints a warning and leaves all local data untouched.
+directory, except the permanent experiment history and its sidecars, are copied into
+`remote_data_url/experiments/`, not directly into the storage root. Cleanup runs when
+**End Experiment** is pressed and before shutdown; it does not run at startup or after individual tasks or blocks.
+Cleanup checks both `remote_git_url` and `remote_data_url`, including that the data root is a mounted, non-empty NFS
+filesystem. An unavailable remote, failed operation, or timeout is logged and normal interface operation continues,
+with local experiment data left untouched unless synchronization completes successfully.
 
-When storage is available, the launcher uses `rsync --archive --no-owner --no-group` to copy the contents of
-`logs`. Owner and group metadata are intentionally not preserved because NFS root-squashing commonly rejects
-those changes; experiment contents, timestamps, permissions, directories, and symlinks are still preserved. A
-modal progress window prevents tasks from launching during the copy and offers **Cancel Sync**. Cancelling or any
-rsync failure retains every local experiment. After a fully successful copy, all but the most recently modified
-experiment are removed from the local cache. Generated data directories are excluded by `.gitignore`.
+When storage is available, the launcher uses `rsync --archive --timeout=30 --progress --no-owner --no-group`
+with root exclusions for `experiment_history.tsv` and `.experiment_history.*` to copy the contents of `logs`.
+In addition to rsync's own I/O timeout, the launcher stops a transfer after 60 seconds
+without progress; active transfers have no total-duration limit. Owner and group metadata are intentionally not
+preserved because NFS root-squashing commonly rejects those changes; experiment contents, timestamps, permissions,
+directories, and symlinks are still preserved. A modal progress window prevents tasks from launching during the copy
+and offers **Cancel Sync**. Cancelling aborts the current operation without removing local data; during shutdown, it
+also cancels shutdown. Any rsync failure retains every local experiment. After a fully successful copy, all but the
+most recently modified experiment are removed from the local cache. Their names and numbers must first be saved
+in the permanent local history; a history read/write failure prevents pruning. The history remains in `logs`
+alongside the retained experiment. Generated data directories, including this local history, are excluded by
+`.gitignore`.
 
-Code updates use `remote_git_url` from the same interface config (normally an NFS-mounted repository path). Each
-cleanup runs `git reset --hard` and then pulls from that explicit URL rather than the checkout's default remote.
-This code update is attempted before data synchronization starts.
+Code updates use `remote_git_url` from the same interface config (normally an NFS-mounted repository path). At
+startup the launcher makes a bounded update attempt; a failure or timeout is logged without preventing the interface
+from opening. Each later cleanup also runs `git reset --hard` and pulls from that explicit URL before data
+synchronization starts.
+
+Cleanup reports data copying and code updating separately. A failed Git update can therefore report
+**Data sync completed. Code update failed.** without implying that the data drive is unavailable.
+The report includes the destination and actual command/probe errors, including rsync errors captured before
+a timeout. Reports are appended locally to `logs/interface_sync.log`, so they remain available when the
+remote is unavailable. Startup code-update failures are also recorded there and shown in the status bar.
+
+End Experiment keeps the cleanup summary visible on the root menu and shows details if either operation
+fails. Before shutdown, the details dialog offers **Retry**, **Shut down anyway**, and **Cancel shutdown**.
+Escape or closing this dialog cancels shutdown. Interface error/warning dialogs support arrow keys to select
+a button, Enter or keypad Enter to activate it, and Escape to dismiss. The same keys work in the sync-cancel
+dialog and the separate nonmodal eye-tracker warnings; tracker warnings never block task execution.
 
 Run System Diagnostic uses the configured `environment.python` interpreter and does not create an experiment or
 block. It checks that PsychoPy can import, `lgpio` can open GPIO chip 0, and the Pi-Plates DAQC2 driver can read the
@@ -185,9 +474,8 @@ Experiment-managed task/subprocess policies:
   native activation, and final realized-rectangle verification. On Linux it also makes the resolved subject
   output XRandR-primary, confirms swap interval 1 on that drawable, and restores the previous primary output when
   `bin.utils.close_task_window()` closes it. Every subject task must use this matching setup/close pair.
-  `bin.utils.setup_window()` is reserved for an
-  already-resolved auxiliary calibration window; the diagnostic and preview process are the only other low-level
-  window-factory users. `tests/test_screen_path_policy.py` enforces this invariant for every current task and
+  Secondary calibration controls use the shared `ExperimenterPreview` process.
+  The diagnostic and preview process are the only other low-level window-factory users. `tests/test_screen_path_policy.py` enforces this invariant for every current task and
   rejects future direct window-factory bypasses.
 
 X11 Main-Screen Idle Masking
@@ -204,12 +492,24 @@ fields:
     "experimenter": "DSI-1"
   },
   "mask_main_inputs": true,
+  "screen_mask_rgb": [174, 165, 163],
+  "sync_bar": {
+    "enabled": true,
+    "height": 20,
+    "interval_mean_seconds": 1.0,
+    "interval_variance_seconds": 0.2
+  },
   "main_touchscreen_xinput": "Exact XInput Touchscreen Name"
 }
 ```
 
 - `mask_main_inputs` defaults to `false` and must be a JSON boolean.
-- When it is `true` and the resolved main and experimenter displays differ, `main_touchscreen_xinput` is required.
+- `screen_mask_rgb` sets the idle main-screen mask color using three integer RGB channels in 0–255;
+  it defaults to `[0, 0, 0]` (black).
+- An enabled top-level `sync_bar` adds five static black/white rectangles to the mask at the
+  subject's visible top, using the same height and rotation as task bars. It stays in phase 0
+  between blocks for checking camera views, without scheduled transitions or GPIO output.
+- When `mask_main_inputs` is `true` and the resolved main and experimenter displays differ, `main_touchscreen_xinput` is required.
   It must be the exact stable device name reported by `xinput list --name-only`; numeric XInput IDs are rejected
   because they can change after reboot.
 - When both screen selectors resolve to the same display, masking is skipped completely for debugging and
@@ -217,13 +517,13 @@ fields:
 - Masking requires Linux with a real X11 `DISPLAY`. It intentionally does not support Xwayland.
 
 While the interface is idle, the manager runs `xinput disable` only for that named touchscreen and covers the main
-display with a fullscreen black window. The experimenter touchscreen and physical mouse are not modified. A task
-subprocess creates its main window, then emits a private readiness marker. The manager removes the black window,
+display with a fullscreen window colored by `screen_mask_rgb`. The experimenter touchscreen and physical mouse are not modified. A task
+subprocess creates its main window, then emits a private readiness marker. The manager removes the mask window,
 maps the touchscreen to the resolved main RandR output with `xinput map-to-output`, enables it, and acknowledges
 release. The task waits for that acknowledgment and then activates its window before beginning timing-sensitive
 work.
-After every block—including errors and user exits—the manager disables the touchscreen again, restores the black
-window, and returns focus to the interface. Choosing **Desktop**, closing the interface window, or otherwise
+After every block—including errors and user exits—the manager disables the touchscreen again, restores the configured
+mask and static bar, and returns focus to the interface. Choosing **Desktop**, closing the interface window, or otherwise
 leaving the interface normally re-enables the touchscreen before exit.
 
 Experiment Quiet Mode
@@ -277,6 +577,7 @@ When run by the experiment manager, the same files are written directly into
 
 Each session directory contains the applicable files from this set:
 
+- `block.json`: the block UUID and enclosing experiment UUID (null for standalone tasks)
 - `event_log.tsv`
 - `message_log.tsv`
 - `behavior_log.tsv` when the task records trial-level behavior
@@ -289,26 +590,62 @@ the file.
 
 The repo also includes a shared checked-in `event_name_library.json`. It is the repo-wide source of truth for event names, codes, event types, and descriptions across tasks. Not every event in that file is used by every task.
 
+All task timestamps use **`task_time_ns`**, integer nanoseconds relative to one experiment origin:
+`time.perf_counter_ns() - origin_perf_counter_ns`. The manager captures that origin once at experiment
+creation and passes it to every block through `NEURO_EXPERIMENT_ORIGIN_PERF_NS`. It never resets at a
+block boundary, and includes gaps between blocks. A standalone task creates one origin for its run.
+Flip callbacks, GPIO writes, and input detection capture native `perf_counter_ns()` values. APIs that
+supply float seconds are converted against this same origin; durations, reaction times, and
+media-relative positions remain in seconds. Nanosecond units do not imply
+nanosecond hardware accuracy. Camera timestamps retain their separate, unsynchronized device clock.
+
 `event_log.tsv` is the deployment-facing timing log shared across tasks. Columns:
 
 - `trial_num`
-- `requested_time_since_session_start`
-- `time_since_session_start`
+- `requested_task_time_ns`
+- `task_time_ns`
 - `event`
 - `event_code`
 - `event_type`
 - `requested_duration`
+- `sync_transition_num`
+- `sync_phase`
 
 Common event-log rules:
 
-- `requested_time_since_session_start` records when a refresh-locked flip or hardware change was submitted; it is blank for events that have no separate request time.
-- `time_since_session_start` records when that flip or hardware operation actually completed, measured from session start using high-resolution real time (`time.perf_counter()`).
-- `event_type` is one of `frame_flip`, `interaction`, or `signal`.
-- Frame-flip events are logged at the real flip time for the frame that changed the main display.
-- Interaction events are logged as close as possible to the touch / click / key / eye-tracker event itself.
-- Signal events are logged as close as possible to the GPIO, DAQC2, or external signal send.
-- Events that have no visible effect or a programmatic zero-duration no-op should not be logged.
-- `requested_duration` always retains the exact configured request, not the nearest frame-achievable duration. It is blank only when no duration was requested.
+- `requested_task_time_ns` records when a refresh-locked flip or hardware change was submitted. For `sync_bar_flip`, it records the sampled target display time, preserving any deferral to protect task timing. It is blank for events that have no separate request time.
+- `task_time_ns` records the observed flip, interaction, or individual output write, in integer nanoseconds on the experiment clock.
+- `event_type` is one of `frame_flip`, `interaction`, `signal`, or `lifecycle`.
+- `sync_transition_num` starts at 1 for each block and increments on each displayed sync inversion,
+  across all trials and video clips. `sync_phase` records the resulting pattern: 0 is black/white/black/white/black;
+  1 is white/black/white/black/white, read left to right from the subject's perspective.
+  Both fields appear on the visual transition and its corresponding GPIO event, and are blank for other events.
+- The first data row is `block_start` (code 1), captured as the task opens its log bundle. The last is
+  `block_end` (code 2), captured once when the task closes the bundle, before log draining and eye-tracker
+  shutdown. Both use native `perf_counter_ns()` captures, type `lifecycle`, and a blank `trial_num`.
+  Cleanup on normal completion, user exit, and Python exceptions closes the log; a forced kill or power loss
+  cannot supply an exact end timestamp and can leave `block_end` absent.
+- Frame-flip times are captured in the first task `callOnFlip` callback, before GPIO callbacks and
+  post-flip processing. The request is captured immediately before `win.flip()`. A backend without
+  `callOnFlip` falls back to the time immediately after `flip()` returns. These are software observations
+  near the swap, not measurements of physical pixel illumination.
+- Touch/click presses use PsychoPy's buffered event time when available, mapped onto the performance
+  clock using a bracketed `clickReset()` anchor. This preserves a press dispatched during a blocking
+  flip. Without a usable buffered time, the timestamp is captured immediately after `getPressed()`,
+  before position lookup, hit-testing, or logging. Hold release records the first missing-touch detection,
+  even when the release is confirmed later by a grace period. Input dispatch and polling still limit
+  accuracy; see [PsychoPy's mouse event implementation](https://psychopy.org/_modules/psychopy/event.html).
+- Each GPIO sync edge retains the standard two columns: `requested_task_time_ns` immediately before
+  `gpio_write()` and `task_time_ns` immediately after it returns. The timestamp is taken at the individual
+  HIGH or LOW write, **never after waiting for the pulse duration**. Sync bar signals are scheduled on
+  the display flip callback. DAQC2 writes use the same before/after capture convention. Deferred log writing
+  preserves these captures and does not substitute a flip, queue-drain, or file-write time.
+- Output timestamps measure the host write call, not electrical feedback. lgpio's pulse worker is
+  [software timed](https://github.com/joan2937/lg/blob/master/lgPthTx.c); validate physical GPIO/display
+  alignment with an external recording and photodiode when measuring hardware latency or pulse width.
+- Frame-flip events describe actual display flips. Explicit lifecycle events can mark behavioral
+  interval boundaries while the display remains unchanged. Zero-duration interval no-ops are not logged.
+- `requested_duration` is in seconds and always retains the exact configured request, not the nearest frame-achievable duration. It is blank only when no duration was requested.
 
 `event_code_library.json` is generated per session as the minimal subset of `event_name_library.json` that was actually used in that run. It includes:
 
@@ -319,13 +656,16 @@ Common event-log rules:
 
 `message_log.tsv` is the non-timing log shared across tasks. Columns:
 
-- `time_since_session_start`
+- `task_time_ns`
 - `level`
 - `message`
 
-Allowed levels are `INFO`, `WARN`, and `ERROR`.
+Message timestamps use the same experiment-wide `task_time_ns`. Allowed levels are `INFO`, `WARN`, and `ERROR`.
 
 `behavior_log.tsv` is task-specific. Every behavior log includes `trial_num` so behavior rows can be aligned with `event_log.tsv`.
+Initiation timestamps use `initiation_task_time_ns`. Video behavior uses `first_frame_task_time_ns` and
+`last_frame_end_task_time_ns`; `video_frame_timing.tsv` uses `requested_task_time_ns`, `expected_task_time_ns`,
+and `task_time_ns` for submission, planned, and realized flips.
 
 Task-Specific Logging
 ---------------------
@@ -336,15 +676,27 @@ Active-foraging event naming:
 - Sequential runs (`sequential=true`) log option-specific frame-flip events such as `option_1_dot` and `option_1_on`.
 - Simultaneous runs (`sequential=false`) log combined frame-flip events such as `options_dot` and `options_on`.
 - `choice_start` marks the first frame where a choice can be made.
-- `grey_inter_trial_interval` marks the flip to the gray post-choice / inter-trial screen.
+- `reward_interval` (3), or `timeout_interval` (4) on timeout trials, is the single `frame_flip`
+  event for the post-choice transition to gray. It carries that flip's requested and observed
+  timestamps and only the reward/timeout interval's requested duration. Zero-pulse outcomes
+  still receive the reward interval. A configured zero-duration outcome retains this event with
+  duration `0` because the choice-clear flip still occurred.
+- `inter_trial_interval` (5) is a `lifecycle` event marking actual ITI onset after either interval,
+  with its own requested duration and no separate request timestamp. The gray display stays
+  unchanged apart from an enabled sync bar. The next phase's onset marks the preceding phase's
+  end; interval-end events do not add display flips. Pump/buzzer events still record individual
+  hardware edges.
+- `grey_inter_trial_interval` (109) is no longer emitted by active foraging. Its shared-library
+  definition and code remain reserved for historical logs. Earlier sessions retain their own
+  event-code-library snapshots, including the earlier `lifecycle` types for codes 3 and 4.
 - `cue_touch` and `option_touch` are the current touch interaction events.
-- `trial_start_signal_on/off`, `pump_on/off`, and `buzzer_on/off` are the current signal events.
+- `pump_on/off` and `buzzer_on/off` record reward and timeout output edges; sync bar events record display synchronization. Historical trial-start signal event codes remain reserved.
 - `event_name_library.json` is shared across tasks. For active-foraging sequential runs it defines `option_{n}_dot` and `option_{n}_on` through templates rather than duplicating a separate static entry for each possible option index.
 
 Active-foraging behavior log columns:
 
 - `trial_num`
-- `initiation_time`
+- `initiation_task_time_ns`
 - `reaction_time`
 - `shape_0 ... shape_(k-1)`
 - `color_0 ... color_(k-1)`
@@ -411,15 +763,15 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
   Each completed clip additionally logs
   `video_main_vblank_validation`, comparing the drawable's actual GLX OML media
   stream counter (MSC) and swap buffer counter (SBC) deltas with the exact
-  planned subject refreshes and source-frame swaps. These values are also saved
+  planned subject refreshes and source-frame swaps, including any additional sync bar swaps. These values are also saved
   in `behavior_log.tsv`. The experimenter preview runs in another process and
   synchronizes only its own drawable to its own output; it cannot become the
   subject window's swap reference. If post-preview main-output validation fails,
   playback never becomes ready.
-- Playback uploads, draws, and calls blocking PsychoPy `Window.flip()` only at
-  source-frame boundaries. Between boundaries the front buffer is left
-  untouched, so the display naturally repeats that image at each hardware
-  refresh without more Python or GL work. Every boundary is scheduled from
+- Playback uploads and draws source video frames only at source-frame boundaries.
+  Between boundaries the front buffer repeats the same image at each hardware
+  refresh. An enabled sync bar adds swaps for its own scheduled inversions while
+  preserving that source image. Every source boundary is scheduled from
   the frame-zero onset plus its absolute source time; the blocking swap maps
   it to the nearest VBL. The measured monitor rate supplies the submission
   margin and cadence diagnostics, but its small measurement error is never
@@ -504,16 +856,24 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
   error. This prevents stale context-global OpenGL state from turning an
   otherwise correctly timed upload into a shifted, partial, or transiently
   corrupted frame.
-- On Raspberry Pi, `play_video` sends one-video-presentation-frame sync pulses on BCM GPIO
-  `sync_pin` (default `18`). Pulse onsets are frame locked and their successive
-  intervals are sampled inclusively from `sync_interval_frames` (default
-  `[100, 300]`) for each interval. `sync_pulse_frames` controls pulse width and
-  defaults to `1`.
+- `play_video` uses the shared `sync_bar` timing and display options. On Raspberry Pi,
+  `sync_pin` (default `18`) toggles once per displayed bar inversion. The earlier
+  video-only `sync_interval_frames` and `sync_pulse_frames` options have been removed.
 - On Raspberry Pi, `play_video` also drives the reward pump through Pi-Plates
-  DAQC2 `DOUT pump_pin`. Both `pump_interval` and
-  `pump_pulse_time_seconds` are required. The first onset occurs one
-  `pump_interval` after task startup and subsequent onsets remain on one
-  absolute session schedule across clip boundaries. Pump writes run on a
+  DAQC2 `DOUT pump_pin`. Both `reward_interval` and
+  `pump_pulse_time_seconds` are required, with a positive pulse duration shorter
+  than `reward_interval`. `reward_interval` is the standard interval name for
+  timed fixation rewards, shared with eye tracker calibration; it replaces
+  `pump_interval`. With eye tracking disabled, the first onset occurs one
+  `reward_interval` after task startup and subsequent onsets remain on one
+  absolute session schedule across clip boundaries. With eye tracking enabled,
+  rewards require valid calibrated gaze within the full subject-screen rectangle
+  (including its edges): more than 95% of the preceding 100 ms and more than 80%
+  of the preceding `reward_interval`, matching calibration auto reward. Current
+  offscreen, invalid or stale gaze blocks delivery. Rolling windows are checked
+  continuously and a reward is delivered as soon as both criteria pass. Each
+  reward clears both windows, requiring a full new `reward_interval` of observations;
+  continuous fixation can earn repeated rewards across clips. Pump writes run on a
   worker thread so DAQC2 I/O cannot stall display flips; delayed intervals are
   skipped rather than replayed. `pump_on` and `pump_off` log rows contain both
   requested and actual edge timestamps. Optional `daq.address`/`daq_address`
@@ -537,7 +897,7 @@ A minimal video-source portion of the configuration is:
   "video_buffer_megabytes": 512,
   "pump_pin": 0,
   "pump_pulse_time_seconds": 0.25,
-  "pump_interval": 60.0
+  "reward_interval": 60.0
 }
 ```
 
@@ -597,43 +957,253 @@ coordinates. The experimenter process transposes the entire scene to the subject
 
 Eye Tracker Calibration
 -----------------------
-`task/calibrate_eye_tracker.py` calibrates two analog eye-position voltages from a Pi-Plates DAQC2plate.
-The reusable implementation lives in `bin/eye_tracking.py` so other tasks can consume the same smoothed,
-calibrated eye position.
-
-Run with a config:
+`task/calibrate_eye_tracker.py` calibrates **Eye 0 (the first UART slot)** from the digital eye tracker.
+`bin/eye_tracking.py` owns acquisition, validity checks, smoothing and calibration. The controller-side wire
+codec and UART routines are adapted from the companion `eye_tracker` repository; provenance and license are
+in `bin/eye_tracker_wire/SOURCE.md`. No separate checkout or camera package is needed on the task Pi.
 
 ```bash
-python task/calibrate_eye_tracker.py --config test_configs/eye_calibration_config.json
+python task/calibrate_eye_tracker.py --config config_files/eye_tracking/calibration_rpi.json
 ```
 
-Important config keys:
+Both Pi launchers use this config, which enables DAQC2 reward output. It uses the shared task defaults for
+calibration and filtering. For a desktop control/display check, use
+`--config test_configs/eye_calibration_config.json --simulate_eye` (reward output disabled). Two displays are required.
+The subject window uses the same placement, realized dimensions, rotation and vblank verification as
+`active_foraging`. Calibration controls run in the same fullscreen, non-vsync `ExperimenterPreview` process
+as other tasks. `experimenter_win_size` is no longer used; the secondary window fills its selected display.
 
-- `screens.main` and `screens.experimenter`: main subject display and experimenter display, using the same selector rules as `active_foraging`.
-- `daq.address`, `daq.x_channel`, `daq.y_channel`: DAQC2plate address and analog input channels. The bundled DAQC2plate guide documents `piplates.DAQC2plate.getADC(addr, channel)` for channels `0` through `7`; channel `8` is the board supply readback and is not used for eye position.
-- `daq.sample_rate_hz`: analog sampling rate, default `240`.
-- `daq.voltage_min` and `daq.voltage_max`: expected valid eye-position voltage range, default `-10.0` to `10.0`.
-- `eye_filter.ema_gamma`: exponential moving-average gamma, default `0.98`.
-- `eye_filter.max_voltage_step`: optional per-sample jump threshold for blink/artifact rejection. Set to `null` to disable step rejection.
-- `initial_x_scale`, `initial_y_scale`, `initial_x_offset`, `initial_y_offset`: starting voltage-to-screen mapping parameters.
-- `fix_diameter`: fixation acceptance diameter, as a fraction of the shorter main-screen dimension. Default `0.05`.
-- `fix_accept_percent`: proportion of recent frame samples that must be inside the fixation window before automatic reward. Defaults to `0.95`; values like `95` are also accepted.
-- `fix_accept_time`: rolling acceptance-window duration in seconds. Default `2.0`.
-- `pump_pin` and `pump_pulse_time_seconds`: manual reward output controlled by the green experimenter-screen button.
+Connection and protocol:
 
-The eye tracker reports centered screen fractions relative to the real main screen dimensions:
-`x=-0.5` is the left edge, `x=0.5` is the right edge, `y=-0.5` is the bottom edge, and `y=0.5` is the top edge.
-The experimenter screen draws a gray preview box with the same aspect ratio as the main screen; the blue eye dot
-and fixation cross are mapped into that box. Clicking inside the box moves the fixation cross on both screens.
-The bottom slider changes `x_scale`, the left slider changes `y_scale`, and the lower-left `x` button sets the
-offsets so the current smoothed eye position maps to the current fixation position.
-When the smoothed eye position stays within `fix_diameter` of the fixation cross for at least `fix_accept_percent`
-of the past `fix_accept_time`, the task delivers one automatic `pump_pulse_time_seconds` reward. That automatic
-reward re-arms only after fixation is broken or the fixation/calibration target is changed.
+- `uart.device` defaults to `/dev/ttyAMA10`, the Pi 5 dedicated **3-pin UART connector**. This differs from
+  `/dev/ttyAMA0`, which selects UART0 on the 40-pin GPIO header. The current tracker profiles
+  also default to `/dev/ttyAMA10`.
+  `/dev/serial0` normally aliases the dedicated connector on Pi 5; an explicit device avoids alias ambiguity.
+  See [Raspberry Pi UART documentation](https://github.com/raspberrypi/documentation/blob/master/documentation/asciidoc/computers/configuration/interfaces.adoc).
+- Both ends must select the UART actually wired: cross TX to RX and share ground, using 3.3 V logic.
+  Disable the serial login console/getty on that device and ensure the task user has serial-port access.
+  If the tracker Pi also uses its 3-pin connector, set its `transport.uart_device` to `/dev/ttyAMA10` too.
+- Use `uart.baud: 460800`, raw 8-N-1 without flow control, matching the tracker. `uart.poll_rate_hz` defaults
+  to 100; this is a request/response protocol, not an unsolicited byte stream. Each exchange consists of a
+  64-byte command and 64-byte status with CRC-32C and echoed command sequence.
+- `uart.manage_tracking: true` sends acknowledged START_TRACKING on entry and STOP_TRACKING on exit.
+  START can also start recording if the tracker config enables `record_on_tracking`; STOP flushes it.
+  Set this option to `false` to poll an already-running tracker without changing its state.
+  State commands retry the identical command `uart.state_retries` times (default 1).
+  Retry attempts start after the short `uart.response_timeout_s` wait (0.25 s) and a
+  0.02 s delay; the final attempt waits up to `uart.state_timeout_s` (10 s).
+  Calibration and video tasks start their UART workers before display initialization
+  and vblank checks, so those operations no longer delay START_TRACKING. Configuration
+  and required media validation still precede task startup. Close may wait for ACKs.
+- `uart.expect_recording` defaults to `true`: a missing `RECORDING` status flag shows a
+  warning while allowing the task and valid gaze acquisition to continue. Set it to `false`
+  when recording on the tracker Pi is intentionally disabled. Error, stopped/unconfigured,
+  calibration, and restarted-service states also produce warnings without aborting tasks.
 
-On exit, the task writes `calibration.json` in its session log directory. The file has one top-level
-`eye_tracker_calibration` object containing `x_scale`, `y_scale`, `x_offset`, and `y_offset`, plus DAQ/filter
-metadata. The same directory contains its message and pump signal event logs.
+Eye data and calibration:
+
+- Only slot 0 is used, whether one or two eyes are configured. Its x/y are signed Q16.16 **crop-local pixels**;
+  pupil diameter is Q12.4 and confidence is 0–255. Input x points right and input y points down.
+- CRC/flags/acknowledgements are checked before use. Blink, lost, stopped, unconfigured, stale or error states
+  cannot earn automatic rewards or set offsets. `uart.max_sample_age_s` defaults to 0.15 s; age includes the
+  reported result age, UART round trip and time since receipt. Camera timestamps are not compared across Pis.
+  Duplicate frames do not update smoothing or count as additional fixation samples. A service restart
+  invalidates the session and requires restarting calibration; its ROI coordinates may have changed.
+- `eye_filter.ema_gamma` defaults to 0 (no added smoothing); higher values below 1 retain more of the previous
+  sample. Filtering occurs at the camera frame rate, not the UART poll rate.
+- The affine calibration maps camera crop pixels to subject-relative fractions:
+  `subject_x = x_scale * eye_x + x_cross * eye_y + x_offset` and
+  `subject_y = y_cross * eye_x + y_scale * eye_y + y_offset`.
+  The corresponding `initial_` coefficient settings initialize calibration; non-null runtime coefficients
+  supplied by the experiment manager take precedence. Defaults are +0.005 for `x_scale`, -0.005 for
+  `y_scale`, and zero for cross terms and offsets. Existing four-coefficient files load with zero cross terms.
+  These are starting values to calibrate, not a measured mapping. **Old analog-voltage calibration values must
+  be cleared/replaced in the experiment state before use.** Changing camera ROI or analysis resolution also
+  requires recalibration. Analog DAQ input configuration is rejected rather than silently reused.
+- Output fractions refer to the oriented subject scene, including the actual window size in windowed mode:
+  x=-0.5 is left, x=0.5 right, y=-0.5 bottom and y=0.5 top. The preview preserves that scene's aspect ratio.
+  With X11 `normal`, the mounted screen is compensated by 90° clockwise stimulus rotation. Subject up
+  therefore maps to native-screen right, and subject left maps to native-screen up. Camera/UART pixels
+  remain in their original coordinates; the display rotation is applied once, after calibration.
+
+Click the preview to move the fixation target, or use **number-pad 8/6/2/4** for up/right/down/left
+with either calibration window focused. Each keypress moves it by 2.5% of the subject-scene width or
+height, stopping at the screen edges. Plain 8/6/2/4 also work. Moving the target resets auto-reward
+fixation history just as clicking does. When the subject looks at the target, **Z** (or **Add point**)
+captures the current valid, smoothed eye position and refits the affine transform using all points collected
+in this calibration session. A persistent red dot marks each captured target on both displays. One point
+changes only offsets; two points adjust the constrained direction while preserving the remaining sensitivity.
+Three noncollinear points determine a full affine transform. Additional points use a least-squares fit;
+collinear or repeated points preserve directions that the observations cannot determine.
+**Delete** (or Backspace) removes the last point and restores the transform and anchor from before that capture.
+Removing every point restores the pre-collection mapping. Invalid/stale eye samples cannot add points.
+
+The bottom and left sliders show signed subject-X/Y gains from the latest fit and update automatically
+after capture or undo. Each gain is the signed length of its affine row (the largest-magnitude coefficient
+sets its sign; the diagonal wins ties), so it controls that subject axis even when the camera axes are mixed.
+Manual changes scale the entire row around the last captured eye position, keeping that position fixed.
+Adding another point refits the collected data and snaps the sliders to the resulting gains. Slider ranges
+expand when necessary to display an automatic fit. Before the first capture, the first valid sample provides
+the gain anchor; moving the target does not change it. The anchor and axis directions are saved with the
+calibration, including when a gain is zero. Invalid gaze is hidden
+and its status is displayed. The green reward button or `r` delivers a manual pulse; Exit or Escape ends the task.
+The `f`, `z`, Delete, `r`, `a`, and `v` shortcuts work with either calibration window focused.
+Arrow keys also work in either window: Right/Left increase/decrease subject-X gain, and Up/Down increase/decrease
+subject-Y gain by 0.0001 per keypress, within the slider limits. The corresponding slider and its readout update
+together. These are signed adjustments: Up moves a negative Y gain toward zero. The gain anchor stays fixed.
+Press `f` with either calibration window focused to double the fixation cross (including stroke width) and
+flash red, orange, yellow, green, blue, indigo, and violet at 7 Hz over one second.
+It then returns to its original color, normal size and steady display. Pressing `f` again
+restarts the cue; the target position, calibration and fixation acceptance area stay unchanged.
+
+Press **V** to toggle attention videos (initially off). Video replaces the fixation cross in a
+**100×100 subject-screen-pixel box**, centered on the current fixation location. Clicking or using
+the number pad moves the video with the target, including on rotated displays. The experimenter
+preview mirrors the video and retains the gaze marker. V off restores the cross; F animates the
+cross when it is visible. Video toggles do not change calibration or reset auto-reward fixation history.
+
+Calibration accepts the same media settings as `play_video.py`: `video_files`, `clip_duration_seconds`,
+`frame_rate`, `seek_timeout_seconds`, `video_buffer_megabytes`, `ffprobe`, and `seed`. Set `video_size`
+to `[width, height]` in pixels to change the box. The supplied calibration configs use the same
+`monkey_kingdom.mp4` path as `test_configs/play_video_config.json`, with 5-second clips at 24 fps;
+edit the paths and rate for your preprocessed HEVC files. Without a config, clip duration defaults to
+5 seconds and `frame_rate` to 30 Hz. Sources must match the configured rate, as in `play_video`.
+
+Random files and start points are selected repeatedly until V is toggled off; no `num_clips` limit
+applies. Clips are center-cropped to the box without stretching. The shared decoder prepares the next
+clip while the current clip plays and scales pixels before transfer to the display. The decoder budget
+is split between these two clips. A delayed seek holds the last video frame; initial loading shows a
+black box. File/decoder errors switch video off and appear in the status readout without aborting
+calibration. Attention clips follow elapsed time, and a slow display uses the latest frame; the full-screen
+task retains its exact-frame presentation policy. UART acquisition and calibration controls continue
+during playback, and the movie continues updating during reward pulses.
+
+Reward and fixation settings:
+
+- `raspi: true` enables the shared `DAQC2DigitalOutputs` adapter. `daq.address` (default 0) and
+  `daq.module_name` select the plate. `pump_pin` means **DAQC2 DOUT bit 0–7**, default 0, as in active foraging;
+  it is not a BCM GPIO pin. Logical on uses `setDOUTbit`, off uses `clrDOUTbit`. With `raspi: false`, reward
+  events are logged without hardware writes. An enabled output that fails to initialize aborts the task.
+  The preview indicates when reward output is disabled; `--raspi` enables it for a direct launch with a test config.
+- `pump_pulse_time_seconds` defaults to 0.25. Pulses use software timing and log actual on/off times.
+  The pump is cleared on exit or exceptions, before UART/camera shutdown.
+- `fixation_radius` sets the allowed distance from the target as a fraction of the shorter
+  subject-scene dimension (default 0.025). For example, on a `1600x2560` scene, `0.025`
+  means a 40-pixel radius. It is configurable and editable through **Fix radius**.
+  If omitted, legacy `fix_diameter` is divided by two (legacy default 0.05);
+  an explicit `fixation_radius` takes precedence.
+- Press **A** to toggle automatic rewards; the mode starts **off**. The preview shows ON/OFF and both
+  fixation percentages. `reward_interval` defaults to **2 seconds** and must exceed the pump pulse duration.
+  Each automatic reward requires **more than 95% fixation during the past 100 ms** and **more than 80%
+  during the past `reward_interval` seconds**, plus a currently valid, in-target eye position.
+- Percentages measure time inside the fixation area, using distinct camera samples and clipping their
+  held durations to each window. Blink/loss count as non-fixation; stale/error states and long observation
+  gaps invalidate history. Repeated UART replies cannot manufacture new camera observations.
+  Both rolling windows are checked continuously. As soon as both criteria pass, a reward is delivered
+  and both windows are cleared. A full new `reward_interval` of observations is required before another
+  reward can qualify. Acquisition continues during pump pulses, counting toward that fresh interval,
+  so sustained fixation can earn repeated rewards without a fixation break. A blink can delay a reward
+  until the rolling windows qualify; rewards do not wait for fixed schedule boundaries or queue up.
+- Toggling the mode or changing gain, zero, target, reward interval, or fixation radius clears history
+  and requires a fresh full interval.
+  Manual **R** rewards remain available and also clear both windows.
+  `fix_accept_percent` is superseded by the two fixed thresholds; an older positive `fix_accept_time` is
+  used as the interval only when `reward_interval` is absent.
+
+On normal exit, `calibration.json` retains the top-level `eye_tracker_calibration` object with all six
+affine coefficients and the collected `calibration_points` (smoothed camera pixels and subject-fraction targets).
+The experiment manager preserves all six coefficients in state and later block configs, including when its
+initial state declared only the older four coefficients. Additional metadata records pixel input units, `eye_id: 0`,
+UART/filter settings, gain anchor, oriented/native screen dimensions, rotation and latest sample validity. The session
+also contains message and pump event logs.
+
+Calibration and task previews reuse their text layouts for changing readouts and disable automatic per-frame
+stimulus logging. This avoids the label-allocation leak documented in PsychoPy 2025.1.1's `TextStim` setter;
+the calibration gaze marker and controls still update at 20 Hz.
+If calibration fails after receiving a sample (including a preview-process crash), the main process turns
+the pump off and saves its applied settings to `calibration_recovery.json` before shutting down.
+This file is marked interrupted and is not automatically imported by the experiment manager. To resume from
+it, explicitly set `eye_tracking.calibration_file` to its path in the calibration task config, check the
+mapping on the rig, and exit normally to write a completed `calibration.json`.
+
+Eye tracking in presentation tasks
+---------------------------------
+`active_foraging`, `play_video`, `match2cue`, `afc_csc1`, `afc_trial_sequence`, `random_image_sequence`, and `trainings/touch_and_hold`
+use the same Eye 0 UART reader and calibration loader. Enable it in a task config with
+`"eye_tracking": {"enabled": true}`. The experiment manager passes the latest calibration coefficients and
+references the calibration artifact so UART/filter settings and pixel-coordinate metadata also carry forward.
+Within an experiment, a newly completed calibration supersedes an older `calibration_file` reference.
+For a standalone task, reference a saved file instead:
+
+```json
+"eye_tracking": {
+  "enabled": true,
+  "calibration_file": "../calibrations/calibration.json"
+}
+```
+
+Relative paths are resolved against the source config before the manager copies it into a block. Embedded
+`eye_tracker_calibration` objects or histories are also accepted. Non-null flat calibration coefficients take
+precedence; null placeholders fall back to saved values. All four coefficients are required for enabled
+presentation tasks. Explicit `eye_tracking.uart` and `eye_tracking.filter` settings override saved settings
+(for example, `"uart": {"simulate": true}` for a hardware-free check). Eye tracking defaults to disabled and
+is independent of `raspi`, which controls reward hardware. Saved UART settings include `simulate`; override
+it to `false` when switching a simulated calibration to hardware, and recalibrate on the rig.
+
+Tasks with an experimenter preview show a blue gaze marker in the subject-oriented scene, including video.
+Invalid, stale and offscreen gaze is hidden. The two sequence tasks currently have no experimenter preview,
+but provide the same main-thread gaze access. In `play_video`, enabled eye tracking also gates timed
+rewards using the calibration auto-reward acceptance rules over the full screen, as described above.
+Video playback continues while gaze is offscreen or unavailable.
+
+For future gaze-dependent task logic, use `session_logs.eye_tracking.get_position()` in the main task thread:
+it returns an unclamped `(x, y)` pair in centered subject-scene fractions, or `None` when invalid/stale.
+`get_state()` provides raw/smoothed crop pixels, validity, timestamps and frame metadata. Check that
+`session_logs.eye_tracking` is not `None` when eye tracking is optional. Both methods read the worker's latest
+state without serial I/O on the presentation thread. `"show_preview": false` disables the marker while keeping
+that API available. The session owns tracker startup/shutdown; gaze updates do not alter stimulus commands.
+Tasks needing continuous fixation history can pass `on_eye_state` to `SessionLogBundle`; it runs on the
+UART worker independently of preview visibility, display flips and pump pulses, and must not block on I/O.
+
+Every enabled presentation block also writes **`eye_tracking.csv` directly in that block's directory**,
+alongside `event_log.tsv` and `behavior_log.tsv`, for example:
+`logs/exp_Y_20260813_001/blocks/1_active_foraging/eye_tracking.csv`.
+Standalone runs put it in their usual session directory. Disabled eye tracking creates no eye CSV.
+
+Recording is driven by **new camera measurements**, independently of screen flips, reward waits,
+or the experimenter preview. UART polling remains **100 Hz** for the expected roughly **50 Hz** eye-position
+stream. The existing protocol returns the latest measurement in response to a request; it has no push stream,
+so acquisition still polls on its own worker. Duplicate responses never create additional CSV rows or update
+smoothing. The acquisition worker captures `perf_counter_ns()` immediately after receiving a decoded status,
+and queues that immutable measurement for a separate CSV writer. There is no recorder polling loop or
+logger-observation timestamp. Tasks read the latest state through a short memory lock without waiting for
+serial I/O or disk writes.
+
+Only received measurements with a camera timestamp create rows, including invalid measurements such as
+blink/loss. Startup, UART timeouts, and repeated stale-status responses do not manufacture samples; those
+conditions remain available through the live state and warnings. Out-of-order responses are rejected without
+rewinding the camera timestamp used for deduplication. Missing frames leave gaps in camera
+sequence/timestamps; polling a latest-value protocol cannot guarantee delivery of every camera frame.
+The obsolete `eye_tracking.record_rate_hz` setting is rejected; remove it from existing configs.
+The CSV columns are:
+
+| Column | Meaning |
+| --- | --- |
+| `task_time_ns` | Local acquisition time in integer nanoseconds from the experiment origin, captured when the UART response is received. Same clock as events; never the writer/flush time or an age-adjusted estimate. |
+| `camera_time_ns` | Original `sensor_timestamp_ns` from the UART status, retained exactly as an integer. This is the camera's clock and must not be subtracted directly from `task_time_ns`. |
+| `x_screen_px`, `y_screen_px` | Calibrated, filtered position in native PsychoPy pixel coordinates: `x = screen_x - W/2`, `y = H/2 - screen_y`, where screen coordinates start at the top left. The full affine transform, scene size and display rotation are applied, matching stimulus positions. Offscreen positions are retained without clamping. |
+| `pupil_diameter_px` | Eye 0 pupil diameter in camera pixels, as supplied by the tracker. |
+| `eye_valid`, `rejection_reason` | Eye validity (`1`/`0`) and reason such as `blink`, `lost`, `stale`, or `tracker_error`. Invalid samples write `nan` for both position coordinates and pupil diameter. |
+| `screen_ready` | `1` once the task has supplied its screen geometry. During setup, `0` means screen coordinates are still `nan`; a valid pupil measurement can already be recorded. |
+| `session_id`, `frame_sequence` | Tracker service and camera frame identifiers. There is no poll/sample index. |
+
+Thus, after accurate calibration, looking at a stimulus positioned at `(x, y)` should record that same
+centered pixel position. The existing main-thread `get_position()` API continues returning subject-scene
+fractions. Applied calibration, UART/filter settings and screen geometry are recorded in
+the block's message log. Calibration and geometry are captured when each measurement is queued. CSV storage
+uses a fixed-size buffer and an 8192-measurement queue, flushes about once per second, and drains accepted
+measurements before UART shutdown. Queue overflow or disk failure reports incomplete recording through a
+warning without blocking acquisition or presentation. Freshness checks for live gaze still account for camera result age and UART round-trip time internally; those estimates do not replace acquisition timestamps.
 
 CPU Affinity for Timing-Critical Tasks
 --------------------------------------
@@ -652,7 +1222,7 @@ Active Foraging Hardware Signals
 --------------------------------
 When `active_foraging` runs with `raspi=true`, the hardware outputs are split across Raspberry Pi GPIO and the Pi-Plates DAQC2plate:
 
-- `trial_start_pin`: Raspberry Pi BCM GPIO pin used for the timing-critical trial-start pulse. This still uses `lgpio` and is scheduled on the PsychoPy flip path for precise timing.
+- `sync_pin`: Raspberry Pi BCM GPIO pin used for sync bar signals, default `18`. The output is updated in the PsychoPy flip callback for every sync bar inversion when the bar is enabled and GPIO is available.
 - `daq.address` or top-level `daq_address`: DAQC2plate address for pump and buzzer output, default `0`.
 - `pump_pin`: DAQC2 DOUT bit for pump reward delivery, in the range `0` through `7`.
 - `buzz_pin`: DAQC2 DOUT bit for the timeout buzzer, in the range `0` through `7`.
@@ -663,15 +1233,41 @@ The launcher setup scripts use the same mapping by default: `task/pulse_pump.py`
 
 Active Foraging Timing
 ----------------------
-The main visual timing parameters in `active_foraging` are interpreted by the presentation mode, not as abstract global delays. Any finite duration is accepted; it does not need to be an exact refresh interval. Each visual phase is planned for the nearest achievable refresh transition using the measured synchronized display rate, while the exact configured request is retained in the event log. `requested_time_since_session_start` and `time_since_session_start` expose flip-submission and realized-flip timing. Minimum semantic rules remain: `choice_time` must be positive, and when `sequential=true` or `is_memory=true`, `duration` must be positive. `pump_delay_time` remains a wall-clock delay before reward delivery.
+The main visual timing parameters in `active_foraging` are interpreted by the presentation mode, not as abstract global delays. Any finite duration is accepted; it does not need to be an exact refresh interval. Each visual phase is planned for the nearest achievable refresh transition using the measured synchronized display rate, while the exact configured request is retained in the event log. `requested_task_time_ns` and `task_time_ns` expose flip-submission and realized-flip timing. Minimum semantic rules remain: `choice_time` must be positive, and when `sequential=true` or `is_memory=true`, `duration` must be positive. `pump_delay_time` remains a wall-clock delay before reward delivery.
 
 - `duration`: stimulus display duration. When `sequential=true`, this is the on-screen time for each individual stimulus in the sequence. When `sequential=false` and `is_memory=true`, the full array remains visible for `duration`, then the task switches to dot-only choice for `choice_time`. When `sequential=false` and `is_memory=false`, `duration` must be exactly `0`; the full array appears on the first choice frame and remains visible for `choice_time` only.
 - `isi`: pre-stimulus cue interval, not a between-trial delay. In simultaneous non-memory mode it shows dots at all candidate locations before the full array appears. In sequential mode, for every task using the shared option-presentation backend (including `active_foraging`, `match2cue`, and `afc_trial_sequence`), it shows the dot cue for each item before that item is shown and, between consecutive stimuli, also holds the post-stimulus dot scene unchanged for the same duration.
 - `choice_time`: response-window extension after the stimulus display phase defined by the active mode. In simultaneous non-memory mode the response window starts on the first frame of the full array and lasts `choice_time`, with the full array remaining visible throughout. In memory modes, the response window begins only after the stimulus display phase has finished and lasts `choice_time`, with only the remembered dot locations visible.
-- `iti`: inter-trial interval after choice handling. This begins only after reward delivery or timeout handling completes; it is not inserted between option presentations within a trial. The old `ibi` config/CLI name remains accepted only as a deprecated compatibility alias.
+- `iti`: a separate inter-trial interval after the entire reward interval or timeout interval,
+  immediately before the next initiation cue. Early pump completion does not start the ITI early,
+  and a double reward does not consume any of the ITI. The old `ibi` config/CLI name remains accepted
+  only as a deprecated compatibility alias.
 - `pump_delay_time`: delay in seconds between a rewarded choice being made and the first pump pulse. It applies only on rewarded trials with at least one configured pump pulse, and defaults to `0.0`.
 - `pump_pulse_time_seconds`: duration in seconds that the pump output remains on for each reward pulse.
 - `inter_pump_interval`: delay in seconds between repeated pump pulses. When omitted, it defaults to `pump_pulse_time_seconds`, preserving the previous behavior.
+
+Every non-timeout trial reserves a fixed reward interval from the actual post-choice gray-screen
+flip. Its duration is derived from the largest pulse count in `reward_to_pulse_map`, across all
+configured levels, rather than from the chosen option or the options sampled on that trial.
+With the standard level-3 double reward, the duration is
+`pump_delay_time + pump_pulse_time_seconds + inter_pump_interval + pump_pulse_time_seconds`.
+A level-2 single reward waits the remaining `inter_pump_interval + pump_pulse_time_seconds`
+after its pulse. Zero-pulse outcomes, including trials with no response, wait the entire reward
+interval. If no pump pulses are configured at any level, the reward interval is zero.
+
+Timeout trials instead use `timeout_duration_seconds`, with no reward interval or pump train
+added, and then receive the full ITI. Timeout takes precedence if a level is mapped to both a
+timeout and pump pulses. Pump timing values and the timeout must be finite and non-negative;
+pulse counts must be non-negative integers.
+
+For example, with delay `0.2 s`, pulse width `0.25 s`, gap `0.1 s`, and ITI `0.2 s`, all
+non-timeout outcomes have a `0.8 s` reward interval followed by `0.2 s` ITI. A `1.5 s` timeout
+instead gives `1.5 s` timeout followed by `0.2 s` ITI. Reward/timeout durations use monotonic
+wall-clock deadlines; the ITI retains its existing nearest-refresh duration planning. Event
+submission and log flushing occur within the ITI budget. Hardware or scheduling delays can
+overrun an interval; overruns above `1 ms` are reported as `outcome_interval_overrun`, and neither
+the final pump pulse nor the following ITI is shortened to hide them. Manual reward requests
+during an automated outcome wait until that interval has finished.
 
 Common `active_foraging` configurations:
 
@@ -694,21 +1290,29 @@ Common `active_foraging` configurations:
 
 Active Foraging Positioning
 ---------------------------
-`active_foraging` places every stimulus center on a stimulus circle in native main-framebuffer pixel coordinates. `center_point` is `[x, y]` with origin at the upper-left of the native `2560x1600` screen. When `center_point` is `null`, it defaults to the exact middle of the main screen. `stim_range_radius` is the circle radius in pixels. When it is `null`, it defaults to half the distance from `center_point` to the closest screen edge. Authored image sizes remain `[width, height]`; their native axis-aligned bounds swap after a 90-degree turn, which placement and overlap checks account for.
+`active_foraging` places every stimulus center on a stimulus circle. Its `center_point` uses PsychoPy-style centered pixel coordinates in the participant's view: `[0, 0]` is screen center, positive X is right, and positive Y is up. `[-500, -500]` therefore means 500 pixels left and down from screen center. `null` also means `[0, 0]`. The task applies the display's software rotation when converting these positions to native framebuffer coordinates for rendering and logging. These settings previously used upper-left-origin native pixels; existing non-null positions authored in that convention must be converted.
+
+`stim_range_radius` is the circle radius in pixels. When it is `null`, it defaults to half the distance from an interior `center_point` to the closest screen edge. Circle centers on or outside the screen edge require an explicit positive radius; circles may extend off-screen.
+
+`display_margin` is the minimum clearance in pixels between **any part of the stimulus image** and each screen edge (default `0`). Before the first trial, active foraging intersects the circle with the rectangle inset by that margin plus half the rotated image dimensions. Random positions are sampled directly and uniformly along the remaining arcs, so no off-screen proposals need to be rejected at trial time. Overlap rejection between stimuli still applies. Authored image sizes remain `[width, height]`; their native axis-aligned bounds swap after a 90- or 270-degree software turn. The calculation uses the actual native framebuffer size and the same output-dependent software rotation as rendering, so the margin also holds in the participant's view. A circle with no usable arc raises a configuration error before trials begin.
+
+For example, on the rig's `1600x2560` participant-facing screen, `center_point: [-500, -500]`, `stim_range_radius: 500`, `image_size: [150, 150]`, and `display_margin: 200` produce an arc toward the central region while excluding positions too near the left edge. A radius of approximately `707.1068` would make that circle pass through `[0, 0]` exactly. The initiation cue is separate and must still have an on-screen center or `null`.
 
 Active foraging and match-to-cue require four self-initiation settings. `initiation_cue_center_position` is either
-`null` for the screen center or `[x, y]` in the same upper-left-origin native framebuffer coordinates.
-`initiation_cue_style` is `"checker"` for the legacy Gaussian-masked checkerboard or `"blob"` for a
-Gaussian-faded cue in `init_dot_color`; both styles have the same dimensions and darken when pressed.
+`null` for the screen center or `[x, y]` in the same participant-centered, Y-up coordinates as `center_point`.
+`initiation_cue_style` is `"checker"` for the legacy Gaussian-masked checkerboard,
+`"dotted_checker"` for that checkerboard with a centered black dot (diameter approximately 20% of cue width),
+or `"blob"` for a Gaussian-faded cue in `init_dot_color`. All styles have the same dimensions and
+Gaussian mask and darken when pressed; the dotted checker's center dot stays black.
 `hold_cue_to_init_time_s` is the continuous cue-hold duration required to initiate a trial.
 `hold_before_choice=true` keeps the pressed cue visible and requires that hold through the pre-choice phases.
 A missing or out-of-cue touch lasting at most 100 ms is tolerated. A longer break aborts only the current trial,
 logs `initiation_cue_release`, and starts the inter-trial interval. When a fixation cross is enabled, it is white
 before and after choice and black while the choice window is open.
 
-- `fixed_positions=true`: locations are evenly spaced around the circle. The spacing angle is `2*pi / num_afc`, and the first location is offset by half that spacing from the point directly below `center_point`.
+- `fixed_positions=true`: locations retain their evenly spaced native-framebuffer layout around the circle. The spacing angle is `2*pi / num_afc`, and the first location is offset by half that spacing from the point directly below the circle center in native coordinates. A fixed location whose full image crosses `display_margin` raises a configuration error rather than moving or dropping an option.
 - `fixed_positions=false`: locations are random points on the circle, with rejected draws when stimulus bounding boxes would overlap.
-- Custom `center_point` and `stim_range_radius` values can be provided in JSON or as `--center_point X Y --stim_range_radius R`.
+- Custom `center_point`, `stim_range_radius`, and `display_margin` values can be provided in JSON or as `--center_point X Y --stim_range_radius R --display_margin M`.
 
 Active Foraging Subject Maps
 ----------------------------
@@ -826,11 +1430,51 @@ All tasks in this repository must support loading a JSON configuration file as a
 - `win_size` (array of 2 ints, optional)
 - `fixation_size` (int, optional)
 - `image_size` (array of 2 ints, optional)
-- `center_point` (array of 2 ints or null, optional): AFC-style stimulus circle center in main-screen pixels
+- `center_point` (array of 2 ints or null, optional): AFC-style stimulus circle center in participant-centered pixels (X right, Y up; null means `[0, 0]`)
 - `stim_range_radius` (int or null, optional): AFC-style stimulus circle radius in pixels
-- `trial_start_pin` (int, optional): AFC-style BCM GPIO pin for the trial-start pulse
+- `display_margin` (non-negative number, optional): active-foraging minimum full-image clearance from each screen edge in pixels (default `0`)
+- `sync_pin` (int or null, optional): BCM GPIO pin for display-synchronized sync bar signals, default `18`; null keeps visual synchronization without GPIO
+- `sync_bar` (object, optional): shared display synchronization options described below
 - `daq.address` or `daq_address` (int, optional): DAQC2plate address for task hardware outputs
 - `pump_pin` and `buzz_pin` (int, optional): DAQC2 DOUT bits, not Raspberry Pi GPIO pins
+
+PsychoPy experiment tasks accept the following optional `sync_bar` block. Omitting it leaves the bar disabled. Maintenance tools such as the RGB adjuster, system diagnostic, and pump/buzzer utilities do not display a sync bar:
+
+```json
+"sync_bar": {
+  "enabled": false,
+  "height": 20,
+  "interval_mean_seconds": 1.0,
+  "interval_variance_seconds": 0.2
+}
+```
+
+The same `sync_bar` object can be set at the top level of an experiment launch config.
+When present, it replaces each block's entire `sync_bar` configuration, including values
+injected from experiment state. Omitted fields use the defaults above; `enabled: false`
+disables the bar for every block. The resolved settings are saved in every block's logged
+`config.json`. Without a launcher-level object, blocks retain their own settings.
+`config_files/interface/rpi_launch_config.json` enables the experiment-level bar with
+the default height and intervals, including its static version on the idle mask.
+
+The enabled bar contains five alternating black and white rectangles at the top of the
+subject's view, accounting for software rotation, and is also visible on the experimenter
+preview. Each rectangle is `subject_screen_width // 5` pixels wide; `height` is in pixels.
+Every scheduled flip inverts all five rectangles. Each interval is sampled uniformly from
+`interval_mean_seconds ± interval_variance_seconds`; both settings use seconds, so the
+defaults produce intervals from 800 ms to 1200 ms. There is no separate minimum-duration
+setting. Sync events retain separate requested and observed display times on the experiment
+clock. When hardware is available, `sync_pin` toggles HIGH/LOW once in the display flip
+callback for each bar inversion, producing one electrical edge per inversion.
+
+Due inversions share ordinary video or trial frame flips. During static scenes the bar can
+swap independently, preserving both the visible scene and the prepared next scene on the
+GPU. Task deadlines reserve the preceding refresh; nearby sync-only swaps defer to the task
+flip. The GPIO edge is deferred with the bar and sent in that actual flip's callback;
+reaching the original requested time never sends an edge on its own.
+Input is sampled before optional sync swaps, and buffered touch timestamps and pending
+input-reset callbacks are preserved. The experimenter preview mirrors the subject's phase
+asynchronously; it does not drive the GPIO clock. Use `sync_pin: null` for visual-only sync.
 
 Tasks must validate the config when loaded and raise a helpful error if required keys are missing or types are invalid. Command-line arguments should override values in the config file when both are provided.
 

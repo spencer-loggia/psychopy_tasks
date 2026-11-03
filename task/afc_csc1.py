@@ -47,6 +47,8 @@ from bin import utils
 from bin.config import load_config, validate_config
 from bin.daqc2_outputs import DAQC2DigitalOutputs
 from bin.frame_timing import plan_frame_duration, wait_until
+from bin.eye_tracking_config import load_eye_tracking_settings
+from bin.pump_control import PumpPulseControl
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.screen import (
@@ -56,6 +58,7 @@ from bin.screen import (
     resolve_scene_size,
     serialize_preview_image,
     set_window_mouse_visible,
+    software_stimulus_rotation,
 )
 from interface.rig_mode import IS_RIG_ENV_VAR, experimenter_cursor_visible_for_touchscreen
 
@@ -125,8 +128,8 @@ def parse_args():
     p.add_argument("--choice_hitbox_scale", type=float, default=None, help="Scale choice hitboxes relative to stimulus size")
     p.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate")
     p.add_argument("--touchscreen", action="store_true", default=None, help="Enable touchscreen mode and hide the main-screen cursor")
-    p.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi GPIO trial-start pulses and DAQC2 DOUT pump/buzzer outputs")
-    p.add_argument("--trial_start_pin", type=int, default=None, help="GPIO pin to use for trial start pulses (BCM numbering)")
+    p.add_argument("--raspi", action="store_true", default=None, help="Enable DAQC2 DOUT pump/buzzer outputs")
+    p.add_argument("--sync_pin", type=int, default=None, help="GPIO pin for display-synchronized sync bar signals (BCM numbering)")
     p.add_argument("--daq_address", type=int, default=None, help="DAQC2plate address for pump/buzzer DOUT outputs")
     p.add_argument("--pump_pin", type=int, default=None, help="DAQC2 DOUT bit for pump reward delivery (0-7)")
     p.add_argument("--buzz_pin", type=int, default=None, help="DAQC2 DOUT bit for timeout buzzer (0-7)")
@@ -163,13 +166,14 @@ def _fmt_optional_int(value: Optional[int]) -> Any:
 def _build_behavior_fieldnames(num_afc: int) -> List[str]:
     fields = [
         "trial_num",
+        "pump_pulse_time",
         "trial_type",
         "cue_feature",
         "choice_feature",
         "target_index",
         "target_shape",
         "target_color",
-        "initiation_time",
+        "initiation_task_time_ns",
     ]
     for idx in range(int(num_afc)):
         fields.extend([f"option_{idx}_shape", f"option_{idx}_color"])
@@ -457,7 +461,8 @@ def run_task(
     refresh_rate: Optional[float] = None,
     touchscreen: bool = False,
     raspi: bool = False,
-    trial_start_pin: int = 18,
+    sync_pin: Optional[int] = 18,
+    sync_bar: Optional[Dict[str, Any]] = None,
     daq_address: int = 0,
     daq_module_name: str = "piplates.DAQC2plate",
     pump_pin: int = 0,
@@ -475,6 +480,7 @@ def run_task(
     choice_hitbox_scale: float = 1.0,
     config_name: Optional[str] = None,
     screen_config: Optional[Dict[str, Any]] = None,
+    eye_tracking_config=None,
 ) -> None:
     utils.set_debug(debug)
     if raspi:
@@ -494,6 +500,7 @@ def run_task(
         if pump_pulse_time_seconds is not None
         else float(reward_pulse_time)
     )
+    pump_control = PumpPulseControl(reward_pulse_s)
     pump_delay_s = float(pump_delay_time)
 
     for label, seconds in (("cue_time", cue_time), ("choice_time", choice_time)):
@@ -592,11 +599,13 @@ def run_task(
     resolved_config_name = str(config_name).strip() if config_name else "afc_csc1"
     behavior_fieldnames = _build_behavior_fieldnames(num_afc)
     session_logs = SessionLogBundle(
+        eye_tracking_config=eye_tracking_config,
         output_root=output_dir,
         task_name="afc_csc1",
         config_name=resolved_config_name,
         behavior_fieldnames=behavior_fieldnames,
         auto_flush=False,
+        live_settings=pump_control.settings if pump_control is not None else None,
     )
     logger = session_logs.event_logger
     msg_logger = session_logs.message_logger
@@ -673,7 +682,6 @@ def run_task(
         )
 
     win = None
-    pigpio_pi = None
     experimenter_preview = None
     task_end_notes = "done"
 
@@ -715,6 +723,8 @@ def run_task(
         if experimenter_screen is not None:
             experimenter_preview = ExperimenterPreview(
                 experimenter_screen,
+                eye_tracking_shared=session_logs.eye_tracking_preview,
+                pump_control=pump_control,
                 task_label=resolved_config_name,
                 start_perf_s=time.perf_counter(),
                 update_interval_s=0.1,
@@ -749,6 +759,15 @@ def run_task(
             fullscreen=bool(fullscreen),
             requested_size=win_size,
             realized_size=tuple(win.size),
+        )
+        session_logs.set_eye_tracking_screen(
+            main_scene_size, software_stimulus_rotation(main_screen.rotation)
+        )
+        utils.configure_sync_bar(
+            win, sync_bar, sync_pin=sync_pin, event_logger=logger,
+            experimenter_preview=experimenter_preview,
+            rotation_degrees=software_stimulus_rotation(main_screen.rotation),
+            frame_duration_s=frame_dur, msg_logger=msg_logger,
         )
         try:
             msg_logger.log(
@@ -944,19 +963,10 @@ def run_task(
             )
 
         def _wait_or_abort(duration_s: float) -> bool:
-            if duration_s is None or float(duration_s) <= 0:
-                return _poll_experimenter_controls()
-            if experimenter_preview is not None:
-                deadline = time.perf_counter() + max(0.0, float(duration_s))
-                while time.perf_counter() < deadline:
-                    if _poll_experimenter_controls():
-                        return True
-                    remaining = deadline - time.perf_counter()
-                    if remaining > 0:
-                        time.sleep(min(0.05, remaining))
-                return _poll_experimenter_controls()
-            core.wait(float(duration_s))
-            return False
+            return not wait_until(
+                time.perf_counter() + max(0.0, float(duration_s or 0.0)),
+                poll_callback=_poll_experimenter_controls,
+            )
 
         _show_preview_afc_scene(phase="ready")
 
@@ -966,20 +976,6 @@ def run_task(
         buzzer_output_on = None
         buzzer_output_off = None
         if raspi:
-            try:
-                import lgpio
-
-                chip = lgpio.gpiochip_open(0)
-                lgpio.gpio_claim_output(chip, int(trial_start_pin))
-                pigpio_pi = chip
-                msg_logger.log("INFO", f"lgpio initialized on chip 0, trial_start_pin={trial_start_pin}")
-            except Exception as e:
-                pigpio_pi = None
-                try:
-                    msg_logger.log("WARN", f"lgpio not available or failed to initialize: {e}; trial-start GPIO signal will be logged only")
-                except Exception:
-                    pass
-
             try:
                 daqc2_outputs = DAQC2DigitalOutputs(
                     address=int(daq_address),
@@ -1005,7 +1001,7 @@ def run_task(
                     pass
         else:
             try:
-                msg_logger.log("INFO", "raspi=False; GPIO/DAQC2 hardware signals will not be sent (events will be logged only)")
+                msg_logger.log("INFO", "raspi=False; DAQC2 pump/buzzer signals will not be sent (events will be logged only)")
             except Exception:
                 pass
 
@@ -1048,28 +1044,34 @@ def run_task(
                 except Exception:
                     pass
                 return
-            start_perf = time.perf_counter()
+            start_perf_requested_ns = time.perf_counter_ns()
             _set_pump_pin(1, context="manual_reward")
+            start_perf_ns = time.perf_counter_ns()
             try:
                 logger.log_signal(
                     trial_num=None,
                     event="pump_on",
-                    timestamp_perf_s=start_perf,
+                    timestamp_perf_ns=start_perf_ns,
+                    requested_timestamp_perf_ns=start_perf_requested_ns,
                     requested_duration=pulse_duration,
                 )
-                core.wait(pulse_duration)
+                wait_until(time.perf_counter() + pulse_duration)
             finally:
-                end_perf = time.perf_counter()
+                end_perf_requested_ns = time.perf_counter_ns()
                 _set_pump_pin(0, context="manual_reward")
+                end_perf_ns = time.perf_counter_ns()
                 logger.log_signal(
                     trial_num=None,
                     event="pump_off",
-                    timestamp_perf_s=end_perf,
+                    timestamp_perf_ns=end_perf_ns,
+                    requested_timestamp_perf_ns=end_perf_requested_ns,
                 )
 
         # Keep exactly one experimenter-control poller. It does not treat poll errors
         # as exits, and it supports manual reward only from the experimenter screen.
-        def _poll_experimenter_controls() -> bool:
+        def _poll_experimenter_controls(*, service_sync=True) -> bool:
+            if service_sync:
+                utils.service_sync_bar(win)
             if experimenter_preview is None:
                 return False
             try:
@@ -1128,6 +1130,7 @@ def run_task(
         msg_logger.log("INFO", f"task_ready n_trials={n_trials} num_afc={num_afc} delay_time={delay_time:.6f}")
 
         for trial_num in range(1, int(n_trials) + 1):
+            reward_pulse_s = pump_control.apply_pending(msg_logger)
             if _poll_experimenter_controls():
                 task_end_notes = "experimenter_exit"
                 msg_logger.log("WARN", "experimenter_exit_before_trial_start")
@@ -1225,10 +1228,7 @@ def run_task(
                 fps=fps,
                 choice_hitbox_scale=(float(choice_hitbox_scale) * (1.25 if touchscreen else 1.0)),
                 trial_meta=trial_meta,
-                raspi=bool(raspi and pigpio_pi is not None),
-                pigpio_pi=pigpio_pi,
-                raspi_pin=trial_start_pin,
-                external_abort_checker=_poll_experimenter_controls,
+                external_abort_checker=lambda: _poll_experimenter_controls(service_sync=False),
                 show_fixation=bool(show_fixation),
             )
             if aborted:
@@ -1293,9 +1293,9 @@ def run_task(
                 logger.log_frame_flip(
                     trial_num=trial_num,
                     event="gray_inter_trial_interval",
-                    timestamp_perf_s=float(gray_start_perf),
-                    requested_timestamp_perf_s=trial_meta.get(
-                        "gray_flip_requested_perf_s"
+                    timestamp_perf_ns=trial_meta["gray_flip_perf_ns"],
+                    requested_timestamp_perf_ns=trial_meta.get(
+                        "gray_flip_requested_perf_ns"
                     ),
                     requested_duration=(
                         gray_duration_requested
@@ -1312,24 +1312,28 @@ def run_task(
                         msg_logger.log("WARN", f"experimenter_exit_during_pump_delay trial_num={trial_num}")
                         break
 
-                pulse_start = time.perf_counter()
+                pulse_start_requested_ns = time.perf_counter_ns()
                 _set_pump_pin(1, context="afc_reward")
+                pulse_start_ns = time.perf_counter_ns()
                 aborted_reward = False
                 try:
                     logger.log_signal(
                         trial_num=trial_num,
                         event="pump_on",
-                        timestamp_perf_s=pulse_start,
+                        timestamp_perf_ns=pulse_start_ns,
+                        requested_timestamp_perf_ns=pulse_start_requested_ns,
                         requested_duration=pulse_duration,
                     )
                     aborted_reward = _wait_or_abort(pulse_duration)
                 finally:
-                    pulse_end = time.perf_counter()
+                    pulse_end_requested_ns = time.perf_counter_ns()
                     _set_pump_pin(0, context="afc_reward")
+                    pulse_end_ns = time.perf_counter_ns()
                     logger.log_signal(
                         trial_num=trial_num,
                         event="pump_off",
-                        timestamp_perf_s=pulse_end,
+                        timestamp_perf_ns=pulse_end_ns,
+                        requested_timestamp_perf_ns=pulse_end_requested_ns,
                     )
                 if aborted_reward:
                     task_end_notes = "experimenter_exit"
@@ -1348,13 +1352,14 @@ def run_task(
 
             behavior_row: Dict[str, Any] = {
                 "trial_num": int(trial_num),
+                "pump_pulse_time": reward_pulse_s,
                 "trial_type": current_trial_type,
                 "cue_feature": trial_meta.get("cue_feature", ""),
                 "choice_feature": trial_meta.get("choice_feature", ""),
                 "target_index": int(target_index - 1),
                 "target_shape": int(target_sid),
                 "target_color": _fmt_optional_int(target_cid),
-                "initiation_time": _fmt_optional(trial_meta.get("initiation_time_s")),
+                "initiation_task_time_ns": trial_meta.get("initiation_task_time_ns", ""),
                 "choice_made_index": chosen_idx_zero_based,
                 "choice_made_shape": "",
                 "choice_made_color": "",
@@ -1426,12 +1431,12 @@ def run_task(
         except Exception:
             pass
         try:
-            session_logs.close()
+            if experimenter_preview is not None:
+                experimenter_preview.close()
         except Exception:
             pass
         try:
-            if experimenter_preview is not None:
-                experimenter_preview.close()
+            session_logs.close()
         except Exception:
             pass
         try:
@@ -1439,7 +1444,6 @@ def run_task(
                 utils.close_task_window(win)
         except Exception:
             pass
-        # Do not call core.quit() here; it raises SystemExit and can mask real exceptions.
     return task_end_notes
 
 
@@ -1508,6 +1512,7 @@ def main():
 
     try:
         task_end_status = run_task(
+            eye_tracking_config=load_eye_tracking_settings(cfg),
             colors_tsv=_get("colors_tsv", cfg.get("colors_tsv")),
             shapes_tsv=_get("shapes_tsv", cfg.get("shapes_tsv")),
             n_trials=int(_get("n", cfg.get("n"))),
@@ -1536,7 +1541,8 @@ def main():
             refresh_rate=_get("refresh_rate", cfg.get("refresh_rate", cfg.get("refrech_rate", None))),
             touchscreen=bool(_get("touchscreen", cfg.get("touchscreen", False))),
             raspi=bool(_get("raspi", cfg.get("raspi", False))),
-            trial_start_pin=int(_get("trial_start_pin", cfg.get("trial_start_pin", cfg.get("raspi_pin", 18)))),
+            sync_pin=_get("sync_pin", 18),
+            sync_bar=cfg.get("sync_bar"),
             daq_address=daq_address,
             daq_module_name=daq_module_name,
             pump_pin=int(_get("pump_pin", cfg.get("pump_pin", 0))),

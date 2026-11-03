@@ -31,5 +31,11 @@
   "self_initiation": false,
   "raspi": false,
   "touchscreen": false,
-  "debug": false
+  "debug": false,
+  "sync_bar": {
+    "enabled": false,
+    "height": 20,
+    "interval_mean_seconds": 1.0,
+    "interval_variance_seconds": 0.2
+  }
 }

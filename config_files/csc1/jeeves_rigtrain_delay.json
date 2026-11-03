@@ -10,7 +10,7 @@
 
   "pump_pin": 0,
   "buzz_pin": 1,
-  "trial_start_pin": 18,
+  "sync_pin": 18,
 
   "seed": null,
   "output_dir": "./logs",
@@ -46,5 +46,11 @@
   "isi": 0.00,
   "fixed_positions": true,
   "raspi": true,
-  "touchscreen": true
+  "touchscreen": true,
+  "sync_bar": {
+    "enabled": false,
+    "height": 20,
+    "interval_mean_seconds": 1.0,
+    "interval_variance_seconds": 0.2
+  }
 }

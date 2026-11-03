@@ -13,12 +13,15 @@ Config keys required/additional:
 - colors_tsv: path to TSV file with ID, R, G, B
 - shapes_tsv: path to TSV file with ID, PATH (SVG)
 - image_size: [W, H]
+- display_margin: minimum clearance in pixels between the full stimulus and each screen edge
 - num_afc, n, duration, isi, iti, choice_time, dot_size, dot_color, init_dot_color
 - initiation_cue_center_position, initiation_cue_style, hold_before_choice,
   hold_cue_to_init_time_s
 - pump_delay_time: delay in seconds between a rewarded choice and the first pump pulse
 - inter_pump_interval: optional delay in seconds between pump pulses; defaults to pump_pulse_time_seconds
-- trial_start_pin is a Raspberry Pi BCM GPIO pin; pump_pin and buzz_pin are
+- The reward interval reserves the longest configured pump train for every non-timeout
+  outcome. A timeout replaces that interval; the full ITI follows either interval.
+- sync_pin is a Raspberry Pi BCM GPIO pin; pump_pin and buzz_pin are
   DAQC2 DOUT bits on the Pi-Plate.
 
 """
@@ -31,7 +34,7 @@ from pathlib import Path
 from typing import Tuple, Optional, List, Dict, Any, Mapping
 import pandas as pd
 
-from psychopy import core, logging as pylogging, event
+from psychopy import logging as pylogging, event
 
 _project_root = Path(__file__).resolve().parents[1]
 if str(_project_root) not in sys.path:
@@ -44,18 +47,23 @@ from bin.affinity import (
     set_process_cpu_affinity,
 )
 from bin.daqc2_outputs import DAQC2DigitalOutputs
-from bin.afc_geometry import compute_afc_positions, screen_px_to_psychopy, stimulus_size
+from bin.afc_geometry import (
+    prepare_afc_placement,
+    subject_centered_to_screen_px,
+)
 from bin.afc_stimuli import render_afc_stimulus
 from bin.frame_timing import (
     plan_frame_duration,
     validate_requested_durations,
     wait_until,
 )
+from bin.eye_tracking_config import load_eye_tracking_settings
+from bin.pump_control import PumpPulseControl
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 import numpy as np
 from bin.config import load_config, resolve_subject_mapped_value, validate_config
-from bin.initiation import INITIATION_CONFIG_KEYS, resolve_initiation_config
+from bin.initiation import INITIATION_CONFIG_KEYS, initiation_cue_position, resolve_initiation_config
 from bin.screen import (
     ExperimenterPreview,
     describe_screen,
@@ -70,6 +78,8 @@ from bin.screen import (
 from interface.rig_mode import IS_RIG_ENV_VAR, experimenter_cursor_visible_for_touchscreen
 from task.active_foraging_timing import (
     duration_requires_visible_phase,
+    reward_interval_duration,
+    run_outcome_interval,
     validate_duration_for_presentation_mode,
 )
 
@@ -175,7 +185,7 @@ def _decode_trial_payload(payload: dict) -> Tuple[List[Tuple[int, int]], List[Tu
 
 
 def _build_behavior_fieldnames(num_afc: int) -> List[str]:
-    fieldnames = ["trial_num", "initiation_time"]
+    fieldnames = ["trial_num", "pump_pulse_time", "initiation_task_time_ns"]
     for opt_idx in range(int(num_afc)):
         fieldnames.extend([f"shape_{opt_idx}", f"color_{opt_idx}", f"lum_{opt_idx}"])
     fieldnames.extend(
@@ -245,14 +255,15 @@ def parse_args():
     p.add_argument("--self_initiation", action="store_true", default=None, help="Require participant to self-initiate each trial by clicking an onset cue")
     p.add_argument("--fixation_size", type=int, default=None, help="Fixation cross size in pixels; 0 disables fixation")
     p.add_argument("--fixed_positions", action="store_true", default=None, help="Fix option positions to evenly spaced locations on the stimulus circle")
-    p.add_argument("--center_point", type=int, nargs=2, default=None, help="Stimulus circle center in main-screen pixels: X Y")
+    p.add_argument("--center_point", type=int, nargs=2, default=None, help="Stimulus circle center in participant-centered pixels: X right, Y up; 0 0 is screen center")
     p.add_argument("--stim_range_radius", type=int, default=None, help="Stimulus circle radius in pixels")
+    p.add_argument("--display_margin", type=float, default=None, help="Minimum clearance from the full stimulus to each screen edge in pixels (default: 0)")
     p.add_argument("--is_memory", action="store_true", default=None, help="If set, items are removed and replaced by dots for the choice period (memory task). If not set, config value or default True is used")
     p.add_argument("--sequential", action="store_true", default=None, help="Present stimuli sequentially (one at a time). If not set, config value or default True is used")
     p.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate (Hz); skip auto-detection if provided")
     p.add_argument("--touchscreen", action="store_true", default=None, help="Enable touchscreen mode (hide mouse cursor)")
-    p.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi GPIO trial-start pulses and DAQC2 DOUT pump/buzzer outputs")
-    p.add_argument("--trial_start_pin", type=int, default=None, help="GPIO pin to use for trial start pulses (BCM numbering)")
+    p.add_argument("--raspi", action="store_true", default=None, help="Enable DAQC2 DOUT pump/buzzer outputs")
+    p.add_argument("--sync_pin", type=int, default=None, help="GPIO pin for display-synchronized sync bar signals (BCM numbering)")
     p.add_argument("--daq_address", type=int, default=None, help="DAQC2plate address for pump/buzzer DOUT outputs")
     p.add_argument("--pump_pin", type=int, default=None, help="DAQC2 DOUT bit for pump reward delivery (0-7)")
     p.add_argument("--buzz_pin", type=int, default=None, help="DAQC2 DOUT bit for timeout buzzer (0-7)")
@@ -313,7 +324,8 @@ def run_task(
     refresh_rate: Optional[float] = None,
     touchscreen: bool = False,
     raspi: bool = False,
-    trial_start_pin: int = 18,
+    sync_pin: Optional[int] = 18,
+    sync_bar: Optional[Dict[str, Any]] = None,
     daq_address: int = 0,
     daq_module_name: str = "piplates.DAQC2plate",
     pump_pin: int = 0,
@@ -339,6 +351,8 @@ def run_task(
     stroke_linejoin: Optional[str] = None,
     stroke_linecap: Optional[str] = None,
     screen_config: Optional[Dict[str, Any]] = None,
+    eye_tracking_config=None,
+    display_margin: float = 0.0,
 ):
     resolved_subject = "" if subject is None else str(subject).strip()
     freq_space_tsv = resolve_subject_mapped_value(
@@ -358,9 +372,15 @@ def run_task(
     if seed is not None:
         random.seed(seed)
 
-    inter_pump_interval_seconds = max(
-        0.0,
-        float(pump_pulse_time_seconds if inter_pump_interval is None else inter_pump_interval),
+    pump_control = PumpPulseControl(pump_pulse_time_seconds)
+    inter_pump_interval_seconds = float(
+        pump_pulse_time_seconds if inter_pump_interval is None else inter_pump_interval
+    )
+    reward_interval_s = reward_interval_duration(
+        pump_delay_time=pump_delay_time,
+        pump_pulse_time_seconds=pump_pulse_time_seconds,
+        inter_pump_interval=inter_pump_interval_seconds,
+        reward_to_pulse_map=reward_to_pulse_map,
     )
     if raspi:
         DAQC2DigitalOutputs.validate_address(int(daq_address))
@@ -378,11 +398,13 @@ def run_task(
     resolved_config_name = str(config_name).strip() if config_name else "active_foraging"
     behavior_fieldnames = _build_behavior_fieldnames(num_afc)
     session_logs = SessionLogBundle(
+        eye_tracking_config=eye_tracking_config,
         output_root=output_dir,
         task_name="active_foraging",
         config_name=resolved_config_name,
         behavior_fieldnames=behavior_fieldnames,
         auto_flush=False,
+        live_settings=pump_control.settings if pump_control is not None else None,
     )
     logger = session_logs.event_logger
     msg_logger = session_logs.message_logger
@@ -405,7 +427,8 @@ def run_task(
             is_memory=bool(is_memory),
         )
         validate_requested_durations(
-            {"isi": isi, "choice_time": choice_time, "iti": iti},
+            {"isi": isi, "choice_time": choice_time, "iti": iti,
+             "timeout_duration_seconds": timeout_duration_seconds},
             positive={"choice_time"},
             context="active_foraging",
         )
@@ -601,6 +624,8 @@ def run_task(
     if experimenter_screen is not None:
         experimenter_preview = ExperimenterPreview(
             experimenter_screen,
+            eye_tracking_shared=session_logs.eye_tracking_preview,
+            pump_control=pump_control,
             task_label=resolved_config_name,
             subject=resolved_subject or "(not set)",
             current_trial_num=1,
@@ -671,6 +696,13 @@ def run_task(
     subject_scene_size = oriented_size(
         main_scene_size,
         stimulus_rotation_degrees,
+    )
+    session_logs.set_eye_tracking_screen(main_scene_size, stimulus_rotation_degrees)
+    utils.configure_sync_bar(
+        win, sync_bar, sync_pin=sync_pin, event_logger=logger,
+        experimenter_preview=experimenter_preview,
+        rotation_degrees=stimulus_rotation_degrees,
+        frame_duration_s=frame_dur, msg_logger=msg_logger,
     )
     fix = utils.make_fixation_cross(
         win,
@@ -776,33 +808,12 @@ def run_task(
             main_rotation_deg=stimulus_rotation_degrees,
         )
 
-    def _wait_or_abort(duration_s: float) -> bool:
-        if duration_s is None or float(duration_s) <= 0:
-            return _poll_experimenter_controls()
-        if experimenter_preview is not None:
-            deadline = time.perf_counter() + max(0.0, float(duration_s))
-            while time.perf_counter() < deadline:
-                if _poll_experimenter_controls():
-                    return True
-                remaining = deadline - time.perf_counter()
-                if remaining > 0:
-                    time.sleep(min(0.05, remaining))
-            return _poll_experimenter_controls()
-        core.wait(duration_s)
-        return False
-
     # If self-initiation requested, build an onset cue ImageStim via utility
     onset_stim = None
     pressed_onset_stim = None
     if self_initiation:
-        onset_position = (
-            (0.0, 0.0)
-            if initiation_cue_center_position is None
-            else screen_px_to_psychopy(
-                initiation_cue_center_position,
-                main_scene_size,
-                field_name="initiation_cue_center_position",
-            )
+        onset_position = initiation_cue_position(
+            initiation_cue_center_position, main_scene_size, stimulus_rotation_degrees,
         )
         onset_stim, pressed_onset_stim = utils.make_initiation_cue_stims(
             win,
@@ -820,27 +831,12 @@ def run_task(
 
     # Initialize hardware outputs if requested; do not fail the task if hardware
     # libraries are unavailable.
-    pigpio_pi = None  # naming kept for compatibility with presenter API
     daqc2_outputs: Optional[DAQC2DigitalOutputs] = None
     pump_output_on = None
     pump_output_off = None
     buzzer_output_on = None
     buzzer_output_off = None
     if raspi:
-        try:
-            import lgpio
-
-            chip = lgpio.gpiochip_open(0)  # 0 is the default chip for RPi5
-            lgpio.gpio_claim_output(chip, trial_start_pin)
-            pigpio_pi = chip  # store chip handle
-            msg_logger.log("INFO", f"lgpio initialized on chip 0, trial_start_pin={trial_start_pin}")
-        except Exception as e:
-            pigpio_pi = None
-            try:
-                msg_logger.log("WARN", f"lgpio not available or failed to initialize: {e}; trial-start GPIO signal will be logged only")
-            except Exception:
-                pass
-
         try:
             daqc2_outputs = DAQC2DigitalOutputs(
                 address=int(daq_address),
@@ -865,7 +861,7 @@ def run_task(
             except Exception:
                 pass
     else:
-        msg_logger.log("INFO", "raspi=False; GPIO/DAQC2 hardware signals will not be sent (events will be logged only)")
+        msg_logger.log("INFO", "raspi=False; DAQC2 pump/buzzer signals will not be sent (events will be logged only)")
 
     def _set_daqc2_output(bit: int, active: bool, *, signal_name: str, context: str) -> None:
         if raspi and daqc2_outputs is not None:
@@ -897,36 +893,39 @@ def run_task(
 
     def _deliver_manual_reward() -> None:
         pulse_duration = max(0.0, float(pump_pulse_time_seconds))
-        start_requested_perf = time.perf_counter()
+        start_requested_perf = time.perf_counter_ns()
         _set_pump_pin(1, context="manual_reward")
-        start_perf = time.perf_counter()
+        start_perf = time.perf_counter_ns()
         try:
             logger.log_signal(
                 trial_num=None,
                 event="pump_on",
-                timestamp_perf_s=start_perf,
-                requested_timestamp_perf_s=start_requested_perf,
+                timestamp_perf_ns=start_perf,
+                requested_timestamp_perf_ns=start_requested_perf,
                 requested_duration=pulse_duration,
             )
-            core.wait(pulse_duration)
+            wait_until(time.perf_counter() + pulse_duration)
         finally:
-            end_requested_perf = time.perf_counter()
+            end_requested_perf = time.perf_counter_ns()
             _set_pump_pin(0, context="manual_reward")
-            end_perf = time.perf_counter()
+            end_perf = time.perf_counter_ns()
             logger.log_signal(
                 trial_num=None,
                 event="pump_off",
-                timestamp_perf_s=end_perf,
-                requested_timestamp_perf_s=end_requested_perf,
+                timestamp_perf_ns=end_perf,
+                requested_timestamp_perf_ns=end_requested_perf,
             )
 
-    def _poll_experimenter_controls() -> bool:
+    def _poll_experimenter_controls(*, allow_manual_reward=True, service_sync=True) -> bool:
+        if service_sync:
+            utils.service_sync_bar(win)
         manual_reward_requested = False
         try:
-            manual_reward_requested = bool(event.getKeys(keyList=["r"]))
+            if allow_manual_reward:
+                manual_reward_requested = bool(event.getKeys(keyList=["r"]))
         except Exception:
             pass
-        if experimenter_preview is not None:
+        if experimenter_preview is not None and allow_manual_reward:
             manual_reward_requested = (
                 experimenter_preview.consume_manual_reward_request()
                 or manual_reward_requested
@@ -1000,6 +999,9 @@ def run_task(
     task_end_notes = "done"
     iti_plan = plan_frame_duration(iti, fps)
     iti_frames = iti_plan.frame_count
+    msg_logger.log("INFO", f"outcome_timing reward_interval_s={reward_interval_s:.9f} "
+                   f"timeout_interval_s={timeout_duration_seconds:.9f} "
+                   f"iti_s={iti_plan.scheduled_s:.9f}")
 
     def _fmt_optional(value: Any) -> str:
         if value == "" or value is None:
@@ -1007,6 +1009,28 @@ def run_task(
         return f"{float(value):.9f}"
 
     try:
+        # All trial images are rasterized at image_size. Clip the circle once,
+        # using the renderer's actual native orientation, before any trial.
+        placement = prepare_afc_placement(
+            fixed_positions=fixed_positions,
+            num_afc=num_afc,
+            center_point=(
+                None if center_point is None else subject_centered_to_screen_px(
+                    center_point, main_scene_size, stimulus_rotation_degrees,
+                    field_name="center_point",
+                )
+            ),
+            stim_range_radius=stim_range_radius,
+            stim_size=oriented_size(image_size, stimulus_rotation_degrees),
+            effective_win_size=main_scene_size,
+            display_margin=display_margin,
+        )
+        msg_logger.log(
+            "INFO",
+            f"stimulus_placement subject_center={center_point} center_px={placement.center_px} radius_px={placement.radius_px} "
+            f"stim_size={placement.stim_size} display_margin={display_margin} "
+            f"valid_arcs_rad={placement.valid_arcs}",
+        )
         msg_logger.log(
             "INFO",
             (
@@ -1017,6 +1041,13 @@ def run_task(
 
         trial_num = 1
         while True:
+            pump_pulse_time_seconds = pump_control.apply_pending(msg_logger)
+            if inter_pump_interval is None:
+                inter_pump_interval_seconds = pump_pulse_time_seconds
+            reward_interval_s = reward_interval_duration(
+                pump_delay_time=pump_delay_time, pump_pulse_time_seconds=pump_pulse_time_seconds,
+                inter_pump_interval=inter_pump_interval_seconds, reward_to_pulse_map=reward_to_pulse_map,
+            )
             if experimenter_preview is not None:
                 experimenter_preview.set_trial_progress(trial_num, n_trials)
             if _poll_experimenter_controls():
@@ -1036,21 +1067,7 @@ def run_task(
                 f"trial_loaded trial_num={trial_num} trial_option_meta={trial_option_meta}",
             )
 
-            first_pair = trial_options[0]
-            stim_size = oriented_size(
-                stimulus_size(preloaded, first_pair),
-                stimulus_rotation_degrees,
-            )
-
-            effective_win_size = main_scene_size
-            sampled_positions, positions = compute_afc_positions(
-                fixed_positions=fixed_positions,
-                num_afc=num_afc,
-                center_point=center_point,
-                stim_range_radius=stim_range_radius,
-                stim_size=stim_size,
-                effective_win_size=effective_win_size,
-            )
+            sampled_positions, positions = placement.sample()
 
             for i, (spos, cpos) in enumerate(zip(sampled_positions, positions), start=1):
                 msg_logger.log("INFO", f"position_assigned trial_num={trial_num} option_num={i} screen_px={spos} psychopy_pos={cpos}")
@@ -1080,16 +1097,13 @@ def run_task(
                 white_fixation_until_choice=True,
                 msg_logger=msg_logger,
                 fps=fps,
-                raspi=bool(raspi and pigpio_pi is not None),
-                pigpio_pi=pigpio_pi,
-                raspi_pin=trial_start_pin,
                 sequential=sequential,
                 is_memory=is_memory,
                 choice_hitbox_scale=1.25 if touchscreen else 1.0,
                 trial_meta=trial_meta,
                 experimenter_preview=experimenter_preview,
-                external_abort_checker=_poll_experimenter_controls,
-                scene_main_size=effective_win_size,
+                external_abort_checker=lambda: _poll_experimenter_controls(service_sync=False),
+                scene_main_size=main_scene_size,
                 event_profile="active_foraging",
                 reward_levels=[reward_map.get(pair, 0) for pair in trial_options],
                 stimulus_rotation_degrees=stimulus_rotation_degrees,
@@ -1111,7 +1125,6 @@ def run_task(
             apply_timeout = 0
 
             if choice_info is not None:
-                abort_requested = False
                 chosen_idx = choice_info["chosen_index"]
                 chosen_pair = trial_options[chosen_idx - 1]
                 reward_level = reward_map.get(chosen_pair, 0)
@@ -1124,106 +1137,38 @@ def run_task(
                 if reward_to_timeout_map is not None:
                     apply_timeout = reward_to_timeout_map.get(str(reward_level), 0)
 
-                gray_duration_requested = float(iti)
-                if num_pulses > 0:
-                    gray_duration_requested += max(0.0, float(pump_delay_time))
-                    gray_duration_requested += float(num_pulses * pump_pulse_time_seconds)
-                    gray_duration_requested += float(max(0, num_pulses - 1) * inter_pump_interval_seconds)
-                if apply_timeout > 0:
-                    gray_duration_requested += float(timeout_duration_seconds)
-            else:
-                abort_requested = False
-                gray_duration_requested = float(iti)
-
-            gray_start_perf = trial_meta.get("gray_flip_perf_s", None)
-            if gray_start_perf is not None:
-                logger.log_frame_flip(
-                    trial_num=trial_num,
-                    event="grey_inter_trial_interval",
-                    timestamp_perf_s=float(gray_start_perf),
-                    requested_timestamp_perf_s=trial_meta.get(
-                        "gray_flip_requested_perf_s"
-                    ),
-                    requested_duration=gray_duration_requested if gray_duration_requested > 0 else None,
+            outcome_duration_s = timeout_duration_seconds if apply_timeout > 0 else reward_interval_s
+            gray_start_ns = trial_meta["gray_flip_perf_ns"]
+            iti_start_ns = run_outcome_interval(
+                trial_num=trial_num, onset_perf_ns=gray_start_ns,
+                onset_requested_perf_ns=trial_meta.get("gray_flip_requested_perf_ns"),
+                num_pulses=num_pulses, apply_timeout=apply_timeout > 0,
+                reward_interval_s=reward_interval_s, timeout_duration_s=timeout_duration_seconds,
+                pump_delay_s=pump_delay_time, pump_pulse_s=pump_pulse_time_seconds,
+                inter_pump_interval_s=inter_pump_interval_seconds, logger=logger,
+                set_pump=lambda value: _set_pump_pin(value, context="task_reward"),
+                set_buzzer=lambda value: _set_buzzer_pin(value, context="timeout"),
+                # Manual rewards wait until automated outputs are off; a nested
+                # manual pulse must not truncate or lengthen the trial's pulse.
+                poll_callback=lambda: _poll_experimenter_controls(allow_manual_reward=False),
+            )
+            if iti_start_ns is None:
+                task_end_notes = "experimenter_exit"
+                msg_logger.log("WARN", f"experimenter_exit_during_outcome_interval trial_num={trial_num}")
+                break
+            if iti_frames > 0:
+                logger.log_event(
+                    trial_num=trial_num, event="inter_trial_interval", event_type="lifecycle",
+                    timestamp_perf_ns=iti_start_ns, requested_duration=iti,
+                )
+            outcome_overrun_s = (iti_start_ns - gray_start_ns) / 1_000_000_000 - outcome_duration_s
+            if outcome_overrun_s > 0.001:
+                msg_logger.log(
+                    "WARN", f"outcome_interval_overrun trial_num={trial_num} "
+                    f"overrun_s={outcome_overrun_s:.9f}; full ITI preserved",
                 )
 
             if choice_info is not None:
-                if num_pulses > 0 and pump_delay_time > 0:
-                    if _wait_or_abort(pump_delay_time):
-                        task_end_notes = "experimenter_exit"
-                        msg_logger.log("WARN", f"experimenter_exit_during_pump_delay trial_num={trial_num}")
-                        abort_requested = True
-
-                if abort_requested:
-                    break
-
-                for pulse_num in range(1, num_pulses + 1):
-                    pulse_start_requested_perf = time.perf_counter()
-                    _set_pump_pin(1, context="task_reward")
-                    pulse_start_perf = time.perf_counter()
-                    logger.log_signal(
-                        trial_num=trial_num,
-                        event="pump_on",
-                        timestamp_perf_s=pulse_start_perf,
-                        requested_timestamp_perf_s=pulse_start_requested_perf,
-                        requested_duration=pump_pulse_time_seconds,
-                    )
-                    if _wait_or_abort(pump_pulse_time_seconds):
-                        task_end_notes = "experimenter_exit"
-                        msg_logger.log("WARN", f"experimenter_exit_during_pump trial_num={trial_num} pulse={pulse_num}")
-                        abort_requested = True
-
-                    pulse_end_requested_perf = time.perf_counter()
-                    _set_pump_pin(0, context="task_reward")
-                    pulse_end_perf = time.perf_counter()
-                    logger.log_signal(
-                        trial_num=trial_num,
-                        event="pump_off",
-                        timestamp_perf_s=pulse_end_perf,
-                        requested_timestamp_perf_s=pulse_end_requested_perf,
-                    )
-                    if abort_requested:
-                        break
-
-                    if pulse_num < num_pulses:
-                        if _wait_or_abort(inter_pump_interval_seconds):
-                            task_end_notes = "experimenter_exit"
-                            msg_logger.log("WARN", f"experimenter_exit_during_inter_pulse_interval trial_num={trial_num} pulse={pulse_num}")
-                            abort_requested = True
-                            break
-
-                if abort_requested:
-                    break
-
-                if apply_timeout > 0:
-                    timeout_start_requested_perf = time.perf_counter()
-                    _set_buzzer_pin(1, context="timeout")
-                    timeout_start_perf = time.perf_counter()
-                    logger.log_signal(
-                        trial_num=trial_num,
-                        event="buzzer_on",
-                        timestamp_perf_s=timeout_start_perf,
-                        requested_timestamp_perf_s=timeout_start_requested_perf,
-                        requested_duration=timeout_duration_seconds,
-                    )
-                    if _wait_or_abort(timeout_duration_seconds):
-                        task_end_notes = "experimenter_exit"
-                        msg_logger.log("WARN", f"experimenter_exit_during_timeout trial_num={trial_num}")
-                        abort_requested = True
-
-                    timeout_end_requested_perf = time.perf_counter()
-                    _set_buzzer_pin(0, context="timeout")
-                    timeout_end_perf = time.perf_counter()
-                    logger.log_signal(
-                        trial_num=trial_num,
-                        event="buzzer_off",
-                        timestamp_perf_s=timeout_end_perf,
-                        requested_timestamp_perf_s=timeout_end_requested_perf,
-                    )
-
-                if abort_requested or task_end_notes != "done":
-                    break
-
                 msg_logger.log(
                     "INFO",
                     (
@@ -1247,7 +1192,8 @@ def run_task(
 
             behavior_row: Dict[str, Any] = {
                 "trial_num": trial_num,
-                "initiation_time": _fmt_optional(trial_meta.get("initiation_time_s")),
+                "pump_pulse_time": pump_pulse_time_seconds,
+                "initiation_task_time_ns": trial_meta.get("initiation_task_time_ns", ""),
                 "choice_made_index": chosen_idx_row,
                 "choice_made_color": "",
                 "choice_made_shape": "",
@@ -1267,28 +1213,6 @@ def run_task(
                 behavior_row["choice_made_shape"] = int(chosen_shape_row)
                 behavior_row["choice_made_color"] = int(chosen_color_row)
                 behavior_row["choice_made_lum"] = int(chosen_lum_row)
-
-            if iti_frames > 0:
-                post_choice_delay_present = (
-                    choice_info is not None
-                    and ((num_pulses > 0) or (apply_timeout > 0))
-                )
-                iti_start_perf = (
-                    time.perf_counter()
-                    if post_choice_delay_present
-                    else float(gray_start_perf)
-                )
-                _show_preview_idle()
-                iti_completed = wait_until(
-                    iti_start_perf + iti_plan.scheduled_s,
-                    poll_callback=_poll_experimenter_controls,
-                )
-                if not iti_completed:
-                    task_end_notes = "experimenter_exit"
-                    msg_logger.log(
-                        "WARN",
-                        f"experimenter_exit_during_iti trial_num={trial_num}",
-                    )
 
             transition_count = trial_meta.get(
                 "main_display_transition_count",
@@ -1322,6 +1246,17 @@ def run_task(
                 break
 
             _flush_between_trials()
+            if iti_frames > 0:
+                _show_preview_idle()
+                # Preview updates and log flushing consume the existing ITI,
+                # rather than adding another outcome-dependent pause after it.
+                if not wait_until(
+                    (iti_start_ns + round(iti_plan.scheduled_s * 1_000_000_000)) / 1_000_000_000,
+                    poll_callback=_poll_experimenter_controls,
+                ):
+                    task_end_notes = "experimenter_exit"
+                    msg_logger.log("WARN", f"experimenter_exit_during_iti trial_num={trial_num}")
+                    break
             trial_num += 1
 
     finally:
@@ -1411,7 +1346,7 @@ def main():
     # Accept both 'refresh_rate' and the common misspelling 'refrech_rate' from config
     refresh_rate = _get("refresh_rate", cfg.get("refresh_rate", cfg.get("refrech_rate", None)))
     touchscreen = bool(_get("touchscreen", cfg.get("touchscreen", False)))
-    trial_start_pin = int(_get("trial_start_pin", cfg.get("trial_start_pin", 18)))
+    sync_pin = _get("sync_pin", 18)
     daq_cfg = cfg.get("daq", {}) if isinstance(cfg.get("daq", {}), dict) else {}
     daq_address = int(_get("daq_address", daq_cfg.get("address", cfg.get("daq_address", 0))))
     daq_module_name = str(daq_cfg.get("module_name", cfg.get("daq_module_name", "piplates.DAQC2plate")))
@@ -1422,6 +1357,7 @@ def main():
     center_point = tuple(center_point_val) if center_point_val is not None else None
     stim_range_radius_val = _get("stim_range_radius", cfg.get("stim_range_radius", None))
     stim_range_radius = float(stim_range_radius_val) if stim_range_radius_val is not None else None
+    display_margin = float(_get("display_margin", cfg.get("display_margin", 0.0)))
     sequential = bool(_get("sequential", cfg.get("sequential", True)))
     is_memory = bool(_get("is_memory", cfg.get("is_memory", True)))
     
@@ -1449,6 +1385,7 @@ def main():
 
     try:
         task_end_status = run_task(
+            eye_tracking_config=load_eye_tracking_settings(cfg),
             colors_tsv=colors_tsv,
             shapes_tsv=shapes_tsv,
             n_trials=n_trials,
@@ -1476,7 +1413,8 @@ def main():
             refresh_rate=refresh_rate,
             touchscreen=touchscreen,
             raspi=_get("raspi", cfg.get("raspi", False)),
-            trial_start_pin=trial_start_pin,
+            sync_pin=sync_pin,
+            sync_bar=cfg.get("sync_bar"),
             daq_address=daq_address,
             daq_module_name=daq_module_name,
             pump_pin=pump_pin,
@@ -1484,6 +1422,7 @@ def main():
             fixed_positions=fixed_positions,
             center_point=center_point,
             stim_range_radius=stim_range_radius,
+            display_margin=display_margin,
             sequential=sequential,
             is_memory=is_memory,
             freq_space_tsv=freq_space_tsv,

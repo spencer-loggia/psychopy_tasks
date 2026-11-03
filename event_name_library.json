@@ -3,7 +3,8 @@
     "This is the shared repo-wide event name library.",
     "Not every event in this file is used by every task.",
     "Per-session event_code_library.json files contain the minimal subset of event names, codes, event types, and descriptions actually used in that run.",
-    "Indexed AFC-style sequential events are defined through templates so option_{n}_dot and option_{n}_on do not need to be duplicated as static entries."
+    "Indexed AFC-style sequential events are defined through templates so option_{n}_dot and option_{n}_on do not need to be duplicated as static entries.",
+    "Code 109 (grey_inter_trial_interval) remains reserved for historical logs; active_foraging now records the choice-clear flip as reward_interval or timeout_interval."
   ],
   "events": {
     "gray_pre_sequence": {
@@ -101,6 +102,21 @@
       "event_type": "interaction",
       "description": "A touch or click was registered on the self-initiation cue."
     },
+    "training_cue_release": {
+      "code": 204,
+      "event_type": "interaction",
+      "description": "Contact with the training cue ended by release or movement outside the cue."
+    },
+    "training_trial_start": {
+      "code": 6,
+      "event_type": "lifecycle",
+      "description": "A training trial began on contact with the cue."
+    },
+    "training_trial_end": {
+      "code": 7,
+      "event_type": "lifecycle",
+      "description": "A training trial ended on release or at its duration limit."
+    },
     "option_touch": {
       "code": 201,
       "event_type": "interaction",
@@ -155,14 +171,74 @@
       "code": 321,
       "event_type": "signal",
       "description": "Buzzer GPIO signal offset."
+    },
+    "block_start": {
+      "code": 1,
+      "event_type": "lifecycle",
+      "description": "Task block logging began."
+    },
+    "block_end": {
+      "code": 2,
+      "event_type": "lifecycle",
+      "description": "Task block ended and log finalization began."
+    },
+    "reward_interval": {
+      "code": 3,
+      "event_type": "frame_flip",
+      "description": "The fixed-duration reward interval began at the post-choice gray-screen flip, including zero-pulse outcomes."
+    },
+    "timeout_interval": {
+      "code": 4,
+      "event_type": "frame_flip",
+      "description": "A timeout interval began at the post-choice gray-screen flip, replacing the reward interval."
+    },
+    "inter_trial_interval": {
+      "code": 5,
+      "event_type": "lifecycle",
+      "description": "The inter-trial interval began after the reward or timeout interval; the gray screen remains unchanged."
+    },
+    "sync_bar_flip": {
+      "code": 120,
+      "event_type": "frame_flip",
+      "description": "All five synchronization rectangles inverted on the main display."
+    },
+    "sync_signal_on": {
+      "code": 304,
+      "event_type": "signal",
+      "description": "Synchronization GPIO changed high on the display flip callback."
+    },
+    "sync_signal_off": {
+      "code": 305,
+      "event_type": "signal",
+      "description": "Synchronization GPIO changed low on the display flip callback."
     }
   },
   "task_event_sets": {
+    "touch_and_hold": [
+      "block_start",
+      "block_end",
+      "onset_cue_on",
+      "cue_touch",
+      "training_cue_release",
+      "training_trial_start",
+      "training_trial_end",
+      "gray_inter_trial_interval",
+      "pump_on",
+      "pump_off",
+      "sync_bar_flip",
+      "sync_signal_on",
+      "sync_signal_off"
+    ],
     "random_image_sequence": [
       "gray_pre_sequence",
       "stimulus_on",
       "gray_inter_stimulus",
-      "gray_final_fixation"
+      "gray_final_fixation",
+      "block_start",
+      "block_end",
+      "sync_bar_flip",
+      "sync_signal_on",
+      "sync_signal_off"
     ],
     "afc_trial_sequence": [
       "trial_cue",
@@ -173,7 +249,12 @@
       "option_touch",
       "trial_start_signal_on",
       "trial_start_signal_off",
-      "inter_stimulus_interval"
+      "inter_stimulus_interval",
+      "block_start",
+      "block_end",
+      "sync_bar_flip",
+      "sync_signal_on",
+      "sync_signal_off"
     ],
     "play_video": [
       "video_clip_start",
@@ -181,16 +262,28 @@
       "video_sync_signal_on",
       "video_sync_signal_off",
       "pump_on",
-      "pump_off"
+      "pump_off",
+      "block_start",
+      "block_end",
+      "sync_bar_flip",
+      "sync_signal_on",
+      "sync_signal_off"
     ],
     "calibrate_eye_tracker": [
       "pump_on",
-      "pump_off"
+      "pump_off",
+      "block_start",
+      "block_end",
+      "sync_bar_flip",
+      "sync_signal_on",
+      "sync_signal_off"
     ],
     "active_foraging": [
+      "reward_interval",
+      "timeout_interval",
+      "inter_trial_interval",
       "onset_cue_on",
       "choice_start",
-      "grey_inter_trial_interval",
       "cue_touch",
       "initiation_cue_release",
       "option_touch",
@@ -202,7 +295,12 @@
       "buzzer_off",
       "options_dot",
       "options_on",
-      "inter_stimulus_interval"
+      "inter_stimulus_interval",
+      "block_start",
+      "block_end",
+      "sync_bar_flip",
+      "sync_signal_on",
+      "sync_signal_off"
     ],
     "match2cue": [
       "onset_cue_on",
@@ -220,7 +318,12 @@
       "pump_off",
       "options_dot",
       "options_on",
-      "inter_stimulus_interval"
+      "inter_stimulus_interval",
+      "block_start",
+      "block_end",
+      "sync_bar_flip",
+      "sync_signal_on",
+      "sync_signal_off"
     ],
     "afc_csc1": [
       "onset_cue_on",
@@ -235,7 +338,19 @@
       "options_dot",
       "options_on",
       "delay_start",
-      "feature_cue_on"
+      "feature_cue_on",
+      "block_start",
+      "block_end",
+      "sync_bar_flip",
+      "sync_signal_on",
+      "sync_signal_off"
+    ],
+    "stim_set_gallery": [
+      "block_start",
+      "block_end",
+      "sync_bar_flip",
+      "sync_signal_on",
+      "sync_signal_off"
     ]
   },
   "event_templates": {

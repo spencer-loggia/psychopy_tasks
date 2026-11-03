@@ -1,0 +1,36 @@
+{
+  "config_name": "eye_calibration",
+  "raspi": true,
+  "fixation_cross_size": 42,
+  "reward_interval": 2.0,
+  "daq": {
+    "address": 0,
+    "module_name": "piplates.DAQC2plate"
+  },
+  "pump_pin": 0,
+  "pump_pulse_time_seconds": 0.25,
+  "uart": {
+    "device": "/dev/ttyAMA10",
+    "baud": 460800
+  },
+  "video_files": [
+    "/mnt/data/stim_videos/preproc/monkey_kingdom.mp4"
+  ],
+  "video_size": [
+    100,
+    100
+  ],
+  "clip_duration_seconds": 5.0,
+  "frame_rate": 24,
+  "seek_timeout_seconds": 30.0,
+  "video_buffer_megabytes": 16,
+  "ffprobe": "ffprobe",
+  "seed": null,
+  "fixation_radius": 0.025,
+  "sync_bar": {
+    "enabled": false,
+    "height": 20,
+    "interval_mean_seconds": 1.0,
+    "interval_variance_seconds": 0.2
+  }
+}

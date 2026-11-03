@@ -18,14 +18,19 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from psychopy import core, event, logging as pylogging
+from psychopy import event, logging as pylogging
 
 _project_root = Path(__file__).resolve().parents[1]
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from bin import utils
-from bin.afc_geometry import compute_afc_positions, screen_px_to_psychopy, stimulus_size
+from bin.afc_geometry import (
+    compute_afc_positions,
+    screen_px_to_psychopy,
+    stimulus_size,
+    subject_centered_to_screen_px,
+)
 from bin.afc_stimuli import (
     AFCStimulusSpace,
     StimulusKey,
@@ -44,6 +49,8 @@ from bin.frame_timing import (
     validate_requested_durations,
     wait_until,
 )
+from bin.eye_tracking_config import load_eye_tracking_settings
+from bin.pump_control import PumpPulseControl
 from bin.logger import SessionLogBundle
 from bin.match2cue_logic import (
     Match2CueTrial,
@@ -143,7 +150,8 @@ def _meta_values(
 def _build_behavior_fieldnames(num_afc: int) -> List[str]:
     fields = [
         "trial_num",
-        "initiation_time",
+        "pump_pulse_time",
+        "initiation_task_time_ns",
         "cue_shape",
         "cue_color",
         "cue_lum",
@@ -253,7 +261,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     )
 
     raspi = bool(cfg.get("raspi", False))
-    trial_start_pin = int(cfg.get("trial_start_pin", 18))
+    sync_pin = cfg.get("sync_pin", 18)
     daq_cfg = cfg.get("daq", {}) if isinstance(cfg.get("daq"), dict) else {}
     daq_address = int(daq_cfg.get("address", cfg.get("daq_address", 0)))
     daq_module_name = str(
@@ -262,6 +270,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     pump_pin = int(cfg.get("pump_pin", 0))
     pump_delay_time = max(0.0, float(cfg.get("pump_delay_time", 0.0)))
     pump_pulse_time = max(0.0, float(cfg.get("pump_pulse_time_seconds", 0.25)))
+    pump_control = PumpPulseControl(pump_pulse_time)
     reward_settings = resolve_match2cue_reward_settings(
         reward_match_cue_prob=cfg.get("reward_match_cue_prob", 0.0),
         correct_num_pulse=cfg.get("correct_num_pulse", 1),
@@ -269,17 +278,20 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
         pump_pulse_time_seconds=pump_pulse_time,
         tie_mode=cfg.get("tie_mode", "random"),
     )
+    inter_pump_interval_s = reward_settings.inter_pump_interval
     if raspi:
         DAQC2DigitalOutputs.validate_address(daq_address)
         DAQC2DigitalOutputs.validate_bit(pump_pin)
 
     config_name = str(cfg.get("config_name", "match2cue")).strip() or "match2cue"
     session_logs = SessionLogBundle(
+        eye_tracking_config=load_eye_tracking_settings(cfg),
         output_root=str(cfg.get("output_dir", "./logs")),
         task_name="match2cue",
         config_name=config_name,
         behavior_fieldnames=_build_behavior_fieldnames(num_afc),
         auto_flush=False,
+        live_settings=pump_control.settings if pump_control is not None else None,
     )
     logger = session_logs.event_logger
     msg_logger = session_logs.message_logger
@@ -331,6 +343,8 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     if experimenter_screen is not None:
         experimenter_preview = ExperimenterPreview(
             experimenter_screen,
+            eye_tracking_shared=session_logs.eye_tracking_preview,
+            pump_control=pump_control,
             task_label=config_name,
             subject=subject,
             current_trial_num=1,
@@ -355,6 +369,13 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     subject_scene_size = oriented_size(
         main_scene_size,
         stimulus_rotation_degrees,
+    )
+    session_logs.set_eye_tracking_screen(main_scene_size, stimulus_rotation_degrees)
+    utils.configure_sync_bar(
+        win, cfg.get("sync_bar"), sync_pin=sync_pin, event_logger=logger,
+        experimenter_preview=experimenter_preview,
+        rotation_degrees=stimulus_rotation_degrees,
+        frame_duration_s=frame_duration, msg_logger=msg_logger,
     )
     msg_logger.log(
         "INFO",
@@ -383,7 +404,12 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
             (0.0, 0.0)
             if initiation_config.cue_center_position is None
             else screen_px_to_psychopy(
-                initiation_config.cue_center_position,
+                subject_centered_to_screen_px(
+                    initiation_config.cue_center_position,
+                    main_scene_size,
+                    stimulus_rotation_degrees,
+                    field_name="initiation_cue_center_position",
+                ),
                 main_scene_size,
                 field_name="initiation_cue_center_position",
             )
@@ -417,19 +443,10 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
         )
 
     pylogging.console.setLevel(pylogging.CRITICAL)
-    pigpio_chip = None
     daqc2_outputs: Optional[DAQC2DigitalOutputs] = None
     pump_on = None
     pump_off = None
     if raspi:
-        try:
-            import lgpio
-
-            pigpio_chip = lgpio.gpiochip_open(0)
-            lgpio.gpio_claim_output(pigpio_chip, trial_start_pin)
-        except Exception as exc:
-            pigpio_chip = None
-            msg_logger.log("WARN", f"lgpio unavailable: {exc}; trial-start signal will be logged only")
         try:
             daqc2_outputs = DAQC2DigitalOutputs(
                 address=daq_address,
@@ -450,8 +467,10 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
 
     task_end_status = "done"
 
-    def poll_controls(*, allow_manual_reward: bool = True) -> bool:
+    def poll_controls(*, allow_manual_reward: bool = True, service_sync: bool = True) -> bool:
         nonlocal task_end_status
+        if service_sync:
+            utils.service_sync_bar(win)
         pressed_keys = set()
         try:
             pressed_keys = set(event.getKeys(keyList=["escape", "r"]))
@@ -481,47 +500,43 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
         return experimenter_exit
 
     def wait_or_abort(duration_s: float, *, allow_manual_reward: bool = True) -> bool:
-        deadline = time.perf_counter() + max(0.0, float(duration_s))
-        while time.perf_counter() < deadline:
-            if poll_controls(allow_manual_reward=allow_manual_reward):
-                return True
-            remaining = deadline - time.perf_counter()
-            if remaining > 0:
-                time.sleep(min(0.05, remaining))
-        return poll_controls(allow_manual_reward=allow_manual_reward)
+        return not wait_until(
+            time.perf_counter() + max(0.0, float(duration_s)),
+            poll_callback=lambda: poll_controls(allow_manual_reward=allow_manual_reward),
+        )
 
     def deliver_reward(trial_num: Optional[int], *, context: str) -> bool:
         nonlocal task_end_status
-        start_requested_perf = time.perf_counter()
+        start_requested_perf = time.perf_counter_ns()
         aborted = False
         try:
             set_pump(True)
-            start_perf = time.perf_counter()
+            start_perf = time.perf_counter_ns()
             logger.log_signal(
                 trial_num=trial_num,
                 event="pump_on",
-                timestamp_perf_s=start_perf,
-                requested_timestamp_perf_s=start_requested_perf,
+                timestamp_perf_ns=start_perf,
+                requested_timestamp_perf_ns=start_requested_perf,
                 requested_duration=pump_pulse_time,
             )
             if context == "manual_reward":
-                core.wait(pump_pulse_time)
+                wait_until(time.perf_counter() + pump_pulse_time)
             else:
                 aborted = wait_or_abort(
                     pump_pulse_time,
                     allow_manual_reward=False,
                 )
         finally:
-            end_requested_perf = time.perf_counter()
+            end_requested_perf = time.perf_counter_ns()
             try:
                 set_pump(False)
             finally:
-                end_perf = time.perf_counter()
+                end_perf = time.perf_counter_ns()
                 logger.log_signal(
                     trial_num=trial_num,
                     event="pump_off",
-                    timestamp_perf_s=end_perf,
-                    requested_timestamp_perf_s=end_requested_perf,
+                    timestamp_perf_ns=end_perf,
+                    requested_timestamp_perf_ns=end_requested_perf,
                 )
         status_counts["Rewards delivered"] += 1
         update_preview_counts()
@@ -548,7 +563,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
         def wait_between_pulses(pulse_num: int) -> bool:
             nonlocal task_end_status
             if wait_or_abort(
-                reward_settings.inter_pump_interval,
+                inter_pump_interval_s,
                 allow_manual_reward=False,
             ):
                 if task_end_status == "done":
@@ -595,7 +610,12 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     run_indefinitely = n_trials <= 0
     fixed_positions = bool(cfg.get("fixed_positions", False))
     center_value = cfg.get("center_point")
-    center_point = tuple(center_value) if center_value is not None else None
+    center_point = (
+        subject_centered_to_screen_px(
+            center_value, main_scene_size, stimulus_rotation_degrees,
+            field_name="center_point",
+        ) if center_value is not None else None
+    )
     radius_value = cfg.get("stim_range_radius")
     stim_range_radius = float(radius_value) if radius_value is not None else None
 
@@ -603,6 +623,9 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     try:
         trial_num = 1
         while run_indefinitely or trial_num <= n_trials:
+            pump_pulse_time = pump_control.apply_pending(msg_logger)
+            if cfg.get("inter_pump_interval") is None:
+                inter_pump_interval_s = pump_pulse_time
             if experimenter_preview is not None:
                 experimenter_preview.set_trial_progress(trial_num, n_trials)
             if poll_controls():
@@ -693,15 +716,12 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 ),
                 msg_logger=msg_logger,
                 fps=fps,
-                raspi=bool(raspi and pigpio_chip is not None),
-                pigpio_pi=pigpio_chip,
-                raspi_pin=trial_start_pin,
                 sequential=sequential,
                 is_memory=is_memory,
                 choice_hitbox_scale=1.25 if touchscreen else 1.0,
                 trial_meta=trial_meta,
                 experimenter_preview=experimenter_preview,
-                external_abort_checker=poll_controls,
+                external_abort_checker=lambda: poll_controls(service_sync=False),
                 scene_main_size=effective_win_size,
                 event_profile="match2cue",
                 pre_options_cue_image=cue_image,
@@ -728,14 +748,14 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                     gray_duration += reward_train_duration(
                         reward_settings.correct_num_pulse,
                         pump_pulse_time,
-                        reward_settings.inter_pump_interval,
+                        inter_pump_interval_s,
                     )
                 logger.log_frame_flip(
                     trial_num=trial_num,
                     event="gray_inter_trial_interval",
-                    timestamp_perf_s=float(gray_start_perf),
-                    requested_timestamp_perf_s=trial_meta.get(
-                        "gray_flip_requested_perf_s"
+                    timestamp_perf_ns=trial_meta["gray_flip_perf_ns"],
+                    requested_timestamp_perf_ns=trial_meta.get(
+                        "gray_flip_requested_perf_ns"
                     ),
                     requested_duration=(gray_duration if gray_duration > 0.0 else None),
                 )
@@ -769,7 +789,8 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
             chosen_shape, chosen_color, chosen_lum = _meta_values(space, chosen_stimulus)
             behavior_row: Dict[str, Any] = {
                 "trial_num": trial_num,
-                "initiation_time": _optional_float(trial_meta.get("initiation_time_s")),
+                "pump_pulse_time": pump_pulse_time,
+                "initiation_task_time_ns": trial_meta.get("initiation_task_time_ns", ""),
                 "cue_shape": cue_shape,
                 "cue_color": cue_color,
                 "cue_lum": cue_lum,
@@ -867,13 +888,13 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
         except Exception:
             pass
         try:
-            msg_logger.log("INFO", f"session_end status={task_end_status}")
-            session_logs.close()
+            if experimenter_preview is not None:
+                experimenter_preview.close()
         except Exception:
             pass
         try:
-            if experimenter_preview is not None:
-                experimenter_preview.close()
+            msg_logger.log("INFO", f"session_end status={task_end_status}")
+            session_logs.close()
         except Exception:
             pass
         try:
@@ -881,13 +902,6 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 daqc2_outputs.close()
         except Exception:
             pass
-        if pigpio_chip is not None:
-            try:
-                import lgpio
-
-                lgpio.gpiochip_close(pigpio_chip)
-            except Exception:
-                pass
         try:
             utils.close_task_window(win)
         except Exception:

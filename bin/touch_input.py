@@ -22,6 +22,16 @@ class MousePressSample:
     buttons: tuple[bool, ...]
     press_started: bool
     buffered_press: bool
+    observed_perf_ns: int
+    timestamp_perf_ns: int
+
+    @property
+    def timestamp_perf_s(self) -> float:
+        return self.timestamp_perf_ns / 1_000_000_000
+
+    @property
+    def observed_perf_s(self) -> float:
+        return self.observed_perf_ns / 1_000_000_000
 
     @property
     def down(self) -> bool:
@@ -40,6 +50,7 @@ class TouchHoldSample:
     qualified: bool
     released: bool
     missing_since_s: Optional[float]
+    missing_since_perf_ns: Optional[int]
 
 
 class TouchHoldTracker:
@@ -71,18 +82,22 @@ class TouchHoldTracker:
     def reset(self) -> None:
         self._started_s: Optional[float] = None
         self._missing_since_s: Optional[float] = None
+        self._missing_since_perf_ns: Optional[int] = None
         self._released = False
 
     def start(self, timestamp_s: Optional[float] = None) -> None:
         now = self._resolve_time(timestamp_s)
         self._started_s = now
         self._missing_since_s = None
+        self._missing_since_perf_ns = None
         self._released = False
 
     def update(
         self,
         touch_registered: bool,
         timestamp_s: Optional[float] = None,
+        *,
+        timestamp_perf_ns: Optional[int] = None,
     ) -> TouchHoldSample:
         now = self._resolve_time(timestamp_s)
         if self._started_s is None:
@@ -93,9 +108,14 @@ class TouchHoldTracker:
         if not self._released:
             if touch_registered:
                 self._missing_since_s = None
+                self._missing_since_perf_ns = None
             else:
                 if self._missing_since_s is None:
                     self._missing_since_s = now
+                    self._missing_since_perf_ns = (
+                        round(now * 1_000_000_000) if timestamp_perf_ns is None
+                        else timestamp_perf_ns
+                    )
                 if now - self._missing_since_s > self.max_break_s:
                     self._released = True
         return self._sample(now)
@@ -113,6 +133,7 @@ class TouchHoldTracker:
             qualified=bool(started and not self._released and elapsed_s >= self.required_hold_s),
             released=self._released,
             missing_since_s=self._missing_since_s,
+            missing_since_perf_ns=self._missing_since_perf_ns,
         )
 
 
@@ -126,7 +147,7 @@ def _as_bool_tuple(value: Any) -> tuple[bool, ...]:
 def _has_press_timestamp(values: Sequence[Any]) -> bool:
     for value in values:
         try:
-            if float(value) > 0.0:
+            if math.isfinite(float(value)) and float(value) > 0.0:
                 return True
         except (TypeError, ValueError):
             continue
@@ -139,12 +160,17 @@ class MousePressTracker:
     def __init__(self, mouse) -> None:
         self.mouse = mouse
         self._previous_down = False
+        self._reset_perf_ns = None
+        self._observed_perf_ns = None
 
     def _read_buttons_and_times(self) -> tuple[tuple[bool, ...], tuple[Any, ...]]:
         try:
             result = self.mouse.getPressed(getTime=True)
         except Exception:
             result = self.mouse.getPressed()
+        # Capture before decoding results, resetting clocks, position lookup,
+        # hit-testing, or logging can delay the detected event.
+        self._observed_perf_ns = time.perf_counter_ns()
 
         if isinstance(result, tuple) and len(result) == 2:
             buttons = _as_bool_tuple(result[0])
@@ -157,10 +183,17 @@ class MousePressTracker:
         return _as_bool_tuple(result), ()
 
     def _reset_click_times(self) -> None:
+        before_ns = time.perf_counter_ns()
         try:
             self.mouse.clickReset()
         except Exception:
-            pass
+            self._reset_perf_ns = None
+        else:
+            after_ns = time.perf_counter_ns()
+            # PsychoPy's buffered button times are elapsed seconds from this
+            # reset. Bracket its clock reset; never substitute the later poll
+            # time for an already-dispatched press during a blocking flip.
+            self._reset_perf_ns = (before_ns + after_ns) // 2
 
     def reset(self) -> None:
         """Discard earlier presses and begin a fresh response window.
@@ -179,6 +212,20 @@ class MousePressTracker:
         buttons, press_times = self._read_buttons_and_times()
         down = any(buttons)
         buffered_press = _has_press_timestamp(press_times)
+        timestamp_perf_ns = self._observed_perf_ns
+        if buffered_press and self._reset_perf_ns is not None:
+            candidates = []
+            for elapsed in press_times:
+                try:
+                    elapsed = float(elapsed)
+                except (ValueError, TypeError):
+                    continue
+                if math.isfinite(elapsed) and elapsed > 0:
+                    candidate = self._reset_perf_ns + round(elapsed * 1_000_000_000)
+                    if candidate <= self._observed_perf_ns:
+                        candidates.append(candidate)
+            if candidates:
+                timestamp_perf_ns = min(candidates)
         press_started = (down and not self._previous_down) or buffered_press
         self._previous_down = down
 
@@ -193,4 +240,6 @@ class MousePressTracker:
             buttons=buttons,
             press_started=bool(press_started),
             buffered_press=bool(buffered_press),
+            observed_perf_ns=self._observed_perf_ns,
+            timestamp_perf_ns=timestamp_perf_ns,
         )

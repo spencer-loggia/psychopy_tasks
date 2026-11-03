@@ -46,7 +46,11 @@ if str(_project_root) not in sys.path:
 
 from bin import utils
 from bin.config import load_config
-from bin.screen import load_screen_config, resolve_scene_size, resolve_task_screens
+from bin.logger import SessionLogBundle
+from bin.screen import (
+    ExperimenterPreview, load_screen_config, resolve_scene_size,
+    serialize_preview_image, software_stimulus_rotation,
+)
 
 
 RGB = Tuple[int, int, int]
@@ -552,16 +556,15 @@ def main() -> None:
         cli_main=_get("main_screen", None),
         cli_experimenter=None,
     )
-    main_screen, _ = resolve_task_screens(screen_config, allow_same_screen=True)
-
     # Initial background only matters before the first page draw.
-    win = utils.setup_window(
+    win, main_screen, experimenter_screen = utils.setup_task_window(
+        screen_config,
         bg_rgb_255=pages[0].bg_rgb,
         fullscreen=fullscreen,
         size=win_size,
-        screen_info=main_screen,
+        allow_same_screen=True,
     )
-
+    logs = preview = None
     mouse = event.Mouse(win=win, visible=True)
     last_mouse_down = False
 
@@ -571,6 +574,26 @@ def main() -> None:
             fullscreen=fullscreen,
             requested_size=win_size,
             realized_size=tuple(win.size),
+        )
+        rotation = software_stimulus_rotation(main_screen.rotation)
+        logs = SessionLogBundle(
+            output_root=cfg.get("output_dir", "logs"), task_name="stim_set_gallery",
+            config_name=cfg.get("config_name", "stim_set_gallery"), auto_flush=False,
+        )
+        _, frame_duration_s = utils.resolve_frame_rate(
+            win, cfg.get("refresh_rate"), msg_logger=logs.message_logger,
+            context="stim_set_gallery",
+        )
+        if experimenter_screen is not None:
+            preview = ExperimenterPreview(
+                experimenter_screen, task_label=cfg.get("config_name", "stim_set_gallery"),
+            )
+            utils.verify_task_window_vblank(win)
+        utils.configure_sync_bar(
+            win, cfg.get("sync_bar"), sync_pin=cfg.get("sync_pin", 18),
+            event_logger=logs.event_logger, experimenter_preview=preview,
+            rotation_degrees=rotation, frame_duration_s=frame_duration_s,
+            msg_logger=logs.message_logger,
         )
         image_size = (int(args.image_size[0]), int(args.image_size[1]))
         radius = (
@@ -646,6 +669,13 @@ def main() -> None:
 
         page_idx = 0
         needs_redraw = True
+        poll_interval_s = 0.002 if (cfg.get("sync_bar") or {}).get("enabled", False) else 0.01
+        preview_pages = [
+            [{"image_payload": serialize_preview_image(stim.image),
+              "pos": tuple(stim.pos), "size": tuple(stim.size), "ori": float(stim.ori)}
+             for stim in image_stims]
+            for _, image_stims, _ in prepared_pages
+        ] if preview is not None else []
         print(f"Loaded {len(pages)} gallery pages.")
         print("Controls: left/right or P/N/space; 1-9 jump; click/touch halves; Q/Escape quit.")
 
@@ -659,6 +689,11 @@ def main() -> None:
                     stim.draw()
                 win.flip()
                 page = pages[page_idx]
+                if preview is not None:
+                    preview.show_static_scene(
+                        bg_rgb_255=page.bg_rgb, main_size=scene_size,
+                        main_rotation_deg=rotation, images=preview_pages[page_idx],
+                    )
                 print(
                     f"Page {page_idx + 1}/{len(pages)}: {page.label} "
                     f"[{page.kind}, n={len(page.ids)}]"
@@ -666,7 +701,7 @@ def main() -> None:
                 needs_redraw = False
 
             keys = event.getKeys()
-            if any(k in ("escape", "q") for k in keys):
+            if any(k in ("escape", "q") for k in keys) or (preview is not None and preview.poll()):
                 break
 
             if any(k in ("right", "space", "n") for k in keys):
@@ -696,10 +731,19 @@ def main() -> None:
                 needs_redraw = True
             last_mouse_down = mouse_down
 
-            core.wait(0.01)
+            utils.service_sync_bar(win)
+            core.wait(poll_interval_s)
 
     finally:
-        win.close()
+        try:
+            if preview is not None:
+                preview.close()
+        finally:
+            try:
+                utils.close_task_window(win)
+            finally:
+                if logs is not None:
+                    logs.close()
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from psychopy import core, event, logging as pylogging
+from psychopy import event, logging as pylogging
 
 _project_root = Path(__file__).resolve().parents[1]
 if str(_project_root) not in sys.path:
@@ -261,7 +261,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     )
 
     raspi = bool(cfg.get("raspi", False))
-    trial_start_pin = int(cfg.get("trial_start_pin", 18))
+    sync_pin = cfg.get("sync_pin", 18)
     daq_cfg = cfg.get("daq", {}) if isinstance(cfg.get("daq"), dict) else {}
     daq_address = int(daq_cfg.get("address", cfg.get("daq_address", 0)))
     daq_module_name = str(
@@ -371,6 +371,12 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
         stimulus_rotation_degrees,
     )
     session_logs.set_eye_tracking_screen(main_scene_size, stimulus_rotation_degrees)
+    utils.configure_sync_bar(
+        win, cfg.get("sync_bar"), sync_pin=sync_pin, event_logger=logger,
+        experimenter_preview=experimenter_preview,
+        rotation_degrees=stimulus_rotation_degrees,
+        frame_duration_s=frame_duration, msg_logger=msg_logger,
+    )
     msg_logger.log(
         "INFO",
         f"resolved_main_scene_size native_size={main_scene_size[0]}x{main_scene_size[1]} "
@@ -437,19 +443,10 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
         )
 
     pylogging.console.setLevel(pylogging.CRITICAL)
-    pigpio_chip = None
     daqc2_outputs: Optional[DAQC2DigitalOutputs] = None
     pump_on = None
     pump_off = None
     if raspi:
-        try:
-            import lgpio
-
-            pigpio_chip = lgpio.gpiochip_open(0)
-            lgpio.gpio_claim_output(pigpio_chip, trial_start_pin)
-        except Exception as exc:
-            pigpio_chip = None
-            msg_logger.log("WARN", f"lgpio unavailable: {exc}; trial-start signal will be logged only")
         try:
             daqc2_outputs = DAQC2DigitalOutputs(
                 address=daq_address,
@@ -470,8 +467,10 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
 
     task_end_status = "done"
 
-    def poll_controls(*, allow_manual_reward: bool = True) -> bool:
+    def poll_controls(*, allow_manual_reward: bool = True, service_sync: bool = True) -> bool:
         nonlocal task_end_status
+        if service_sync:
+            utils.service_sync_bar(win)
         pressed_keys = set()
         try:
             pressed_keys = set(event.getKeys(keyList=["escape", "r"]))
@@ -501,14 +500,10 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
         return experimenter_exit
 
     def wait_or_abort(duration_s: float, *, allow_manual_reward: bool = True) -> bool:
-        deadline = time.perf_counter() + max(0.0, float(duration_s))
-        while time.perf_counter() < deadline:
-            if poll_controls(allow_manual_reward=allow_manual_reward):
-                return True
-            remaining = deadline - time.perf_counter()
-            if remaining > 0:
-                time.sleep(min(0.05, remaining))
-        return poll_controls(allow_manual_reward=allow_manual_reward)
+        return not wait_until(
+            time.perf_counter() + max(0.0, float(duration_s)),
+            poll_callback=lambda: poll_controls(allow_manual_reward=allow_manual_reward),
+        )
 
     def deliver_reward(trial_num: Optional[int], *, context: str) -> bool:
         nonlocal task_end_status
@@ -525,7 +520,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 requested_duration=pump_pulse_time,
             )
             if context == "manual_reward":
-                core.wait(pump_pulse_time)
+                wait_until(time.perf_counter() + pump_pulse_time)
             else:
                 aborted = wait_or_abort(
                     pump_pulse_time,
@@ -721,15 +716,12 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 ),
                 msg_logger=msg_logger,
                 fps=fps,
-                raspi=bool(raspi and pigpio_chip is not None),
-                pigpio_pi=pigpio_chip,
-                raspi_pin=trial_start_pin,
                 sequential=sequential,
                 is_memory=is_memory,
                 choice_hitbox_scale=1.25 if touchscreen else 1.0,
                 trial_meta=trial_meta,
                 experimenter_preview=experimenter_preview,
-                external_abort_checker=poll_controls,
+                external_abort_checker=lambda: poll_controls(service_sync=False),
                 scene_main_size=effective_win_size,
                 event_profile="match2cue",
                 pre_options_cue_image=cue_image,
@@ -910,13 +902,6 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 daqc2_outputs.close()
         except Exception:
             pass
-        if pigpio_chip is not None:
-            try:
-                import lgpio
-
-                lgpio.gpiochip_close(pigpio_chip)
-            except Exception:
-                pass
         try:
             utils.close_task_window(win)
         except Exception:

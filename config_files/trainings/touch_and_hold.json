@@ -18,5 +18,11 @@
   "daq": {"address": 0},
   "pump_pin": 0,
   "pump_pulse_time_seconds": 0.15,
-  "eye_tracking": {"enabled": true}
+  "eye_tracking": {"enabled": true},
+  "sync_bar": {
+    "enabled": false,
+    "height": 20,
+    "interval_mean_seconds": 1.0,
+    "interval_variance_seconds": 0.2
+  }
 }

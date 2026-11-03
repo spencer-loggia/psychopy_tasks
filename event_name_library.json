@@ -196,6 +196,21 @@
       "code": 5,
       "event_type": "lifecycle",
       "description": "The inter-trial interval began after the reward or timeout interval; the gray screen remains unchanged."
+    },
+    "sync_bar_flip": {
+      "code": 120,
+      "event_type": "frame_flip",
+      "description": "All five synchronization rectangles inverted on the main display."
+    },
+    "sync_signal_on": {
+      "code": 304,
+      "event_type": "signal",
+      "description": "Synchronization GPIO changed high on the display flip callback."
+    },
+    "sync_signal_off": {
+      "code": 305,
+      "event_type": "signal",
+      "description": "Synchronization GPIO changed low on the display flip callback."
     }
   },
   "task_event_sets": {
@@ -209,7 +224,10 @@
       "training_trial_end",
       "gray_inter_trial_interval",
       "pump_on",
-      "pump_off"
+      "pump_off",
+      "sync_bar_flip",
+      "sync_signal_on",
+      "sync_signal_off"
     ],
     "random_image_sequence": [
       "gray_pre_sequence",
@@ -217,7 +235,10 @@
       "gray_inter_stimulus",
       "gray_final_fixation",
       "block_start",
-      "block_end"
+      "block_end",
+      "sync_bar_flip",
+      "sync_signal_on",
+      "sync_signal_off"
     ],
     "afc_trial_sequence": [
       "trial_cue",
@@ -230,7 +251,10 @@
       "trial_start_signal_off",
       "inter_stimulus_interval",
       "block_start",
-      "block_end"
+      "block_end",
+      "sync_bar_flip",
+      "sync_signal_on",
+      "sync_signal_off"
     ],
     "play_video": [
       "video_clip_start",
@@ -240,13 +264,19 @@
       "pump_on",
       "pump_off",
       "block_start",
-      "block_end"
+      "block_end",
+      "sync_bar_flip",
+      "sync_signal_on",
+      "sync_signal_off"
     ],
     "calibrate_eye_tracker": [
       "pump_on",
       "pump_off",
       "block_start",
-      "block_end"
+      "block_end",
+      "sync_bar_flip",
+      "sync_signal_on",
+      "sync_signal_off"
     ],
     "active_foraging": [
       "reward_interval",
@@ -267,7 +297,10 @@
       "options_on",
       "inter_stimulus_interval",
       "block_start",
-      "block_end"
+      "block_end",
+      "sync_bar_flip",
+      "sync_signal_on",
+      "sync_signal_off"
     ],
     "match2cue": [
       "onset_cue_on",
@@ -287,7 +320,10 @@
       "options_on",
       "inter_stimulus_interval",
       "block_start",
-      "block_end"
+      "block_end",
+      "sync_bar_flip",
+      "sync_signal_on",
+      "sync_signal_off"
     ],
     "afc_csc1": [
       "onset_cue_on",
@@ -304,7 +340,17 @@
       "delay_start",
       "feature_cue_on",
       "block_start",
-      "block_end"
+      "block_end",
+      "sync_bar_flip",
+      "sync_signal_on",
+      "sync_signal_off"
+    ],
+    "stim_set_gallery": [
+      "block_start",
+      "block_end",
+      "sync_bar_flip",
+      "sync_signal_on",
+      "sync_signal_off"
     ]
   },
   "event_templates": {

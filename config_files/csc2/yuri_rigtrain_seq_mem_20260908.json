@@ -42,7 +42,7 @@
   },
   "pump_pin": 0,
   "buzz_pin": 1,
-  "trial_start_pin": 18,
+  "sync_pin": 18,
 
   "seed": null,
   "output_dir": "./logs",
@@ -80,5 +80,11 @@
   "is_memory": true,
   "raspi": true,
   "touchscreen": true,
-  "eye_tracking": {"enabled": true}
+  "eye_tracking": {"enabled": true},
+  "sync_bar": {
+    "enabled": false,
+    "height": 20,
+    "interval_mean_seconds": 1.0,
+    "interval_variance_seconds": 0.2
+  }
 }

@@ -29,7 +29,6 @@ from bin.pump_control import PumpPulseControl
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.video_playback import (
-    RandomFramePulseSchedule,
     SharedVideoFrameBuffer,
     center_crop_bounds,
     is_raspberry_pi,
@@ -65,11 +64,9 @@ def parse_args():
     parser.add_argument("--frame_rate", type=float, default=None, help="Authoritative video presentation and clip-selection rate (Hz)")
     parser.add_argument("--video_buffer_megabytes", type=float, default=None, help="Maximum shared-memory budget for prepared RGB video chunks")
     parser.add_argument("--ffprobe", default=None, help="Path to ffprobe for codec probing")
-    parser.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi frame-sync GPIO and pump behavior")
+    parser.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi DAQC2 pump behavior")
     parser.add_argument("--no_raspi", action="store_false", dest="raspi", help="Disable Raspberry Pi hardware behavior")
-    parser.add_argument("--sync_pin", type=int, default=None, help="BCM GPIO pin for frame-locked video sync pulses")
-    parser.add_argument("--sync_interval_frames", type=int, nargs=2, default=None, metavar=("MIN", "MAX"), help="Inclusive randomized interval between sync-pulse onsets, in video presentation frames")
-    parser.add_argument("--sync_pulse_frames", type=int, default=None, help="Sync pulse width in video presentation frames")
+    parser.add_argument("--sync_pin", type=int, default=None, help="BCM GPIO pin for display-synchronized sync bar signals")
     parser.add_argument("--daq_address", type=int, default=None, help="Pi-Plates DAQC2plate address (0-7)")
     parser.add_argument("--daq_module", default=None, help="Python module for the DAQC2plate driver")
     parser.add_argument("--pump_pin", type=int, default=None, help="DAQC2 DOUT bit for the periodic pump pulse (0-7)")
@@ -94,9 +91,8 @@ def run_task(
     ffprobe_bin: str = "ffprobe",
     screen_config=None,
     raspi: bool = False,
-    sync_pin: int = 18,
-    sync_interval_frames: Tuple[int, int] = (100, 300),
-    sync_pulse_frames: int = 1,
+    sync_pin: Optional[int] = 18,
+    sync_bar: Optional[dict] = None,
     seek_timeout_seconds: float = 30.0,
     daq_address: int = 0,
     daq_module_name: str = "piplates.DAQC2plate",
@@ -128,25 +124,9 @@ def run_task(
         raise ValueError("video_buffer_megabytes must be positive and finite")
     video_buffer_bytes = int(round(video_buffer_megabytes * 1024 * 1024))
     selection_rng = random.Random(seed)
-    sync_rng = random.Random(None if seed is None else int(seed) + 0x51A7)
-    if len(sync_interval_frames) != 2:
-        raise ValueError("sync_interval_frames must contain exactly MIN and MAX")
-    sync_interval_min = int(sync_interval_frames[0])
-    sync_interval_max = int(sync_interval_frames[1])
-    sync_pulse_frames = int(sync_pulse_frames)
-    sync_pin = int(sync_pin)
     daq_address = DAQC2DigitalOutputs.validate_address(int(daq_address))
     pump_pin = DAQC2DigitalOutputs.validate_bit(int(pump_pin))
     if raspi:
-        # Validate all timing parameters before opening windows or GPIO.
-        RandomFramePulseSchedule(
-            sync_interval_min,
-            sync_interval_max,
-            pulse_width_frames=sync_pulse_frames,
-            rng=random.Random(0),
-        )
-        if sync_pin < 0:
-            raise ValueError("sync_pin must be a non-negative BCM GPIO number")
         if reward_interval is None or pump_pulse_time_seconds is None:
             raise ValueError(
                 "reward_interval and pump_pulse_time_seconds are required when raspi=true"
@@ -168,8 +148,6 @@ def run_task(
     win = None
     experimenter_preview = None
     frame_publisher = None
-    sync_lgpio = None
-    sync_gpio_chip = None
     pump_outputs = None
     pump_controller = None
     pump_control = (
@@ -229,7 +207,6 @@ def run_task(
             "main_vblank_delta_sbc",
             "main_vblank_expected_delta_sbc",
             "scheduled_video_slots_skipped",
-            "sync_pulses",
         ],
         additional_table_fieldnames={
             "video_frame_timing": [
@@ -487,7 +464,6 @@ def run_task(
                     "scheduled_video_slots_skipped",
                     "",
                 ),
-                "sync_pulses": playback.get("sync_pulses", ""),
             }
         )
 
@@ -557,24 +533,6 @@ def run_task(
 
     try:
         if raspi:
-            import lgpio
-
-            sync_lgpio = lgpio
-            sync_gpio_chip = lgpio.gpiochip_open(0)
-            if isinstance(sync_gpio_chip, int) and sync_gpio_chip < 0:
-                raise RuntimeError(
-                    f"Could not open GPIO chip 0; lgpio={sync_gpio_chip}"
-                )
-            claim_result = lgpio.gpio_claim_output(sync_gpio_chip, sync_pin)
-            if isinstance(claim_result, int) and claim_result < 0:
-                raise RuntimeError(
-                    f"Could not claim sync GPIO {sync_pin}; lgpio={claim_result}"
-                )
-            write_result = lgpio.gpio_write(sync_gpio_chip, sync_pin, 0)
-            if isinstance(write_result, int) and write_result < 0:
-                raise RuntimeError(
-                    f"Could not initialize sync GPIO {sync_pin} low; lgpio={write_result}"
-                )
             pump_outputs = DAQC2DigitalOutputs(
                 address=daq_address,
                 module_name=daq_module_name,
@@ -697,8 +655,7 @@ def run_task(
                 "INFO",
                 (
                     "pi5_video_mode decoder=ffpyplayer "
-                    f"sync_pin={sync_pin} interval_frames={sync_interval_min}-{sync_interval_max} "
-                    f"pulse_width_frames={sync_pulse_frames} pump_dout={pump_pin}"
+                    f"sync_pin={sync_pin} pump_dout={pump_pin}"
                 ),
             )
         msg_logger.log(
@@ -713,7 +670,7 @@ def run_task(
                 f"realized_win_size={tuple(win.size)}"
             ),
         )
-        fps, _ = utils.resolve_frame_rate(
+        fps, frame_duration = utils.resolve_frame_rate(
             win,
             refresh_rate,
             msg_logger=msg_logger,
@@ -789,6 +746,12 @@ def run_task(
                 ),
             )
 
+        utils.configure_sync_bar(
+            win, sync_bar, sync_pin=sync_pin, event_logger=logger,
+            experimenter_preview=experimenter_preview,
+            rotation_degrees=main_rotation_deg,
+            frame_duration_s=frame_duration, msg_logger=msg_logger,
+        )
         main_vblank = utils.verify_task_window_vblank(win)
         primary_lease = main_vblank.primary_lease
         main_vblank_status = (
@@ -884,6 +847,7 @@ def run_task(
             return True
 
         while played_videos < num_clips:
+            utils.service_sync_bar(win)
             if pump_control is not None:
                 values = pump_control.settings.apply_pending(msg_logger, on_apply=apply_reward_settings)
                 pump_pulse_time_seconds, reward_interval = values["pump_pulse_time"], values["reward_interval"]
@@ -925,16 +889,6 @@ def run_task(
                     main_size=native_main_size,
                     main_rotation_deg=main_rotation_deg,
                 )
-            sync_schedule = (
-                RandomFramePulseSchedule(
-                    sync_interval_min,
-                    sync_interval_max,
-                    pulse_width_frames=sync_pulse_frames,
-                    rng=sync_rng,
-                )
-                if raspi
-                else None
-            )
             try:
                 try:
                     playback_info = utils.play_video_fill_screen(
@@ -951,10 +905,6 @@ def run_task(
                         trial_num=played_videos + 1,
                         stream_info=chosen_stream,
                         frame_publisher=frame_publisher,
-                        sync_schedule=sync_schedule,
-                        sync_gpio_module=sync_lgpio,
-                        sync_gpio_chip=sync_gpio_chip,
-                        sync_pin=sync_pin,
                         frame_publish_interval_s=0.1,
                         clip_start_s=selected_clip.start_s,
                         clip_duration_s=selected_clip.duration_s,
@@ -1045,15 +995,6 @@ def run_task(
             except Exception as exc:
                 msg_logger.log("ERROR", f"periodic_pump_cleanup_failed error={exc}")
             _drain_pump_edges()
-        if sync_lgpio is not None and sync_gpio_chip is not None:
-            try:
-                sync_lgpio.gpio_write(sync_gpio_chip, sync_pin, 0)
-            except Exception:
-                pass
-            try:
-                sync_lgpio.gpiochip_close(sync_gpio_chip)
-            except Exception:
-                pass
         if experimenter_preview is not None:
             try:
                 experimenter_preview.close()
@@ -1141,17 +1082,8 @@ def main():
             ffprobe_bin=_get("ffprobe", cfg.get("ffprobe", "ffprobe")),
             screen_config=screen_config,
             raspi=bool(_get("raspi", is_raspberry_pi())),
-            sync_pin=int(_get("sync_pin", cfg.get("sync_pin", 18))),
-            sync_interval_frames=tuple(
-                int(value)
-                for value in _get(
-                    "sync_interval_frames",
-                    cfg.get("sync_interval_frames", (100, 300)),
-                )
-            ),
-            sync_pulse_frames=int(
-                _get("sync_pulse_frames", cfg.get("sync_pulse_frames", 1))
-            ),
+            sync_pin=_get("sync_pin", 18),
+            sync_bar=cfg.get("sync_bar"),
             seek_timeout_seconds=float(
                 _get("seek_timeout_seconds", cfg.get("seek_timeout_seconds", 30.0))
             ),

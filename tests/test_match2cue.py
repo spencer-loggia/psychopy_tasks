@@ -8,6 +8,8 @@ from unittest.mock import Mock, patch
 
 from PIL import Image
 
+import bin as bin_package
+
 from bin.afc_stimuli import load_afc_stimulus_space, render_afc_stimulus
 from bin.logger import EventCodeLibrary, load_task_event_definitions
 from bin.match2cue_logic import (
@@ -316,7 +318,9 @@ class Match2CueStimulusTests(unittest.TestCase):
             rasterize_svg=native,
             rasterize_svg_with_color=recolored,
         )
-        with patch.dict(sys.modules, {"bin.utils": fake_utils}):
+        with patch.dict(sys.modules, {"bin.utils": fake_utils}), patch.object(
+            bin_package, "utils", fake_utils, create=True,
+        ):
             rendered = render_afc_stimulus(
                 (1, None),
                 shapes={1: Path("shape.svg")},

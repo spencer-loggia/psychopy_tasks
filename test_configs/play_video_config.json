@@ -15,12 +15,16 @@
   "fullscreen": true,
   "bg": [0, 0, 0],
   "sync_pin": 18,
-  "sync_interval_frames": [100, 300],
-  "sync_pulse_frames": 1,
 
   "pump_pin": 0,
   "pump_pulse_time_seconds": 0.1,
   "reward_interval": 5.0,
 
-  "eye_tracking": {"enabled": true}
+  "eye_tracking": {"enabled": true},
+  "sync_bar": {
+    "enabled": false,
+    "height": 20,
+    "interval_mean_seconds": 1.0,
+    "interval_variance_seconds": 0.2
+  }
 }

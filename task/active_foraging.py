@@ -21,7 +21,7 @@ Config keys required/additional:
 - inter_pump_interval: optional delay in seconds between pump pulses; defaults to pump_pulse_time_seconds
 - The reward interval reserves the longest configured pump train for every non-timeout
   outcome. A timeout replaces that interval; the full ITI follows either interval.
-- trial_start_pin is a Raspberry Pi BCM GPIO pin; pump_pin and buzz_pin are
+- sync_pin is a Raspberry Pi BCM GPIO pin; pump_pin and buzz_pin are
   DAQC2 DOUT bits on the Pi-Plate.
 
 """
@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Tuple, Optional, List, Dict, Any, Mapping
 import pandas as pd
 
-from psychopy import core, logging as pylogging, event
+from psychopy import logging as pylogging, event
 
 _project_root = Path(__file__).resolve().parents[1]
 if str(_project_root) not in sys.path:
@@ -262,8 +262,8 @@ def parse_args():
     p.add_argument("--sequential", action="store_true", default=None, help="Present stimuli sequentially (one at a time). If not set, config value or default True is used")
     p.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate (Hz); skip auto-detection if provided")
     p.add_argument("--touchscreen", action="store_true", default=None, help="Enable touchscreen mode (hide mouse cursor)")
-    p.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi GPIO trial-start pulses and DAQC2 DOUT pump/buzzer outputs")
-    p.add_argument("--trial_start_pin", type=int, default=None, help="GPIO pin to use for trial start pulses (BCM numbering)")
+    p.add_argument("--raspi", action="store_true", default=None, help="Enable DAQC2 DOUT pump/buzzer outputs")
+    p.add_argument("--sync_pin", type=int, default=None, help="GPIO pin for display-synchronized sync bar signals (BCM numbering)")
     p.add_argument("--daq_address", type=int, default=None, help="DAQC2plate address for pump/buzzer DOUT outputs")
     p.add_argument("--pump_pin", type=int, default=None, help="DAQC2 DOUT bit for pump reward delivery (0-7)")
     p.add_argument("--buzz_pin", type=int, default=None, help="DAQC2 DOUT bit for timeout buzzer (0-7)")
@@ -324,7 +324,8 @@ def run_task(
     refresh_rate: Optional[float] = None,
     touchscreen: bool = False,
     raspi: bool = False,
-    trial_start_pin: int = 18,
+    sync_pin: Optional[int] = 18,
+    sync_bar: Optional[Dict[str, Any]] = None,
     daq_address: int = 0,
     daq_module_name: str = "piplates.DAQC2plate",
     pump_pin: int = 0,
@@ -697,6 +698,12 @@ def run_task(
         stimulus_rotation_degrees,
     )
     session_logs.set_eye_tracking_screen(main_scene_size, stimulus_rotation_degrees)
+    utils.configure_sync_bar(
+        win, sync_bar, sync_pin=sync_pin, event_logger=logger,
+        experimenter_preview=experimenter_preview,
+        rotation_degrees=stimulus_rotation_degrees,
+        frame_duration_s=frame_dur, msg_logger=msg_logger,
+    )
     fix = utils.make_fixation_cross(
         win,
         size=fixation_size,
@@ -824,27 +831,12 @@ def run_task(
 
     # Initialize hardware outputs if requested; do not fail the task if hardware
     # libraries are unavailable.
-    pigpio_pi = None  # naming kept for compatibility with presenter API
     daqc2_outputs: Optional[DAQC2DigitalOutputs] = None
     pump_output_on = None
     pump_output_off = None
     buzzer_output_on = None
     buzzer_output_off = None
     if raspi:
-        try:
-            import lgpio
-
-            chip = lgpio.gpiochip_open(0)  # 0 is the default chip for RPi5
-            lgpio.gpio_claim_output(chip, trial_start_pin)
-            pigpio_pi = chip  # store chip handle
-            msg_logger.log("INFO", f"lgpio initialized on chip 0, trial_start_pin={trial_start_pin}")
-        except Exception as e:
-            pigpio_pi = None
-            try:
-                msg_logger.log("WARN", f"lgpio not available or failed to initialize: {e}; trial-start GPIO signal will be logged only")
-            except Exception:
-                pass
-
         try:
             daqc2_outputs = DAQC2DigitalOutputs(
                 address=int(daq_address),
@@ -869,7 +861,7 @@ def run_task(
             except Exception:
                 pass
     else:
-        msg_logger.log("INFO", "raspi=False; GPIO/DAQC2 hardware signals will not be sent (events will be logged only)")
+        msg_logger.log("INFO", "raspi=False; DAQC2 pump/buzzer signals will not be sent (events will be logged only)")
 
     def _set_daqc2_output(bit: int, active: bool, *, signal_name: str, context: str) -> None:
         if raspi and daqc2_outputs is not None:
@@ -912,7 +904,7 @@ def run_task(
                 requested_timestamp_perf_ns=start_requested_perf,
                 requested_duration=pulse_duration,
             )
-            core.wait(pulse_duration)
+            wait_until(time.perf_counter() + pulse_duration)
         finally:
             end_requested_perf = time.perf_counter_ns()
             _set_pump_pin(0, context="manual_reward")
@@ -924,7 +916,9 @@ def run_task(
                 requested_timestamp_perf_ns=end_requested_perf,
             )
 
-    def _poll_experimenter_controls(*, allow_manual_reward=True) -> bool:
+    def _poll_experimenter_controls(*, allow_manual_reward=True, service_sync=True) -> bool:
+        if service_sync:
+            utils.service_sync_bar(win)
         manual_reward_requested = False
         try:
             if allow_manual_reward:
@@ -1103,15 +1097,12 @@ def run_task(
                 white_fixation_until_choice=True,
                 msg_logger=msg_logger,
                 fps=fps,
-                raspi=bool(raspi and pigpio_pi is not None),
-                pigpio_pi=pigpio_pi,
-                raspi_pin=trial_start_pin,
                 sequential=sequential,
                 is_memory=is_memory,
                 choice_hitbox_scale=1.25 if touchscreen else 1.0,
                 trial_meta=trial_meta,
                 experimenter_preview=experimenter_preview,
-                external_abort_checker=_poll_experimenter_controls,
+                external_abort_checker=lambda: _poll_experimenter_controls(service_sync=False),
                 scene_main_size=main_scene_size,
                 event_profile="active_foraging",
                 reward_levels=[reward_map.get(pair, 0) for pair in trial_options],
@@ -1355,7 +1346,7 @@ def main():
     # Accept both 'refresh_rate' and the common misspelling 'refrech_rate' from config
     refresh_rate = _get("refresh_rate", cfg.get("refresh_rate", cfg.get("refrech_rate", None)))
     touchscreen = bool(_get("touchscreen", cfg.get("touchscreen", False)))
-    trial_start_pin = int(_get("trial_start_pin", cfg.get("trial_start_pin", 18)))
+    sync_pin = _get("sync_pin", 18)
     daq_cfg = cfg.get("daq", {}) if isinstance(cfg.get("daq", {}), dict) else {}
     daq_address = int(_get("daq_address", daq_cfg.get("address", cfg.get("daq_address", 0))))
     daq_module_name = str(daq_cfg.get("module_name", cfg.get("daq_module_name", "piplates.DAQC2plate")))
@@ -1422,7 +1413,8 @@ def main():
             refresh_rate=refresh_rate,
             touchscreen=touchscreen,
             raspi=_get("raspi", cfg.get("raspi", False)),
-            trial_start_pin=trial_start_pin,
+            sync_pin=sync_pin,
+            sync_bar=cfg.get("sync_bar"),
             daq_address=daq_address,
             daq_module_name=daq_module_name,
             pump_pin=pump_pin,

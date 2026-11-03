@@ -20,5 +20,11 @@
   "init_dot_color": [100, 100, 100],
   "margin": 200, 
   "delay_time": 1.0,
-  "fixed_positions": true
+  "fixed_positions": true,
+  "sync_bar": {
+    "enabled": false,
+    "height": 20,
+    "interval_mean_seconds": 1.0,
+    "interval_variance_seconds": 0.2
+  }
 }

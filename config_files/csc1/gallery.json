@@ -84,5 +84,11 @@
   "clockwise": false,
   "show_labels": false,
   "show_page_title": true,
-  "show_luminance_labels": true
+  "show_luminance_labels": true,
+  "sync_bar": {
+    "enabled": false,
+    "height": 20,
+    "interval_mean_seconds": 1.0,
+    "interval_variance_seconds": 0.2
+  }
 }

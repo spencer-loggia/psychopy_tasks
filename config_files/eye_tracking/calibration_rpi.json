@@ -26,5 +26,11 @@
   "video_buffer_megabytes": 16,
   "ffprobe": "ffprobe",
   "seed": null,
-  "fixation_radius": 0.025
+  "fixation_radius": 0.025,
+  "sync_bar": {
+    "enabled": false,
+    "height": 20,
+    "interval_mean_seconds": 1.0,
+    "interval_variance_seconds": 0.2
+  }
 }

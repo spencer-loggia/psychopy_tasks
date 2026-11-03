@@ -26,6 +26,7 @@ def load_task():
     for name in ("set_debug", "load_color_palette", "load_shape_definitions",
                  "split_background_from_palette", "setup_task_window", "close_task_window",
                  "resolve_frame_rate", "make_fixation_cross", "make_bg_rect",
+                 "configure_sync_bar", "service_sync_bar",
                  "make_initiation_cue_stims", "TrialBufferManager",
                  "present_trial_with_persistent_dots"):
         setattr(utils, name, Mock())
@@ -57,6 +58,23 @@ class ActiveForagingTaskTests(unittest.TestCase):
                 ), patch.object(task, "run_task", return_value="done") as run:
                     task.main()
                 self.assertEqual(run.call_args.kwargs["display_margin"], expected)
+
+    def test_sync_config_and_pin_cli_override_reach_task(self):
+        config_path = Path(__file__).resolve().parents[1] / "config_files/csc2/yuri_headfix_train_noseq_nomem_20260930.json"
+        config = json.loads(config_path.read_text())
+        config["screens"] = {"main": 0, "experimenter": 1}
+        config["eye_tracking"] = {"enabled": False}
+        config["sync_pin"] = 18
+        config["sync_bar"] = {"enabled": True, "height": 24}
+        for configured_pin, extra_args, expected_pin in ((18, [], 18), (18, ["--sync_pin", "23"], 23), (None, [], None)):
+            config["sync_pin"] = configured_pin
+            task = load_task()
+            with patch.object(sys, "argv", ["active_foraging", "--config", str(config_path), *extra_args]), patch.object(
+                task, "load_config", return_value=config,
+            ), patch.object(task, "run_task", return_value="done") as run:
+                task.main()
+            self.assertEqual(run.call_args.kwargs["sync_pin"], expected_pin)
+            self.assertEqual(run.call_args.kwargs["sync_bar"], config["sync_bar"])
 
     def test_all_modes_keep_full_iti_after_fixed_reward_or_replacement_timeout(self):
         for sequential, memory in ((False, False), (False, True), (True, False), (True, True)):
@@ -111,6 +129,9 @@ class ActiveForagingTaskTests(unittest.TestCase):
         cue_times, gray_times = [], []
 
         def present(**kwargs):
+            sync_calls = utils.service_sync_bar.call_count
+            self.assertFalse(kwargs["external_abort_checker"]())
+            self.assertEqual(utils.service_sync_bar.call_count, sync_calls)
             if change_pulse and kwargs["trial_num"] == 2:
                 control.request(0.4)
             self.assertEqual(kwargs["sequential"], sequential)

@@ -583,10 +583,7 @@ class BufferedVideoFrameStream:
     def _abort_reason(abort_checker: Optional[Callable[[], Any]]) -> str:
         if abort_checker is None:
             return ""
-        try:
-            result = abort_checker()
-        except Exception:
-            return ""
+        result = abort_checker()
         if not result:
             return ""
         return str(result) if isinstance(result, str) else "external_abort"

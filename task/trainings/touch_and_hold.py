@@ -43,6 +43,7 @@ def run_task(
     initiation_cue_style="checker", init_dot_color=(50, 50, 50),
     raspi=False, daq_address=0, daq_module_name="piplates.DAQC2plate",
     pump_pin=0, pump_pulse_time_seconds=0.275, eye_tracking_config=None,
+    sync_bar=None, sync_pin=18,
 ):
     state = TouchAndHoldState(
         duration=duration, iti=iti, reward_interval=reward_interval,
@@ -90,7 +91,9 @@ def run_task(
             set_window_mouse_visible(win, False)
         messages.log("INFO", f"training_session subject={subject} main={describe_screen(main_screen)} "
                      f"experimenter={describe_screen(experimenter_screen)}")
-        utils.resolve_frame_rate(win, None, msg_logger=messages, context="touch_and_hold")
+        _, frame_duration_s = utils.resolve_frame_rate(
+            win, None, msg_logger=messages, context="touch_and_hold",
+        )
         scene_size = resolve_scene_size(
             main_screen, fullscreen=fullscreen, requested_size=win_size, realized_size=tuple(win.size),
         )
@@ -116,6 +119,12 @@ def run_task(
             )
             cleanup.callback(preview.close)
             utils.verify_task_window_vblank(win)
+
+        utils.configure_sync_bar(
+            win, sync_bar, sync_pin=sync_pin, event_logger=logger,
+            experimenter_preview=preview, rotation_degrees=rotation,
+            frame_duration_s=frame_duration_s, msg_logger=messages,
+        )
 
         # Cache the shared cue images once; send only scene/counter changes.
         preview_images = [dict(
@@ -251,7 +260,7 @@ def run_task(
                     timestamp_perf_s=state.trial_started_s, requested_duration=duration,
                 )
             if was_visible and ((state.touching and not was_touching) or pressed):
-                logger.log_interaction(trial_num=trial_num, event="cue_touch", timestamp_perf_ns=sample.observed_perf_ns)
+                logger.log_interaction(trial_num=trial_num, event="cue_touch", timestamp_perf_ns=sample.timestamp_perf_ns)
             if was_visible and (
                 (was_touching and (not touching or pressed)) or (pressed and not touching)
             ):
@@ -273,6 +282,16 @@ def run_task(
             elif due:
                 start_pump()
             show_scene()
+            sync_deadline_s = pump_until_s
+            for deadline_s in (
+                state.next_reward_s,
+                state.iti_until_s if state.phase == "iti" else None,
+                state.trial_started_s + state.duration
+                if state.phase == "holding" and state.duration is not None else None,
+            ):
+                if deadline_s is not None:
+                    sync_deadline_s = deadline_s if sync_deadline_s is None else min(sync_deadline_s, deadline_s)
+            utils.service_sync_bar(win, deadline_perf_s=sync_deadline_s)
             # Continuous mode has no between-trial gap in which to flush.
             # Never perform disk flushes while a pump output is active.
             if pump_until_s is None and time.perf_counter() >= next_flush_s:
@@ -314,6 +333,7 @@ def main():
             pump_pin=cfg.get("pump_pin", 0),
             pump_pulse_time_seconds=cfg.get("pump_pulse_time_seconds", 0.275),
             eye_tracking_config=load_eye_tracking_settings(cfg),
+            sync_bar=cfg.get("sync_bar"), sync_pin=cfg.get("sync_pin", 18),
         )
         return 0 if status == "done" else USER_EXIT_CODE
     except Exception as exc:

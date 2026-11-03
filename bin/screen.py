@@ -1792,6 +1792,7 @@ def _experimenter_preview_process(
     calibration_actions_queue=None,
     pump_control=None,
     live_settings=None,
+    sync_bar_shared=None,
 ) -> None:
     startup_reported = False
 
@@ -1829,6 +1830,43 @@ def _experimenter_preview_process(
     settings_height = SETTINGS_STRIP_HEIGHT if live_settings is not None else 0.0
     outside_bg_rgb = (30, 30, 30)
     preview_outline_rgb = (150, 150, 150)
+    sync_rectangles = []
+    sync_layout_key = None
+    sync_drawn_phase = None
+
+    def _draw_sync_bar(layout=None):
+        nonlocal sync_rectangles, sync_layout_key, sync_drawn_phase
+        if sync_bar_shared is None or sync_bar_shared[0] <= 0:
+            return
+        height, source_width, source_height, phase = sync_bar_shared
+        if layout is None:
+            layout = compute_preview_aspect_fit(
+                preview_canvas_size, (source_width, source_height),
+                settings_height=settings_height,
+            )
+        box_width, box_height = layout["box_size"]
+        center_x, center_y = layout["box_center"]
+        scale = box_width / source_width
+        key = (height, source_width, source_height, box_width, box_height, center_x, center_y)
+        if key != sync_layout_key:
+            width = (int(source_width) // 5) * scale
+            sync_rectangles = [
+                visual.Rect(
+                    win, width=width, height=height * scale, units="pix",
+                    pos=(center_x - box_width / 2 + (index + .5) * width,
+                         center_y + box_height / 2 - height * scale / 2),
+                    lineColor=None, autoLog=False,
+                ) for index in range(5)
+            ]
+            sync_layout_key = key
+            sync_drawn_phase = None
+        if phase != sync_drawn_phase:
+            for index, rectangle in enumerate(sync_rectangles):
+                level = 2 * ((index + int(phase)) % 2) - 1
+                rectangle.fillColor = (level, level, level)
+            sync_drawn_phase = phase
+        for rectangle in sync_rectangles:
+            rectangle.draw()
 
     def _make_bg_rect(bg_rgb_255: Sequence[int]):
         return visual.Rect(
@@ -2248,6 +2286,7 @@ def _experimenter_preview_process(
                     payload = latest
                 controls.poll_controls()
                 controls.draw(payload)
+                _draw_sync_bar()
                 win.flip()
                 core.wait(max(0.02, update_interval_ms / 1000.0))
         except Exception as exc:
@@ -2461,7 +2500,10 @@ def _experimenter_preview_process(
         )
 
         while not stop_event.is_set():
-            redraw_requested = False
+            redraw_requested = bool(
+                sync_bar_shared is not None and sync_bar_shared[0] > 0
+                and sync_bar_shared[3] != sync_drawn_phase
+            )
             if mouse_visible is not None and time.perf_counter() - last_cursor_apply_s >= 0.5:
                 set_window_mouse_visible(win, bool(mouse_visible))
                 last_cursor_apply_s = time.perf_counter()
@@ -2695,6 +2737,7 @@ def _experimenter_preview_process(
                         movie_outline_rect.draw()
                     _draw_overlay(movie_layout)
                     _draw_gaze(movie_layout)
+                    _draw_sync_bar(movie_layout)
                     win.flip()
                     last_gaze_redraw_s = time.perf_counter()
                     continue
@@ -2714,6 +2757,7 @@ def _experimenter_preview_process(
                 static_scene["preview_outline_rect"].draw()
                 _draw_overlay()
                 _draw_gaze(static_scene.get("layout"))
+                _draw_sync_bar(static_scene.get("layout"))
                 win.flip()
             except Exception:
                 static_scene = _build_static_scene(
@@ -2791,6 +2835,9 @@ class ExperimenterPreview:
         self._preview_main_rotation_deg = 0
         self._preview_command_sequence = 0
         self._ctx = mp.get_context("spawn")
+        # Geometry is set once before enabling; only the phase changes on the
+        # subject side. No queue or lock enters the display callback path.
+        self._sync_bar_shared = self._ctx.Array("d", [0.0] * 4, lock=False)
         # The process queue and local outbox are both single-slot. A sender
         # thread absorbs multiprocessing's feeder-thread handoff without ever
         # blocking the timing-critical task thread; newer snapshots replace a
@@ -2849,6 +2896,7 @@ class ExperimenterPreview:
                 self._calibration_actions,
                 pump_control,
                 self._live_settings,
+                self._sync_bar_shared,
             ),
             daemon=True,
         )
@@ -2907,6 +2955,14 @@ class ExperimenterPreview:
                 "Experimenter preview mailbox could not start: "
                 f"{type(exc).__name__}: {str(exc).strip()}"
             ) from exc
+
+    def configure_sync_bar(self, height, native_size, rotation_degrees=0) -> None:
+        width, screen_height = oriented_size(native_size, rotation_degrees)
+        self._sync_bar_shared[1:] = (width, screen_height, 0)
+        self._sync_bar_shared[0] = height
+
+    def set_sync_bar_phase(self, phase: int) -> None:
+        self._sync_bar_shared[3] = phase
 
     def poll(self) -> bool:
         if self.exit_requested:

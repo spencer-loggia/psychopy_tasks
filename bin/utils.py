@@ -35,7 +35,6 @@ from .screen import (
 from .frame_timing import (
     FrameTransitionScheduler,
     capture_perf_counter_on_flip,
-    arm_flip_timestamp,
     flip_submission_time,
     flip_with_timestamps,
     plan_frame_duration,
@@ -49,7 +48,6 @@ from .buffered_video import (
     VideoPreparationAborted,
 )
 from .video_playback import (
-    RandomFramePulseSchedule,
     SharedVideoFrameBuffer,
     VideoRefreshCadence,
     center_crop_bounds,
@@ -87,7 +85,6 @@ IMAGE_EXTS = RASTER_EXTS | VECTOR_EXTS  # for discovery
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".mpeg", ".mpg", ".m4v", ".wmv"}
 
 NON_ASSOCIATED_SHAPE_IDS: Tuple[int, ...] = tuple(range(14, 28))
-
 
 
 def find_image_files(images_dir: str, recursive: bool = False) -> List[Path]:
@@ -206,7 +203,24 @@ def close_task_window(win) -> str:
     session = getattr(win, "_neuro_tasks_main_vblank_session", None)
     if not isinstance(session, MainDisplayVBlankSession):
         raise RuntimeError("window was not created by setup_task_window")
-    return session.close(win)
+    sync_display = getattr(win, "_neuro_tasks_sync_display", None)
+    try:
+        if sync_display is not None:
+            sync_display.close()
+    finally:
+        result = session.close(win)
+    return result
+
+
+def configure_sync_bar(win, config=None, **kwargs):
+    from .sync_display import configure_sync_bar as configure
+    return configure(win, config, **kwargs)
+
+
+def service_sync_bar(win, *, deadline_perf_s=None):
+    from .frame_timing import service_background_presenter
+    if getattr(win, "_neuro_tasks_sync_display", None) is not None:
+        service_background_presenter(deadline_perf_s=deadline_perf_s)
 
 
 def _log_message(msg_logger, level: str, message: str) -> None:
@@ -413,22 +427,6 @@ def _summarize_video_frame_timing(
     }
 
 
-def _set_gpio_level_on_flip(lgpio_module, chip, pin: int, level: int, capture=None) -> None:
-    """Set a GPIO level from PsychoPy's frame-flip callback queue."""
-    if lgpio_module is None or chip is None:
-        raise RuntimeError("Frame sync GPIO was not initialized")
-    pin, level = int(pin), int(level)
-    requested_ns = time.perf_counter_ns()
-    result = lgpio_module.gpio_write(chip, pin, level)
-    actual_ns = time.perf_counter_ns()
-    if capture is not None:
-        capture.update(requested_perf_ns=requested_ns, actual_perf_ns=actual_ns)
-    if isinstance(result, int) and result < 0:
-        raise RuntimeError(
-            f"GPIO write failed with code {result} on pin {int(pin)}"
-        )
-
-
 def play_video_fill_screen(
     win: visual.Window,
     video_path: Union[str, Path],
@@ -443,10 +441,6 @@ def play_video_fill_screen(
     trial_num: Optional[int] = None,
     stream_info: Optional[Dict[str, Any]] = None,
     frame_publisher: Optional[SharedVideoFrameBuffer] = None,
-    sync_schedule: Optional[RandomFramePulseSchedule] = None,
-    sync_gpio_module=None,
-    sync_gpio_chip=None,
-    sync_pin: int = 18,
     frame_publish_interval_s: float = 0.0,
     clip_start_s: float = 0.0,
     clip_duration_s: Optional[float] = None,
@@ -470,10 +464,6 @@ def play_video_fill_screen(
     stream = dict(stream_info or {})
     if not stream:
         stream = probe_video_stream(video_file, ffprobe_bin=ffprobe_bin)
-    if sync_schedule is not None and (
-        sync_gpio_module is None or sync_gpio_chip is None
-    ):
-        raise RuntimeError("A sync schedule requires an initialized GPIO output")
 
     frame_publish_interval_s = float(frame_publish_interval_s)
     if frame_publish_interval_s < 0.0:
@@ -615,7 +605,6 @@ def play_video_fill_screen(
     frames_presented = 0
     source_frame_holds_completed = 0
     display_refreshes_presented = 0
-    sync_records: List[Dict[str, Any]] = []
     expected_duration_s = requested_clip_duration_s
     actual_source_start_s = None
     actual_source_last_frame_s = None
@@ -635,7 +624,6 @@ def play_video_fill_screen(
     )
     frame_stream = None
     prepared_frame = None
-    clear_flip_completed = False
     display_warmup_flips = 0
     startup_preload_frames = 0
     startup_average_preparation_fps = 0.0
@@ -656,6 +644,8 @@ def play_video_fill_screen(
     }
     glx_swap_interval = None
     glx_swap_interval_detail = "not queried"
+    sync_display = getattr(win, "_neuro_tasks_sync_display", None)
+    sync_flips_at_onset = getattr(sync_display, "extra_flip_count", 0)
     glx_sync_start = None
     glx_sync_start_detail = "not queried"
     glx_sync_end = None
@@ -663,15 +653,14 @@ def play_video_fill_screen(
     glx_sync_validation: Dict[str, Any] = {
         "status": "UNAVAILABLE",
     }
+    source_deadline = None
 
     def _poll_abort_reason():
+        service_sync_bar(win, deadline_perf_s=source_deadline)
         if allow_escape and event.getKeys(["escape"]):
             return "escape_pressed"
         if external_abort_checker is not None:
-            try:
-                external_abort = external_abort_checker()
-            except Exception:
-                external_abort = False
+            external_abort = external_abort_checker()
             if external_abort:
                 return (
                     str(external_abort)
@@ -823,6 +812,10 @@ def play_video_fill_screen(
             # front buffer naturally holds that source frame across the
             # intervening refreshes (for example, two refreshes at 30-on-60).
             for expected_frame_index in range(video_frame_count):
+                source_deadline = (
+                    time.perf_counter() if first_flip_perf is None else
+                    first_flip_perf + expected_frame_index / video_frame_rate
+                )
                 reason = _poll_abort_reason()
                 if reason:
                     _mark_aborted(reason)
@@ -883,11 +876,6 @@ def play_video_fill_screen(
                 current_source_time_s = float(
                     prepared_frame.source_pts_s
                 )
-                sync_edges = ()
-                if sync_schedule is not None:
-                    sync_edges = sync_schedule.edges_for_frame(
-                        display_frame_index
-                    )
 
                 target_flip_perf = None
                 if first_flip_perf is not None:
@@ -902,18 +890,6 @@ def play_video_fill_screen(
                     capture_perf_counter_on_flip,
                     flip_perf_capture,
                 )
-                sync_captures = []
-                for edge in sync_edges:
-                    capture = {}
-                    sync_captures.append(capture)
-                    win.callOnFlip(
-                        _set_gpio_level_on_flip,
-                        sync_gpio_module,
-                        sync_gpio_chip,
-                        int(sync_pin),
-                        int(edge.level),
-                        capture,
-                    )
 
                 frame_draw_started_s = time.perf_counter()
                 # The aspect-cover video is opaque and covers the complete
@@ -981,16 +957,6 @@ def play_video_fill_screen(
                     ]
                 )
                 actual_source_last_frame_s = current_source_time_s
-                for edge, capture in zip(sync_edges, sync_captures):
-                    sync_records.append(
-                        {
-                            "level": int(edge.level),
-                            "frame_index": int(edge.frame_index),
-                            "interval_frames": edge.interval_frames,
-                            "timestamp_perf_ns": capture["actual_perf_ns"],
-                            "requested_timestamp_perf_ns": capture["requested_perf_ns"],
-                        }
-                    )
 
                 if first_flip_ps is None:
                     first_flip_ps = flip_ps
@@ -999,6 +965,7 @@ def play_video_fill_screen(
                     first_flip_perf_ns = flip_perf_ns
                     first_flip_requested_perf_ns = flip_requested_perf_ns
                     actual_source_start_s = current_source_time_s
+                    sync_flips_at_onset = getattr(sync_display, "extra_flip_count", 0)
                     glx_sync_start, glx_sync_start_detail = (
                         query_glx_sync_values()
                     )
@@ -1070,27 +1037,12 @@ def play_video_fill_screen(
                             flip_perf + frame_publish_interval_s
                         )
     finally:
-        final_sync_edge = None
-        final_sync_capture = {}
         clear_flip_perf_capture: Dict[str, int] = {}
         try:
             win.callOnFlip(
                 capture_perf_counter_on_flip,
                 clear_flip_perf_capture,
             )
-            if sync_schedule is not None:
-                final_sync_edge = sync_schedule.mark_forced_low(
-                    frames_presented
-                )
-                if final_sync_edge is not None:
-                    win.callOnFlip(
-                        _set_gpio_level_on_flip,
-                        sync_gpio_module,
-                        sync_gpio_chip,
-                        int(sync_pin),
-                        0,
-                        final_sync_capture,
-                    )
             if bg_rect is not None:
                 bg_rect.draw()
 
@@ -1110,7 +1062,6 @@ def play_video_fill_screen(
             win.flip()
             clear_flip_return_perf_ns = time.perf_counter_ns()
             clear_flip_submitted_perf_s = end_requested_perf_ns / 1_000_000_000
-            clear_flip_completed = True
             # The requested timestamp is when Python submitted the blocking
             # flip. Keep the predicted next-VBL target separate for timing
             # validation and the nominal scheduled endpoint.
@@ -1134,16 +1085,6 @@ def play_video_fill_screen(
                 display_refreshes_presented = (
                     refresh_cadence.total_refreshes
                 )
-            if final_sync_edge is not None:
-                sync_records.append(
-                    {
-                        "level": 0,
-                        "frame_index": int(final_sync_edge.frame_index),
-                        "interval_frames": None,
-                        "timestamp_perf_ns": final_sync_capture["actual_perf_ns"],
-                        "requested_timestamp_perf_ns": final_sync_capture["requested_perf_ns"],
-                    }
-                )
             if abs(clip_offset_timing_error_s) > timing_failure_threshold_s:
                 late_frame_count += 1
                 _log_message(
@@ -1155,16 +1096,6 @@ def play_video_fill_screen(
                     "action=record_actual_offset",
                 )
         finally:
-            if sync_schedule is not None and not clear_flip_completed:
-                try:
-                    _set_gpio_level_on_flip(
-                        sync_gpio_module,
-                        sync_gpio_chip,
-                        int(sync_pin),
-                        0,
-                    )
-                except Exception:
-                    pass
             if frame_stream is not None:
                 # Drop the final NumPy export before closing its SharedMemory.
                 prepared_frame = None
@@ -1199,7 +1130,9 @@ def play_video_fill_screen(
                     else None
                 )
                 expected_delta_sbc = (
-                    video_frame_count
+                    video_frame_count + (
+                        getattr(sync_display, "extra_flip_count", 0) - sync_flips_at_onset
+                    )
                     if timing_validation["complete"]
                     else None
                 )
@@ -1408,46 +1341,6 @@ def play_video_fill_screen(
                         f"{(1000.0 * minimum_flip_submission_headroom_s if math.isfinite(minimum_flip_submission_headroom_s) else math.nan):.3f}"
                     ),
                 )
-            if logger is not None:
-                for record in sync_records:
-                    is_on = int(record["level"]) == 1
-                    pulse_duration = (
-                        refresh_cadence.refreshes_for_source_frames(
-                            int(record["frame_index"]),
-                            int(sync_schedule.pulse_width_frames),
-                        )
-                        * display_frame_period_s
-                        if is_on and sync_schedule is not None
-                        else None
-                    )
-                    logger.log_signal(
-                        trial_num=trial_num,
-                        event=(
-                            "video_sync_signal_on"
-                            if is_on
-                            else "video_sync_signal_off"
-                        ),
-                        timestamp_perf_ns=record["timestamp_perf_ns"],
-                        requested_timestamp_perf_ns=record["requested_timestamp_perf_ns"],
-                        requested_duration=(
-                            pulse_duration if is_on else None
-                        ),
-                    )
-                    if is_on:
-                        _log_message(
-                            msg_logger,
-                            "INFO",
-                            (
-                                f"video_sync_pulse "
-                                f"trial_num={trial_num} "
-                                f"file={video_file.name} "
-                                f"display_frame="
-                                f"{record['frame_index']} "
-                                f"interval_frames="
-                                f"{record['interval_frames']} "
-                                f"pin={int(sync_pin)}"
-                            ),
-                        )
 
     # A boundary timing miss changes a hold by a VBL but does not omit the
     # source frame. Keep source-frame drops distinct from cadence quality.
@@ -1619,11 +1512,6 @@ def play_video_fill_screen(
         ),
         "effective_video_frame_rate": effective_video_frame_rate,
         "scheduled_video_frame_count": video_frame_count,
-        "sync_pulses": sum(
-            1
-            for record in sync_records
-            if int(record["level"]) == 1
-        ),
         "crop_bounds": tuple(crop_bounds),
         "prepared_frame_size": tuple(prepared_size),
         "video_buffer_bytes": (
@@ -2119,35 +2007,6 @@ def make_initiation_cue_stims(
     return idle_cue, pressed_cue
 
 
-def _send_led_pulse_on_flip(chip, pin: int, duration_us: int, capture=None):
-    """GPIO pulse callback executed by PsychoPy at flip time.
-    
-    This runs just after the swap through PsychoPy's callOnFlip mechanism.
-    Capture the GPIO operation itself; its completion can follow the swap.
-    
-    Args:
-        chip: lgpio chip handle
-        pin: GPIO pin number (BCM numbering)
-        duration_us: pulse duration in microseconds
-    """
-    import lgpio
-    
-    # Set pin HIGH immediately (called at flip time by PsychoPy)
-    _set_gpio_level_on_flip(lgpio, chip, pin, 1, capture)
-    
-    # Queue the asynchronous clear only after preserving the HIGH write time.
-    # lgpio's pulse worker is software timed; this call does not wait for LOW.
-    result = lgpio.tx_pulse(chip, pin, 0, duration_us, 0, 1)
-    
-    # If pulse fails, at least turn the pin back off
-    if result < 0:
-        try:
-            lgpio.gpio_write(chip, pin, 0)
-        except Exception:
-            pass
-        raise RuntimeError(f"GPIO pulse scheduling failed with code {result} during flip callback")
-
-
 def present_trial_with_persistent_dots(
     win: visual.Window,
     preloaded: Dict[Union[Path, Tuple[int, int]], Image.Image],
@@ -2171,9 +2030,6 @@ def present_trial_with_persistent_dots(
     white_fixation_until_choice: bool = False,
     msg_logger=None,
     fps: Optional[float] = None,
-    raspi: bool = False,
-    pigpio_pi=None,
-    raspi_pin: int = 18,
     sequential: bool = True,
     is_memory: bool = True,
     choice_hitbox_scale: float = 1.0,
@@ -2273,9 +2129,6 @@ def present_trial_with_persistent_dots(
     enforce_initiation_hold = hold_before_choice
     initiation_cue_released = False
     fixation_color = (255, 255, 255) if white_fixation_until_choice else (0, 0, 0)
-    trial_start_signal_armed_s: Optional[float] = None
-    trial_start_signal_sent = False
-    trial_signal_capture = {}
 
     def _set_fixation_color(color_rgb: Tuple[int, int, int]) -> None:
         nonlocal fixation_color
@@ -2313,12 +2166,9 @@ def present_trial_with_persistent_dots(
     def _should_abort(notes: str) -> bool:
         if external_abort_checker is None:
             return False
-        try:
-            if external_abort_checker():
-                _log_message(msg_logger, "WARN", notes)
-                return True
-        except Exception:
-            pass
+        if external_abort_checker():
+            _log_message(msg_logger, "WARN", notes)
+            return True
         return False
 
     def _frame_event_name(kind: str, option_idx: Optional[int] = None) -> str:
@@ -2359,38 +2209,6 @@ def present_trial_with_persistent_dots(
             return "initiation_cue_release"
         return "option_touch"
 
-    def _arm_trial_start_signal() -> bool:
-        nonlocal trial_start_signal_armed_s, trial_start_signal_sent
-        if trial_start_signal_sent or trial_start_signal_armed_s is not None:
-            return True
-        if not raspi or pigpio_pi is None:
-            return True
-        try:
-            pulse_s = 0.25
-            duration_us = int(pulse_s * 1_000_000)
-            arm_flip_timestamp(win)
-            win.callOnFlip(_send_led_pulse_on_flip, pigpio_pi, raspi_pin, duration_us, trial_signal_capture)
-            trial_start_signal_armed_s = pulse_s
-            _log_message(msg_logger, "INFO", f"raspi_pulse_registered trial_num={trial_num} duration_s={pulse_s:.6f}")
-            return True
-        except Exception as e:
-            error_msg = f"trial_start_signal_registration_failed trial_num={trial_num} error={e}"
-            _log_message(msg_logger, "ERROR", error_msg)
-            return False
-
-    def _commit_trial_start_signal() -> None:
-        nonlocal trial_start_signal_armed_s, trial_start_signal_sent
-        if trial_start_signal_armed_s is None:
-            return
-        logger.log_signal(
-            trial_num=trial_num,
-            event="trial_start_signal_on",
-            timestamp_perf_ns=trial_signal_capture["actual_perf_ns"],
-            requested_timestamp_perf_ns=trial_signal_capture["requested_perf_ns"],
-            requested_duration=trial_start_signal_armed_s,
-        )
-        trial_start_signal_sent = True
-        trial_start_signal_armed_s = None
 
     def _preview_images(items: Sequence[Dict[str, Any]]) -> list[Dict[str, Any]]:
         images = []
@@ -2566,14 +2384,11 @@ def present_trial_with_persistent_dots(
             )
         except Exception:
             pass
-        if not _arm_trial_start_signal():
-            return True, None
         # Reset immediately before the response-opening flip. A press already
         # held here is ignored; a new press or short tap during the flip is not.
         mouse_presses.reset()
         oc_timing = flip_with_timestamps(win)
         oc_perf = oc_timing.actual_perf_s
-        _commit_trial_start_signal()
         logger.log_frame_flip(
             trial_num=trial_num,
             event=_frame_event_name("onset_cue"),
@@ -2581,6 +2396,7 @@ def present_trial_with_persistent_dots(
             requested_timestamp_perf_ns=oc_timing.requested_perf_ns,
         )
         initiation_started = False
+        initiation_target_perf = None
         while True:
             if _event.getKeys(["escape"]):
                 _log_message(msg_logger, "WARN", f"escape_pressed trial_num={trial_num} during_onset_cue=1")
@@ -2598,6 +2414,7 @@ def present_trial_with_persistent_dots(
             ):
                 initiation_started = True
                 initiation_hold.start(touch_sample.timestamp_perf_s)
+                initiation_target_perf = touch_sample.timestamp_perf_s + hold_cue_to_init_time_s
                 _set_initiation_time(perf_ns=touch_sample.timestamp_perf_ns)
                 logger.log_interaction(
                     trial_num=trial_num,
@@ -2666,6 +2483,7 @@ def present_trial_with_persistent_dots(
                     except Exception:
                         pass
 
+            service_sync_bar(win, deadline_perf_s=initiation_target_perf if initiation_started else None)
             _core.wait(0.002)
 
     cue_frames = cue_plan.frame_count
@@ -2691,8 +2509,6 @@ def present_trial_with_persistent_dots(
             }
         ]
         _show_preview(cue_preview)
-        if not _arm_trial_start_signal():
-            return True, None
         pre_options_cue_touched = False
         cue_touch_target = None
         clear_timing = None
@@ -2760,7 +2576,6 @@ def present_trial_with_persistent_dots(
             return _finish_released_trial()
         cue_timing = flip_with_timestamps(win)
         cue_perf = cue_timing.actual_perf_s
-        _commit_trial_start_signal()
         _set_initiation_time(perf_ns=cue_timing.actual_perf_ns)
         logger.log_frame_flip(
             trial_num=trial_num,
@@ -3068,6 +2883,7 @@ def present_trial_with_persistent_dots(
                     _commit_choice(chosen_idx, click_pos, touch_sample.timestamp_perf_ns)
                     break
 
+            service_sync_bar(win, deadline_perf_s=deadline_perf)
             remaining = deadline_perf - time.perf_counter()
             if remaining > 0:
                 _core.wait(min(poll_interval_s, remaining))
@@ -3166,8 +2982,6 @@ def present_trial_with_persistent_dots(
                 cue_dot = _make_dot(pos, cue_color)
                 dots.append(cue_dot)
                 dot_records.append({"pos": tuple(pos), "radius": float(dot_size) / 2.0, "color": tuple(cue_color)})
-                if not _arm_trial_start_signal():
-                    return True, None
                 bg_rect.draw()
                 for d in dots:
                     d.draw()
@@ -3179,7 +2993,6 @@ def present_trial_with_persistent_dots(
                 if dot_timing is None:
                     return _interrupted_result()
                 dot_perf = dot_timing.actual_perf_s
-                _commit_trial_start_signal()
                 _set_initiation_time(perf_ns=dot_timing.actual_perf_ns)
                 logger.log_frame_flip(
                     trial_num=trial_num,
@@ -3197,8 +3010,6 @@ def present_trial_with_persistent_dots(
             current_preview_image = [
                 _make_preview_image_entry(pil_img, stim, reward_level)
             ]
-            if not _arm_trial_start_signal():
-                return True, None
             bg_rect.draw()
             for d in dots:
                 d.draw()
@@ -3212,7 +3023,6 @@ def present_trial_with_persistent_dots(
                 return _interrupted_result()
             flip_ps = stim_timing.psychopy_s
             flip_perf = stim_timing.actual_perf_s
-            _commit_trial_start_signal()
             _set_initiation_time(perf_ns=stim_timing.actual_perf_ns)
             logger.log_frame_flip(
                 trial_num=trial_num,
@@ -3310,8 +3120,6 @@ def present_trial_with_persistent_dots(
                 dot = _make_dot(pos, cue_color)
                 dots.append(dot)
                 dot_records.append({"pos": tuple(pos), "radius": float(dot_size) / 2.0, "color": tuple(cue_color)})
-            if not _arm_trial_start_signal():
-                return True, None
             bg_rect.draw()
             for d in dots:
                 d.draw()
@@ -3323,7 +3131,6 @@ def present_trial_with_persistent_dots(
             if dot_timing is None:
                 return _interrupted_result()
             dot_perf = dot_timing.actual_perf_s
-            _commit_trial_start_signal()
             _set_initiation_time(perf_ns=dot_timing.actual_perf_ns)
             logger.log_frame_flip(
                 trial_num=trial_num,
@@ -3338,8 +3145,6 @@ def present_trial_with_persistent_dots(
                 isi_plan,
             )
 
-        if not _arm_trial_start_signal():
-            return True, None
         if not is_memory:
             _prepare_choice_display()
         bg_rect.draw()
@@ -3362,7 +3167,6 @@ def present_trial_with_persistent_dots(
             return _interrupted_result()
         flip_ps = stim_timing.psychopy_s
         flip_perf = stim_timing.actual_perf_s
-        _commit_trial_start_signal()
         _set_initiation_time(perf_ns=stim_timing.actual_perf_ns)
         stim_request = (
             stim_plan.requested_s
@@ -3680,9 +3484,6 @@ def present_delayed_afc_trial(
     choice_hitbox_scale: float = 1.0,
     trial_meta: Optional[Dict[str, Any]] = None,
     cue_pos: Tuple[float, float] = (0.0, 0.0),
-    raspi: bool = False,
-    pigpio_pi=None,
-    raspi_pin: int = 18,
     external_abort_checker=None,
     show_fixation: bool = False,
 ) -> Tuple[bool, Optional[Dict[str, Any]]]:
@@ -3923,9 +3724,6 @@ def present_delayed_afc_trial(
     except Exception:
         pass
 
-    trial_start_signal_armed_s: Optional[float] = None
-    trial_start_signal_sent = False
-    trial_signal_capture = {}
 
     def _set_initiation_time(*, perf_ns: int) -> None:
         if trial_meta is None or "initiation_task_time_ns" in trial_meta:
@@ -3946,12 +3744,9 @@ def present_delayed_afc_trial(
             _log_message(msg_logger, "WARN", f"escape_pressed trial_num={trial_num} reason={reason}")
             return True
         if external_abort_checker is not None:
-            try:
-                if external_abort_checker():
-                    _log_message(msg_logger, "WARN", f"external_abort trial_num={trial_num} reason={reason}")
-                    return True
-            except Exception:
-                pass
+            if external_abort_checker():
+                _log_message(msg_logger, "WARN", f"external_abort trial_num={trial_num} reason={reason}")
+                return True
         return False
 
     def _draw_fixation_if_requested() -> None:
@@ -3962,37 +3757,6 @@ def present_delayed_afc_trial(
         bg_rect.draw()
         _draw_fixation_if_requested()
 
-    def _arm_trial_start_signal() -> bool:
-        nonlocal trial_start_signal_armed_s, trial_start_signal_sent
-        if trial_start_signal_sent or trial_start_signal_armed_s is not None:
-            return True
-        if not raspi or pigpio_pi is None:
-            return True
-        try:
-            pulse_s = 0.25
-            duration_us = int(pulse_s * 1_000_000)
-            arm_flip_timestamp(win)
-            win.callOnFlip(_send_led_pulse_on_flip, pigpio_pi, raspi_pin, duration_us, trial_signal_capture)
-            trial_start_signal_armed_s = pulse_s
-            _log_message(msg_logger, "INFO", f"raspi_pulse_registered trial_num={trial_num} duration_s={pulse_s:.6f}")
-            return True
-        except Exception as e:
-            _log_message(msg_logger, "ERROR", f"trial_start_signal_registration_failed trial_num={trial_num} error={e}")
-            return False
-
-    def _commit_trial_start_signal() -> None:
-        nonlocal trial_start_signal_armed_s, trial_start_signal_sent
-        if trial_start_signal_armed_s is None:
-            return
-        logger.log_signal(
-            trial_num=trial_num,
-            event="trial_start_signal_on",
-            timestamp_perf_ns=trial_signal_capture["actual_perf_ns"],
-            requested_timestamp_perf_ns=trial_signal_capture["requested_perf_ns"],
-            requested_duration=trial_start_signal_armed_s,
-        )
-        trial_start_signal_sent = True
-        trial_start_signal_armed_s = None
 
     # Mandatory self-initiation cue: show the checkerboard cue and wait for a *new*
     # click/touch inside its bounds before beginning the AFC cue/delay/choice sequence.
@@ -4042,10 +3806,12 @@ def present_delayed_afc_trial(
                 while any(mouse.getPressed()):
                     if _abort_from_input("waiting_for_onset_cue_release"):
                         return True, None
-                    _core.wait(0.005)
+                    service_sync_bar(win)
+                    _core.wait(0.002)
                 mouse_presses.reset()
                 break
-        _core.wait(0.01)
+        service_sync_bar(win)
+        _core.wait(0.002)
 
     next_visual_target_perf_s: Optional[float] = None
     if isi_frames > 0:
@@ -4063,8 +3829,6 @@ def present_delayed_afc_trial(
             f"pre_cue_interval trial_num={trial_num} duration_s={isi_s:.6f}",
         )
 
-    if not _arm_trial_start_signal():
-        return True, None
     bg_rect.draw()
     cue_stim.draw()
     _draw_fixation_if_requested()
@@ -4081,7 +3845,6 @@ def present_delayed_afc_trial(
         if cue_timing is None:
             return True, None
     cue_perf = cue_timing.actual_perf_s
-    _commit_trial_start_signal()
     _set_initiation_time(perf_ns=cue_timing.actual_perf_ns)
     if trial_meta is not None:
         trial_meta["cue_flip_perf_s"] = float(cue_perf)
@@ -4257,6 +4020,7 @@ def present_delayed_afc_trial(
                     "choice_feature": choice_feature,
                 }
                 break
+        service_sync_bar(win, deadline_perf_s=choice_transition_request_deadline)
         remaining = choice_transition_request_deadline - time.perf_counter()
         if remaining > 0:
             _core.wait(min(poll_interval_s, remaining))

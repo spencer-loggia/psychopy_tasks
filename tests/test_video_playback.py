@@ -27,7 +27,6 @@ from bin.buffered_video import (
 from bin.eye_tracking import EyeTrackerState
 from bin.eye_tracking_config import EyeTrackingSettings
 from bin.video_playback import (
-    RandomFramePulseSchedule,
     SharedVideoFrameBuffer,
     SharedVideoFrameReader,
     center_crop_bounds,
@@ -42,6 +41,14 @@ from bin.video_playback import (
 
 
 class VideoPlaybackTests(unittest.TestCase):
+    def test_abort_checker_propagates_sync_presenter_failures(self):
+        failure = RuntimeError("sync GPIO write failed")
+        checker = Mock(side_effect=failure)
+        with self.assertRaises(RuntimeError) as raised:
+            BufferedVideoFrameStream._abort_reason(checker)
+        self.assertIs(raised.exception, failure)
+        checker.assert_called_once_with()
+
     def test_video_probe_uses_container_duration_fallback(self):
         probe_result = types.SimpleNamespace(
             stdout=(
@@ -606,26 +613,6 @@ class VideoPlaybackTests(unittest.TestCase):
         ):
             stream.next_frame()
 
-    def test_random_frame_pulses_have_frame_locked_edges(self):
-        schedule = RandomFramePulseSchedule(
-            100,
-            300,
-            pulse_width_frames=1,
-            rng=random.Random(7),
-        )
-        edges = []
-        for frame_index in range(700):
-            edges.extend(schedule.edges_for_frame(frame_index))
-
-        on_edges = [edge for edge in edges if edge.level == 1]
-        off_edges = [edge for edge in edges if edge.level == 0]
-        self.assertGreaterEqual(len(on_edges), 2)
-        self.assertEqual(len(off_edges), len(on_edges))
-        for on_edge, off_edge in zip(on_edges, off_edges):
-            self.assertGreaterEqual(on_edge.interval_frames, 100)
-            self.assertLessEqual(on_edge.interval_frames, 300)
-            self.assertEqual(off_edge.frame_index, on_edge.frame_index + 1)
-
     def test_shared_frame_buffer_publishes_latest_rgb_without_decoding(self):
         width, height = 4, 3
         source = np.arange(width * height * 3, dtype=np.uint8).reshape(
@@ -790,25 +777,6 @@ class VideoPlaybackTests(unittest.TestCase):
             target_stimulus.current_frame = frame_index
             uploaded_frames.append(frame_index)
 
-        class FakeGPIO:
-            def __init__(self):
-                self.writes = []
-                self.write_times = []
-
-            def gpio_write(self, chip, pin, level):
-                self.writes.append((win.refresh_index, chip, pin, level))
-                before_ns = round(clock.now_s * 1_000_000_000)
-                clock.now_s += 0.001  # A slow GPIO write must not shift flip time.
-                self.write_times.append((before_ns, round(clock.now_s * 1_000_000_000)))
-                return 0
-
-        gpio = FakeGPIO()
-        sync_schedule = RandomFramePulseSchedule(
-            2,
-            2,
-            pulse_width_frames=1,
-            rng=random.Random(0),
-        )
         frame_publisher = Mock()
         event_logger = Mock()
         message_logger = Mock()
@@ -881,10 +849,6 @@ class VideoPlaybackTests(unittest.TestCase):
                     "height": 2,
                 },
                 frame_publisher=frame_publisher,
-                sync_schedule=sync_schedule,
-                sync_gpio_module=gpio,
-                sync_gpio_chip="chip",
-                sync_pin=18,
                 frame_publish_interval_s=0.0,
                 clip_start_s=0.0,
                 clip_duration_s=0.125,
@@ -995,21 +959,6 @@ class VideoPlaybackTests(unittest.TestCase):
                 for call in publish_calls
             ],
             [round(flip_time(i) * 1_000_000_000) / 1_000_000_000 for i in (3, 7, 8)],
-        )
-
-        # The pulse begins on source frame 2's boundary. The unchanged front
-        # buffer holds it through the intervening VBLs, then clear forces low.
-        self.assertEqual(
-            gpio.writes,
-            [(8, "chip", 18, 1), (11, "chip", 18, 0)],
-        )
-        self.assertEqual(result["sync_pulses"], 1)
-        sync_calls = event_logger.log_signal.call_args_list
-        self.assertEqual(len(sync_calls), 2)
-        self.assertEqual(
-            [(call.kwargs["requested_timestamp_perf_ns"], call.kwargs["timestamp_perf_ns"])
-             for call in sync_calls],
-            gpio.write_times,
         )
 
         end_flip_call = next(
@@ -1203,6 +1152,8 @@ class PlayVideoTaskTests(unittest.TestCase):
             return_value=(win, main_screen, None)
         )
         fake_utils.make_bg_rect = Mock(return_value=object())
+        fake_utils.configure_sync_bar = Mock()
+        fake_utils.service_sync_bar = Mock()
         fake_utils.resolve_frame_rate = Mock(
             return_value=(float(monitor_rate), 1.0 / float(monitor_rate))
         )
@@ -1308,7 +1259,6 @@ class PlayVideoTaskTests(unittest.TestCase):
             "aborted": False,
             "abort_reason": "",
             "dropped_frames": 0,
-            "sync_pulses": 0,
         }
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1350,6 +1300,43 @@ class PlayVideoTaskTests(unittest.TestCase):
                 module.main()
                 self.assertEqual(module.run_task.call_args.kwargs["reward_interval"], expected)
 
+    def test_sync_config_and_pin_cli_override_reach_task(self):
+        module, _, _ = self._make_validation_harness(source_rate="30/1", monitor_rate=60)
+        sync_config = {"enabled": True, "height": 24}
+        module.load_config = Mock(return_value={
+            "config_name": "video", "output_dir": "unused", "video_files": ["clip.mp4"],
+            "clip_duration_seconds": 2, "num_clips": 1,
+            "sync_pin": 18, "sync_bar": sync_config,
+        })
+        module.run_task = Mock(return_value="done")
+        for configured_pin, extra_args, expected_pin in ((18, [], 18), (18, ["--sync_pin", "23"], 23), (None, [], None)):
+            module.load_config.return_value["sync_pin"] = configured_pin
+            with self.subTest(extra_args=extra_args), patch.object(
+                sys, "argv", ["play_video", "--config", "video.json", *extra_args],
+            ):
+                module.main()
+                self.assertEqual(module.run_task.call_args.kwargs["sync_pin"], expected_pin)
+                self.assertEqual(module.run_task.call_args.kwargs["sync_bar"], sync_config)
+
+    def test_video_abort_poll_does_not_consume_a_source_refresh(self):
+        module, utils, _ = self._make_validation_harness(source_rate="30/1", monitor_rate=60)
+
+        def play(**kwargs):
+            sync_calls = utils.service_sync_bar.call_count
+            self.assertFalse(kwargs["external_abort_checker"]())
+            self.assertEqual(utils.service_sync_bar.call_count, sync_calls)
+            return {"video_name": "clip.mp4", "aborted": False}
+
+        utils.play_video_fill_screen.side_effect = play
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "clip.mp4"
+            path.touch()
+            self.assertEqual(module.run_task(
+                video_files=[str(path)], clip_duration_seconds=2, num_clips=1,
+                output_dir=tmp,
+            ), "done")
+        self.assertEqual(utils.service_sync_bar.call_count, 1)
+
     def test_enabled_eye_tracking_connects_acquisition_to_pump_gate_without_preview(self):
         for enabled in (False, True):
             with self.subTest(enabled=enabled):
@@ -1387,11 +1374,7 @@ class PlayVideoTaskTests(unittest.TestCase):
                     self.assertFalse(policy.status(now_s=anchor_perf_s + 1).due)
 
                 controller.start.side_effect = start
-                gpio = types.SimpleNamespace(
-                    gpiochip_open=Mock(return_value=0), gpio_claim_output=Mock(return_value=0),
-                    gpio_write=Mock(return_value=0), gpiochip_close=Mock(),
-                )
-                with tempfile.TemporaryDirectory() as tmpdir, patch.dict(sys.modules, {"lgpio": gpio}):
+                with tempfile.TemporaryDirectory() as tmpdir:
                     path = Path(tmpdir) / "clip.mp4"
                     path.touch()
                     self.assertEqual(module.run_task(
@@ -1423,11 +1406,7 @@ class PlayVideoTaskTests(unittest.TestCase):
             return {"video_name": "clip.mp4", "aborted": False}
 
         utils.play_video_fill_screen.side_effect = play
-        gpio = types.SimpleNamespace(
-            gpiochip_open=Mock(return_value=0), gpio_claim_output=Mock(return_value=0),
-            gpio_write=Mock(return_value=0), gpiochip_close=Mock(),
-        )
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(sys.modules, {"lgpio": gpio}):
+        with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "clip.mp4"
             path.touch()
             self.assertEqual(module.run_task(
@@ -1498,11 +1477,7 @@ class PlayVideoTaskTests(unittest.TestCase):
             return {"video_name": "clip.mp4", "aborted": False}
 
         utils.play_video_fill_screen.side_effect = play
-        gpio = types.SimpleNamespace(
-            gpiochip_open=Mock(return_value=0), gpio_claim_output=Mock(return_value=0),
-            gpio_write=Mock(return_value=0), gpiochip_close=Mock(),
-        )
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(sys.modules, {"lgpio": gpio}), patch.object(
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
             module.time, "perf_counter", side_effect=lambda: clock[0],
         ), patch.object(module.time, "perf_counter_ns", side_effect=lambda: round(clock[0] * 1e9)):
             path = Path(tmp) / "clip.mp4"
@@ -1570,11 +1545,7 @@ class PlayVideoTaskTests(unittest.TestCase):
             return {"video_name": "clip.mp4", "aborted": False}
 
         utils.play_video_fill_screen.side_effect = play
-        gpio = types.SimpleNamespace(
-            gpiochip_open=Mock(return_value=0), gpio_claim_output=Mock(return_value=0),
-            gpio_write=Mock(return_value=0), gpiochip_close=Mock(),
-        )
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(sys.modules, {"lgpio": gpio}):
+        with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "clip.mp4"
             path.touch()
             self.assertEqual(module.run_task(
@@ -1690,7 +1661,6 @@ class PlayVideoTaskTests(unittest.TestCase):
             "aborted": False,
             "abort_reason": "",
             "dropped_frames": 0,
-            "sync_pulses": 0,
         }
         play_video_fill_screen = Mock(return_value=playback_result)
         fake_utils = types.ModuleType("bin.utils")
@@ -1698,6 +1668,8 @@ class PlayVideoTaskTests(unittest.TestCase):
             return_value=(win, main_screen, experimenter_screen)
         )
         fake_utils.make_bg_rect = Mock(return_value=object())
+        fake_utils.configure_sync_bar = Mock()
+        fake_utils.service_sync_bar = Mock()
         fake_utils.resolve_frame_rate = Mock(return_value=(60.0, 1.0 / 60.0))
         fake_utils.play_video_fill_screen = play_video_fill_screen
         fake_utils.verify_task_window_vblank = Mock(

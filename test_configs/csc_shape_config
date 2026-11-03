@@ -16,5 +16,11 @@
   "dot_size": 10,
   "dot_color": [155, 155, 155],
   "init_dot_color": [100, 100, 100],
-  "margin": 200
+  "margin": 200,
+  "sync_bar": {
+    "enabled": false,
+    "height": 20,
+    "interval_mean_seconds": 1.0,
+    "interval_variance_seconds": 0.2
+  }
 }

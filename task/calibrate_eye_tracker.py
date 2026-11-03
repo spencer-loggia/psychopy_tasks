@@ -84,7 +84,7 @@ def parse_args():
 
 def _deliver_reward_pulse(
     *, outputs, pump_pin, pulse_duration_s, logger, should_exit=lambda: False,
-    on_wait=None,
+    on_wait=None, sync_window=None,
 ):
     """Use DAQC2 logical on/off semantics and log actual software-timed edges.
 
@@ -96,6 +96,10 @@ def _deliver_reward_pulse(
         raise ValueError("pump_pulse_time_seconds must be finite and nonnegative")
     if duration_s == 0:
         return time.perf_counter()
+    poll_interval_s = (
+        0.002 if sync_window is not None
+        and getattr(sync_window, "_neuro_tasks_sync_display", None) is not None else 0.01
+    )
     requested_ns = time.perf_counter_ns()
     try:
         outputs.write(pump_pin, True)
@@ -114,7 +118,9 @@ def _deliver_reward_pulse(
                 break
             if on_wait is not None:
                 on_wait()
-            core.wait(min(0.01, max(0, deadline - time.perf_counter())))
+            elif sync_window is not None:
+                utils.service_sync_bar(sync_window, deadline_perf_s=deadline)
+            core.wait(min(poll_interval_s, max(0, deadline - time.perf_counter())))
     finally:
         requested_off_ns = time.perf_counter_ns()
         outputs.write(pump_pin, False)
@@ -161,6 +167,8 @@ def run_task(
     video_buffer_megabytes=DEFAULT_BUFFER_BYTES / (1024 * 1024),
     ffprobe_bin="ffprobe",
     seed=None,
+    sync_bar=None,
+    sync_pin=18,
 ) -> Path:
     uart_config = uart_config or UARTEyeTrackerConfig()
     filter_config = filter_config or EyeFilterConfig()
@@ -352,6 +360,14 @@ def run_task(
             },
         )
         utils.verify_task_window_vblank(main_win)
+        _, sync_frame_duration_s = utils.resolve_frame_rate(
+            main_win, None, msg_logger=msg_logger, context="calibrate_eye_tracker",
+        )
+        utils.configure_sync_bar(
+            main_win, sync_bar, sync_pin=sync_pin, event_logger=logger,
+            experimenter_preview=preview, rotation_degrees=rotation,
+            frame_duration_s=sync_frame_duration_s, msg_logger=msg_logger,
+        )
         pylogging.console.setLevel(pylogging.CRITICAL)
         msg_logger.log(
             "INFO",
@@ -442,6 +458,7 @@ def run_task(
                 # Keep the attention movie moving during the software-timed
                 # pulse; the UART observation worker is already independent.
                 on_wait=draw_scene if videos.enabled else None,
+                sync_window=main_win,
             )
             # The UART callback builds fresh history during the pulse, after
             # the reset at onset. Keep those new samples for the next reward.
@@ -725,6 +742,7 @@ def main():
         ),
         pump_pin=int(cfg.get("pump_pin", 0)),
         pump_pulse_time_seconds=float(cfg.get("pump_pulse_time_seconds", 0.25)),
+        sync_bar=cfg.get("sync_bar"), sync_pin=cfg.get("sync_pin", 18),
         **video_options,
     )
     print(f"Saved eye calibration to {path}")

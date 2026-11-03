@@ -590,7 +590,7 @@ nanosecond hardware accuracy. Camera timestamps retain their separate, unsynchro
 
 Common event-log rules:
 
-- `requested_task_time_ns` records when a refresh-locked flip or hardware change was submitted; it is blank for events that have no separate request time.
+- `requested_task_time_ns` records when a refresh-locked flip or hardware change was submitted. For `sync_bar_flip`, it records the sampled target display time, preserving any deferral to protect task timing. It is blank for events that have no separate request time.
 - `task_time_ns` records the observed flip, interaction, or individual output write, in integer nanoseconds on the experiment clock.
 - `event_type` is one of `frame_flip`, `interaction`, `signal`, or `lifecycle`.
 - The first data row is `block_start` (code 1), captured as the task opens its log bundle. The last is
@@ -610,10 +610,8 @@ Common event-log rules:
   accuracy; see [PsychoPy's mouse event implementation](https://psychopy.org/_modules/psychopy/event.html).
 - Each GPIO sync edge retains the standard two columns: `requested_task_time_ns` immediately before
   `gpio_write()` and `task_time_ns` immediately after it returns. The timestamp is taken at the individual
-  HIGH or LOW write, **never after waiting for the pulse duration**. A 0.25 s trial-start pulse captures
-  its onset before asking lgpio to schedule the asynchronous clear; its single `trial_start_signal_on`
-  row does not invent a timestamp for that unobserved clear. Video sync logs each explicit HIGH/LOW
-  edge separately. DAQC2 writes use the same before/after capture convention. Deferred log writing
+  HIGH or LOW write, **never after waiting for the pulse duration**. Sync bar signals are scheduled on
+  the display flip callback. DAQC2 writes use the same before/after capture convention. Deferred log writing
   preserves these captures and does not substitute a flip, queue-drain, or file-write time.
 - Output timestamps measure the host write call, not electrical feedback. lgpio's pulse worker is
   [software timed](https://github.com/joan2937/lg/blob/master/lgPthTx.c); validate physical GPIO/display
@@ -658,13 +656,14 @@ Active-foraging event naming:
   duration `0` because the choice-clear flip still occurred.
 - `inter_trial_interval` (5) is a `lifecycle` event marking actual ITI onset after either interval,
   with its own requested duration and no separate request timestamp. The gray display stays
-  unchanged. The next phase's onset marks the preceding phase's end; no interval-end events or
-  additional flips are introduced. Pump/buzzer events still record individual hardware edges.
+  unchanged apart from an enabled sync bar. The next phase's onset marks the preceding phase's
+  end; interval-end events do not add display flips. Pump/buzzer events still record individual
+  hardware edges.
 - `grey_inter_trial_interval` (109) is no longer emitted by active foraging. Its shared-library
   definition and code remain reserved for historical logs. Earlier sessions retain their own
   event-code-library snapshots, including the earlier `lifecycle` types for codes 3 and 4.
 - `cue_touch` and `option_touch` are the current touch interaction events.
-- `trial_start_signal_on/off`, `pump_on/off`, and `buzzer_on/off` are the current signal events.
+- `pump_on/off` and `buzzer_on/off` record reward and timeout output edges; sync bar events record display synchronization. Historical trial-start signal event codes remain reserved.
 - `event_name_library.json` is shared across tasks. For active-foraging sequential runs it defines `option_{n}_dot` and `option_{n}_on` through templates rather than duplicating a separate static entry for each possible option index.
 
 Active-foraging behavior log columns:
@@ -737,15 +736,15 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
   Each completed clip additionally logs
   `video_main_vblank_validation`, comparing the drawable's actual GLX OML media
   stream counter (MSC) and swap buffer counter (SBC) deltas with the exact
-  planned subject refreshes and source-frame swaps. These values are also saved
+  planned subject refreshes and source-frame swaps, including any additional sync bar swaps. These values are also saved
   in `behavior_log.tsv`. The experimenter preview runs in another process and
   synchronizes only its own drawable to its own output; it cannot become the
   subject window's swap reference. If post-preview main-output validation fails,
   playback never becomes ready.
-- Playback uploads, draws, and calls blocking PsychoPy `Window.flip()` only at
-  source-frame boundaries. Between boundaries the front buffer is left
-  untouched, so the display naturally repeats that image at each hardware
-  refresh without more Python or GL work. Every boundary is scheduled from
+- Playback uploads and draws source video frames only at source-frame boundaries.
+  Between boundaries the front buffer repeats the same image at each hardware
+  refresh. An enabled sync bar adds swaps for its own scheduled inversions while
+  preserving that source image. Every source boundary is scheduled from
   the frame-zero onset plus its absolute source time; the blocking swap maps
   it to the nearest VBL. The measured monitor rate supplies the submission
   margin and cadence diagnostics, but its small measurement error is never
@@ -830,11 +829,9 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
   error. This prevents stale context-global OpenGL state from turning an
   otherwise correctly timed upload into a shifted, partial, or transiently
   corrupted frame.
-- On Raspberry Pi, `play_video` sends one-video-presentation-frame sync pulses on BCM GPIO
-  `sync_pin` (default `18`). Pulse onsets are frame locked and their successive
-  intervals are sampled inclusively from `sync_interval_frames` (default
-  `[100, 300]`) for each interval. `sync_pulse_frames` controls pulse width and
-  defaults to `1`.
+- `play_video` uses the shared `sync_bar` timing and display options. On Raspberry Pi,
+  `sync_pin` (default `18`) toggles once per displayed bar inversion. The earlier
+  video-only `sync_interval_frames` and `sync_pulse_frames` options have been removed.
 - On Raspberry Pi, `play_video` also drives the reward pump through Pi-Plates
   DAQC2 `DOUT pump_pin`. Both `reward_interval` and
   `pump_pulse_time_seconds` are required, with a positive pulse duration shorter
@@ -1198,7 +1195,7 @@ Active Foraging Hardware Signals
 --------------------------------
 When `active_foraging` runs with `raspi=true`, the hardware outputs are split across Raspberry Pi GPIO and the Pi-Plates DAQC2plate:
 
-- `trial_start_pin`: Raspberry Pi BCM GPIO pin used for the timing-critical trial-start pulse. This still uses `lgpio` and is scheduled on the PsychoPy flip path for precise timing.
+- `sync_pin`: Raspberry Pi BCM GPIO pin used for sync bar signals, default `18`. The output is updated in the PsychoPy flip callback for every sync bar inversion when the bar is enabled and GPIO is available.
 - `daq.address` or top-level `daq_address`: DAQC2plate address for pump and buzzer output, default `0`.
 - `pump_pin`: DAQC2 DOUT bit for pump reward delivery, in the range `0` through `7`.
 - `buzz_pin`: DAQC2 DOUT bit for the timeout buzzer, in the range `0` through `7`.
@@ -1409,9 +1406,38 @@ All tasks in this repository must support loading a JSON configuration file as a
 - `center_point` (array of 2 ints or null, optional): AFC-style stimulus circle center in participant-centered pixels (X right, Y up; null means `[0, 0]`)
 - `stim_range_radius` (int or null, optional): AFC-style stimulus circle radius in pixels
 - `display_margin` (non-negative number, optional): active-foraging minimum full-image clearance from each screen edge in pixels (default `0`)
-- `trial_start_pin` (int, optional): AFC-style BCM GPIO pin for the trial-start pulse
+- `sync_pin` (int or null, optional): BCM GPIO pin for display-synchronized sync bar signals, default `18`; null keeps visual synchronization without GPIO
+- `sync_bar` (object, optional): shared display synchronization options described below
 - `daq.address` or `daq_address` (int, optional): DAQC2plate address for task hardware outputs
 - `pump_pin` and `buzz_pin` (int, optional): DAQC2 DOUT bits, not Raspberry Pi GPIO pins
+
+PsychoPy experiment tasks accept the following optional `sync_bar` block. Omitting it leaves the bar disabled. Maintenance tools such as the RGB adjuster, system diagnostic, and pump/buzzer utilities do not display a sync bar:
+
+```json
+"sync_bar": {
+  "enabled": false,
+  "height": 20,
+  "interval_mean_seconds": 1.0,
+  "interval_variance_seconds": 0.2
+}
+```
+
+The enabled bar contains five alternating black and white rectangles at the top of the
+subject's view, accounting for software rotation, and is also visible on the experimenter
+preview. Each rectangle is `subject_screen_width // 5` pixels wide; `height` is in pixels.
+Every scheduled flip inverts all five rectangles. Each interval is sampled uniformly from
+`interval_mean_seconds ± interval_variance_seconds`; both settings use seconds, so the
+defaults produce intervals from 800 ms to 1200 ms. There is no separate minimum-duration
+setting. Sync events retain separate requested and observed display times on the experiment
+clock. When hardware is available, `sync_pin` toggles HIGH/LOW once in the display flip
+callback for each bar inversion, producing one electrical edge per inversion.
+
+Due inversions share ordinary video or trial frame flips. During static scenes the bar can
+swap independently, preserving both the visible scene and the prepared next scene on the
+GPU. Task deadlines reserve the preceding refresh; nearby sync-only swaps defer to the task
+flip. Input is sampled before optional sync swaps, and buffered touch timestamps and pending
+input-reset callbacks are preserved. The experimenter preview mirrors the subject's phase
+asynchronously; it does not drive the GPIO clock. Use `sync_pin: null` for visual-only sync.
 
 Tasks must validate the config when loaded and raise a helpful error if required keys are missing or types are invalid. Command-line arguments should override values in the config file when both are provided.
 

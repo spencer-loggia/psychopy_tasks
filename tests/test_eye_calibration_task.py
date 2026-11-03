@@ -31,8 +31,11 @@ def load_task():
         "close_task_window",
         "make_bg_rect",
         "verify_task_window_vblank",
+        "configure_sync_bar",
+        "service_sync_bar",
     ):
         setattr(utils, name, Mock())
+    utils.resolve_frame_rate = Mock(return_value=(60.0, 1.0 / 60.0))
     renderer = types.ModuleType("bin.eye_calibration_preview")
     renderer._make_fixation_cross = Mock(return_value=[Mock(), Mock()])
     renderer._draw_fixation_cross = Mock()
@@ -54,6 +57,23 @@ def load_task():
 class EyeCalibrationTaskTests(unittest.TestCase):
     def setUp(self):
         self.task = load_task()
+
+    def test_static_reward_sync_polling_protects_the_pump_off_deadline(self):
+        task = self.task
+        now = [10.0]
+        win = object()
+        with patch.object(task.time, "perf_counter", side_effect=lambda: now[0]), patch.object(
+            task.time, "perf_counter_ns", side_effect=lambda: round(now[0] * 1e9),
+        ), patch.object(task.core, "wait", side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)):
+            task._deliver_reward_pulse(
+                outputs=Mock(), pump_pin=0, pulse_duration_s=0.25,
+                logger=Mock(), sync_window=win,
+            )
+        self.assertAlmostEqual(now[0], 10.25)
+        self.assertGreater(task.utils.service_sync_bar.call_count, 1)
+        for call in task.utils.service_sync_bar.call_args_list:
+            self.assertIs(call.args[0], win)
+            self.assertEqual(call.kwargs["deadline_perf_s"], 10.25)
 
     def test_uart_starts_before_display_setup_and_stops_if_setup_fails(self):
         task = self.task
@@ -369,6 +389,8 @@ class EyeCalibrationTaskTests(unittest.TestCase):
                 fullscreen=False,
                 win_size=(800, 600),
                 uart_config=UARTEyeTrackerConfig(simulate=True),
+                sync_bar={"enabled": True, "height": 24},
+                sync_pin=23,
             )
             saved = json.loads(result.read_text())["eye_tracker_calibration"]
             reloaded = load_eye_tracking_settings(
@@ -377,6 +399,11 @@ class EyeCalibrationTaskTests(unittest.TestCase):
         self.assertEqual(saved["main_screen_size_px"], [600, 800])
         self.assertEqual(saved["main_native_size_px"], [800, 600])
         self.assertEqual(saved["main_rotation_deg"], 90)
+        sync_call = task.utils.configure_sync_bar.call_args
+        self.assertEqual(sync_call.args[1], {"enabled": True, "height": 24})
+        self.assertEqual(sync_call.kwargs["sync_pin"], 23)
+        self.assertEqual(sync_call.kwargs["rotation_degrees"], 90)
+        self.assertIs(sync_call.kwargs["experimenter_preview"], preview)
         self.assertEqual(saved["input_units"], "crop_local_pixels")
         self.assertAlmostEqual(saved["x_offset"], 1.25)
         self.assertAlmostEqual(saved["y_offset"], -0.75)

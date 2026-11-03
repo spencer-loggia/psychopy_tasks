@@ -8,6 +8,27 @@ import time
 from typing import Any, Callable, Iterable, Mapping, Optional
 
 
+# One subject display runs per task process. Its optional sync presenter also
+# services sparse waits; the experimenter window lives in a separate process.
+_background_presenter = None
+_wait_deadline_perf_s = None
+
+
+def set_background_presenter(presenter) -> None:
+    global _background_presenter
+    _background_presenter = presenter
+
+
+def service_background_presenter(*, deadline_perf_s=None) -> None:
+    if _background_presenter is not None:
+        if _wait_deadline_perf_s is not None:
+            deadline_perf_s = (
+                _wait_deadline_perf_s if deadline_perf_s is None
+                else min(deadline_perf_s, _wait_deadline_perf_s)
+            )
+        _background_presenter.service(deadline_perf_s=deadline_perf_s)
+
+
 @dataclass(frozen=True)
 class FrameDurationPlan:
     """Nearest refresh-locked representation of a requested duration."""
@@ -188,17 +209,26 @@ def wait_until(
         raise ValueError("poll_interval_s must be a positive finite value")
     sleeper = time.sleep if wait_fn is None else wait_fn
 
-    while True:
-        if poll_callback is not None and poll_callback():
-            return False
-        remaining_s = deadline - time.perf_counter()
-        if remaining_s <= 0.0:
-            return True
-        sleeper(
-            remaining_s
-            if poll_callback is None
-            else min(interval, remaining_s)
-        )
+    global _wait_deadline_perf_s
+    previous_deadline = _wait_deadline_perf_s
+    _wait_deadline_perf_s = (
+        deadline if previous_deadline is None else min(deadline, previous_deadline)
+    )
+    try:
+        while True:
+            if poll_callback is not None and poll_callback():
+                return False
+            service_background_presenter()
+            remaining_s = deadline - time.perf_counter()
+            if remaining_s <= 0.0:
+                return True
+            sleeper(
+                remaining_s
+                if poll_callback is None and _background_presenter is None
+                else min(interval, remaining_s)
+            )
+    finally:
+        _wait_deadline_perf_s = previous_deadline
 
 
 def wait_until_flip_submission(

@@ -1,4 +1,4 @@
-"""Video validation, shared-frame mirroring, and frame pulse scheduling."""
+"""Video validation, refresh cadence planning, and shared-frame mirroring."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -417,86 +417,6 @@ def raspberry_pi_model(model_path: str | Path = "/proc/device-tree/model") -> st
 
 def is_raspberry_pi(model_path: str | Path = "/proc/device-tree/model") -> bool:
     return "raspberry pi" in raspberry_pi_model(model_path).lower()
-
-
-@dataclass(frozen=True)
-class FramePulseEdge:
-    level: int
-    frame_index: int
-    interval_frames: Optional[int] = None
-
-
-class RandomFramePulseSchedule:
-    """Schedule fixed-width pulses at randomized display-frame intervals."""
-
-    def __init__(
-        self,
-        minimum_interval_frames: int = 100,
-        maximum_interval_frames: int = 300,
-        pulse_width_frames: int = 1,
-        *,
-        rng: Optional[random.Random] = None,
-    ):
-        self.minimum_interval_frames = int(minimum_interval_frames)
-        self.maximum_interval_frames = int(maximum_interval_frames)
-        self.pulse_width_frames = int(pulse_width_frames)
-        if self.minimum_interval_frames <= 0:
-            raise ValueError("minimum sync interval must be at least one frame")
-        if self.maximum_interval_frames < self.minimum_interval_frames:
-            raise ValueError("maximum sync interval must be >= minimum sync interval")
-        if self.pulse_width_frames <= 0:
-            raise ValueError("sync pulse width must be at least one frame")
-        if self.pulse_width_frames >= self.minimum_interval_frames:
-            raise ValueError("sync pulse width must be shorter than the minimum interval")
-
-        self._rng = rng or random.Random()
-        self._high = False
-        self._off_frame: Optional[int] = None
-        first_interval = self._sample_interval()
-        self._next_on_frame = first_interval
-        self._next_interval = first_interval
-
-    @property
-    def high(self) -> bool:
-        return self._high
-
-    def _sample_interval(self) -> int:
-        return int(
-            self._rng.randint(
-                self.minimum_interval_frames,
-                self.maximum_interval_frames,
-            )
-        )
-
-    def edges_for_frame(self, frame_index: int) -> tuple[FramePulseEdge, ...]:
-        frame_index = int(frame_index)
-        edges: list[FramePulseEdge] = []
-        if self._high and self._off_frame == frame_index:
-            self._high = False
-            self._off_frame = None
-            edges.append(FramePulseEdge(level=0, frame_index=frame_index))
-
-        if (not self._high) and self._next_on_frame == frame_index:
-            interval = self._next_interval
-            self._high = True
-            self._off_frame = frame_index + self.pulse_width_frames
-            edges.append(
-                FramePulseEdge(
-                    level=1,
-                    frame_index=frame_index,
-                    interval_frames=interval,
-                )
-            )
-            self._next_interval = self._sample_interval()
-            self._next_on_frame = frame_index + self._next_interval
-        return tuple(edges)
-
-    def mark_forced_low(self, frame_index: int) -> Optional[FramePulseEdge]:
-        if not self._high:
-            return None
-        self._high = False
-        self._off_frame = None
-        return FramePulseEdge(level=0, frame_index=int(frame_index))
 
 
 class SharedVideoFrameBuffer:

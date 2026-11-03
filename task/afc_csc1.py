@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from psychopy import core, logging as pylogging
+from psychopy import logging as pylogging
 
 _project_root = Path(__file__).resolve().parents[1]
 if str(_project_root) not in sys.path:
@@ -122,8 +122,8 @@ def parse_args():
     p.add_argument("--choice_hitbox_scale", type=float, default=None, help="Scale choice hitboxes relative to stimulus size")
     p.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate")
     p.add_argument("--touchscreen", action="store_true", default=None, help="Enable touchscreen mode and hide the main-screen cursor")
-    p.add_argument("--raspi", action="store_true", default=None, help="Enable Raspberry Pi GPIO trial-start pulses and DAQC2 DOUT pump/buzzer outputs")
-    p.add_argument("--trial_start_pin", type=int, default=None, help="GPIO pin to use for trial start pulses (BCM numbering)")
+    p.add_argument("--raspi", action="store_true", default=None, help="Enable DAQC2 DOUT pump/buzzer outputs")
+    p.add_argument("--sync_pin", type=int, default=None, help="GPIO pin for display-synchronized sync bar signals (BCM numbering)")
     p.add_argument("--daq_address", type=int, default=None, help="DAQC2plate address for pump/buzzer DOUT outputs")
     p.add_argument("--pump_pin", type=int, default=None, help="DAQC2 DOUT bit for pump reward delivery (0-7)")
     p.add_argument("--buzz_pin", type=int, default=None, help="DAQC2 DOUT bit for timeout buzzer (0-7)")
@@ -441,7 +441,8 @@ def run_task(
     refresh_rate: Optional[float] = None,
     touchscreen: bool = False,
     raspi: bool = False,
-    trial_start_pin: int = 18,
+    sync_pin: Optional[int] = 18,
+    sync_bar: Optional[Dict[str, Any]] = None,
     daq_address: int = 0,
     daq_module_name: str = "piplates.DAQC2plate",
     pump_pin: int = 0,
@@ -660,7 +661,6 @@ def run_task(
         )
 
     win = None
-    pigpio_pi = None
     experimenter_preview = None
     task_end_notes = "done"
 
@@ -741,6 +741,12 @@ def run_task(
         )
         session_logs.set_eye_tracking_screen(
             main_scene_size, software_stimulus_rotation(main_screen.rotation)
+        )
+        utils.configure_sync_bar(
+            win, sync_bar, sync_pin=sync_pin, event_logger=logger,
+            experimenter_preview=experimenter_preview,
+            rotation_degrees=software_stimulus_rotation(main_screen.rotation),
+            frame_duration_s=frame_dur, msg_logger=msg_logger,
         )
         try:
             msg_logger.log(
@@ -935,19 +941,10 @@ def run_task(
             )
 
         def _wait_or_abort(duration_s: float) -> bool:
-            if duration_s is None or float(duration_s) <= 0:
-                return _poll_experimenter_controls()
-            if experimenter_preview is not None:
-                deadline = time.perf_counter() + max(0.0, float(duration_s))
-                while time.perf_counter() < deadline:
-                    if _poll_experimenter_controls():
-                        return True
-                    remaining = deadline - time.perf_counter()
-                    if remaining > 0:
-                        time.sleep(min(0.05, remaining))
-                return _poll_experimenter_controls()
-            core.wait(float(duration_s))
-            return False
+            return not wait_until(
+                time.perf_counter() + max(0.0, float(duration_s or 0.0)),
+                poll_callback=_poll_experimenter_controls,
+            )
 
         _show_preview_afc_scene(phase="ready")
 
@@ -957,20 +954,6 @@ def run_task(
         buzzer_output_on = None
         buzzer_output_off = None
         if raspi:
-            try:
-                import lgpio
-
-                chip = lgpio.gpiochip_open(0)
-                lgpio.gpio_claim_output(chip, int(trial_start_pin))
-                pigpio_pi = chip
-                msg_logger.log("INFO", f"lgpio initialized on chip 0, trial_start_pin={trial_start_pin}")
-            except Exception as e:
-                pigpio_pi = None
-                try:
-                    msg_logger.log("WARN", f"lgpio not available or failed to initialize: {e}; trial-start GPIO signal will be logged only")
-                except Exception:
-                    pass
-
             try:
                 daqc2_outputs = DAQC2DigitalOutputs(
                     address=int(daq_address),
@@ -996,7 +979,7 @@ def run_task(
                     pass
         else:
             try:
-                msg_logger.log("INFO", "raspi=False; GPIO/DAQC2 hardware signals will not be sent (events will be logged only)")
+                msg_logger.log("INFO", "raspi=False; DAQC2 pump/buzzer signals will not be sent (events will be logged only)")
             except Exception:
                 pass
 
@@ -1050,7 +1033,7 @@ def run_task(
                     requested_timestamp_perf_ns=start_perf_requested_ns,
                     requested_duration=pulse_duration,
                 )
-                core.wait(pulse_duration)
+                wait_until(time.perf_counter() + pulse_duration)
             finally:
                 end_perf_requested_ns = time.perf_counter_ns()
                 _set_pump_pin(0, context="manual_reward")
@@ -1064,7 +1047,9 @@ def run_task(
 
         # Keep exactly one experimenter-control poller. It does not treat poll errors
         # as exits, and it supports manual reward only from the experimenter screen.
-        def _poll_experimenter_controls() -> bool:
+        def _poll_experimenter_controls(*, service_sync=True) -> bool:
+            if service_sync:
+                utils.service_sync_bar(win)
             if experimenter_preview is None:
                 return False
             try:
@@ -1217,10 +1202,7 @@ def run_task(
                 fps=fps,
                 choice_hitbox_scale=(float(choice_hitbox_scale) * (1.25 if touchscreen else 1.0)),
                 trial_meta=trial_meta,
-                raspi=bool(raspi and pigpio_pi is not None),
-                pigpio_pi=pigpio_pi,
-                raspi_pin=trial_start_pin,
-                external_abort_checker=_poll_experimenter_controls,
+                external_abort_checker=lambda: _poll_experimenter_controls(service_sync=False),
                 show_fixation=bool(show_fixation),
             )
             if aborted:
@@ -1436,7 +1418,6 @@ def run_task(
                 utils.close_task_window(win)
         except Exception:
             pass
-        # Do not call core.quit() here; it raises SystemExit and can mask real exceptions.
     return task_end_notes
 
 
@@ -1534,7 +1515,8 @@ def main():
             refresh_rate=_get("refresh_rate", cfg.get("refresh_rate", cfg.get("refrech_rate", None))),
             touchscreen=bool(_get("touchscreen", cfg.get("touchscreen", False))),
             raspi=bool(_get("raspi", cfg.get("raspi", False))),
-            trial_start_pin=int(_get("trial_start_pin", cfg.get("trial_start_pin", cfg.get("raspi_pin", 18)))),
+            sync_pin=_get("sync_pin", 18),
+            sync_bar=cfg.get("sync_bar"),
             daq_address=daq_address,
             daq_module_name=daq_module_name,
             pump_pin=int(_get("pump_pin", cfg.get("pump_pin", 0))),

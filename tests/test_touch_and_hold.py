@@ -174,7 +174,7 @@ class TouchAndHoldStateTests(unittest.TestCase):
 class TouchAndHoldTaskTests(unittest.TestCase):
     def exercise(self, *, contacts, until=3, rotation="normal", preview_enabled=False,
                  preview_failure=False, manual_at=None, eye_enabled=False, pulse_change=None,
-                 setting_changes=(), **options):
+                 setting_changes=(), buffered_presses=(), sync_pause=None, **options):
         clock = FakeClock()
         origin = clock.seconds()
         origin_ns = clock.ns
@@ -184,7 +184,15 @@ class TouchAndHoldTaskTests(unittest.TestCase):
         def contact():
             return next((position for start, end, position in contacts if start <= elapsed() < end), None)
         mouse = Mock()
-        mouse.getPressed.side_effect = lambda **kw: ([contact() is not None, False, False], [0, 0, 0])
+        reset_s = [0.0]
+        mouse.clickReset.side_effect = lambda: reset_s.__setitem__(0, elapsed())
+
+        def read_buttons(**kwargs):
+            buffered = next((press - reset_s[0] for press in buffered_presses
+                             if reset_s[0] < press <= elapsed()), 0)
+            return [contact() is not None, False, False], [buffered, 0, 0]
+
+        mouse.getPressed.side_effect = read_buttons
         mouse.getPos.side_effect = lambda: contact() or (0, 0)
         manual_sent = False
         def keys(**kwargs):
@@ -204,6 +212,15 @@ class TouchAndHoldTaskTests(unittest.TestCase):
         main = ScreenGeometry(0, 0, 0, 800, 600, rotation=rotation)
         secondary = ScreenGeometry(1, 800, 0, 800, 600) if preview_enabled else None
         utils.setup_task_window.return_value = win, main, secondary
+        utils.resolve_frame_rate.return_value = (60.0, 1.0 / 60.0)
+
+        def service_sync(*args, **kwargs):
+            nonlocal sync_pause
+            if sync_pause is not None and elapsed() >= sync_pause[0]:
+                clock.sleep(sync_pause[1])
+                sync_pause = None
+
+        utils.service_sync_bar.side_effect = service_sync
         utils.split_background_from_palette.return_value = (128, 128, 128), {}
         cue = Mock(pos=(0, 0), size=(100, 100), image=Image.new("RGBA", (100, 100)))
         cue.contains.side_effect = lambda pos: abs(pos[0]) <= 50 and abs(pos[1]) <= 50
@@ -279,6 +296,42 @@ class TouchAndHoldTaskTests(unittest.TestCase):
             self.assertIs(preview_factory.call_args.kwargs["eye_tracking_shared"], eye.preview_state)
             eye.close.assert_called_once()
         return status, rows, edges, utils, preview
+
+    def test_sync_bar_is_configured_with_rotation_and_serviced_during_static_hold(self):
+        config = {"enabled": True, "height": 24}
+        _, _, _, utils, preview = self.exercise(
+            contacts=[], until=0.1, preview_enabled=True, rotation="inverted",
+            sync_bar=config, sync_pin=23,
+        )
+        call = utils.configure_sync_bar.call_args
+        self.assertIs(call.args[1], config)
+        self.assertEqual(call.kwargs["sync_pin"], 23)
+        self.assertEqual(call.kwargs["rotation_degrees"], 270)
+        self.assertEqual(call.kwargs["frame_duration_s"], 1.0 / 60.0)
+        self.assertIs(call.kwargs["experimenter_preview"], preview)
+        self.assertGreater(utils.service_sync_bar.call_count, 2)
+
+    def test_sync_swaps_respect_an_active_reward_deadline(self):
+        _, _, _, utils, _ = self.exercise(
+            contacts=[(0.1, 1.5, (0, 0))], duration=None,
+            sync_bar={"enabled": True},
+        )
+        deadlines = [call.kwargs["deadline_perf_s"]
+                     for call in utils.service_sync_bar.call_args_list]
+        self.assertTrue(any(deadline is not None for deadline in deadlines))
+        self.assertTrue(any(deadline is None for deadline in deadlines))
+
+    def test_short_tap_during_sync_swap_keeps_original_press_timestamp(self):
+        _, rows, _, _, _ = self.exercise(
+            contacts=[(0.055, 0.056, (0, 0))], buffered_presses=[0.055],
+            sync_pause=(0.050, 0.020), sync_bar={"enabled": True}, duration=None,
+        )
+        presses = [row for row in rows if row["event"] == "cue_touch"]
+        releases = [row for row in rows if row["event"] == "training_cue_release"]
+        self.assertEqual(len(presses), 1)
+        self.assertEqual(int(presses[0]["task_time_ns"]), 55_000_000)
+        self.assertEqual(len(releases), 1)
+        self.assertGreaterEqual(int(releases[0]["task_time_ns"]), 70_000_000)
 
     def test_release_cancels_active_reward_and_starts_full_iti(self):
         status, rows, edges, _, _ = self.exercise(

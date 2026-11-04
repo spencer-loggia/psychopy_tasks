@@ -1111,7 +1111,7 @@ def run_task(
         onset_stim = utils.make_onset_cue_stim(
             win,
             bg_rgb_255=bg_rgb,
-            size_frac=0.5,
+            size_frac=0.7,
             cells=36,
             sigma_frac=0.10,
             zero_threshold=0.5,
@@ -1119,7 +1119,7 @@ def run_task(
         )
 
         onset_stim.pos = _rotate_position_clockwise(
-            (0.0, -float(main_scene_size[0]) / 3.0)
+            (0.0, -float(main_scene_size[0]) / 4.0)
         )
         msg_logger.log(
             "INFO",

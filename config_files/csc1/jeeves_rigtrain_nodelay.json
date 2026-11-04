@@ -5,7 +5,7 @@
   "pump_delay_time": 0.0,
   "pump_pulse_time_seconds": 0.25,
   "inter_pump_interval": 0.1, 
-  "timeout_duration_seconds": 3.0,
+  "timeout_duration_seconds": 5.0,
  
 
   "pump_pin": 0,
@@ -19,7 +19,7 @@
     "experimenter": null
   },
   "refresh_rate": 60,
-  "n": 3000,
+  "n": 5000,
 
   "fullscreen": true,
   "win_size": [2560, 1600],
@@ -34,7 +34,7 @@
   "stroke_color": [0, 0, 0],
   "stroke_linejoin": "round",
   "stroke_linecap": "round",
-  "image_size": [128, 128],
+  "image_size": [160, 160],
 
 
   "self_initiation": true,

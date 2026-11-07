@@ -471,6 +471,8 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
         nonlocal task_end_status
         if service_sync:
             utils.service_sync_bar(win)
+        if experimenter_preview is not None:
+            experimenter_preview.poll_settings_keyboard()
         pressed_keys = set()
         try:
             pressed_keys = set(event.getKeys(keyList=["escape", "r"]))

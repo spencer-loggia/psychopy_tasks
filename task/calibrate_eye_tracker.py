@@ -485,6 +485,7 @@ def run_task(
             # with the preview's requests before applying any action, so both
             # focus paths share point capture, attention and reward behavior. Gain and
             # target steps go to the UI owner and return as a normal revision.
+            preview.poll_settings_keyboard()
             main_keys = event.getKeys(CALIBRATION_KEYS)
             x_steps = main_keys.count("right") - main_keys.count("left")
             y_steps = main_keys.count("up") - main_keys.count("down")

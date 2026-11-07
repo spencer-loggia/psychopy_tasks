@@ -129,6 +129,6 @@ def validate_duration_for_presentation_mode(
     if duration_s != 0.0:
         raise ValueError(
             f"Invalid {context} timing config: when sequential=false and "
-            "is_memory=false, duration must be exactly 0. In this mode the stimuli "
-            "appear on the first choice frame and remain visible for choice_time only."
+            "is_memory=false, duration must be exactly 0. In this mode option "
+            "presentation and selection share the choice_time window."
         )

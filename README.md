@@ -675,6 +675,11 @@ Active-foraging event naming:
 
 - Sequential runs (`sequential=true`) log option-specific frame-flip events such as `option_1_dot` and `option_1_on`.
 - Simultaneous runs (`sequential=false`) log combined frame-flip events such as `options_dot` and `options_on`.
+- With gaze gating enabled, simultaneous runs instead log each revealed or hidden option
+  as `option_{n}_on` or `option_{n}_off`. Hiding a stimulus restores its existing dot;
+  it does not start another saccade deadline. `fixation_accepted` (205) records each accepted
+  fixation; the message log identifies the option. `saccade_timeout` (206) marks a fixation
+  failure, followed directly by `inter_trial_interval` at the gray-screen flip.
 - `choice_start` marks the first frame where a choice can be made.
 - `reward_interval` (3), or `timeout_interval` (4) on timeout trials, is the single `frame_flip`
   event for the post-choice transition to gray. It carries that flip's requested and observed
@@ -945,6 +950,10 @@ The `active_foraging` experimenter display shows the config name, current subjec
 reward level: red for `0`, gray for `1`, yellow for `2`, and green for `3`. Clicking `rew.` or pressing `r`
 delivers the configured manual juice-pump pulse. The keyboard command works when either the main task window or
 experimenter window has keyboard focus.
+Press `Tab` to cycle through the parameter buttons and `Enter` to edit the focused value.
+Type the new value and press `Enter` to confirm, or `Escape` to cancel. This also works
+while the subject window has focus. Reward, exit, and controls with dedicated shortcuts
+remain outside the Tab cycle.
 
 The `match2cue` display uses the same preview, subject/trial indicator, manual reward control, and exit control.
 Its running counts are `Correct`, `Incorrect`, and `Rewards delivered`; it does not show reward-level outlines.
@@ -1246,7 +1255,43 @@ The main visual timing parameters in `active_foraging` are interpreted by the pr
 - `pump_pulse_time_seconds`: duration in seconds that the pump output remains on for each reward pulse.
 - `inter_pump_interval`: delay in seconds between repeated pump pulses. When omitted, it defaults to `pump_pulse_time_seconds`, preserving the previous behavior.
 
-Every non-timeout trial reserves a fixed reward interval from the actual post-choice gray-screen
+Optional fixation gating uses these active-foraging settings:
+
+```json
+"wait_for_saccade_on_dot": true,
+"fixation_window_radius": 150,
+"fixation_criteria_s": 0.1,
+"saccade_wait_timeout_s": 1.0
+```
+
+`wait_for_saccade_on_dot` defaults to `false`. Enabling it requires `isi > 0` and
+enabled, calibrated eye tracking. The radius is in subject-display pixels, and the
+fixation criterion requires a continuous interval of valid gaze inside that circle.
+The existing sample-based fixation detector runs with eye acquisition; the presentation
+thread only reads its result. Missing, stale, and invalid samples cannot earn fixation.
+Light grey window outlines appear only in the experimenter preview.
+
+In sequential mode, every dot remains visible for at least the configured ISI and until
+its fixation is accepted. The stimulus then follows the normal duration and memory rules.
+In non-sequential mode, each option appears only while that option is fixated, returning
+to its dot when fixation is lost. With `is_memory=false`, `duration` must be `0.0` and
+the choice window opens at the initial `options_dot` flip. The subject has exactly
+`choice_time` to inspect and choose options; waiting for fixation never delays or extends
+that deadline. The minimum ISI still applies before a stimulus can be revealed.
+With `is_memory=true`, the stimulus timer starts with the first revealed option after
+the minimum ISI, followed by dot-only choice.
+
+`saccade_wait_timeout_s` is a positive number of seconds, or `null` to disable saccade
+timeouts. It measures time from the most recent new-dot onset until valid gaze first
+enters an option's fixation window; the fixation-duration criterion may finish later.
+Sequential trials get a fresh deadline for each new option dot. Simultaneous trials
+have one deadline from the initial `options_dot` flip until gaze reaches any option.
+Subsequent gaze loss does not restart that deadline. In non-memory mode, a timeout
+equal to or longer than `choice_time` has no effect; a shorter timeout can end the trial
+early if no dot is reached. A saccade timeout clears the display and starts the full ITI
+immediately, without a reward or punishment interval; the next trial proceeds normally.
+
+Every completed non-timeout trial reserves a fixed reward interval from the actual post-choice gray-screen
 flip. Its duration is derived from the largest pulse count in `reward_to_pulse_map`, across all
 configured levels, rather than from the chosen option or the options sampled on that trial.
 With the standard level-3 double reward, the duration is
@@ -1458,8 +1503,9 @@ disables the bar for every block. The resolved settings are saved in every block
 the default height and intervals, including its static version on the idle mask.
 
 The enabled bar contains five alternating black and white rectangles at the top of the
-subject's view, accounting for software rotation, and is also visible on the experimenter
-preview. Each rectangle is `subject_screen_width // 5` pixels wide; `height` is in pixels.
+subject's view, accounting for software rotation. The experimenter preview shows only a
+small `sync ON` / `sync OFF` phase indicator. Each rectangle is
+`subject_screen_width // 5` pixels wide; `height` is in pixels.
 Every scheduled flip inverts all five rectangles. Each interval is sampled uniformly from
 `interval_mean_seconds ± interval_variance_seconds`; both settings use seconds, so the
 defaults produce intervals from 800 ms to 1200 ms. There is no separate minimum-duration

@@ -1,11 +1,13 @@
 """Shared preview editors remain compact and consume all edit-only input."""
 import math
+import queue
+import sys
 import types
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from bin.live_settings_ui import SETTINGS_STRIP_HEIGHT, SettingsPanel
-from bin.screen import compute_preview_aspect_fit
+from bin.screen import ExperimenterPreview, compute_preview_aspect_fit
 from tests.test_eye_calibration_preview import NativeLabel, Stimulus, TextStim
 
 
@@ -72,6 +74,69 @@ class LiveSettingsUITests(unittest.TestCase):
             self.assertFalse(panel.editing)
             self.assertEqual(settings.snapshot()[spec.name], (0.25, 0.5))
         self.assertEqual(panel.handle_keys(["escape", "r"]), ["escape", "r"])
+
+    def test_tab_cycles_only_settings_and_enter_opens_focused_value(self):
+        settings, panel = self.make_panel()
+        self.assertEqual(panel.handle_keys(["enter", "r", "escape"]), ["enter", "r", "escape"])
+        for index in (0, 1, 2, 0):
+            self.assertEqual(panel.handle_keys(["tab"]), [])
+            panel.draw()
+            self.assertEqual(panel.focused_index, index)
+            self.assertEqual(panel.buttons[panel.specs[index].name].lineWidth, 3)
+        self.assertEqual(panel.handle_keys(["enter", "0", "period", "5", "num_enter", "r"]), [])
+        self.assertEqual(settings.snapshot()[panel.specs[0].name], (0.25, 0.5))
+        self.assertFalse(panel.editing)
+        panel.handle_keys(["tab", "return"])
+        self.assertEqual(panel.active_spec, panel.specs[1])
+
+    def make_keyboard_bridge(self):
+        preview = object.__new__(ExperimenterPreview)
+        preview._settings_keys_queue = queue.Queue()
+        preview._settings_keyboard_state = [0, 0]
+        preview._settings_keyboard_sequence = 0
+        preview._settings_pending_edit = False
+        pending = []
+
+        def get_keys(keyList=None, timeStamped=False):
+            selected = [item for item in pending if keyList is None or item[0] in keyList]
+            pending[:] = [item for item in pending if item not in selected]
+            return selected if timeStamped else [item[0] for item in selected]
+
+        psychopy = types.ModuleType("psychopy")
+        psychopy.event = types.SimpleNamespace(getKeys=get_keys)
+        return preview, pending, patch.dict(sys.modules, {"psychopy": psychopy})
+
+    def test_subject_window_forwards_ordered_complete_editor_batch(self):
+        settings, panel = self.make_panel()
+        preview, pending, installed = self.make_keyboard_bridge()
+        pending.extend((key, index) for index, key in enumerate(
+            ["tab", "return", "num_0", "num_decimal", "num_5", "return", "r", "escape"]
+        ))
+        with installed:
+            preview.poll_settings_keyboard()
+        sequence, keys = preview._settings_keys_queue.get_nowait()
+        self.assertEqual(sequence, 1)
+        self.assertEqual(panel.handle_keys(keys), [])
+        self.assertEqual(settings.snapshot()[panel.specs[0].name], (0.25, 0.5))
+        self.assertEqual(pending, [])
+
+    def test_subject_window_routes_pending_editor_input_before_preview_acknowledges(self):
+        _, panel = self.make_panel()
+        preview, pending, installed = self.make_keyboard_bridge()
+        with installed:
+            pending.extend([("tab", 0), ("enter", 1)])
+            preview.poll_settings_keyboard()
+            pending.extend([("num_5", 2), ("escape", 3)])
+            preview.poll_settings_keyboard()
+            for _ in range(2):
+                sequence, keys = preview._settings_keys_queue.get_nowait()
+                self.assertEqual(panel.handle_keys(keys), [])
+                preview._settings_keyboard_state[:] = [sequence, int(panel.editing)]
+            self.assertFalse(panel.editing)
+            pending.extend([("r", 4), ("escape", 5), ("num_8", 6), ("tab", 7)])
+            preview.poll_settings_keyboard()
+            self.assertEqual(pending, [("r", 4), ("escape", 5), ("num_8", 6)])
+            self.assertEqual(preview._settings_keys_queue.get_nowait()[1], ["tab"])
 
     def test_cancel_invalid_and_calibration_keys_do_not_change_settings(self):
         settings, panel = self.make_panel()

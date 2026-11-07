@@ -1793,6 +1793,8 @@ def _experimenter_preview_process(
     pump_control=None,
     live_settings=None,
     sync_bar_shared=None,
+    settings_keys_queue=None,
+    settings_keyboard_state=None,
 ) -> None:
     startup_reported = False
 
@@ -1830,43 +1832,33 @@ def _experimenter_preview_process(
     settings_height = SETTINGS_STRIP_HEIGHT if live_settings is not None else 0.0
     outside_bg_rgb = (30, 30, 30)
     preview_outline_rgb = (150, 150, 150)
-    sync_rectangles = []
-    sync_layout_key = None
     sync_drawn_phase = None
 
-    def _draw_sync_bar(layout=None):
-        nonlocal sync_rectangles, sync_layout_key, sync_drawn_phase
+    def _draw_sync_status():
+        nonlocal sync_drawn_phase
         if sync_bar_shared is None or sync_bar_shared[0] <= 0:
             return
-        height, source_width, source_height, phase = sync_bar_shared
-        if layout is None:
-            layout = compute_preview_aspect_fit(
-                preview_canvas_size, (source_width, source_height),
-                settings_height=settings_height,
-            )
-        box_width, box_height = layout["box_size"]
-        center_x, center_y = layout["box_center"]
-        scale = box_width / source_width
-        key = (height, source_width, source_height, box_width, box_height, center_x, center_y)
-        if key != sync_layout_key:
-            width = (int(source_width) // 5) * scale
-            sync_rectangles = [
-                visual.Rect(
-                    win, width=width, height=height * scale, units="pix",
-                    pos=(center_x - box_width / 2 + (index + .5) * width,
-                         center_y + box_height / 2 - height * scale / 2),
-                    lineColor=None, autoLog=False,
-                ) for index in range(5)
-            ]
-            sync_layout_key = key
-            sync_drawn_phase = None
-        if phase != sync_drawn_phase:
-            for index, rectangle in enumerate(sync_rectangles):
-                level = 2 * ((index + int(phase)) % 2) - 1
-                rectangle.fillColor = (level, level, level)
-            sync_drawn_phase = phase
-        for rectangle in sync_rectangles:
-            rectangle.draw()
+        sync_drawn_phase = int(sync_bar_shared[3])
+        set_preview_text(sync_status_text, "sync ON" if sync_drawn_phase else "sync OFF")
+        sync_status_text.draw()
+
+    def _read_settings_keys():
+        sequence, batches = 0, []
+        if settings_keys_queue is not None:
+            while True:
+                try:
+                    sequence, batch = settings_keys_queue.get_nowait()
+                except queue.Empty:
+                    break
+                batches.append(batch)
+        return sequence, batches
+
+    def _publish_settings_keyboard(panel, sequence):
+        if panel is not None and settings_keyboard_state is not None:
+            settings_keyboard_state[1] = int(panel.editing)
+            if sequence:
+                # Publish editor state before acknowledging forwarded input.
+                settings_keyboard_state[0] = sequence
 
     def _make_bg_rect(bg_rgb_255: Sequence[int]):
         return visual.Rect(
@@ -1982,6 +1974,23 @@ def _experimenter_preview_process(
             )
             dots.append(dot)
 
+        circles = []
+        for item in payload.get("circles", []) or []:
+            circles.append(visual.Circle(
+                win,
+                radius=max(1.0, scale_scene_length(
+                    float(item["radius"]), oriented_main_size, preview_size,
+                )),
+                pos=_map_pos(item.get("pos", (0, 0))),
+                fillColor=None,
+                lineColor=_preview_rgb255_to_psychopy(item.get("color", (200, 200, 200))),
+                lineColorSpace="rgb",
+                lineWidth=max(1.0, scale_scene_length(
+                    float(item.get("line_width", 2.0)), oriented_main_size, preview_size,
+                )),
+                units="pix", autoLog=False,
+            ))
+
         hit_boxes = []
         for item in payload.get("hit_boxes", []) or []:
             scaled_size = _map_size(item.get("size", (64, 64)))
@@ -2065,6 +2074,7 @@ def _experimenter_preview_process(
             "preview_outline_rect": preview_outline_rect,
             "images": images,
             "dots": dots,
+            "circles": circles,
             "hit_boxes": hit_boxes,
             "fixation": fixation,
             "highlight_box": highlight_box,
@@ -2249,6 +2259,12 @@ def _experimenter_preview_process(
     # separate drawable wait on a second output's vertical blank and contend
     # with the timing-critical subject window.
     configure_window_vsync(win, False)
+    sync_status_text = visual.TextStim(
+        win, text="sync OFF", height=14, units="pix",
+        pos=(0, float(preview_canvas_size[1]) / 2 - 16),
+        color=_preview_rgb255_to_psychopy((210, 210, 210)),
+        colorSpace="rgb", autoLog=False,
+    )
     last_cursor_apply_s = 0.0
     if mouse_visible is not None:
         set_window_mouse_visible(win, bool(mouse_visible))
@@ -2273,6 +2289,7 @@ def _experimenter_preview_process(
             )
             payload = {}
             controls.draw(payload)
+            _draw_sync_status()
             win.flip()
             _report_startup({
                 "ok": True,
@@ -2284,9 +2301,11 @@ def _experimenter_preview_process(
                 latest = _get_latest_preview_command(command_queue)
                 if latest is not None:
                     payload = latest
-                controls.poll_controls()
+                sequence, forwarded_batches = _read_settings_keys()
+                controls.poll_controls(forwarded_key_batches=forwarded_batches)
+                _publish_settings_keyboard(controls.settings_panel, sequence)
                 controls.draw(payload)
-                _draw_sync_bar()
+                _draw_sync_status()
                 win.flip()
                 core.wait(max(0.02, update_interval_ms / 1000.0))
         except Exception as exc:
@@ -2487,6 +2506,7 @@ def _experimenter_preview_process(
         static_scene["preview_bg_rect"].draw()
         static_scene["preview_outline_rect"].draw()
         _draw_overlay()
+        _draw_sync_status()
         win.flip()
         _report_startup(
             {
@@ -2643,11 +2663,15 @@ def _experimenter_preview_process(
                     continue
 
             editing_this_frame = settings_panel is not None and settings_panel.editing
+            sequence, forwarded_batches = _read_settings_keys()
             try:
-                keys = event.getKeys()
+                local_keys = event.getKeys()
+                keys = local_keys
                 if settings_panel is not None:
-                    redraw_requested = redraw_requested or bool(keys)
-                    keys = settings_panel.handle_keys(keys)
+                    redraw_requested = redraw_requested or bool(local_keys) or bool(forwarded_batches)
+                    keys = []
+                    for batch in (*forwarded_batches, local_keys):
+                        keys.extend(settings_panel.handle_keys(batch))
                 if "r" in keys:
                     reward_event.set()
                 if "escape" in keys:
@@ -2676,6 +2700,7 @@ def _experimenter_preview_process(
                 except Exception:
                     pass
             last_mouse_down = mouse_down
+            _publish_settings_keyboard(settings_panel, sequence)
 
             try:
                 if shared_movie_active:
@@ -2737,7 +2762,7 @@ def _experimenter_preview_process(
                         movie_outline_rect.draw()
                     _draw_overlay(movie_layout)
                     _draw_gaze(movie_layout)
-                    _draw_sync_bar(movie_layout)
+                    _draw_sync_status()
                     win.flip()
                     last_gaze_redraw_s = time.perf_counter()
                     continue
@@ -2748,6 +2773,8 @@ def _experimenter_preview_process(
                     stim.draw()
                 for stim in static_scene["images"]:
                     stim.draw()
+                for circle in static_scene["circles"]:
+                    circle.draw()
                 for hit_box in static_scene["hit_boxes"]:
                     hit_box.draw()
                 if static_scene["fixation"] is not None:
@@ -2757,7 +2784,7 @@ def _experimenter_preview_process(
                 static_scene["preview_outline_rect"].draw()
                 _draw_overlay()
                 _draw_gaze(static_scene.get("layout"))
-                _draw_sync_bar(static_scene.get("layout"))
+                _draw_sync_status()
                 win.flip()
             except Exception:
                 static_scene = _build_static_scene(
@@ -2838,6 +2865,10 @@ class ExperimenterPreview:
         # Geometry is set once before enabling; only the phase changes on the
         # subject side. No queue or lock enters the display callback path.
         self._sync_bar_shared = self._ctx.Array("d", [0.0] * 4, lock=False)
+        self._settings_keys_queue = self._ctx.Queue() if self._live_settings is not None else None
+        self._settings_keyboard_state = self._ctx.Array("q", [0, 0], lock=False)
+        self._settings_keyboard_sequence = 0
+        self._settings_pending_edit = False
         # The process queue and local outbox are both single-slot. A sender
         # thread absorbs multiprocessing's feeder-thread handoff without ever
         # blocking the timing-critical task thread; newer snapshots replace a
@@ -2897,6 +2928,8 @@ class ExperimenterPreview:
                 pump_control,
                 self._live_settings,
                 self._sync_bar_shared,
+                self._settings_keys_queue,
+                self._settings_keyboard_state,
             ),
             daemon=True,
         )
@@ -2907,6 +2940,7 @@ class ExperimenterPreview:
             startup_receiver.close()
             self._queue.close()
             self._close_calibration_actions()
+            self._close_settings_keyboard()
             self._closed = True
             raise RuntimeError(
                 f"Experimenter preview process could not start: "
@@ -2936,6 +2970,7 @@ class ExperimenterPreview:
             self._process.join(timeout=1.0)
             self._queue.close()
             self._close_calibration_actions()
+            self._close_settings_keyboard()
             self._closed = True
             raise RuntimeError(
                 f"Experimenter preview failed to realize on "
@@ -2964,9 +2999,43 @@ class ExperimenterPreview:
     def set_sync_bar_phase(self, phase: int) -> None:
         self._sync_bar_shared[3] = phase
 
+    def poll_settings_keyboard(self) -> None:
+        """Forward settings input when the subject window owns keyboard focus.
+
+        The preview owns editing and validation. Only queued keystrokes cross
+        processes; the stimulus thread never waits for the editor to respond.
+        """
+        keys_queue = getattr(self, "_settings_keys_queue", None)
+        if keys_queue is None or getattr(self, "_closed", False):
+            return
+        from psychopy import event
+
+        acknowledged, editing = self._settings_keyboard_state
+        if acknowledged < self._settings_keyboard_sequence:
+            editing = editing or self._settings_pending_edit
+        navigation = ("tab", "return", "enter", "num_enter")
+        keys = event.getKeys(keyList=None if editing else navigation, timeStamped=True)
+        if not editing and any(key in navigation[1:] for key, _ in keys):
+            # Include text typed in the same input batch as Enter. Timestamp
+            # ordering preserves Tab, Enter, value, Enter even between polls.
+            keys.extend(event.getKeys(timeStamped=True))
+            keys.sort(key=lambda item: item[1])
+        if not keys:
+            return
+        self._settings_pending_edit = bool(editing or any(key in navigation[1:] for key, _ in keys))
+        self._settings_keyboard_sequence += 1
+        keys_queue.put_nowait((self._settings_keyboard_sequence, [key for key, _ in keys]))
+
+    def _close_settings_keyboard(self) -> None:
+        keys_queue = getattr(self, "_settings_keys_queue", None)
+        if keys_queue is not None:
+            keys_queue.cancel_join_thread()
+            keys_queue.close()
+
     def poll(self) -> bool:
         if self.exit_requested:
             return True
+        self.poll_settings_keyboard()
         if not getattr(self, "_closed", False) and not self._process.is_alive():
             raise RuntimeError(
                 "Experimenter preview process exited unexpectedly with status "
@@ -3205,6 +3274,7 @@ class ExperimenterPreview:
         main_size: Sequence[int],
         images: Optional[list[Dict[str, Any]]] = None,
         dots: Optional[list[Dict[str, Any]]] = None,
+        circles: Optional[list[Dict[str, Any]]] = None,
         hit_boxes: Optional[list[Dict[str, Any]]] = None,
         fixation_size: Optional[float] = None,
         fixation_color: Sequence[int] = (0, 0, 0),
@@ -3220,6 +3290,7 @@ class ExperimenterPreview:
             "main_rotation_deg": _quarter_turn_degrees(main_rotation_deg),
             "images": list(images or []),
             "dots": list(dots or []),
+            "circles": list(circles or []),
             "hit_boxes": list(hit_boxes or []),
             "fixation_size": fixation_size,
             "fixation_color": list(fixation_color),
@@ -3356,5 +3427,9 @@ class ExperimenterPreview:
             pass
         try:
             self._close_calibration_actions()
+        except Exception:
+            pass
+        try:
+            self._close_settings_keyboard()
         except Exception:
             pass

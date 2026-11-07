@@ -58,6 +58,7 @@ from bin.frame_timing import (
     wait_until,
 )
 from bin.eye_tracking_config import load_eye_tracking_settings
+from bin.dot_fixation import DotFixationGate, validate_dot_fixation_config
 from bin.pump_control import PumpPulseControl
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
@@ -353,7 +354,27 @@ def run_task(
     screen_config: Optional[Dict[str, Any]] = None,
     eye_tracking_config=None,
     display_margin: float = 0.0,
+    wait_for_saccade_on_dot: bool = False,
+    saccade_wait_timeout_s: Optional[float] = 1.0,
+    fixation_criteria_s: float = 0.1,
+    fixation_window_radius: float = 150.0,
 ):
+    validate_dot_fixation_config(
+        wait_for_saccade_on_dot,
+        isi=isi,
+        eye_tracking_enabled=eye_tracking_config is not None,
+        saccade_wait_timeout_s=saccade_wait_timeout_s,
+        fixation_criteria_s=fixation_criteria_s,
+        fixation_window_radius=fixation_window_radius,
+    )
+    dot_fixation_gate = (
+        DotFixationGate(
+            eye_tracking_config,
+            fixation_criteria_s=fixation_criteria_s,
+            fixation_window_radius=fixation_window_radius,
+        )
+        if wait_for_saccade_on_dot else None
+    )
     resolved_subject = "" if subject is None else str(subject).strip()
     freq_space_tsv = resolve_subject_mapped_value(
         freq_space_tsv,
@@ -399,6 +420,7 @@ def run_task(
     behavior_fieldnames = _build_behavior_fieldnames(num_afc)
     session_logs = SessionLogBundle(
         eye_tracking_config=eye_tracking_config,
+        on_eye_state=dot_fixation_gate.observe if dot_fixation_gate is not None else None,
         output_root=output_dir,
         task_name="active_foraging",
         config_name=resolved_config_name,
@@ -917,6 +939,8 @@ def run_task(
             )
 
     def _poll_experimenter_controls(*, allow_manual_reward=True, service_sync=True) -> bool:
+        if experimenter_preview is not None:
+            experimenter_preview.poll_settings_keyboard()
         if service_sync:
             utils.service_sync_bar(win)
         manual_reward_requested = False
@@ -1107,6 +1131,8 @@ def run_task(
                 event_profile="active_foraging",
                 reward_levels=[reward_map.get(pair, 0) for pair in trial_options],
                 stimulus_rotation_degrees=stimulus_rotation_degrees,
+                dot_fixation_gate=dot_fixation_gate,
+                saccade_wait_timeout_s=saccade_wait_timeout_s,
             )
             if aborted:
                 if task_end_notes == "done" and _poll_experimenter_controls():
@@ -1137,9 +1163,13 @@ def run_task(
                 if reward_to_timeout_map is not None:
                     apply_timeout = reward_to_timeout_map.get(str(reward_level), 0)
 
-            outcome_duration_s = timeout_duration_seconds if apply_timeout > 0 else reward_interval_s
+            saccade_timeout = trial_meta.get("saccade_timeout", False)
+            outcome_duration_s = (
+                0.0 if saccade_timeout else
+                timeout_duration_seconds if apply_timeout > 0 else reward_interval_s
+            )
             gray_start_ns = trial_meta["gray_flip_perf_ns"]
-            iti_start_ns = run_outcome_interval(
+            iti_start_ns = gray_start_ns if saccade_timeout else run_outcome_interval(
                 trial_num=trial_num, onset_perf_ns=gray_start_ns,
                 onset_requested_perf_ns=trial_meta.get("gray_flip_requested_perf_ns"),
                 num_pulses=num_pulses, apply_timeout=apply_timeout > 0,
@@ -1156,7 +1186,7 @@ def run_task(
                 task_end_notes = "experimenter_exit"
                 msg_logger.log("WARN", f"experimenter_exit_during_outcome_interval trial_num={trial_num}")
                 break
-            if iti_frames > 0:
+            if iti_frames > 0 or saccade_timeout:
                 logger.log_event(
                     trial_num=trial_num, event="inter_trial_interval", event_type="lifecycle",
                     timestamp_perf_ns=iti_start_ns, requested_duration=iti,
@@ -1260,6 +1290,8 @@ def run_task(
             trial_num += 1
 
     finally:
+        if dot_fixation_gate is not None:
+            dot_fixation_gate.stop()
         try:
             _set_pump_pin(0, context="task_cleanup")
             _set_buzzer_pin(0, context="task_cleanup")
@@ -1394,6 +1426,10 @@ def main():
             choice_time=choice_time,
             iti=iti,
             isi=isi,
+            wait_for_saccade_on_dot=cfg.get("wait_for_saccade_on_dot", False),
+            saccade_wait_timeout_s=cfg.get("saccade_wait_timeout_s", 1.0),
+            fixation_criteria_s=cfg.get("fixation_criteria_s", 0.1),
+            fixation_window_radius=cfg.get("fixation_window_radius", 150.0),
             init_dot_color=init_dot_color,
             dot_size=dot_size,
             dot_color=dot_color,

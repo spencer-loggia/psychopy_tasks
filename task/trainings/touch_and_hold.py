@@ -230,6 +230,8 @@ def run_task(
         show_scene()
         status = "done"
         while state.phase != "done":
+            if preview is not None:
+                preview.poll_settings_keyboard()
             keys = event.getKeys(keyList=["escape", "r"])
             if "escape" in keys or (preview is not None and preview.poll()):
                 status = "user_exit"

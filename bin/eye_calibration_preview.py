@@ -565,11 +565,15 @@ class EyeCalibrationControls:
             self.delete_count += 1
         self._publish_controls()
 
-    def poll_controls(self):
+    def poll_controls(self, *, forwarded_key_batches=()):
         editing_this_frame = self.settings_panel is not None and self.settings_panel.editing
         keys = event.getKeys() if self.settings_panel is not None else event.getKeys(keyList=("escape", *CALIBRATION_KEYS))
         if self.settings_panel is not None:
-            keys = self.settings_panel.handle_keys(keys)
+            keys = [
+                key
+                for batch in (*forwarded_key_batches, keys)
+                for key in self.settings_panel.handle_keys(batch)
+            ]
         with self.controls_shared.get_lock():
             self._apply_pending_gains_locked()
             x_steps, y_steps = self.controls_shared[7:9]

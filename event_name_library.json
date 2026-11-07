@@ -107,6 +107,16 @@
       "event_type": "interaction",
       "description": "Contact with the training cue ended by release or movement outside the cue."
     },
+    "fixation_accepted": {
+      "code": 205,
+      "event_type": "interaction",
+      "description": "Gaze met the required continuous fixation duration within an option window."
+    },
+    "saccade_timeout": {
+      "code": 206,
+      "event_type": "interaction",
+      "description": "The fixation wait timed out; the trial ended directly in the inter-trial interval."
+    },
     "training_trial_start": {
       "code": 6,
       "event_type": "lifecycle",
@@ -279,6 +289,8 @@
       "sync_signal_off"
     ],
     "active_foraging": [
+      "fixation_accepted",
+      "saccade_timeout",
       "reward_interval",
       "timeout_interval",
       "inter_trial_interval",
@@ -364,6 +376,14 @@
       "code_group": "option_index",
       "event_type": "frame_flip",
       "description_template": "Dot cue for option {option_index} became visible."
+    },
+    "afc_option_off": {
+      "task_names": ["active_foraging"],
+      "event_name_regex": "^option_(?P<option_index>[1-9][0-9]*)_off$",
+      "code_base": 1200,
+      "code_group": "option_index",
+      "event_type": "frame_flip",
+      "description_template": "Stimulus for option {option_index} was hidden, restoring its existing dot cue."
     },
     "afc_option_on": {
       "task_names": [

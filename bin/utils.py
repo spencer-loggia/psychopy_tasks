@@ -657,8 +657,6 @@ def play_video_fill_screen(
 
     def _poll_abort_reason():
         service_sync_bar(win, deadline_perf_s=source_deadline)
-        if allow_escape and event.getKeys(["escape"]):
-            return "escape_pressed"
         if external_abort_checker is not None:
             external_abort = external_abort_checker()
             if external_abort:
@@ -667,6 +665,8 @@ def play_video_fill_screen(
                     if isinstance(external_abort, str)
                     else "external_abort"
                 )
+        if allow_escape and event.getKeys(["escape"]):
+            return "escape_pressed"
         if stop_on_mouse_click and mouse is not None:
             try:
                 if any(mouse.getPressed()):
@@ -2048,6 +2048,8 @@ def present_trial_with_persistent_dots(
     detect_pre_options_cue_touch: bool = False,
     on_pre_options_cue_touch: Optional[Callable[[], bool]] = None,
     pre_options_cue_touch_event: str = "match_cue_touch",
+    dot_fixation_gate=None,
+    saccade_wait_timeout_s: Optional[float] = 1.0,
 ):
     """Present stimuli one at a time, leave faint dots at their locations,
     show all dots for `choice_time`, then clear.
@@ -2072,6 +2074,12 @@ def present_trial_with_persistent_dots(
 
     dots: List[visual.Circle] = []
     dot_records: List[Dict[str, Any]] = []
+    fixation_positions = []
+    saccade_timed_out = False
+    saccade_timeout_s = (
+        math.inf if dot_fixation_gate is None or saccade_wait_timeout_s is None
+        else float(saccade_wait_timeout_s)
+    )
     _visual = visual
     stim_sizes: List[Tuple[float, float]] = []
     # stims to potentially keep visible during the choice period when is_memory is False
@@ -2104,7 +2112,7 @@ def present_trial_with_persistent_dots(
         minimum_frames=1 if pre_options_cue_image is not None else 0,
     )
     delay_plan = plan_frame_duration(pre_options_delay, fps)
-    isi_plan = plan_frame_duration(isi, fps)
+    isi_plan = plan_frame_duration(isi, fps, minimum_frames=1 if dot_fixation_gate is not None else 0)
     choice_plan = plan_frame_duration(choice_time, fps, minimum_frames=1)
     if sequential or is_memory:
         stim_plan = plan_frame_duration(duration, fps, minimum_frames=1)
@@ -2264,6 +2272,11 @@ def present_trial_with_persistent_dots(
             main_size=tuple(scene_main_size) if scene_main_size is not None else tuple(win.size),
             images=_preview_images(preview_items),
             dots=_preview_dots(),
+            circles=[
+                {"pos": tuple(pos), "radius": dot_fixation_gate.fixation_window_radius,
+                 "color": (210, 210, 210), "line_width": 2.0}
+                for pos in fixation_positions
+            ],
             hit_boxes=build_reward_hit_boxes(
                 hitbox_items,
                 hitbox_scale=choice_hitbox_scale,
@@ -2309,7 +2322,7 @@ def present_trial_with_persistent_dots(
             f"initiation_cue_released trial_num={trial_num}",
         )
 
-    def _finish_released_trial() -> Tuple[bool, None]:
+    def _finish_incomplete_trial() -> Tuple[bool, None]:
         nonlocal held_initiation_cue_visible
         held_initiation_cue_visible = False
         if white_fixation_until_choice:
@@ -2318,6 +2331,9 @@ def present_trial_with_persistent_dots(
         if fix is not None:
             fix.draw()
         gray_timing = flip_with_timestamps(win)
+        dots.clear()
+        dot_records.clear()
+        fixation_positions.clear()
         _show_preview([])
         if trial_meta is not None:
             trial_meta["gray_flip_perf_s"] = float(gray_timing.actual_perf_s)
@@ -2353,8 +2369,10 @@ def present_trial_with_persistent_dots(
         return False
 
     def _interrupted_result() -> Tuple[bool, None]:
-        if initiation_cue_released:
-            return _finish_released_trial()
+        if dot_fixation_gate is not None:
+            dot_fixation_gate.stop()
+        if saccade_timed_out or initiation_cue_released:
+            return _finish_incomplete_trial()
         return True, None
 
     if onset_cue is not None:
@@ -2398,6 +2416,8 @@ def present_trial_with_persistent_dots(
         initiation_started = False
         initiation_target_perf = None
         while True:
+            if experimenter_preview is not None:
+                experimenter_preview.poll_settings_keyboard()
             if _event.getKeys(["escape"]):
                 _log_message(msg_logger, "WARN", f"escape_pressed trial_num={trial_num} during_onset_cue=1")
                 return True, None
@@ -2456,7 +2476,7 @@ def present_trial_with_persistent_dots(
                         _log_initiation_cue_release(
                             hold_sample.missing_since_perf_ns
                         )
-                        return _finish_released_trial()
+                        return _finish_incomplete_trial()
                     if trial_meta is not None:
                         trial_meta.pop("initiation_task_time_ns", None)
                     initiation_started = False
@@ -2573,7 +2593,7 @@ def present_trial_with_persistent_dots(
         cue_stim.draw()
         _draw_pre_choice_overlay()
         if _poll_held_initiation_cue():
-            return _finish_released_trial()
+            return _finish_incomplete_trial()
         cue_timing = flip_with_timestamps(win)
         cue_perf = cue_timing.actual_perf_s
         _set_initiation_time(perf_ns=cue_timing.actual_perf_ns)
@@ -2586,6 +2606,8 @@ def present_trial_with_persistent_dots(
         )
 
         def _poll_pre_options_cue_phase() -> bool:
+            if experimenter_preview is not None:
+                experimenter_preview.poll_settings_keyboard()
             if _event.getKeys(["escape"]):
                 _log_message(
                     msg_logger,
@@ -2855,6 +2877,8 @@ def present_trial_with_persistent_dots(
                 _commit_choice(chosen_idx, start_click_pos_acquired, start_touch.timestamp_perf_ns)
 
     def _abort_from_input(reason: str) -> bool:
+        if experimenter_preview is not None:
+            experimenter_preview.poll_settings_keyboard()
         if _event.getKeys(["escape"]):
             _log_message(msg_logger, "WARN", f"escape_pressed trial_num={trial_num} reason={reason}")
             return True
@@ -2862,7 +2886,7 @@ def present_trial_with_persistent_dots(
             return True
         return _should_abort(reason)
 
-    def _poll_choice_until(deadline_perf: float) -> bool:
+    def _poll_choice_until(deadline_perf: float, *, sync_deadline_perf=None) -> bool:
         nonlocal click_registered, click_perf_capture, click_meta, chosen_info
         while time.perf_counter() < deadline_perf and not click_registered:
             if _abort_from_input("experimenter_exit_during_choice"):
@@ -2883,7 +2907,9 @@ def present_trial_with_persistent_dots(
                     _commit_choice(chosen_idx, click_pos, touch_sample.timestamp_perf_ns)
                     break
 
-            service_sync_bar(win, deadline_perf_s=deadline_perf)
+            service_sync_bar(
+                win, deadline_perf_s=deadline_perf if sync_deadline_perf is None else sync_deadline_perf,
+            )
             remaining = deadline_perf - time.perf_counter()
             if remaining > 0:
                 _core.wait(min(poll_interval_s, remaining))
@@ -2954,6 +2980,190 @@ def present_trial_with_persistent_dots(
             before_flip_callback=before_flip_callback,
         )
 
+    def _start_dot_fixation(timing, targets):
+        if dot_fixation_gate is not None:
+            fixation_positions[:] = targets
+            dot_fixation_gate.start(
+                targets,
+                native_size=tuple(scene_main_size) if scene_main_size is not None else tuple(win.size),
+                rotation_degrees=rotation_degrees,
+                onset_perf_s=timing.actual_perf_s,
+            )
+
+    def _log_fixation_accepted(option_index, now_s):
+        logger.log_interaction(
+            trial_num=trial_num, event="fixation_accepted",
+            timestamp_perf_s=now_s,
+        )
+
+        _log_message(
+            msg_logger, "INFO",
+            f"fixation_accepted trial_num={trial_num} option_index={option_index} perf_s={now_s:.9f}",
+        )
+
+    def _timeout_dot_fixation(now_s):
+        nonlocal saccade_timed_out
+        saccade_timed_out = True
+        if trial_meta is not None:
+            trial_meta["saccade_timeout"] = True
+        logger.log_interaction(
+            trial_num=trial_num, event="saccade_timeout", timestamp_perf_s=now_s,
+        )
+
+    def _wait_for_dot_fixation(dot_timing, option_index):
+        """Poll memory only; the dot remains in the front buffer while waiting."""
+        nonlocal next_visual_target_perf_s
+        deadline = dot_timing.actual_perf_s + saccade_timeout_s
+        try:
+            while True:
+                if _abort_from_input("experimenter_exit_during_dot_fixation"):
+                    return False
+                now = time.perf_counter()
+                if dot_fixation_gate.reached_dot_before(deadline):
+                    deadline = math.inf
+                if now >= deadline:
+                    _timeout_dot_fixation(now)
+                    return False
+                if dot_fixation_gate.status(now_s=now) is not None:
+                    _log_fixation_accepted(option_index, now)
+                    # An extended gaze wait is response-driven, not a missed
+                    # scheduled transition. Preserve the ISI minimum otherwise.
+                    if now >= flip_submission_time(next_visual_target_perf_s, frame_dur):
+                        next_visual_target_perf_s = None
+                    return True
+                service_sync_bar(win, deadline_perf_s=deadline)
+                _core.wait(min(poll_interval_s, max(0.0, deadline - time.perf_counter())))
+        finally:
+            dot_fixation_gate.stop()
+
+    def _run_gaze_contingent_options(dot_timing):
+        """Reveal only the fixated option, swapping only when visibility changes."""
+        minimum_onset = transition_scheduler.target_after(dot_timing.actual_perf_s, isi_plan)
+        minimum_submission = flip_submission_time(minimum_onset, frame_dur)
+        timeout_deadline = dot_timing.actual_perf_s + saccade_timeout_s
+        accepted_previous = None
+        visible_index = None
+        stimulus_started = False
+        stimulus_deadline = None
+        try:
+            while True:
+                if _abort_from_input("experimenter_exit_during_dot_fixation"):
+                    return False
+                now = time.perf_counter()
+                if click_registered:
+                    return True
+                if dot_fixation_gate.reached_dot_before(timeout_deadline):
+                    timeout_deadline = math.inf
+                if choice_started and now >= _choice_transition_request_deadline():
+                    # A timeout at/after the choice deadline has no effect,
+                    # even if a poll resumes late. A shorter timeout still
+                    # gets its actual deadline during final flip preparation.
+                    if timeout_deadline >= choice_deadline:
+                        return True
+                    if now < timeout_deadline:
+                        _core.wait(min(poll_interval_s, timeout_deadline - now))
+                        continue
+                if now >= timeout_deadline:
+                    _timeout_dot_fixation(now)
+                    return False
+                accepted = dot_fixation_gate.status(now_s=now)
+                if accepted is not None:
+                    if accepted != accepted_previous:
+                        _log_fixation_accepted(accepted, now)
+                accepted_previous = accepted
+                if (
+                    is_memory and stimulus_started and not choice_started
+                    and now >= flip_submission_time(stimulus_deadline, frame_dur)
+                ):
+                    _prepare_choice_display()
+                    for dot, record in zip(dots, dot_records):
+                        dot.fillColor = rgb255_to_psychopy(dot_color)
+                        dot.fillColorSpace = "rgb"
+                        record["color"] = tuple(dot_color)
+                    bg_rect.draw()
+                    for dot in dots:
+                        dot.draw()
+                    if fix is not None:
+                        fix.draw()
+                    timing = _flip_prepared_scene(
+                        stimulus_deadline, "experimenter_exit_during_choice_start",
+                        before_flip_callback=_open_choice_input,
+                    )
+                    if timing is None:
+                        return False
+                    visible_index = None
+                    _build_choice_hit_targets()
+                    _start_choice_window(timing)
+                    _show_preview([])
+
+                desired_index = (
+                    accepted if now >= minimum_submission and not (is_memory and choice_started)
+                    else None
+                )
+                phase_deadline = choice_deadline if choice_started else stimulus_deadline
+                if phase_deadline is not None and now >= phase_deadline - frame_dur:
+                    # Reserve the ending refresh for choice onset or gray.
+                    # A late reveal/hide must not take that refresh and force
+                    # the scheduled transition one frame later.
+                    desired_index = visible_index
+                if desired_index != visible_index:
+                    first_reveal = not stimulus_started and desired_index is not None
+                    bg_rect.draw()
+                    for dot in dots:
+                        dot.draw()
+                    if desired_index is not None:
+                        stims[desired_index - 1].draw()
+                    if is_memory and not choice_started:
+                        _draw_pre_choice_overlay()
+                    elif fix is not None:
+                        fix.draw()
+                    timing = _flip_prepared_scene(
+                        minimum_onset if first_reveal and now < minimum_onset else None,
+                        "experimenter_exit_during_gaze_contingent_stimulus",
+                    )
+                    if timing is None:
+                        return False
+                    if visible_index is not None:
+                        logger.log_frame_flip(
+                            trial_num=trial_num, event=f"option_{visible_index}_off",
+                            timestamp_perf_ns=timing.actual_perf_ns,
+                            requested_timestamp_perf_ns=timing.requested_perf_ns,
+                        )
+                    visible_index = desired_index
+                    if visible_index is not None:
+                        logger.log_frame_flip(
+                            trial_num=trial_num, event=f"option_{visible_index}_on",
+                            timestamp_perf_ns=timing.actual_perf_ns,
+                            requested_timestamp_perf_ns=timing.requested_perf_ns,
+                        )
+                    if first_reveal:
+                        stimulus_started = True
+                        if is_memory:
+                            stimulus_deadline = transition_scheduler.target_after(timing.actual_perf_s, stim_plan)
+                    _show_preview([preview_images[visible_index - 1]] if visible_index is not None else [])
+
+                if click_registered:
+                    return True
+                if choice_started:
+                    choice_request = _choice_transition_request_deadline()
+                    if _poll_choice_until(
+                        min(time.perf_counter() + poll_interval_s, choice_request, timeout_deadline),
+                        sync_deadline_perf=min(choice_request, timeout_deadline),
+                    ):
+                        return False
+                    if click_registered:
+                        return True
+                else:
+                    deadline = timeout_deadline
+                    if stimulus_deadline is not None:
+                        deadline = min(deadline, flip_submission_time(stimulus_deadline, frame_dur))
+                    elif time.perf_counter() < minimum_submission:
+                        deadline = min(deadline, minimum_submission)
+                    service_sync_bar(win, deadline_perf_s=deadline)
+                    _core.wait(min(poll_interval_s, max(0.0, deadline - time.perf_counter())))
+        finally:
+            dot_fixation_gate.stop()
+
     if sequential:
         presentation_items = []
         for idx, (p, pos) in enumerate(zip(trial_options, positions), start=1):
@@ -2992,6 +3202,7 @@ def present_trial_with_persistent_dots(
                 )
                 if dot_timing is None:
                     return _interrupted_result()
+                _start_dot_fixation(dot_timing, [pos])
                 dot_perf = dot_timing.actual_perf_s
                 _set_initiation_time(perf_ns=dot_timing.actual_perf_ns)
                 logger.log_frame_flip(
@@ -3006,6 +3217,8 @@ def present_trial_with_persistent_dots(
                     dot_perf,
                     isi_plan,
                 )
+                if dot_fixation_gate is not None and not _wait_for_dot_fixation(dot_timing, idx):
+                    return _interrupted_result()
 
             current_preview_image = [
                 _make_preview_image_entry(pil_img, stim, reward_level)
@@ -3051,6 +3264,7 @@ def present_trial_with_persistent_dots(
             # post-stimulus dot scene remains visible and unchanged. The hold
             # is not shown after the final stimulus, immediately before choice.
             if idx < len(trial_options) and isi_frames > 0:
+                fixation_positions.clear()
                 bg_rect.draw()
                 for d in dots:
                     d.draw()
@@ -3114,12 +3328,16 @@ def present_trial_with_persistent_dots(
             except Exception:
                 stim_sizes.append((0.0, 0.0))
 
+        gaze_choice_at_dot_onset = dot_fixation_gate is not None and not is_memory
         if isi_frames > 0:
             cue_color = init_dot_color if init_dot_color is not None else dot_color
             for pos in positions:
                 dot = _make_dot(pos, cue_color)
                 dots.append(dot)
                 dot_records.append({"pos": tuple(pos), "radius": float(dot_size) / 2.0, "color": tuple(cue_color)})
+            if gaze_choice_at_dot_onset:
+                _prepare_choice_display()
+                _build_choice_hit_targets()
             bg_rect.draw()
             for d in dots:
                 d.draw()
@@ -3127,9 +3345,11 @@ def present_trial_with_persistent_dots(
             dot_timing = _flip_prepared_scene(
                 next_visual_target_perf_s,
                 "experimenter_exit_during_isi",
+                before_flip_callback=_open_choice_input if gaze_choice_at_dot_onset else None,
             )
             if dot_timing is None:
                 return _interrupted_result()
+            _start_dot_fixation(dot_timing, list(positions))
             dot_perf = dot_timing.actual_perf_s
             _set_initiation_time(perf_ns=dot_timing.actual_perf_ns)
             logger.log_frame_flip(
@@ -3139,74 +3359,81 @@ def present_trial_with_persistent_dots(
                 requested_timestamp_perf_ns=dot_timing.requested_perf_ns,
                 requested_duration=isi_plan.requested_s,
             )
+            if gaze_choice_at_dot_onset:
+                _start_choice_window(dot_timing)
             _show_preview([])
             next_visual_target_perf_s = transition_scheduler.target_after(
                 dot_perf,
                 isi_plan,
             )
 
-        if not is_memory:
-            _prepare_choice_display()
-        bg_rect.draw()
-        for d in dots:
-            d.draw()
-        for s in stims:
-            s.draw()
-        if is_memory:
-            _draw_pre_choice_overlay()
-        elif fix is not None:
-            fix.draw()
-        stim_timing = _flip_prepared_scene(
-            next_visual_target_perf_s,
-            "experimenter_exit_during_stimulus",
-            before_flip_callback=(
-                _open_choice_input if not is_memory else None
-            ),
-        )
-        if stim_timing is None:
-            return _interrupted_result()
-        flip_ps = stim_timing.psychopy_s
-        flip_perf = stim_timing.actual_perf_s
-        _set_initiation_time(perf_ns=stim_timing.actual_perf_ns)
-        stim_request = (
-            stim_plan.requested_s
-            if is_memory
-            else choice_plan.requested_s
-        )
-        logger.log_frame_flip(
-            trial_num=trial_num,
-            event=_frame_event_name("stim"),
-            timestamp_perf_ns=stim_timing.actual_perf_ns,
-            requested_timestamp_perf_ns=stim_timing.requested_perf_ns,
-            requested_duration=stim_request,
-        )
-        _show_preview(preview_images)
-        if not is_memory:
-            _build_choice_hit_targets()
-            _start_choice_window(stim_timing)
+        if dot_fixation_gate is not None:
+            if not _run_gaze_contingent_options(dot_timing):
+                return _interrupted_result()
         else:
-            next_visual_target_perf_s = transition_scheduler.target_after(
-                flip_perf,
-                stim_plan,
-            )
-            if not dots:
-                for pos in positions:
-                    dot = _make_dot(pos, dot_color)
-                    dots.append(dot)
-                    dot_records.append(
-                        {
-                            "pos": tuple(pos),
-                            "radius": float(dot_size) / 2.0,
-                            "color": tuple(dot_color),
-                        }
-                    )
+            if not is_memory:
+                _prepare_choice_display()
+            bg_rect.draw()
             for d in dots:
-                d.fillColor = rgb255_to_psychopy(dot_color)
-                d.fillColorSpace = "rgb"
-            for item in dot_records:
-                item["color"] = tuple(dot_color)
+                d.draw()
+            for s in stims:
+                s.draw()
+            if is_memory:
+                _draw_pre_choice_overlay()
+            elif fix is not None:
+                fix.draw()
+            stim_timing = _flip_prepared_scene(
+                next_visual_target_perf_s,
+                "experimenter_exit_during_stimulus",
+                before_flip_callback=(
+                    _open_choice_input if not is_memory else None
+                ),
+            )
+            if stim_timing is None:
+                return _interrupted_result()
+            flip_ps = stim_timing.psychopy_s
+            flip_perf = stim_timing.actual_perf_s
+            _set_initiation_time(perf_ns=stim_timing.actual_perf_ns)
+            stim_request = (
+                stim_plan.requested_s
+                if is_memory
+                else choice_plan.requested_s
+            )
+            logger.log_frame_flip(
+                trial_num=trial_num,
+                event=_frame_event_name("stim"),
+                timestamp_perf_ns=stim_timing.actual_perf_ns,
+                requested_timestamp_perf_ns=stim_timing.requested_perf_ns,
+                requested_duration=stim_request,
+            )
+            _show_preview(preview_images)
+            if not is_memory:
+                _build_choice_hit_targets()
+                _start_choice_window(stim_timing)
+            else:
+                next_visual_target_perf_s = transition_scheduler.target_after(
+                    flip_perf,
+                    stim_plan,
+                )
+                if not dots:
+                    for pos in positions:
+                        dot = _make_dot(pos, dot_color)
+                        dots.append(dot)
+                        dot_records.append(
+                            {
+                                "pos": tuple(pos),
+                                "radius": float(dot_size) / 2.0,
+                                "color": tuple(dot_color),
+                            }
+                        )
+                for d in dots:
+                    d.fillColor = rgb255_to_psychopy(dot_color)
+                    d.fillColorSpace = "rgb"
+                for item in dot_records:
+                    item["color"] = tuple(dot_color)
 
     if not click_registered:
+        fixation_positions.clear()
         if not choice_started:
             _prepare_choice_display()
             bg_rect.draw()
@@ -3257,6 +3484,9 @@ def present_trial_with_persistent_dots(
         clear_timing = transition_scheduler.flip_at(win, choice_deadline)
         if clear_timing is None:
             return True, None
+    dots.clear()
+    dot_records.clear()
+    fixation_positions.clear()
     _show_preview([])
     _record_gray_flip(clear_timing)
     if trial_meta is not None:
@@ -3740,13 +3970,13 @@ def present_delayed_afc_trial(
             trial_meta["gray_flip_requested_perf_ns"] = timing.requested_perf_ns
 
     def _abort_from_input(reason: str) -> bool:
-        if event.getKeys(["escape"]):
-            _log_message(msg_logger, "WARN", f"escape_pressed trial_num={trial_num} reason={reason}")
-            return True
         if external_abort_checker is not None:
             if external_abort_checker():
                 _log_message(msg_logger, "WARN", f"external_abort trial_num={trial_num} reason={reason}")
                 return True
+        if event.getKeys(["escape"]):
+            _log_message(msg_logger, "WARN", f"escape_pressed trial_num={trial_num} reason={reason}")
+            return True
         return False
 
     def _draw_fixation_if_requested() -> None:

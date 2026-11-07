@@ -19,6 +19,7 @@ class SettingsPanel:
         self.settings = settings
         self.specs = tuple(settings.specs)
         self.active_spec = None
+        self.focused_index = None
         self.text = ""
         self.error = ""
         self.replace_text = False
@@ -105,19 +106,35 @@ class SettingsPanel:
     def click(self, pos):
         if self.editing:
             return True
-        for spec in self.specs:
+        for index, spec in enumerate(self.specs):
             if self.buttons[spec.name].contains(pos):
-                self.active_spec = spec
-                self.text = str(self.settings.snapshot()[spec.name][1])
-                self.error = ""
-                self.replace_text = True
+                self.focused_index = index
+                self._begin_edit(spec)
                 return True
         return False
 
+    def _begin_edit(self, spec):
+        self.active_spec = spec
+        self.text = str(self.settings.snapshot()[spec.name][1])
+        self.error = ""
+        self.replace_text = True
+
     def handle_keys(self, keys):
-        if not self.editing:
-            return keys
+        unhandled = []
+        editing_this_batch = self.editing
         for key in keys:
+            if not self.editing:
+                if key == "tab" and self.specs:
+                    self.focused_index = (
+                        0 if self.focused_index is None else
+                        (self.focused_index + 1) % len(self.specs)
+                    )
+                elif key in ("return", "enter", "num_enter") and self.focused_index is not None:
+                    self._begin_edit(self.specs[self.focused_index])
+                    editing_this_batch = True
+                else:
+                    unhandled.append(key)
+                continue
             if key == "escape":
                 self.active_spec = None
                 break
@@ -144,7 +161,7 @@ class SettingsPanel:
                     self.error = ""
         # A confirmation/cancellation consumes the whole keyboard batch, so
         # trailing reward/exit/calibration keys cannot escape into task input.
-        return []
+        return [] if editing_this_batch else unhandled
 
     def _visible_input_text(self):
         # Numeric glyphs fit within one font em. Reserve that conservative
@@ -159,13 +176,16 @@ class SettingsPanel:
         if pos is not None and self.button is not None:
             self.button.pos = self.label.pos = pos
         values = self.settings.snapshot()
-        for spec in self.specs:
+        for index, spec in enumerate(self.specs):
             current, requested = values[spec.name]
             suffix = f" {spec.units}" if spec.units else ""
             label = f"{spec.label}: {current:g}{suffix}"
             if current != requested:
                 label += f"\nNext: {requested:g}{suffix}"
             set_preview_text(self.labels[spec.name], label)
+            focused = index == self.focused_index
+            self.buttons[spec.name].lineColor = (0.4, 0.7, 1) if focused else (0.3,) * 3
+            self.buttons[spec.name].lineWidth = 3 if focused else 1
             self.buttons[spec.name].draw()
             self.labels[spec.name].draw()
         if self.editing:

@@ -50,6 +50,7 @@ class ActiveForagingTaskTests(unittest.TestCase):
                 config = dict(cfg)
                 config["screens"] = {"main": 0, "experimenter": 1}
                 config["eye_tracking"] = {"enabled": False}
+                config["wait_for_saccade_on_dot"] = False
                 config.pop("display_margin", None)
                 if configured is not None:
                     config["display_margin"] = configured
@@ -64,6 +65,7 @@ class ActiveForagingTaskTests(unittest.TestCase):
         config = json.loads(config_path.read_text())
         config["screens"] = {"main": 0, "experimenter": 1}
         config["eye_tracking"] = {"enabled": False}
+        config["wait_for_saccade_on_dot"] = False
         config["sync_pin"] = 18
         config["sync_bar"] = {"enabled": True, "height": 24}
         for configured_pin, extra_args, expected_pin in ((18, [], 18), (18, ["--sync_pin", "23"], 23), (None, [], None)):
@@ -75,6 +77,44 @@ class ActiveForagingTaskTests(unittest.TestCase):
                 task.main()
             self.assertEqual(run.call_args.kwargs["sync_pin"], expected_pin)
             self.assertEqual(run.call_args.kwargs["sync_bar"], config["sync_bar"])
+
+    def test_dot_fixation_config_reaches_task(self):
+        task = load_task()
+        config_path = Path(__file__).resolve().parents[1] / "config_files/csc2/yuri_headfix_train_noseq_nomem_20260930.json"
+        config = json.loads(config_path.read_text())
+        config["screens"] = {"main": 0, "experimenter": 1}
+        config.update(wait_for_saccade_on_dot=True, saccade_wait_timeout_s=2.5,
+                      fixation_criteria_s=0.15, fixation_window_radius=75)
+        settings = object()
+        for timeout in (2.5, None):
+            config["saccade_wait_timeout_s"] = timeout
+            with self.subTest(timeout=timeout):
+                with patch.object(sys, "argv", ["active_foraging", "--config", str(config_path)]), patch.object(
+                    task, "load_config", return_value=config,
+                ), patch.object(task, "load_eye_tracking_settings", return_value=settings), patch.object(
+                    task, "run_task", return_value="done",
+                ) as run:
+                    task.main()
+                for key in ("wait_for_saccade_on_dot", "saccade_wait_timeout_s", "fixation_criteria_s", "fixation_window_radius"):
+                    self.assertEqual(run.call_args.kwargs[key], config[key])
+                self.assertIs(run.call_args.kwargs["eye_tracking_config"], settings)
+
+    def test_invalid_dot_fixation_dependencies_fail_before_starting_resources(self):
+        from bin.eye_tracking_config import EyeTrackingSettings
+        for isi, settings, message in ((0.0, EyeTrackingSettings(), "isi"), (0.1, None, "eye_tracking")):
+            with self.subTest(isi=isi, enabled=settings is not None):
+                task = load_task()
+                with patch.object(task, "SessionLogBundle") as logs, self.assertRaisesRegex(ValueError, message):
+                    task.run_task(
+                        colors_tsv="unused", shapes_tsv="unused", n_trials=1, num_afc=1,
+                        duration=0.1, choice_time=1, iti=0.2, isi=isi,
+                        init_dot_color=None, dot_size=10, dot_color=(128, 128, 128),
+                        output_dir="unused", subject="Test", freq_space_tsv={"Test": "unused"},
+                        reward_space_tsv={"Test": "unused"},
+                        wait_for_saccade_on_dot=True, eye_tracking_config=settings,
+                    )
+                logs.assert_not_called()
+                task.utils.setup_task_window.assert_not_called()
 
     def test_all_modes_keep_full_iti_after_fixed_reward_or_replacement_timeout(self):
         for sequential, memory in ((False, False), (False, True), (True, False), (True, True)):
@@ -90,6 +130,10 @@ class ActiveForagingTaskTests(unittest.TestCase):
             with self.subTest(gap=gap), tempfile.TemporaryDirectory() as tmp:
                 self._exercise_task(Path(tmp), False, False, gap=gap, change_pulse=True)
 
+    def test_fixation_timeout_skips_outcome_interval_and_continues_after_full_iti(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._exercise_task(Path(tmp), True, True, saccade_timeout=True)
+
     def test_trials_reuse_safe_arcs_with_rotated_rectangular_images(self):
         for rotation in ("normal", "right", "inverted", "left"):
             with self.subTest(rotation=rotation), tempfile.TemporaryDirectory() as tmp:
@@ -101,7 +145,7 @@ class ActiveForagingTaskTests(unittest.TestCase):
 
     def _exercise_task(self, root, sequential, memory, *, gap=0.1,
                        image_size=(10, 10), output_rotation="normal", placement_options=None,
-                       change_pulse=False):
+                       change_pulse=False, saccade_timeout=False):
         task = load_task()
         control = PumpPulseControl(0.25)
         task.PumpPulseControl = Mock(return_value=control)
@@ -152,6 +196,8 @@ class ActiveForagingTaskTests(unittest.TestCase):
             gray_times.append(clock.ns)
             kwargs["trial_meta"].update(gray_flip_perf_ns=clock.ns,
                                         gray_flip_requested_perf_ns=clock.ns - 100)
+            if saccade_timeout and kwargs["trial_num"] == 5:
+                kwargs["trial_meta"]["saccade_timeout"] = True
             index = choices[kwargs["trial_num"] - 1]
             return False, None if index is None else {"chosen_index": index}
 
@@ -185,7 +231,7 @@ class ActiveForagingTaskTests(unittest.TestCase):
         )
         self.assertEqual(result, "done")
         for trial, duration_ns in enumerate(
-            round(((1.5 if i == 3 else reward_durations[i]) + 0.2) * 1e9) for i in range(5)
+            round(((0 if saccade_timeout and i == 4 else 1.5 if i == 3 else reward_durations[i]) + 0.2) * 1e9) for i in range(5)
         ):
             self.assertEqual(cue_times[trial + 1] - gray_times[trial], duration_ns)
 
@@ -206,6 +252,13 @@ class ActiveForagingTaskTests(unittest.TestCase):
             timeout = trial == 4
             phases = [row for row in events if row["event"] in (
                 "reward_interval", "timeout_interval", "inter_trial_interval")]
+            if saccade_timeout and trial == 5:
+                self.assertEqual([row["event"] for row in phases], ["inter_trial_interval"])
+                self.assertEqual(float(phases[0]["requested_duration"]), 0.2)
+                cue_event = next(row for row in events if row["event"] == "onset_cue_on")
+                self.assertEqual(int(phases[0]["task_time_ns"]) - int(cue_event["task_time_ns"]), 50_000_000)
+                self.assertFalse(any(row["event"] in ("pump_on", "buzzer_on") for row in events))
+                continue
             self.assertEqual([row["event"] for row in phases],
                              ["timeout_interval" if timeout else "reward_interval", "inter_trial_interval"])
             self.assertEqual([row["event_code"] for row in phases], ["4" if timeout else "3", "5"])

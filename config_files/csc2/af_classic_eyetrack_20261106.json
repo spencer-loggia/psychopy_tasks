@@ -79,7 +79,7 @@
   "saccade_wait_timeout_s": 4.0,
   
   "iti": 0.2,
-  "duration": 0.25,
+  "duration": 0.0,
   "num_afc": 3,
   "choice_time": 2.0,
   "isi": 0.1,

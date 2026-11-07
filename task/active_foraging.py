@@ -49,6 +49,7 @@ from bin.affinity import (
 from bin.daqc2_outputs import DAQC2DigitalOutputs
 from bin.afc_geometry import (
     prepare_afc_placement,
+    stimulus_size,
     subject_centered_to_screen_px,
 )
 from bin.afc_stimuli import render_afc_stimulus

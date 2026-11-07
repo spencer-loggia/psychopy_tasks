@@ -27,6 +27,7 @@ def load_task():
     utils = types.ModuleType("bin.utils")
     for name in ("set_debug", "load_color_palette", "load_shape_definitions",
                  "split_background_from_palette", "setup_task_window", "close_task_window",
+                 "verify_task_window_vblank",
                  "resolve_frame_rate", "make_fixation_cross", "make_bg_rect",
                  "configure_sync_bar", "service_sync_bar",
                  "make_initiation_cue_stims", "TrialBufferManager",
@@ -136,6 +137,15 @@ class ActiveForagingTaskTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self._exercise_task(Path(tmp), True, True, saccade_timeout=True)
 
+    def test_nonmemory_choices_show_correctly_sized_experimenter_feedback(self):
+        for size, rotation in (((150, 150), "normal"), ((80, 20), "right")):
+            with self.subTest(size=size, rotation=rotation), tempfile.TemporaryDirectory() as tmp:
+                self._exercise_task(
+                    Path(tmp), False, False, image_size=size, output_rotation=rotation,
+                    with_preview=True, change_fixation=True,
+                    placement_options=dict(fixed_positions=True, stim_range_radius=200),
+                )
+
     def test_live_fixation_radius_applies_next_trial_and_is_logged_in_pixels(self):
         for sequential, memory in ((True, True), (False, False)):
             with self.subTest(sequential=sequential), tempfile.TemporaryDirectory() as tmp:
@@ -152,7 +162,8 @@ class ActiveForagingTaskTests(unittest.TestCase):
 
     def _exercise_task(self, root, sequential, memory, *, gap=0.1,
                        image_size=(10, 10), output_rotation="normal", placement_options=None,
-                       change_pulse=False, saccade_timeout=False, change_fixation=False):
+                       change_pulse=False, saccade_timeout=False, change_fixation=False,
+                       with_preview=False):
         task = load_task()
         control = PumpPulseControl(0.25, fixation_window_radius=150 if change_fixation else None)
         task.PumpPulseControl = Mock(return_value=control)
@@ -165,9 +176,15 @@ class ActiveForagingTaskTests(unittest.TestCase):
         utils = task.utils
         utils.split_background_from_palette.return_value = (128, 128, 128), {1: (255, 0, 0)}
         utils.load_shape_definitions.return_value = {i: Path("shape.svg") for i in range(4)}
+        preview = Mock()
+        preview.poll.return_value = False
+        preview.consume_manual_reward_request.return_value = False
+        task.ExperimenterPreview = Mock(return_value=preview)
         utils.setup_task_window.return_value = (
-            Mock(size=(800, 600)), ScreenGeometry(0, 0, 0, 800, 600, rotation=output_rotation), None,
+            Mock(size=(800, 600)), ScreenGeometry(0, 0, 0, 800, 600, rotation=output_rotation),
+            ScreenGeometry(1, 800, 0, 800, 600) if with_preview else None,
         )
+        utils.make_fixation_cross.return_value = None
         utils.resolve_frame_rate.return_value = 60.0, 1 / 60.0
         utils.make_initiation_cue_stims.return_value = Mock(), Mock()
         image = np.zeros((image_size[1], image_size[0], 3), dtype=np.uint8)
@@ -264,6 +281,18 @@ class ActiveForagingTaskTests(unittest.TestCase):
             placement_options.get("initiation_cue_center_position", (0, 0)),
         )
         self.assertEqual(result, "done")
+        if with_preview:
+            task.ExperimenterPreview.assert_called_once()
+            feedback_scenes = [call.kwargs for call in preview.show_static_scene.call_args_list
+                               if call.kwargs["images"]]
+            self.assertEqual(len(feedback_scenes), sum(choice is not None for choice in choices))
+            for scene in feedback_scenes:
+                self.assertEqual(len(scene["images"]), 4)
+                for item in scene["images"]:
+                    self.assertEqual(item["size"], list(image_size))
+                    self.assertEqual(item["ori"], software_stimulus_rotation(output_rotation))
+                self.assertEqual(scene["highlight_box"]["size"], [dimension * 1.2 for dimension in image_size])
+            preview.close.assert_called_once()
         for trial, duration_ns in enumerate(
             round(((0 if saccade_timeout and i == 4 else 1.5 if i == 3 else reward_durations[i]) + 0.2) * 1e9) for i in range(5)
         ):

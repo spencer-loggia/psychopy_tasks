@@ -16,6 +16,7 @@ from bin.screen import (
     ScreenGeometry,
     _bind_linux_pyglet_display,
     _get_latest_preview_command,
+    _get_preview_command,
     _parse_xrandr_query,
     _parse_xrandr_primary_output,
     _wait_for_preview_startup,
@@ -597,6 +598,47 @@ class ScreenConfigTests(unittest.TestCase):
                 coalesce_s=0.1,
             )
             self.assertEqual(newest["type"], "latest")
+        finally:
+            preview._sender_stop.set()
+            sender.join(timeout=0.2)
+
+    def test_preview_wait_wakes_on_scene_arrival_before_idle_refresh(self):
+        waiting = threading.Event()
+
+        class Commands(queue.Queue):
+            def get(self, *args, **kwargs):
+                waiting.set()
+                return super().get(*args, **kwargs)
+
+        commands = Commands()
+        received = []
+        receiver = threading.Thread(target=lambda: received.append(
+            _get_preview_command(commands, wait_s=5.0, preserve_order=True)
+        ), daemon=True)
+        receiver.start()
+        self.assertTrue(waiting.wait(timeout=1.0))
+        commands.put({"type": "static_scene", "images": ["revealed"]})
+        receiver.join(timeout=1.0)
+        self.assertFalse(receiver.is_alive(), "Scene arrival did not wake the preview")
+        self.assertEqual(received[0]["images"], ["revealed"])
+
+    def test_ordered_preview_sender_preserves_short_reveal_then_hide(self):
+        preview = object.__new__(ExperimenterPreview)
+        preview._queue = queue.Queue(maxsize=1)
+        preview._queue.put_nowait({"type": "already_in_flight"})
+        preview._outbox = queue.Queue()
+        preview._preserve_scene_transitions = True
+        preview._sender_stop = threading.Event()
+        preview.poll = lambda: False
+        sender = threading.Thread(target=preview._command_sender_loop)
+        sender.start()
+        try:
+            for scene in ("reveal", "hide", "clear"):
+                preview._send({"type": scene})
+            received = [_get_preview_command(preview._queue, wait_s=1.0, preserve_order=True)
+                        for _ in range(4)]
+            self.assertEqual([scene["type"] for scene in received],
+                             ["already_in_flight", "reveal", "hide", "clear"])
         finally:
             preview._sender_stop.set()
             sender.join(timeout=0.2)

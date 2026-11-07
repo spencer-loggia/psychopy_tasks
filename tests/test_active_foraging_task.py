@@ -283,6 +283,7 @@ class ActiveForagingTaskTests(unittest.TestCase):
         self.assertEqual(result, "done")
         if with_preview:
             task.ExperimenterPreview.assert_called_once()
+            self.assertEqual(task.ExperimenterPreview.call_args.kwargs["preserve_scene_transitions"], change_fixation)
             feedback_scenes = [call.kwargs for call in preview.show_static_scene.call_args_list
                                if call.kwargs["images"]]
             self.assertEqual(len(feedback_scenes), sum(choice is not None for choice in choices))

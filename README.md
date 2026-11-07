@@ -831,9 +831,11 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
 - The preview is a subject-view mirror: it transposes the complete native main
   framebuffer geometry (background, positions, stimuli, hit boxes, and video
   crop), rather than merely undoing each stimulus orientation. Scene commands
-  use a bounded, sequenced latest-snapshot mailbox, and shared video reads the
-  newest committed ring frame, so a slow preview drops stale work instead of
-  accumulating lag.
+  wake the preview immediately instead of waiting for the periodic overlay refresh.
+  Ordinary previews use a bounded, sequenced latest-snapshot mailbox, and shared
+  video reads the newest committed ring frame. Gaze-gated active foraging retains
+  scene transitions in order so each brief reveal gets a preview flip before its hide;
+  the background sender keeps this transport off the subject's presentation thread.
 - During movie playback the experimenter overlay shows a separate `Video:`
   elapsed timer. Its zero is the actual main-display first-frame flip callback,
   independent of decoder preparation time and preview transport latency.
@@ -1271,6 +1273,8 @@ fixation criterion requires a continuous interval of valid gaze inside that circ
 The existing sample-based fixation detector runs with eye acquisition; the presentation
 thread only reads its result. Missing, stale, and invalid samples cannot earn fixation.
 Light grey window outlines appear only in the experimenter preview.
+Stimulus reveals and hides wake that preview immediately and appear on successive
+preview flips, rather than being replaced between its periodic 100 ms updates.
 When fixation gating is enabled, the experimenter screen also has a **Fix radius**
 button. Click it, or focus it with Tab and press Enter, to edit
 `fixation_window_radius` in pixels. Confirmed edits take effect at the next trial

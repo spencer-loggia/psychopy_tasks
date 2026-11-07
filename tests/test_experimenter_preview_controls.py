@@ -6,43 +6,58 @@ import types
 import unittest
 from unittest.mock import Mock, patch
 
-from bin.screen import ScreenGeometry, _experimenter_preview_process
+import numpy as np
+
+from bin.screen import ScreenGeometry, _experimenter_preview_process, serialize_preview_image
 from tests.test_eye_calibration_preview import Stimulus, TextStim
 from tests.test_live_settings_ui import SettingsModel
 
 
 class ExperimenterPreviewControlsTests(unittest.TestCase):
-    def render(self, *, sync_enabled, settings=None, key_batches=()):
+    def render(self, *, sync_enabled, settings=None, key_batches=(), scenes=None,
+               preserve_scene_transitions=False, render_cycles=1):
         primitives, drawn = [], []
+        pending_images, self.frames = [], []
 
         def factory(kind, cls=Stimulus):
             def build(win, **kwargs):
                 stim = cls(win, **kwargs)
                 primitives.append((kind, stim))
-                stim.draw = lambda: drawn.append((kind, getattr(stim, "text", None)))
+                def draw():
+                    drawn.append((kind, getattr(stim, "text", None)))
+                    if kind == "image":
+                        pending_images.append(tuple(stim.pos))
+                stim.draw = draw
                 return stim
             return build
 
         visual = types.SimpleNamespace(
             Rect=factory("rect"), Circle=factory("circle"),
             TextStim=factory("text", TextStim),
+            ImageStim=factory("image"),
         )
         mouse = Mock()
         mouse.getPressed.return_value = (False, False, False)
         psychopy = types.ModuleType("psychopy")
         psychopy.visual = visual
         psychopy.event = types.SimpleNamespace(getKeys=lambda: [], Mouse=lambda **kwargs: mouse)
-        psychopy.core = types.SimpleNamespace(wait=lambda duration: None)
+        self.wait = Mock()
+        psychopy.core = types.SimpleNamespace(wait=self.wait)
         sync = [20 if sync_enabled else 0, 800, 600, 0]
         win = Mock()
-        win.flip.side_effect = lambda: sync.__setitem__(3, 1)
+        def flip():
+            self.frames.append(tuple(pending_images))
+            pending_images.clear()
+            sync[3] = 1
+        win.flip.side_effect = flip
         commands = queue.Queue()
-        commands.put({
+        for scene in scenes if scenes is not None else [{
             "type": "static_scene", "main_size": (600, 800), "main_rotation_deg": 90,
             "circles": [{"pos": (60, 80), "radius": 20, "color": (200, 200, 200)}],
-        })
+        }]:
+            commands.put(scene)
         stop = Mock()
-        stop.is_set.side_effect = [False, True]
+        stop.is_set.side_effect = [False] * render_cycles + [True]
         startup = Mock()
         settings_keys = queue.Queue()
         for index, batch in enumerate(key_batches, start=1):
@@ -58,10 +73,21 @@ class ExperimenterPreviewControlsTests(unittest.TestCase):
                 None, None, None, None, None, types.SimpleNamespace(value=float("nan")),
                 stop, startup, sync_bar_shared=sync, live_settings=settings,
                 settings_keys_queue=settings_keys, settings_keyboard_state=self.keyboard_state,
+                preserve_scene_transitions=preserve_scene_transitions,
             )
         self.assertTrue(startup.send.call_args.args[0]["ok"])
-        self.assertEqual(win.flip.call_count, 2)
+        self.assertEqual(win.flip.call_count, render_cycles + 1)
         return primitives, drawn
+
+    def test_short_reveal_is_drawn_on_next_flip_before_queued_hide(self):
+        payload = serialize_preview_image(np.zeros((4, 4, 3), dtype=np.uint8))
+        self.render(sync_enabled=False, preserve_scene_transitions=True, render_cycles=2, scenes=[
+            {"type": "static_scene", "main_size": (800, 600),
+             "images": [{"image_payload": payload, "pos": (100, 20), "size": (40, 40)}]},
+            {"type": "static_scene", "main_size": (800, 600), "images": []},
+        ])
+        self.assertEqual(self.frames, [(), ((100, 20),), ()])
+        self.wait.assert_not_called()
 
     def test_sync_uses_phase_text_without_adding_bar_rectangles(self):
         enabled, drawn = self.render(sync_enabled=True)

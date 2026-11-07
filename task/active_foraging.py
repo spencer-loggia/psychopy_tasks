@@ -658,6 +658,7 @@ def run_task(
             total_trials=n_trials,
             start_perf_s=time.perf_counter(),
             update_interval_s=0.1,
+            preserve_scene_transitions=wait_for_saccade_on_dot,
             mouse_visible=experimenter_mouse_visible,
         )
         utils.verify_task_window_vblank(win)

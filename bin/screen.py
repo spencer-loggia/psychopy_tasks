@@ -1770,6 +1770,20 @@ def _wait_for_preview_startup(startup_receiver, process, timeout_s: float):
     return None, None
 
 
+def _get_preview_command(command_queue, *, wait_s=0.0, preserve_order=False):
+    """Wake on a new scene; the timeout only controls periodic idle redraws."""
+    try:
+        first = command_queue.get(timeout=max(0.0, float(wait_s)))
+    except (queue.Empty, OSError, ValueError):
+        return None
+    if preserve_order:
+        return first
+    latest = _get_latest_preview_command(command_queue, coalesce_s=0.0)
+    if latest is not None and int(latest.get("_preview_sequence", 0)) >= int(first.get("_preview_sequence", 0)):
+        return latest
+    return first
+
+
 def _experimenter_preview_process(
     screen_info: ScreenGeometry,
     task_label: str,
@@ -1795,6 +1809,7 @@ def _experimenter_preview_process(
     sync_bar_shared=None,
     settings_keys_queue=None,
     settings_keyboard_state=None,
+    preserve_scene_transitions=False,
 ) -> None:
     startup_reported = False
 
@@ -2255,7 +2270,7 @@ def _experimenter_preview_process(
             }
         )
         raise
-    # The preview is diagnostic and updates at a low fixed rate. Never let its
+    # Scene updates wake the preview immediately. Never let its
     # separate drawable wait on a second output's vertical blank and contend
     # with the timing-critical subject window.
     configure_window_vsync(win, False)
@@ -2528,7 +2543,11 @@ def _experimenter_preview_process(
                 set_window_mouse_visible(win, bool(mouse_visible))
                 last_cursor_apply_s = time.perf_counter()
 
-            latest_payload = _get_latest_preview_command(command_queue)
+            latest_payload = _get_preview_command(
+                command_queue,
+                wait_s=0.0 if shared_movie_active else max(0.02, update_interval_ms / 1000.0),
+                preserve_order=preserve_scene_transitions,
+            )
             for payload in (() if latest_payload is None else (latest_payload,)):
                 try:
                     command_type = str(payload.get("type", "")).strip().lower()
@@ -2800,7 +2819,6 @@ def _experimenter_preview_process(
                         "total_trials": current_total_trials,
                     }
                 )
-            core.wait(max(0.02, float(update_interval_ms) / 1000.0))
     except Exception as exc:
         _report_startup(
             {
@@ -2840,6 +2858,7 @@ class ExperimenterPreview:
         eye_tracking_shared=None,
         pump_control=None,
         live_settings=None,
+        preserve_scene_transitions: bool = False,
     ):
         self.screen_info = screen_info
         self.task_label = task_label
@@ -2851,6 +2870,7 @@ class ExperimenterPreview:
         self.update_interval_s = max(0.05, float(update_interval_s))
         self.exit_requested = False
         self._closed = False
+        self._preserve_scene_transitions = bool(preserve_scene_transitions)
         self._live_settings = (
             live_settings if live_settings is not None else
             pump_control.settings if pump_control is not None else None
@@ -2869,12 +2889,11 @@ class ExperimenterPreview:
         self._settings_keyboard_state = self._ctx.Array("q", [0, 0], lock=False)
         self._settings_keyboard_sequence = 0
         self._settings_pending_edit = False
-        # The process queue and local outbox are both single-slot. A sender
-        # thread absorbs multiprocessing's feeder-thread handoff without ever
-        # blocking the timing-critical task thread; newer snapshots replace a
-        # pending one while the preview is behind.
+        # The sender isolates process-queue backpressure from task timing.
+        # Gaze-gated trials retain ordered scene transitions so a short reveal
+        # gets a preview flip before its hide; other previews keep latest state.
         self._queue = self._ctx.Queue(maxsize=1)
-        self._outbox: queue.Queue = queue.Queue(maxsize=1)
+        self._outbox: queue.Queue = queue.Queue(maxsize=0 if self._preserve_scene_transitions else 1)
         self._sender_stop = threading.Event()
         self._sender_thread = None
         self._reward_event = self._ctx.Event()
@@ -2930,6 +2949,7 @@ class ExperimenterPreview:
                 self._sync_bar_shared,
                 self._settings_keys_queue,
                 self._settings_keyboard_state,
+                self._preserve_scene_transitions,
             ),
             daemon=True,
         )
@@ -3156,10 +3176,9 @@ class ExperimenterPreview:
                 except queue.Empty:
                     continue
 
-            # If the process queue is still occupied, continually replace the
-            # pending value with the newest local snapshot. The main task never
-            # waits for this transport thread.
-            while True:
+            # Ordinary previews replace stale snapshots; gaze-gated previews
+            # retain each transition. The task never waits for this sender.
+            while not getattr(self, "_preserve_scene_transitions", False):
                 try:
                     pending = self._outbox.get_nowait()
                 except queue.Empty:

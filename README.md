@@ -19,6 +19,7 @@ The experimenter preview offers compact numeric controls shared by all reward ta
 | Fix interval | Eye calibration and video with eye tracking/reward enabled | Fixation reward interval in seconds |
 | Reward interval | Video with reward output but no eye tracking | Seconds between reward onsets |
 | Fix radius | Eye calibration | Radius as a fraction of the shorter subject-scene dimension |
+| Fix radius | Active foraging with fixation gating | `fixation_window_radius` in subject-display pixels; applies next trial |
 
 Click a control to edit; typing replaces the value, Enter confirms, and Esc cancels
 without exiting the task. Invalid values leave the editor open with an explanation.
@@ -1270,6 +1271,11 @@ fixation criterion requires a continuous interval of valid gaze inside that circ
 The existing sample-based fixation detector runs with eye acquisition; the presentation
 thread only reads its result. Missing, stale, and invalid samples cannot earn fixation.
 Light grey window outlines appear only in the experimenter preview.
+When fixation gating is enabled, the experimenter screen also has a **Fix radius**
+button. Click it, or focus it with Tab and press Enter, to edit
+`fixation_window_radius` in pixels. Confirmed edits take effect at the next trial
+for both gaze detection and the grey outlines. The existing `live_setting` message
+logs record the initial value, confirmations, and applied changes.
 
 In sequential mode, every dot remains visible for at least the configured ISI and until
 its fixation is accepted. The stimulus then follows the normal duration and memory rules.

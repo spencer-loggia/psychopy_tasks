@@ -393,7 +393,10 @@ def run_task(
     if seed is not None:
         random.seed(seed)
 
-    pump_control = PumpPulseControl(pump_pulse_time_seconds)
+    pump_control = PumpPulseControl(
+        pump_pulse_time_seconds,
+        fixation_window_radius=fixation_window_radius if wait_for_saccade_on_dot else None,
+    )
     inter_pump_interval_seconds = float(
         pump_pulse_time_seconds if inter_pump_interval is None else inter_pump_interval
     )
@@ -1065,7 +1068,12 @@ def run_task(
 
         trial_num = 1
         while True:
-            pump_pulse_time_seconds = pump_control.apply_pending(msg_logger)
+            settings = pump_control.settings.apply_pending(msg_logger)
+            pump_pulse_time_seconds = settings["pump_pulse_time"]
+            if dot_fixation_gate is not None:
+                # The gate is stopped between trials. Its next start creates
+                # fresh histories; detection and preview use this same radius.
+                dot_fixation_gate.fixation_window_radius = settings["fixation_window_radius"]
             if inter_pump_interval is None:
                 inter_pump_interval_seconds = pump_pulse_time_seconds
             reward_interval_s = reward_interval_duration(

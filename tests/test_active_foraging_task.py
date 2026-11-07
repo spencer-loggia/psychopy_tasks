@@ -14,6 +14,8 @@ import bin
 import numpy as np
 from bin.screen import ScreenGeometry, oriented_size, rotate_centered_point, software_stimulus_rotation
 from bin.pump_control import PumpPulseControl
+from bin.eye_tracking import EyeCalibration, EyeTrackerState
+from bin.eye_tracking_config import EyeTrackingSettings
 from tests.test_active_foraging_timing import FakeClock
 
 
@@ -134,6 +136,11 @@ class ActiveForagingTaskTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self._exercise_task(Path(tmp), True, True, saccade_timeout=True)
 
+    def test_live_fixation_radius_applies_next_trial_and_is_logged_in_pixels(self):
+        for sequential, memory in ((True, True), (False, False)):
+            with self.subTest(sequential=sequential), tempfile.TemporaryDirectory() as tmp:
+                self._exercise_task(Path(tmp), sequential, memory, change_fixation=True)
+
     def test_trials_reuse_safe_arcs_with_rotated_rectangular_images(self):
         for rotation in ("normal", "right", "inverted", "left"):
             with self.subTest(rotation=rotation), tempfile.TemporaryDirectory() as tmp:
@@ -145,9 +152,9 @@ class ActiveForagingTaskTests(unittest.TestCase):
 
     def _exercise_task(self, root, sequential, memory, *, gap=0.1,
                        image_size=(10, 10), output_rotation="normal", placement_options=None,
-                       change_pulse=False, saccade_timeout=False):
+                       change_pulse=False, saccade_timeout=False, change_fixation=False):
         task = load_task()
-        control = PumpPulseControl(0.25)
+        control = PumpPulseControl(0.25, fixation_window_radius=150 if change_fixation else None)
         task.PumpPulseControl = Mock(return_value=control)
         widths = [0.25] * 6
         if change_pulse:
@@ -178,6 +185,23 @@ class ActiveForagingTaskTests(unittest.TestCase):
             self.assertEqual(utils.service_sync_bar.call_count, sync_calls)
             if change_pulse and kwargs["trial_num"] == 2:
                 control.request(0.4)
+            if change_fixation:
+                gate = kwargs["dot_fixation_gate"]
+                if kwargs["trial_num"] == 2:
+                    control.settings.request("fixation_window_radius", 225)
+                radius = 150 if kwargs["trial_num"] <= 2 else 225
+                self.assertEqual(gate.fixation_window_radius, radius)
+                # A gaze 200 pixels from the target changes from outside to
+                # inside only on the trial after the edit is confirmed.
+                onset = clock.seconds()
+                gate.start([(0, 0)], native_size=(800, 600), rotation_degrees=0, onset_perf_s=onset)
+                for index in range(12):
+                    gate.observe(EyeTrackerState(
+                        timestamp_perf_s=onset + index * 0.01, frame_sequence=index,
+                        valid=True, x_smooth_px=0.25, y_smooth_px=0,
+                    ))
+                self.assertEqual(gate.status(now_s=onset + 0.11), None if radius == 150 else 1)
+                gate.stop()
             self.assertEqual(kwargs["sequential"], sequential)
             self.assertEqual(kwargs["is_memory"], memory)
             margin = placement_options.get("display_margin", 0)
@@ -209,7 +233,9 @@ class ActiveForagingTaskTests(unittest.TestCase):
             "time.perf_counter", side_effect=clock.seconds,
         ), patch("time.perf_counter_ns", side_effect=lambda: clock.ns), patch(
             "time.sleep", side_effect=clock.sleep,
-        ), patch.object(task, "prepare_afc_placement", wraps=task.prepare_afc_placement) as prepare:
+        ), patch.object(task, "prepare_afc_placement", wraps=task.prepare_afc_placement) as prepare, patch(
+            "bin.task_eye_tracking.TaskEyeTrackingSession",
+        ):
             result = task.run_task(
                 colors_tsv="colors.tsv", shapes_tsv="shapes.tsv", n_trials=len(choices), num_afc=4,
                 duration=0.1 if sequential or memory else 0, choice_time=1, isi=0.1, iti=0.2,
@@ -221,8 +247,16 @@ class ActiveForagingTaskTests(unittest.TestCase):
                 timeout_duration_seconds=1.5,
                 reward_to_pulse_map={"0": 0, "1": 0, "2": 1, "3": 2},
                 reward_to_timeout_map={"0": 1, "1": 0, "2": 0, "3": 0},
+                wait_for_saccade_on_dot=change_fixation,
+                eye_tracking_config=(
+                    EyeTrackingSettings(calibration=EyeCalibration(x_scale=1, y_scale=1))
+                    if change_fixation else None
+                ),
                 **placement_options,
             )
+        task.PumpPulseControl.assert_called_once_with(
+            0.25, fixation_window_radius=150 if change_fixation else None,
+        )
         prepare.assert_called_once()
         cue_pos = utils.make_initiation_cue_stims.call_args.kwargs["position"]
         self.assertEqual(
@@ -236,6 +270,19 @@ class ActiveForagingTaskTests(unittest.TestCase):
             self.assertEqual(cue_times[trial + 1] - gray_times[trial], duration_ns)
 
         event_path = next((root / "logs").rglob("event_log.tsv"))
+        if change_fixation:
+            with (event_path.parent / "message_log.tsv").open() as handle:
+                edits = [dict(json.loads(row["message"].removeprefix("live_setting ")),
+                              task_time_ns=int(row["task_time_ns"]))
+                         for row in csv.DictReader(handle, delimiter="\t")
+                         if row["message"].startswith("live_setting ")]
+            radius_edits = [item for item in edits if item["name"] == "fixation_window_radius"]
+            self.assertCountEqual([item["phase"] for item in radius_edits], ["initial", "confirmed", "applied"])
+            by_phase = {item["phase"]: item for item in radius_edits}
+            self.assertEqual([by_phase[phase]["new_value"] for phase in ("initial", "confirmed", "applied")],
+                             [150, 225, 225])
+            self.assertLess(by_phase["confirmed"]["task_time_ns"], by_phase["applied"]["task_time_ns"])
+            self.assertTrue(all(item["units"] == "px" for item in radius_edits))
         with event_path.open() as handle:
             rows = list(csv.DictReader(handle, delimiter="\t"))
         with (event_path.parent / "behavior_log.tsv").open() as handle:

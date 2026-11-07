@@ -5,10 +5,12 @@ from .live_settings_ui import SettingsPanel
 
 class PumpPulseControl:
     def __init__(self, duration_s, *, allow_zero=True, maximum_s=None, boundary="trial",
-                 reward_interval=None, fixation_radius=None, interval_label="Reward interval"):
+                 reward_interval=None, fixation_radius=None, fixation_window_radius=None,
+                 interval_label="Reward interval"):
         self.settings = reward_settings(
             duration_s, allow_zero=allow_zero, maximum_s=maximum_s, boundary=boundary,
             reward_interval=reward_interval, fixation_radius=fixation_radius, interval_label=interval_label,
+            fixation_window_radius=fixation_window_radius,
         )
 
     def request(self, value):

@@ -195,7 +195,8 @@ class LiveSettings:
 
 
 def reward_settings(pulse_s, *, allow_zero=True, maximum_s=None, reward_interval=None,
-                    fixation_radius=None, boundary="trial", interval_label="Reward interval"):
+                    fixation_radius=None, fixation_window_radius=None, boundary="trial",
+                    interval_label="Reward interval"):
     """Common reward specs; other tasks can construct LiveSettings directly."""
     specs = [SettingSpec("pump_pulse_time", "Pump", "Pump pulse duration (seconds)", "s",
                          allow_minimum=allow_zero,
@@ -211,4 +212,8 @@ def reward_settings(pulse_s, *, allow_zero=True, maximum_s=None, reward_interval
         specs.append(SettingSpec("fixation_radius", "Fix radius", "Fixation radius (screen fraction)",
                                  "frac", allow_minimum=False))
         initial["fixation_radius"] = fixation_radius
+    if fixation_window_radius is not None:
+        specs.append(SettingSpec("fixation_window_radius", "Fix radius", "Fixation window radius (pixels)",
+                                 "px", allow_minimum=False))
+        initial["fixation_window_radius"] = fixation_window_radius
     return LiveSettings(specs, initial, boundary=boundary, less_than=relations)

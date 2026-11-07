@@ -33,6 +33,33 @@ class PumpControlTests(unittest.TestCase):
         editor.draw((100, 100))
         self.assertEqual(editor.label.text, "Pump: 0.375 s")
 
+    def test_fixation_pixel_radius_uses_shared_button_and_keyboard_editor(self):
+        control = PumpPulseControl(0.25, fixation_window_radius=150)
+        self.addCleanup(control.settings.close, Mock())
+        editor = PumpPulseEditor(
+            Mock(), control, visual=types.SimpleNamespace(Rect=Stimulus, TextStim=TextStim),
+        )
+        editor.layout_strip((800, 600))
+        editor.draw()
+        self.assertEqual(editor.labels["fixation_window_radius"].text, "Fix radius: 150 px")
+        editor.handle_keys(["tab", "tab", "enter", "2", "2", "5", "enter"])
+        self.assertEqual(control.settings.snapshot()["fixation_window_radius"], (150, 225))
+        editor.draw()
+        self.assertIn("Next: 225 px", editor.labels["fixation_window_radius"].text)
+        control.apply_pending()
+        editor.draw()
+        self.assertEqual(editor.labels["fixation_window_radius"].text, "Fix radius: 225 px")
+        self.assertTrue(editor.click(editor.buttons["fixation_window_radius"].pos))
+        editor.handle_keys(["0", "enter"])
+        self.assertTrue(editor.editing)
+        self.assertTrue(editor.error)
+        self.assertEqual(control.settings.snapshot()["fixation_window_radius"], (225, 225))
+        editor.handle_keys(["escape"])
+        self.assertEqual(control.snapshot(), (0.25, 0.25))
+        for invalid in (-1, float("nan"), float("inf")):
+            with self.subTest(value=invalid), self.assertRaises(ValueError):
+                control.settings.request("fixation_window_radius", invalid)
+
     def test_escape_cancels_edit_without_exiting_or_changing_pending_value(self):
         control, editor = self.editor()
         control.request(0.3)

@@ -63,9 +63,9 @@
             }
         },
         "CSC2": {
-            "classic": {
+            "classic_eyetrack": {
                 "launch": "task/active_foraging.py",
-                "config": "config_files/csc2/yuri_rigtrain_noseq_nomem_20260615.json"
+                "config": "config_files/csc2/af_classic_eyetrack_20261106.json"
             }, 
             "seq_mem": {
                 "launch": "task/active_foraging.py",

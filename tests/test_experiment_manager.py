@@ -51,6 +51,79 @@ class FakeClock:
 
 
 class ExperimentManagerTests(unittest.TestCase):
+    def test_saved_configs_prune_inactive_settings_after_runtime_overrides(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            launch_config, launch_path = self._project(root)
+            (root / "task" / "active_foraging.py").write_text("# task\n", encoding="utf-8")
+            launch_config.update({
+                "record_experiment_video": False,
+                "video_config": {"fps": 24},
+                "sync_bar": {"enabled": False, "height": 40},
+                "eye_tracker_experiment": {"enabled": False, "uart": {"device": "/unused"}},
+            })
+            launch_config["initial_state"].update({
+                "self_initiation": False, "wait_for_saccade_on_dot": False,
+            })
+            launch_path.write_text(json.dumps(launch_config), encoding="utf-8")
+            source = root / "configs" / "demo.json"
+            task_config = {
+                "config_name": "csc2_foraging_classic",
+                "placement_distribution": "uniform", "center_point": [300, -480],
+                "stim_range_radius": 700, "fixed_positions": True, "display_margin": 300,
+                "self_initiation": True, "initiation_cue_style": "checker",
+                "initiation_cue_center_position": [300, -480],
+                "hold_before_choice": False, "hold_cue_to_init_time_s": .25,
+                "wait_for_saccade_on_dot": True, "fixation_criteria_s": .2,
+                "fixation_window_radius": 175, "saccade_wait_timeout_s": 4,
+                "sequential": False, "is_memory": False, "duration": 0,
+                "eye_tracking": {"enabled": False, "uart": {"device": "/unused"}},
+                "sync_bar": {"enabled": True, "height": 20}, "sync_pin": 18,
+                "win_size": [800, 600], "raspi": False, "pump_pin": 0,
+                "pump_pulse_time_seconds": .25,
+                "freq_space_tsv": {"Subject One": "selected.csv", "Other": "other.csv"},
+                "reward_space_tsv": {"Subject One": "reward.csv", "Other": "other_reward.csv"},
+            }
+            source.write_text(json.dumps(task_config), encoding="utf-8")
+            manager = ExperimentManager(
+                working_dir=root, launch_config_path=launch_path, launch_config=launch_config,
+                subject_name="Subject One", subject_code="S1",
+            )
+            try:
+                block = manager.prepare_block(
+                    task_name="Custom menu label", launch_value="task/active_foraging.py",
+                    config_value="configs/demo.json",
+                )
+                saved = json.loads(block.config_path.read_text(encoding="utf-8"))
+                for key in (
+                    "center_point", "stim_range_radius", "fixed_positions", "duration",
+                    "initiation_cue_style", "initiation_cue_center_position", "hold_before_choice",
+                    "hold_cue_to_init_time_s", "fixation_criteria_s", "fixation_window_radius",
+                    "saccade_wait_timeout_s", "sync_pin", "win_size", "pump_pin", "x_scale",
+                ):
+                    self.assertNotIn(key, saved)
+                self.assertEqual(saved["placement_distribution"], "uniform")
+                self.assertEqual(saved["display_margin"], 300)
+                self.assertEqual(saved["pump_pulse_time_seconds"], .25)
+                self.assertEqual(saved["eye_tracking"], {"enabled": False})
+                self.assertEqual(saved["sync_bar"], {"enabled": False})
+                self.assertFalse(saved["self_initiation"])
+                self.assertFalse(saved["wait_for_saccade_on_dot"])
+                self.assertEqual(saved["freq_space_tsv"], {"Subject One": "selected.csv"})
+                self.assertEqual(saved["reward_space_tsv"], {"Subject One": "reward.csv"})
+                self.assertEqual(saved["block_id"], block.block_id)
+                self.assertEqual(saved["output_dir"], str(block.output_dir))
+                saved_launch = json.loads((manager.experiment_dir / "launch_config.json").read_text())
+                self.assertNotIn("video_config", saved_launch)
+                self.assertEqual(saved_launch["sync_bar"], {"enabled": False})
+                self.assertEqual(saved_launch["eye_tracker_experiment"], {"enabled": False})
+                self.assertEqual(saved_launch["tasks"], launch_config["tasks"])
+                self.assertEqual(saved_launch["initial_state"], launch_config["initial_state"])
+                self.assertEqual(json.loads(source.read_text()), task_config)
+                self.assertEqual(json.loads(launch_path.read_text()), launch_config)
+            finally:
+                manager.finish()
+
     def test_experiment_sync_override_is_resolved_and_saved_in_every_block(self):
         block_sync = {"enabled": True, "height": 44,
                       "interval_mean_seconds": 3.0, "interval_variance_seconds": 0.8}

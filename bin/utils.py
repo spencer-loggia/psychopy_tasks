@@ -2085,6 +2085,16 @@ def present_trial_with_persistent_dots(
     # stims to potentially keep visible during the choice period when is_memory is False
     stims_for_choice: List[visual.ImageStim] = []
     stims_for_choice_preview: List[Dict[str, Any]] = []
+    # Active-foraging preview cards expose identity to the experimenter only.
+    # Their overlays track actual subject-display flips, independently of the
+    # slower preview renderer and of whether a fixation has been accepted.
+    is_active_foraging = event_profile == "active_foraging"
+    option_preview_items: List[Dict[str, Any]] = []
+    preview_option_phase = False
+    visible_option_indices: set[int] = set()
+    revealed_option_indices: set[int] = set()
+    chosen_preview_index: Optional[int] = None
+    first_option_flip_perf_ns: Optional[int] = None
     preview_reward_levels: Optional[list[int]] = None
     if reward_levels is not None:
         preview_reward_levels = [int(level) for level in reward_levels]
@@ -2245,6 +2255,36 @@ def present_trial_with_persistent_dots(
             return
         preview_items = list(images or [])
         hitbox_items = list(preview_items)
+        option_overlays = {}
+        if is_active_foraging and preview_option_phase:
+            preview_items = list(option_preview_items)
+            hitbox_items = list(option_preview_items)
+            status_boxes = []
+            for index, item in enumerate(option_preview_items, start=1):
+                color = (
+                    (180, 80, 255) if index == chosen_preview_index
+                    else (50, 130, 255) if index in revealed_option_indices
+                    else None
+                )
+                if color is not None:
+                    # Reward outlines have a 6 px stroke; leave a small gap
+                    # between it and the separate 4 px outer status stroke.
+                    status_boxes.append({
+                        "pos": tuple(item["pos"]),
+                        "size": [float(v) * choice_hitbox_scale + 24.0 for v in item["size"]],
+                        "ori": item.get("ori", 0.0),
+                        "color": color,
+                        "line_width": 4.0,
+                    })
+            option_overlays = {
+                "overlay_dots": [
+                    {"pos": tuple(item["pos"]), "radius": float(dot_size) / 2.0,
+                     "color": tuple(dot_color)}
+                    for index, item in enumerate(option_preview_items, start=1)
+                    if index not in visible_option_indices
+                ],
+                "status_boxes": status_boxes,
+            }
         if held_initiation_cue_visible and pressed_onset_cue is not None:
             preview_items.append(
                 {
@@ -2284,7 +2324,18 @@ def present_trial_with_persistent_dots(
             fixation_size=fixation_size,
             fixation_color=fixation_color,
             main_rotation_deg=rotation_degrees,
+            **option_overlays,
         )
+
+    def _record_option_scene(timing, visible_indices) -> None:
+        """Record a successfully displayed option scene, never a planned one."""
+        nonlocal preview_option_phase, first_option_flip_perf_ns
+        preview_option_phase = True
+        visible_option_indices.clear()
+        visible_option_indices.update(visible_indices)
+        revealed_option_indices.update(visible_option_indices)
+        if visible_option_indices and first_option_flip_perf_ns is None:
+            first_option_flip_perf_ns = timing.actual_perf_ns
 
     def _make_preview_image_entry(
         image_obj,
@@ -2323,7 +2374,7 @@ def present_trial_with_persistent_dots(
         )
 
     def _finish_incomplete_trial() -> Tuple[bool, None]:
-        nonlocal held_initiation_cue_visible
+        nonlocal held_initiation_cue_visible, preview_option_phase
         held_initiation_cue_visible = False
         if white_fixation_until_choice:
             _set_fixation_color((255, 255, 255))
@@ -2334,6 +2385,7 @@ def present_trial_with_persistent_dots(
         dots.clear()
         dot_records.clear()
         fixation_positions.clear()
+        preview_option_phase = False
         _show_preview([])
         if trial_meta is not None:
             trial_meta["gray_flip_perf_s"] = float(gray_timing.actual_perf_s)
@@ -2797,9 +2849,18 @@ def present_trial_with_persistent_dots(
         except Exception:
             pass
 
-    def _commit_choice(chosen_idx: int, click_pos: Tuple[float, float], click_perf_ns: int) -> None:
+    def _commit_choice(chosen_idx: int, click_pos: Tuple[float, float], click_perf_ns: int) -> bool:
         click_perf = click_perf_ns / 1_000_000_000
-        nonlocal click_registered, click_perf_capture, click_meta, chosen_info
+        nonlocal click_registered, click_perf_capture, click_meta, chosen_info, chosen_preview_index
+        if is_active_foraging and (
+            first_option_flip_perf_ns is None or click_perf_ns < first_option_flip_perf_ns
+        ):
+            _log_message(
+                msg_logger, "INFO",
+                f"choice_touch_rejected trial_num={trial_num} option_index={chosen_idx} "
+                "reason=no_option_revealed_at_touch",
+            )
+            return False
         click_perf_capture = float(click_perf)
         chosen_info = {
             "chosen_index": int(chosen_idx),
@@ -2817,6 +2878,10 @@ def present_trial_with_persistent_dots(
         )
         click_meta = {"idx": chosen_idx}
         click_registered = True
+        if is_active_foraging:
+            chosen_preview_index = chosen_idx
+            _show_preview()
+        return True
 
     def _arm_choice_input() -> None:
         nonlocal choice_input_armed
@@ -2904,8 +2969,8 @@ def present_trial_with_persistent_dots(
                 _log_choice_touch_attempt(click_pos, chosen_idx, origin="touch_start")
 
                 if chosen_idx is not None:
-                    _commit_choice(chosen_idx, click_pos, touch_sample.timestamp_perf_ns)
-                    break
+                    if _commit_choice(chosen_idx, click_pos, touch_sample.timestamp_perf_ns):
+                        break
 
             service_sync_bar(
                 win, deadline_perf_s=deadline_perf if sync_deadline_perf is None else sync_deadline_perf,
@@ -3092,6 +3157,7 @@ def present_trial_with_persistent_dots(
                     if timing is None:
                         return False
                     visible_index = None
+                    _record_option_scene(timing, [])
                     _build_choice_hit_targets()
                     _start_choice_window(timing)
                     _show_preview([])
@@ -3130,6 +3196,7 @@ def present_trial_with_persistent_dots(
                             requested_timestamp_perf_ns=timing.requested_perf_ns,
                         )
                     visible_index = desired_index
+                    _record_option_scene(timing, [visible_index] if visible_index is not None else [])
                     if visible_index is not None:
                         logger.log_frame_flip(
                             trial_num=trial_num, event=f"option_{visible_index}_on",
@@ -3185,6 +3252,8 @@ def present_trial_with_persistent_dots(
                 (idx, pos, pil_img, stim, reward_level)
             )
 
+        option_preview_items[:] = stims_for_choice_preview
+
         for idx, pos, pil_img, stim, reward_level in presentation_items:
             cue_dot = None
             if isi_frames > 0:
@@ -3203,6 +3272,7 @@ def present_trial_with_persistent_dots(
                 if dot_timing is None:
                     return _interrupted_result()
                 _start_dot_fixation(dot_timing, [pos])
+                _record_option_scene(dot_timing, [])
                 dot_perf = dot_timing.actual_perf_s
                 _set_initiation_time(perf_ns=dot_timing.actual_perf_ns)
                 logger.log_frame_flip(
@@ -3234,6 +3304,7 @@ def present_trial_with_persistent_dots(
             )
             if stim_timing is None:
                 return _interrupted_result()
+            _record_option_scene(stim_timing, [idx])
             flip_ps = stim_timing.psychopy_s
             flip_perf = stim_timing.actual_perf_s
             _set_initiation_time(perf_ns=stim_timing.actual_perf_ns)
@@ -3275,6 +3346,7 @@ def present_trial_with_persistent_dots(
                 )
                 if break_timing is None:
                     return _interrupted_result()
+                _record_option_scene(break_timing, [])
                 logger.log_frame_flip(
                     trial_num=trial_num,
                     event=_frame_event_name("inter_stimulus"),
@@ -3306,6 +3378,7 @@ def present_trial_with_persistent_dots(
                 )
                 if off_timing is None:
                     return _interrupted_result()
+                _record_option_scene(off_timing, range(1, len(trial_options) + 1))
                 next_visual_target_perf_s = None
                 _build_choice_hit_targets()
                 _start_choice_window(off_timing)
@@ -3328,6 +3401,7 @@ def present_trial_with_persistent_dots(
             except Exception:
                 stim_sizes.append((0.0, 0.0))
 
+        option_preview_items[:] = preview_images
         gaze_choice_at_dot_onset = dot_fixation_gate is not None and not is_memory
         if isi_frames > 0:
             cue_color = init_dot_color if init_dot_color is not None else dot_color
@@ -3350,6 +3424,7 @@ def present_trial_with_persistent_dots(
             if dot_timing is None:
                 return _interrupted_result()
             _start_dot_fixation(dot_timing, list(positions))
+            _record_option_scene(dot_timing, [])
             dot_perf = dot_timing.actual_perf_s
             _set_initiation_time(perf_ns=dot_timing.actual_perf_ns)
             logger.log_frame_flip(
@@ -3391,6 +3466,7 @@ def present_trial_with_persistent_dots(
             )
             if stim_timing is None:
                 return _interrupted_result()
+            _record_option_scene(stim_timing, range(1, len(trial_options) + 1))
             flip_ps = stim_timing.psychopy_s
             flip_perf = stim_timing.actual_perf_s
             _set_initiation_time(perf_ns=stim_timing.actual_perf_ns)
@@ -3452,6 +3528,9 @@ def present_trial_with_persistent_dots(
             )
             if choice_timing is None:
                 return _interrupted_result()
+            _record_option_scene(
+                choice_timing, [] if is_memory else range(1, len(trial_options) + 1),
+            )
             next_visual_target_perf_s = None
             _build_choice_hit_targets()
             _start_choice_window(choice_timing)
@@ -3487,6 +3566,7 @@ def present_trial_with_persistent_dots(
     dots.clear()
     dot_records.clear()
     fixation_positions.clear()
+    preview_option_phase = False
     _show_preview([])
     _record_gray_flip(clear_timing)
     if trial_meta is not None:

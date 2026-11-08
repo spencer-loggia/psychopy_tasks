@@ -1,4 +1,4 @@
-"""Shared stimulus sizing and circular placement for AFC-style tasks."""
+"""Shared stimulus sizing and screen-safe placement for AFC-style tasks."""
 from __future__ import annotations
 
 import math
@@ -12,6 +12,16 @@ from bin.screen import rotate_centered_point
 
 
 StimulusKey = Tuple[int, Optional[int]]
+
+
+def normalize_placement_distribution(value: str = "circle") -> str:
+    """Validate the mode before callers parse mode-specific geometry."""
+    if not isinstance(value, str):
+        raise ValueError("placement_distribution must be 'circle' or 'uniform'")
+    normalized = value.strip().lower()
+    if normalized not in ("circle", "uniform"):
+        raise ValueError("placement_distribution must be 'circle' or 'uniform'")
+    return normalized
 
 
 def stimulus_size(
@@ -210,20 +220,56 @@ def _sample_non_overlapping_circle_positions(
     return positions_px
 
 
+def _sample_non_overlapping_uniform_positions(
+    count: int,
+    center_bounds: Tuple[float, float, float, float],
+    stim_size: Tuple[float, float],
+    *,
+    rng: random.Random,
+    max_attempts: int = 2000,
+) -> List[Tuple[float, float]]:
+    """Sample the full safe rectangle, rejecting collisions with earlier items.
+
+    Each proposal is uniform in area. Rejection conditions subsequent options
+    on the non-overlap constraint; no circle or radial density is involved.
+    """
+    left, top, right, bottom = center_bounds
+    positions_px: List[Tuple[float, float]] = []
+    for _ in range(max_attempts):
+        candidate = (rng.uniform(left, right), rng.uniform(top, bottom))
+        if not _has_overlap(candidate, positions_px, stim_size):
+            positions_px.append(candidate)
+            if len(positions_px) == count:
+                return positions_px
+    raise RuntimeError(
+        f"Could not place {count} non-overlapping stimuli in the uniform placement area; "
+        "reduce num_afc, image_size, or display_margin"
+    )
+
+
 @dataclass(frozen=True)
 class AFCPlacement:
     """Screen-safe geometry prepared once and sampled for successive trials."""
 
-    center_px: Tuple[float, float]
-    radius_px: float
+    center_px: Optional[Tuple[float, float]]
+    radius_px: Optional[float]
     stim_size: Tuple[float, float]
     effective_win_size: Tuple[float, float]
     num_afc: int
     valid_arcs: Tuple[Tuple[float, float], ...]
     fixed_positions_px: Optional[Tuple[Tuple[float, float], ...]]
+    placement_distribution: str = "circle"
+    center_bounds: Optional[Tuple[float, float, float, float]] = None
 
     def sample(self, *, rng=None):
-        if self.fixed_positions_px is not None:
+        if self.placement_distribution == "uniform":
+            sampled_positions_px = _sample_non_overlapping_uniform_positions(
+                self.num_afc,
+                self.center_bounds,
+                self.stim_size,
+                rng=rng if rng is not None else random,
+            )
+        elif self.fixed_positions_px is not None:
             sampled_positions_px = list(self.fixed_positions_px)
         else:
             sampled_positions_px = _sample_non_overlapping_circle_positions(
@@ -250,20 +296,26 @@ def prepare_afc_placement(
     effective_win_size: Tuple[int, int],
     *,
     display_margin: float = 0.0,
+    placement_distribution: str = "circle",
 ) -> AFCPlacement:
-    """Precompute allowed arcs using the stimulus's rotated native pixel bounds.
+    """Precompute safe center bounds and, for circle placement, allowed arcs.
 
     ``stim_size`` is the axis-aligned footprint after applying the same software
     rotation as the renderer. The screen size and center use native framebuffer
     coordinates; an equal margin at every edge is invariant under screen turns.
+    ``uniform`` samples across the full safe rectangle; circle-only settings
+    (``fixed_positions``, ``center_point``, ``stim_range_radius``) are ignored.
     """
+    placement_distribution = normalize_placement_distribution(placement_distribution)
     if isinstance(num_afc, bool) or int(num_afc) != num_afc or num_afc <= 0:
         raise ValueError("num_afc must be a positive integer")
-    center_px, radius_px = resolve_stimulus_circle(
-        center_point,
-        stim_range_radius,
-        effective_win_size,
-    )
+    center_px = radius_px = None
+    if placement_distribution == "circle":
+        center_px, radius_px = resolve_stimulus_circle(
+            center_point,
+            stim_range_radius,
+            effective_win_size,
+        )
     display_margin = float(display_margin)
     if not math.isfinite(display_margin) or display_margin < 0:
         raise ValueError("display_margin must be finite and non-negative")
@@ -271,8 +323,28 @@ def prepare_afc_placement(
     if not all(math.isfinite(v) and v > 0 for v in (stim_w, stim_h)):
         raise ValueError("stim_size dimensions must be finite and positive")
     width, height = map(float, effective_win_size)
+    if not all(math.isfinite(v) and v > 0 for v in (width, height)):
+        raise ValueError(f"Invalid main screen size for stimulus placement: {effective_win_size}")
     left, top = display_margin + stim_w / 2.0, display_margin + stim_h / 2.0
     right, bottom = width - left, height - top
+    center_bounds = (left, top, right, bottom)
+    if placement_distribution == "uniform":
+        if left >= right or top >= bottom:
+            raise ValueError(
+                "No valid uniform placement area: the full rotated stimulus must fit inside "
+                "display_margin. Check image_size and screen size."
+            )
+        return AFCPlacement(
+            center_px=None,
+            radius_px=None,
+            stim_size=(stim_w, stim_h),
+            effective_win_size=(width, height),
+            num_afc=num_afc,
+            valid_arcs=(),
+            fixed_positions_px=None,
+            placement_distribution=placement_distribution,
+            center_bounds=center_bounds,
+        )
     valid_arcs = _valid_circle_arcs(center_px, radius_px, (left, top, right, bottom))
     if not valid_arcs:
         raise ValueError(
@@ -299,6 +371,8 @@ def prepare_afc_placement(
         num_afc=num_afc,
         valid_arcs=valid_arcs,
         fixed_positions_px=fixed_positions_px,
+        placement_distribution=placement_distribution,
+        center_bounds=center_bounds,
     )
 
 
@@ -311,10 +385,12 @@ def compute_afc_positions(
     effective_win_size: Tuple[int, int],
     *,
     display_margin: float = 0.0,
+    placement_distribution: str = "circle",
     rng: Optional[random.Random] = None,
 ) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
-    """Return screen-pixel and PsychoPy coordinates on screen-safe circle arcs."""
+    """Return screen-pixel and PsychoPy coordinates for the selected distribution."""
     return prepare_afc_placement(
         fixed_positions, num_afc, center_point, stim_range_radius, stim_size,
         effective_win_size, display_margin=display_margin,
+        placement_distribution=placement_distribution,
     ).sample(rng=rng)

@@ -137,7 +137,8 @@ class ActiveForagingFixationTests(unittest.TestCase):
     def present(self, *, accepted_after=0.2, sequential=True, memory=True,
                 isi=0.1, timeout=0.5, gated=True, abort_after=None,
                 schedule=None, duration=0.1, choice_time=0.1, event_logger=None,
-                sync_service=None, arrival_after=..., click_after=None):
+                sync_service=None, arrival_after=..., click_after=None,
+                click_intervals=None, click_index=1, buffered_touch=None):
         clock = FakeClock()
         module, psychopy = load_presenter(clock)
         window = Display(clock)
@@ -147,13 +148,31 @@ class ActiveForagingFixationTests(unittest.TestCase):
         metadata = {}
         options = [(1, 1), (2, 1)]
         positions = [(-100, 0), (100, 0)]
-        if click_after is not None:
+        if click_after is not None or click_intervals is not None:
             mouse = psychopy.event.Mouse.return_value
-            mouse.getPos.return_value = positions[0]
+            mouse.getPos.return_value = positions[click_index - 1]
+            intervals = click_intervals if click_intervals is not None else [(click_after, math.inf)]
             mouse.getPressed.side_effect = lambda **kwargs: (
-                (bool(window.flips and clock.seconds() - window.flips[0] / 1e9 >= click_after), False, False),
+                (bool(window.flips and any(start <= clock.seconds() - window.flips[0] / 1e9 < stop
+                                          for start, stop in intervals)), False, False),
                 (0, 0, 0),
             )
+        if buffered_touch is not None:
+            mouse = psychopy.event.Mouse.return_value
+            mouse.getPos.return_value = positions[click_index - 1]
+            reset_s = [clock.seconds()]
+            sent = []
+            mouse.clickReset.side_effect = lambda: reset_s.__setitem__(0, clock.seconds())
+
+            def buffered_buttons(**kwargs):
+                observed_after, pressed_after = buffered_touch
+                elapsed = 0.0
+                if window.flips and not sent and clock.seconds() - window.flips[0] / 1e9 >= observed_after:
+                    elapsed = window.flips[0] / 1e9 + pressed_after - reset_s[0]
+                    sent.append(True)
+                return ((False, False, False), (elapsed, 0, 0))
+
+            mouse.getPressed.side_effect = buffered_buttons
 
         def abort():
             return bool(abort_after is not None and gate.starts
@@ -177,6 +196,7 @@ class ActiveForagingFixationTests(unittest.TestCase):
                 sequential=sequential, is_memory=memory, trial_meta=metadata,
                 experimenter_preview=preview, external_abort_checker=abort,
                 scene_main_size=window.size, event_profile="active_foraging",
+                reward_levels=[3, 0],
                 dot_fixation_gate=gate, saccade_wait_timeout_s=timeout,
             )
         events = (
@@ -393,19 +413,123 @@ class ActiveForagingFixationTests(unittest.TestCase):
                 self.assertFalse(metadata.get("saccade_timeout"))
                 self.assertNotIn("saccade_timeout", [event["event"] for event in events])
 
-    def test_nonmemory_dot_choice_is_available_before_fixation(self):
+    def test_nonmemory_dot_choice_is_rejected_until_an_option_has_flipped(self):
         for click_after in (0, 0.05):
             with self.subTest(click_after=click_after):
-                result, events, _, _, window, _ = self.present(
+                result, events, metadata, _, window, _ = self.present(
                     sequential=False, memory=False, accepted_after=None,
                     choice_time=0.3, timeout=None, click_after=click_after,
                 )
-                aborted, choice_info = result
-                self.assertFalse(aborted)
-                self.assertEqual(choice_info["chosen_index"], 1)
-                self.assertAlmostEqual(choice_info["reaction_time_s"], click_after, delta=0.002)
+                self.assertEqual(result, (False, None))
                 self.assertNotIn("fixation_accepted", [event["event"] for event in events])
+                self.assertNotIn("option_touch", [event["event"] for event in events])
                 self.assertEqual(window.scenes, [(), ()])
+                self.assertAlmostEqual((metadata["gray_flip_perf_ns"] - window.flips[0]) / 1e9, 0.3, places=8)
+
+    def test_held_early_touch_does_not_become_a_choice_after_reveal(self):
+        result, events, _, _, _, _ = self.present(
+            sequential=False, memory=False, accepted_after=0.12,
+            choice_time=0.3, timeout=None, click_after=0.05,
+        )
+        self.assertEqual(result, (False, None))
+        self.assertIn("option_1_on", [e["event"] for e in events])
+        self.assertNotIn("option_touch", [e["event"] for e in events])
+
+    def test_fresh_touch_after_reveal_succeeds_after_an_early_rejected_touch(self):
+        result, events, _, _, _, _ = self.present(
+            sequential=False, memory=False, accepted_after=0.12,
+            choice_time=0.3, timeout=None, click_intervals=[(0.05, 0.07), (0.20, 0.22)],
+        )
+        self.assertEqual(result[1]["chosen_index"], 1)
+        self.assertAlmostEqual(result[1]["reaction_time_s"], 0.2, delta=0.002)
+        self.assertEqual([e["event"] for e in events].count("option_touch"), 1)
+
+    def test_buffered_pre_reveal_touch_is_rejected_when_polled_after_reveal(self):
+        result, events, _, _, _, _ = self.present(
+            sequential=False, memory=False, accepted_after=0.02,
+            choice_time=0.3, timeout=None, buffered_touch=(0.12, 0.09),
+        )
+        self.assertEqual(result, (False, None))
+        self.assertIn("option_1_on", [e["event"] for e in events])
+        self.assertNotIn("option_touch", [e["event"] for e in events])
+
+    def test_fixation_acceptance_alone_does_not_unlock_choices_before_actual_reveal(self):
+        result, events, _, _, _, _ = self.present(
+            sequential=False, memory=False, accepted_after=0.02,
+            isi=0.2, choice_time=0.3, timeout=None, click_intervals=[(0.05, 0.07)],
+        )
+        self.assertEqual(result, (False, None))
+        self.assertIn("fixation_accepted", [e["event"] for e in events])
+        self.assertIn("option_1_on", [e["event"] for e in events])
+        self.assertNotIn("option_touch", [e["event"] for e in events])
+
+    def test_any_option_is_selectable_after_one_reveal_and_status_persists_after_hiding(self):
+        result, events, _, _, window, preview = self.present(
+            sequential=False, memory=False, schedule=[(0.02, 1), (0.14, None)],
+            choice_time=0.3, timeout=None, click_after=0.2, click_index=2,
+        )
+        self.assertEqual(result[1]["chosen_index"], 2)
+        self.assertNotIn("option_2_on", [e["event"] for e in events])
+        scenes = [c.kwargs for c in preview.show_static_scene.call_args_list]
+        option_scenes = [s for s in scenes if "overlay_dots" in s]
+        self.assertTrue(option_scenes)
+        for scene in option_scenes:
+            self.assertEqual(len(scene["images"]), 2)
+            self.assertEqual([b["color"] for b in scene["hit_boxes"]], [[60, 180, 75], [220, 60, 60]])
+        self.assertEqual(len(option_scenes[0]["overlay_dots"]), 2)
+        self.assertEqual(option_scenes[0]["status_boxes"], [])
+        self.assertEqual([d["pos"] for d in option_scenes[1]["overlay_dots"]], [(100.0, 0.0)])
+        self.assertEqual(option_scenes[1]["status_boxes"][0]["color"], (50, 130, 255))
+        chosen = option_scenes[-1]
+        self.assertEqual(len(chosen["overlay_dots"]), 2)
+        self.assertEqual([b["color"] for b in chosen["status_boxes"]], [(50, 130, 255), (180, 80, 255)])
+        for status in chosen["status_boxes"]:
+            reward = next(b for b in chosen["hit_boxes"] if tuple(b["pos"]) == tuple(status["pos"]))
+            self.assertTrue(all(a > b for a, b in zip(status["size"], reward["size"])))
+        self.assertEqual(scenes[-1]["images"], [])
+        self.assertEqual(window.scenes, [(), ((-100, 0),), (), ()])
+
+    def test_preview_visibility_matches_each_main_flip_in_all_presentation_modes(self):
+        for sequential in (False, True):
+            for memory in (False, True):
+                for gated in (False, True):
+                    with self.subTest(sequential=sequential, memory=memory, gated=gated):
+                        _, _, _, _, window, preview = self.present(
+                            sequential=sequential, memory=memory, gated=gated,
+                            accepted_after=0.02, choice_time=0.3,
+                        )
+                        scenes = [c.kwargs for c in preview.show_static_scene.call_args_list]
+                        self.assertEqual(len(scenes), len(window.scenes))
+                        revealed = set()
+                        for main_images, scene in zip(window.scenes, scenes):
+                            if "overlay_dots" not in scene:
+                                self.assertEqual(main_images, ())
+                                continue
+                            identities = {tuple(i["pos"]) for i in scene["images"]}
+                            hidden = {tuple(d["pos"]) for d in scene["overlay_dots"]}
+                            self.assertEqual(identities - hidden, set(main_images))
+                            self.assertEqual(len(scene["hit_boxes"]), 2)
+                            revealed.update(main_images)
+                            self.assertEqual({tuple(b["pos"]) for b in scene["status_boxes"]}, revealed)
+
+    def test_choices_remain_available_after_reveal_in_all_presentation_modes(self):
+        for sequential in (False, True):
+            for memory in (False, True):
+                for gated in (False, True):
+                    with self.subTest(sequential=sequential, memory=memory, gated=gated):
+                        result, events, _, _, _, preview = self.present(
+                            sequential=sequential, memory=memory, gated=gated,
+                            accepted_after=0.02, choice_time=1.0, click_after=0.65,
+                        )
+                        self.assertEqual(result[1]["chosen_index"], 1)
+                        touch = next(e for e in events if e["event"] == "option_touch")
+                        first = next(e for e in events if e["event"] in ["option_1_on", "options_on"])
+                        self.assertGreaterEqual(touch["timestamp_perf_ns"], first["timestamp_perf_ns"])
+                        self.assertTrue(any(
+                            b["color"] == (180, 80, 255)
+                            for c in preview.show_static_scene.call_args_list
+                            for b in c.kwargs.get("status_boxes", [])
+                        ))
 
     def test_on_time_saccade_allows_fixation_criterion_to_finish_after_deadline(self):
         for sequential, memory in ((True, True), (False, False), (False, True)):

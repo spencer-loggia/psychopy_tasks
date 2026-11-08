@@ -1,3 +1,7 @@
+from contextlib import ExitStack
+import importlib.util
+import io
+import json
 import random
 import sys
 import tempfile
@@ -21,6 +25,126 @@ from bin.match2cue_logic import (
     score_match2cue_choice,
     should_deliver_match_cue_tap_reward,
 )
+
+
+def load_task_without_display():
+    """Import the entry point without importing PsychoPy or opening resources."""
+    psychopy = types.ModuleType("psychopy")
+    psychopy.event = types.SimpleNamespace(getKeys=lambda **kwargs: [])
+    psychopy.logging = types.SimpleNamespace(console=Mock(), CRITICAL=50)
+    utils = types.ModuleType("bin.utils")
+    for name in (
+        "set_debug", "setup_task_window", "close_task_window", "resolve_frame_rate",
+        "make_fixation_cross", "make_bg_rect", "make_initiation_cue_stims",
+        "configure_sync_bar", "service_sync_bar", "TrialBufferManager",
+    ):
+        setattr(utils, name, Mock())
+    path = Path(__file__).resolve().parents[1] / "task/match2cue.py"
+    spec = importlib.util.spec_from_file_location("_match2cue_config_under_test", path)
+    task = importlib.util.module_from_spec(spec)
+    with patch.dict(sys.modules, {"psychopy": psychopy, "bin.utils": utils}), patch.object(
+        bin_package, "utils", utils, create=True,
+    ):
+        spec.loader.exec_module(task)
+    return task
+
+
+class Match2CueConfigurationTests(unittest.TestCase):
+    def config(self, **overrides):
+        return {
+            "config_name": "pruned_match", "subject": "Yuri", "n": 1,
+            "colors_tsv": "colors.tsv", "shapes_tsv": "shapes.tsv",
+            "n_colors": 0, "n_shapes": 2, "image_size": [20, 20],
+            "match_cue_duration": 0.2, "delay_time": 0.0,
+            "screens": {"main": 0, "experimenter": ""},
+            **overrides,
+        }
+
+    def test_cli_accepts_pruned_snapshot_without_disabled_initiation_settings(self):
+        task = load_task_without_display()
+        cfg = self.config(self_initiation=False, placement_distribution="uniform", display_margin=25)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps(cfg), encoding="utf-8")
+            with patch.object(sys, "argv", ["match2cue", "--config", str(path)]), patch.object(
+                task, "run_task", return_value="done",
+            ) as run:
+                task.main()
+        self.assertEqual(run.call_args.args[0], cfg)
+        self.assertEqual(run.call_args.kwargs["screen_config"], {"main": 0, "experimenter": None})
+
+    def test_cli_default_self_initiation_still_requires_initiation_settings(self):
+        task = load_task_without_display()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps(self.config()), encoding="utf-8")
+            with patch.object(sys, "argv", ["match2cue", "--config", str(path)]), patch.object(
+                task, "run_task",
+            ) as run, patch.object(sys, "stderr", new_callable=io.StringIO) as stderr:
+                with self.assertRaises(SystemExit) as raised:
+                    task.main()
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn("initiation_cue_center_position", stderr.getvalue())
+        run.assert_not_called()
+
+    def test_disabled_initiation_ignores_inactive_invalid_fields_before_resource_startup(self):
+        invalid = {
+            "initiation_cue_center_position": "not coordinates",
+            "initiation_cue_style": "not a style", "hold_before_choice": "not a bool",
+            "hold_cue_to_init_time_s": -1,
+        }
+        for fields in ({}, invalid):
+            with self.subTest(fields=fields):
+                task = load_task_without_display()
+                with patch.object(task, "load_afc_stimulus_space", side_effect=RuntimeError("resource boundary")) as load, patch.object(
+                    task, "SessionLogBundle",
+                ) as logs:
+                    with self.assertRaisesRegex(RuntimeError, "resource boundary"):
+                        task.run_task(self.config(self_initiation=False, **fields), screen_config={})
+                load.assert_called_once()
+                logs.assert_not_called()
+                task.utils.setup_task_window.assert_not_called()
+
+    def test_run_task_default_self_initiation_validates_before_resource_startup(self):
+        task = load_task_without_display()
+        with patch.object(task, "load_afc_stimulus_space") as load:
+            with self.assertRaisesRegex(KeyError, "initiation_cue_center_position"):
+                task.run_task(self.config(), screen_config={})
+        load.assert_not_called()
+
+    def test_uniform_geometry_routes_margin_and_ignores_inactive_circle_values(self):
+        task = load_task_without_display()
+        cfg = self.config(
+            self_initiation=False, placement_distribution=" UNIFORM ", display_margin=37.5,
+            center_point="invalid inactive coordinates", stim_range_radius="invalid inactive radius",
+            fixed_positions=True,
+        )
+        space = types.SimpleNamespace(
+            bg=(128, 128, 128), stimuli=((1, None), (2, None)), shapes={}, colors={},
+        )
+        trial = Match2CueTrial(cue=(1, None), options=((1, None), (2, None)), reward_draw=0)
+        preloaded = {(1, None): Image.new("RGB", (20, 20))}
+        task.utils.setup_task_window.return_value = (
+            types.SimpleNamespace(size=(800, 600)), types.SimpleNamespace(rotation="normal"), None,
+        )
+        task.utils.resolve_frame_rate.return_value = (60, 1 / 60)
+        task.utils.make_fixation_cross.return_value = None
+        task.utils.TrialBufferManager.return_value.get_next_trial.return_value = {"trial_idx": 1}
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(task, "load_afc_stimulus_space", return_value=space))
+            stack.enter_context(patch.object(task, "SessionLogBundle", return_value=Mock()))
+            stack.enter_context(patch.object(task, "describe_screen", return_value="test screen"))
+            stack.enter_context(patch.object(task, "resolve_scene_size", return_value=(800, 600)))
+            stack.enter_context(patch.object(task, "_decode_trial_payload", return_value=(trial, preloaded)))
+            placement = stack.enter_context(patch.object(
+                task, "compute_afc_positions", side_effect=RuntimeError("placement boundary"),
+            ))
+            with self.assertRaisesRegex(RuntimeError, "placement boundary"):
+                task.run_task(cfg, screen_config={})
+        self.assertEqual(placement.call_args.args[2:4], (None, None))
+        self.assertEqual(placement.call_args.kwargs["placement_distribution"], "uniform")
+        self.assertEqual(placement.call_args.kwargs["display_margin"], 37.5)
+        task.utils.make_initiation_cue_stims.assert_not_called()
 
 
 class Match2CueLogicTests(unittest.TestCase):

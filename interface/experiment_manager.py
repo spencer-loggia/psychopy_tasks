@@ -20,6 +20,7 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Optional
 from bin.task_clock import EXPERIMENT_ORIGIN_ENV, TaskClock
 from bin.sync_bar import SyncBarConfig
 from bin.config import load_config
+from bin.config_snapshot import build_launch_config_snapshot, build_task_config_snapshot
 from bin.run_identity import BLOCK_ID_ENV, EXPERIMENT_ID_ENV, BLOCK_IDENTITY_FILENAME, new_run_id
 from bin.eye_tracking import (
     EXPERIMENT_BLOCK_NUMBER_ENV,
@@ -253,7 +254,10 @@ class ExperimentManager:
         self.blocks_path = self.experiment_dir / BLOCKS_FILENAME
         self.event_library_path = self.experiment_dir / "event_name_library.json"
 
-        shutil.copy2(self.launch_config_path, self.experiment_dir / "launch_config.json")
+        _write_json_atomic(
+            self.experiment_dir / "launch_config.json",
+            build_launch_config_snapshot(self.launch_config),
+        )
         source_event_library = self.working_dir / "event_name_library.json"
         if not source_event_library.is_file():
             raise FileNotFoundError(f"Event library not found: {source_event_library}")
@@ -439,7 +443,12 @@ class ExperimentManager:
             }
 
         config_path = output_dir / BLOCK_CONFIG_FILENAME
-        _write_json_atomic(config_path, block_config)
+        # Filter after state, calibration, sync, and display overrides so this
+        # executable record reflects the settings that actually reach the task.
+        _write_json_atomic(
+            config_path,
+            build_task_config_snapshot(block_config, launch_path=launch_path),
+        )
         _write_json_atomic(output_dir / BLOCK_IDENTITY_FILENAME, {
             "experiment_id": self.experiment_id, "block_id": block_id,
             "block_num": block_num, "block_name": block_name,

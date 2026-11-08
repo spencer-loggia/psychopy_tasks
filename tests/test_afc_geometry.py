@@ -5,6 +5,7 @@ from unittest.mock import Mock
 
 from bin.afc_geometry import (
     compute_afc_positions,
+    normalize_placement_distribution,
     prepare_afc_placement,
     resolve_stimulus_circle,
     screen_px_to_psychopy,
@@ -85,6 +86,136 @@ class AFCGeometryTests(unittest.TestCase):
         second = compute_afc_positions(**kwargs, rng=random.Random(7))
 
         self.assertEqual(first, second)
+
+    def test_explicit_circle_keeps_default_placement_and_rng_sequence(self):
+        for fixed in (False, True):
+            kwargs = dict(fixed_positions=fixed, num_afc=3, center_point=None,
+                          stim_range_radius=120, stim_size=(30, 30), effective_win_size=(800, 600))
+            implicit_rng, explicit_rng = random.Random(7), random.Random(7)
+            implicit = prepare_afc_placement(**kwargs)
+            explicit = prepare_afc_placement(**kwargs, placement_distribution="circle")
+            with self.subTest(fixed=fixed):
+                for _ in range(20):
+                    self.assertEqual(implicit.sample(rng=implicit_rng), explicit.sample(rng=explicit_rng))
+                self.assertEqual(implicit_rng.getstate(), explicit_rng.getstate())
+
+    def test_uniform_ignores_circle_settings_and_is_seed_repeatable(self):
+        kwargs = dict(num_afc=4, stim_size=(60, 40), effective_win_size=(800, 600),
+                      display_margin=30, placement_distribution="uniform")
+        regular = prepare_afc_placement(False, center_point=None, stim_range_radius=100, **kwargs)
+        inactive_invalid = prepare_afc_placement(
+            True, center_point="unused", stim_range_radius=float("nan"), **kwargs,
+        )
+        self.assertIsNone(inactive_invalid.center_px)
+        self.assertIsNone(inactive_invalid.radius_px)
+        self.assertIsNone(inactive_invalid.fixed_positions_px)
+        self.assertEqual(inactive_invalid.valid_arcs, ())
+        self.assertEqual(inactive_invalid.center_bounds, (60, 50, 740, 550))
+        rng1, rng2 = random.Random(17), random.Random(17)
+        samples = []
+        for _ in range(10):
+            sample = inactive_invalid.sample(rng=rng1)
+            self.assertEqual(sample, regular.sample(rng=rng2))
+            samples.append(sample)
+        self.assertNotEqual(samples[0], samples[1], "Uniform remains random even with fixed_positions=true")
+        computed = compute_afc_positions(
+            True, center_point=[], stim_range_radius="unused", **kwargs, rng=random.Random(17),
+        )
+        self.assertEqual(samples[0], computed)
+
+    def test_uniform_full_rectangle_sampling_is_uniform_in_area(self):
+        placement = prepare_afc_placement(
+            False, 1, None, None, (80, 40), (800, 600), display_margin=30,
+            placement_distribution="uniform",
+        )
+        left, top, right, bottom = placement.center_bounds
+        counts = [[0] * 4 for _ in range(4)]
+        normalized = []
+        rng = random.Random(3)
+        for _ in range(6000):
+            points, positions = placement.sample(rng=rng)
+            x, y = points[0]
+            nx, ny = (x-left)/(right-left), (y-top)/(bottom-top)
+            normalized.append((nx, ny))
+            counts[min(3, int(nx*4))][min(3, int(ny*4))] += 1
+            self.assertEqual(positions[0], (x-400, 300-y))
+        # Fixed seed and generous bounds check spatial coverage and equal-area
+        # density without requiring a statistical test to pass by chance.
+        for row in counts:
+            for count in row:
+                self.assertAlmostEqual(count/6000, 1/16, delta=.015)
+        for axis in (0, 1):
+            values = [p[axis] for p in normalized]
+            self.assertLess(min(values), .005)
+            self.assertGreater(max(values), .995)
+            self.assertAlmostEqual(sum(values)/len(values), .5, delta=.015)
+
+    def test_uniform_rectangular_footprints_and_nonoverlap_for_all_rotations(self):
+        image_size, margin = (240, 80), 200
+        for output_rotation in ("normal", "right", "inverted", "left"):
+            rotation = software_stimulus_rotation(output_rotation)
+            native_size = oriented_size((1600, 2560), rotation)
+            footprint = oriented_size(image_size, rotation)
+            placement = prepare_afc_placement(
+                False, 8, None, None, footprint, native_size,
+                display_margin=margin, placement_distribution="uniform",
+            )
+            rng = random.Random(8)
+            with self.subTest(output_rotation=output_rotation):
+                for _ in range(100):
+                    _, positions = placement.sample(rng=rng)
+                    for i, (px, py) in enumerate(positions):
+                        for dx in (-120, 120):
+                            for dy in (-40, 40):
+                                rx, ry = rotate_centered_point((dx, dy), rotation)
+                                sx, sy = rotate_centered_point((px+rx, py+ry), -rotation)
+                                self.assertLessEqual(abs(sx), 800-margin+1e-9)
+                                self.assertLessEqual(abs(sy), 1280-margin+1e-9)
+                        for qx, qy in positions[:i]:
+                            self.assertTrue(abs(px-qx) >= footprint[0] or abs(py-qy) >= footprint[1])
+
+    def test_uniform_rejects_overlapping_proposals(self):
+        placement = prepare_afc_placement(
+            False, 2, None, None, (50, 50), (800, 600), placement_distribution="uniform",
+        )
+        rng = Mock()
+        rng.uniform.side_effect = [100, 100, 110, 110, 200, 100]
+        points, _ = placement.sample(rng=rng)
+        self.assertEqual(points, [(100, 100), (200, 100)])
+        self.assertEqual(rng.uniform.call_count, 6)
+
+    def test_uniform_impossible_packing_fails_instead_of_overlapping(self):
+        placement = prepare_afc_placement(
+            False, 2, None, None, (600, 400), (800, 600), placement_distribution="uniform",
+        )
+        with self.assertRaisesRegex(RuntimeError, "Could not place 2.*uniform placement area"):
+            placement.sample(rng=random.Random(2))
+
+    def test_uniform_requires_positive_area_and_valid_active_geometry(self):
+        kwargs = dict(fixed_positions=False, num_afc=2, center_point=None, stim_range_radius=None,
+                      stim_size=(40, 20), effective_win_size=(800, 600), placement_distribution="uniform")
+        for override in ({"display_margin": 300}, {"stim_size": (800, 20)}, {"stim_size": (900, 20)}):
+            with self.subTest(override=override), self.assertRaisesRegex(ValueError, "No valid uniform placement area"):
+                prepare_afc_placement(**(kwargs | override))
+        for override in ({"effective_win_size": (800, float("nan"))}, {"display_margin": -1},
+                         {"stim_size": (-20, 20)}, {"num_afc": 0}):
+            with self.subTest(override=override), self.assertRaises(ValueError):
+                prepare_afc_placement(**(kwargs | override))
+
+    def test_unknown_placement_distribution_is_rejected(self):
+        for distribution in (None, "", "rectangle", "random", 1):
+            with self.subTest(distribution=distribution), self.assertRaisesRegex(ValueError, "placement_distribution"):
+                prepare_afc_placement(False, 1, None, None, (20, 20), (800, 600),
+                                      placement_distribution=distribution)
+
+    def test_placement_distribution_normalizes_before_geometry_is_parsed(self):
+        self.assertEqual(normalize_placement_distribution(), "circle")
+        self.assertEqual(normalize_placement_distribution(" CIRCLE "), "circle")
+        self.assertEqual(normalize_placement_distribution(" Uniform "), "uniform")
+        placement = prepare_afc_placement(
+            True, 1, "unused", "unused", (20, 20), (800, 600), placement_distribution=" Uniform ",
+        )
+        self.assertEqual(placement.placement_distribution, "uniform")
 
     def test_circle_may_extend_outside_main_screen(self):
         self.assertEqual(

@@ -27,6 +27,7 @@ if str(_project_root) not in sys.path:
 from bin import utils
 from bin.afc_geometry import (
     compute_afc_positions,
+    normalize_placement_distribution,
     screen_px_to_psychopy,
     stimulus_size,
     subject_centered_to_screen_px,
@@ -205,7 +206,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
-    initiation_config = resolve_initiation_config(cfg)
+    self_initiation = bool(cfg.get("self_initiation", True))
+    initiation_config = resolve_initiation_config(
+        cfg if self_initiation else {}, require_keys=self_initiation,
+    )
+    placement_distribution = normalize_placement_distribution(cfg.get("placement_distribution", "circle"))
     subject_value = cfg["subject"]
     if not isinstance(subject_value, str) or not subject_value.strip():
         raise ValueError("Config field 'subject' must be a non-empty string")
@@ -221,7 +226,6 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     iti = float(cfg.get("iti", 1.0))
     sequential = bool(cfg.get("sequential", False))
     is_memory = bool(cfg.get("is_memory", False))
-    self_initiation = bool(cfg.get("self_initiation", True))
     if num_afc < 1:
         raise ValueError("num_afc must be at least 1")
     validate_requested_durations(
@@ -611,14 +615,14 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     iti_frames = iti_plan.frame_count
     run_indefinitely = n_trials <= 0
     fixed_positions = bool(cfg.get("fixed_positions", False))
-    center_value = cfg.get("center_point")
+    center_value = cfg.get("center_point") if placement_distribution == "circle" else None
     center_point = (
         subject_centered_to_screen_px(
             center_value, main_scene_size, stimulus_rotation_degrees,
             field_name="center_point",
         ) if center_value is not None else None
     )
-    radius_value = cfg.get("stim_range_radius")
+    radius_value = cfg.get("stim_range_radius") if placement_distribution == "circle" else None
     stim_range_radius = float(radius_value) if radius_value is not None else None
 
     show_preview_idle()
@@ -653,6 +657,8 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 ),
                 effective_win_size,
                 rng=position_rng,
+                display_margin=float(cfg.get("display_margin", 0.0)),
+                placement_distribution=placement_distribution,
             )
             msg_logger.log(
                 "INFO",
@@ -927,7 +933,7 @@ def main() -> None:
                 "n",
                 "match_cue_duration",
                 "delay_time",
-                *INITIATION_CONFIG_KEYS,
+                *(INITIATION_CONFIG_KEYS if cfg.get("self_initiation", True) else ()),
             ],
             allow_zero_duration=True,
         )

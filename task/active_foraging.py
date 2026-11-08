@@ -48,8 +48,8 @@ from bin.affinity import (
 )
 from bin.daqc2_outputs import DAQC2DigitalOutputs
 from bin.afc_geometry import (
+    normalize_placement_distribution,
     prepare_afc_placement,
-    stimulus_size,
     subject_centered_to_screen_px,
 )
 from bin.afc_stimuli import render_afc_stimulus
@@ -71,9 +71,7 @@ from bin.screen import (
     describe_screen,
     load_screen_config,
     oriented_size,
-    reward_level_color,
     resolve_scene_size,
-    serialize_preview_image,
     set_window_mouse_visible,
     software_stimulus_rotation,
 )
@@ -257,6 +255,7 @@ def parse_args():
     p.add_argument("--self_initiation", action="store_true", default=None, help="Require participant to self-initiate each trial by clicking an onset cue")
     p.add_argument("--fixation_size", type=int, default=None, help="Fixation cross size in pixels; 0 disables fixation")
     p.add_argument("--fixed_positions", action="store_true", default=None, help="Fix option positions to evenly spaced locations on the stimulus circle")
+    p.add_argument("--placement_distribution", choices=("circle", "uniform"), default=None, help="Option placement: circle (default) or uniform over the allowed screen area")
     p.add_argument("--center_point", type=int, nargs=2, default=None, help="Stimulus circle center in participant-centered pixels: X right, Y up; 0 0 is screen center")
     p.add_argument("--stim_range_radius", type=int, default=None, help="Stimulus circle radius in pixels")
     p.add_argument("--display_margin", type=float, default=None, help="Minimum clearance from the full stimulus to each screen edge in pixels (default: 0)")
@@ -333,6 +332,7 @@ def run_task(
     pump_pin: int = 0,
     buzz_pin: int = 1,
     fixed_positions: bool = False,
+    placement_distribution: str = "circle",
     center_point: Optional[Tuple[float, float]] = None,
     stim_range_radius: Optional[float] = None,
     sequential: bool = True,
@@ -360,6 +360,7 @@ def run_task(
     fixation_criteria_s: float = 0.1,
     fixation_window_radius: float = 150.0,
 ):
+    placement_distribution = normalize_placement_distribution(placement_distribution)
     validate_dot_fixation_config(
         wait_for_saccade_on_dot,
         isi=isi,
@@ -658,7 +659,7 @@ def run_task(
             total_trials=n_trials,
             start_perf_s=time.perf_counter(),
             update_interval_s=0.1,
-            preserve_scene_transitions=wait_for_saccade_on_dot,
+            preserve_scene_transitions=True,
             mouse_visible=experimenter_mouse_visible,
         )
         utils.verify_task_window_vblank(win)
@@ -763,75 +764,6 @@ def run_task(
             fixation_color=(255, 255, 255),
             reward_counts=reward_counts,
             highlight_box=None,
-            main_rotation_deg=stimulus_rotation_degrees,
-        )
-
-    def _preview_choice_feedback(
-        *,
-        preloaded_items: Dict[Tuple[int, int], Any],
-        trial_options_current: List[Tuple[int, int]],
-        positions_current: List[Tuple[float, float]],
-        chosen_index_1based: int,
-        reward_level: int,
-    ) -> None:
-        if experimenter_preview is None:
-            return
-        preview_fixation_size = int(getattr(fix, "height", 0)) if fix is not None else None
-        images = []
-        highlight_box = None
-
-        if is_memory:
-            dots = [
-                {
-                    "pos": [float(pos[0]), float(pos[1])],
-                    "radius": float(dot_size) / 2.0,
-                    "color": list(dot_color),
-                }
-                for pos in positions_current
-            ]
-            chosen_pos = positions_current[chosen_index_1based - 1]
-            highlight_box = {
-                "pos": [float(chosen_pos[0]), float(chosen_pos[1])],
-                "size": [float(dot_size * 2.4), float(dot_size * 2.4)],
-                "color": list(reward_level_color(reward_level)),
-                "line_width": 6.0,
-            }
-        else:
-            dots = []
-            highlight_size = (float(dot_size * 2.4), float(dot_size * 2.4))
-            for idx, (pair, pos) in enumerate(zip(trial_options_current, positions_current), start=1):
-                image_obj = preloaded_items.get(pair)
-                payload = serialize_preview_image(image_obj)
-                if payload is None:
-                    continue
-                size_px = stimulus_size(preloaded_items, pair)
-                images.append(
-                    {
-                        "image_payload": payload,
-                        "pos": [float(pos[0]), float(pos[1])],
-                        "size": [float(size_px[0]), float(size_px[1])],
-                        "ori": stimulus_rotation_degrees,
-                    }
-                )
-                if idx == chosen_index_1based:
-                    highlight_size = (float(size_px[0]) * 1.20, float(size_px[1]) * 1.20)
-                    highlight_box = {
-                        "pos": [float(pos[0]), float(pos[1])],
-                        "size": [highlight_size[0], highlight_size[1]],
-                        "color": list(reward_level_color(reward_level)),
-                        "line_width": 6.0,
-                        "ori": stimulus_rotation_degrees,
-                    }
-
-        experimenter_preview.show_static_scene(
-            bg_rgb_255=bg,
-            main_size=main_scene_size,
-            images=images,
-            dots=dots,
-            fixation_size=preview_fixation_size,
-            fixation_color=(255, 255, 255),
-            reward_counts=reward_counts,
-            highlight_box=highlight_box,
             main_rotation_deg=stimulus_rotation_degrees,
         )
 
@@ -1038,13 +970,13 @@ def run_task(
         return f"{float(value):.9f}"
 
     try:
-        # All trial images are rasterized at image_size. Clip the circle once,
-        # using the renderer's actual native orientation, before any trial.
+        # Prepare the allowed region once using the renderer's actual native
+        # orientation, including the full rotated stimulus footprint.
         placement = prepare_afc_placement(
             fixed_positions=fixed_positions,
             num_afc=num_afc,
             center_point=(
-                None if center_point is None else subject_centered_to_screen_px(
+                None if placement_distribution == "uniform" or center_point is None else subject_centered_to_screen_px(
                     center_point, main_scene_size, stimulus_rotation_degrees,
                     field_name="center_point",
                 )
@@ -1053,12 +985,15 @@ def run_task(
             stim_size=oriented_size(image_size, stimulus_rotation_degrees),
             effective_win_size=main_scene_size,
             display_margin=display_margin,
+            placement_distribution=placement_distribution,
         )
         msg_logger.log(
             "INFO",
-            f"stimulus_placement subject_center={center_point} center_px={placement.center_px} radius_px={placement.radius_px} "
+            f"stimulus_placement distribution={placement_distribution} "
+            f"subject_center={center_point if placement_distribution == 'circle' else None} "
+            f"center_px={placement.center_px} radius_px={placement.radius_px} "
             f"stim_size={placement.stim_size} display_margin={display_margin} "
-            f"valid_arcs_rad={placement.valid_arcs}",
+            f"valid_arcs_rad={placement.valid_arcs} center_bounds_px={placement.center_bounds}",
         )
         msg_logger.log(
             "INFO",
@@ -1167,6 +1102,8 @@ def run_task(
                 chosen_shape_idx, chosen_color_idx, chosen_lum_idx = trial_option_meta[chosen_idx - 1]
                 reward_level_row = reward_level
                 reward_counts[int(reward_level)] = reward_counts.get(int(reward_level), 0) + 1
+                if experimenter_preview is not None:
+                    experimenter_preview.set_reward_counts(reward_counts)
 
                 if reward_to_pulse_map is not None:
                     num_pulses = reward_to_pulse_map.get(str(reward_level), 0)
@@ -1216,13 +1153,6 @@ def run_task(
                         f"base_color_idx={chosen_color_idx} shape_idx={chosen_shape_idx} "
                         f"lum_idx={chosen_lum_idx} reward_level={reward_level}"
                     ),
-                )
-                _preview_choice_feedback(
-                    preloaded_items=preloaded,
-                    trial_options_current=trial_options,
-                    positions_current=positions,
-                    chosen_index_1based=chosen_idx,
-                    reward_level=reward_level,
                 )
 
             if _poll_experimenter_controls():
@@ -1335,6 +1265,9 @@ def run_task(
 def main():
     args = parse_args()
     cfg = load_config(args.config)
+    self_initiation = bool(
+        args.self_initiation if args.self_initiation is not None else cfg.get("self_initiation", False)
+    )
     validate_config(
         cfg,
         required=[
@@ -1345,7 +1278,7 @@ def main():
             "freq_space_tsv",
             "reward_space_tsv",
             "n",
-            *INITIATION_CONFIG_KEYS,
+            *(INITIATION_CONFIG_KEYS if self_initiation else ()),
         ],
         allow_zero_duration=True,
     )
@@ -1361,13 +1294,17 @@ def main():
         cli_main=args.main_screen,
         cli_experimenter=args.experimenter_screen,
     )
-    initiation_config = resolve_initiation_config(cfg)
+    initiation_config = resolve_initiation_config(
+        cfg if self_initiation else {}, require_keys=self_initiation,
+    )
 
     colors_tsv = _get("colors_tsv", cfg.get("colors_tsv"))
     shapes_tsv = _get("shapes_tsv", cfg.get("shapes_tsv"))
     n_trials = int(_get("n", cfg.get("n")))
     num_afc = int(_get("num_afc", cfg.get("num_afc", 4)))
-    duration_raw = _get("duration", cfg.get("duration", None))
+    sequential = bool(_get("sequential", True))
+    is_memory = bool(_get("is_memory", True))
+    duration_raw = _get("duration", None if sequential or is_memory else 0.0)
     if duration_raw is None:
         print("ERROR: missing required args: --duration or config", file=sys.stderr)
         sys.exit(2)
@@ -1395,13 +1332,12 @@ def main():
     pump_pin = int(_get("pump_pin", cfg.get("pump_pin", 0)))
     buzz_pin = int(_get("buzz_pin", cfg.get("buzz_pin", 1)))
     fixed_positions = bool(_get("fixed_positions", cfg.get("fixed_positions", False)))
-    center_point_val = _get("center_point", cfg.get("center_point", None))
+    placement_distribution = normalize_placement_distribution(_get("placement_distribution", "circle"))
+    center_point_val = _get("center_point") if placement_distribution == "circle" else None
     center_point = tuple(center_point_val) if center_point_val is not None else None
-    stim_range_radius_val = _get("stim_range_radius", cfg.get("stim_range_radius", None))
+    stim_range_radius_val = _get("stim_range_radius") if placement_distribution == "circle" else None
     stim_range_radius = float(stim_range_radius_val) if stim_range_radius_val is not None else None
     display_margin = float(_get("display_margin", cfg.get("display_margin", 0.0)))
-    sequential = bool(_get("sequential", cfg.get("sequential", True)))
-    is_memory = bool(_get("is_memory", cfg.get("is_memory", True)))
     
     # New reward system parameters
     freq_space_tsv = cfg.get("freq_space_tsv")
@@ -1450,7 +1386,7 @@ def main():
             win_size=win_size,
             image_size=image_size,
             debug=debug,
-            self_initiation=_get("self_initiation", cfg.get("self_initiation", False)),
+            self_initiation=self_initiation,
             initiation_cue_center_position=initiation_config.cue_center_position,
             initiation_cue_style=initiation_config.cue_style,
             hold_before_choice=initiation_config.hold_before_choice,
@@ -1466,6 +1402,7 @@ def main():
             pump_pin=pump_pin,
             buzz_pin=buzz_pin,
             fixed_positions=fixed_positions,
+            placement_distribution=placement_distribution,
             center_point=center_point,
             stim_range_radius=stim_range_radius,
             display_margin=display_margin,

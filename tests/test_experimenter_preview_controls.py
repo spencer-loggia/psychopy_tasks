@@ -15,9 +15,9 @@ from tests.test_live_settings_ui import SettingsModel
 
 class ExperimenterPreviewControlsTests(unittest.TestCase):
     def render(self, *, sync_enabled, settings=None, key_batches=(), scenes=None,
-               preserve_scene_transitions=False, render_cycles=1):
+               preserve_scene_transitions=False, render_cycles=1, local_keys=()):
         primitives, drawn = [], []
-        pending_images, self.frames = [], []
+        pending, self.frames = [], []
 
         def factory(kind, cls=Stimulus):
             def build(win, **kwargs):
@@ -25,8 +25,7 @@ class ExperimenterPreviewControlsTests(unittest.TestCase):
                 primitives.append((kind, stim))
                 def draw():
                     drawn.append((kind, getattr(stim, "text", None)))
-                    if kind == "image":
-                        pending_images.append(tuple(stim.pos))
+                    pending.append((kind, stim))
                 stim.draw = draw
                 return stim
             return build
@@ -40,14 +39,17 @@ class ExperimenterPreviewControlsTests(unittest.TestCase):
         mouse.getPressed.return_value = (False, False, False)
         psychopy = types.ModuleType("psychopy")
         psychopy.visual = visual
-        psychopy.event = types.SimpleNamespace(getKeys=lambda: [], Mouse=lambda **kwargs: mouse)
+        psychopy.event = types.SimpleNamespace(getKeys=lambda: list(local_keys), Mouse=lambda **kwargs: mouse)
         self.wait = Mock()
         psychopy.core = types.SimpleNamespace(wait=self.wait)
         sync = [20 if sync_enabled else 0, 800, 600, 0]
         win = Mock()
+        self.rendered_sequence = types.SimpleNamespace(value=0)
+        self.acknowledged_at_flip = []
         def flip():
-            self.frames.append(tuple(pending_images))
-            pending_images.clear()
+            self.frames.append(tuple(pending))
+            pending.clear()
+            self.acknowledged_at_flip.append(self.rendered_sequence.value)
             sync[3] = 1
         win.flip.side_effect = flip
         commands = queue.Queue()
@@ -74,20 +76,44 @@ class ExperimenterPreviewControlsTests(unittest.TestCase):
                 stop, startup, sync_bar_shared=sync, live_settings=settings,
                 settings_keys_queue=settings_keys, settings_keyboard_state=self.keyboard_state,
                 preserve_scene_transitions=preserve_scene_transitions,
+                rendered_sequence_shared=self.rendered_sequence,
             )
         self.assertTrue(startup.send.call_args.args[0]["ok"])
         self.assertEqual(win.flip.call_count, render_cycles + 1)
         return primitives, drawn
 
-    def test_short_reveal_is_drawn_on_next_flip_before_queued_hide(self):
-        payload = serialize_preview_image(np.zeros((4, 4, 3), dtype=np.uint8))
-        self.render(sync_enabled=False, preserve_scene_transitions=True, render_cycles=2, scenes=[
-            {"type": "static_scene", "main_size": (800, 600),
-             "images": [{"image_payload": payload, "pos": (100, 20), "size": (40, 40)}]},
-            {"type": "static_scene", "main_size": (800, 600), "images": []},
-        ])
-        self.assertEqual(self.frames, [(), ((100, 20),), ()])
-        self.wait.assert_not_called()
+    def test_brief_reveals_and_chosen_status_each_get_a_separate_low_rate_flip(self):
+        image = serialize_preview_image(np.zeros((4, 4, 3), dtype=np.uint8))
+        positions = [(-100, 20), (100, 20)]
+        hidden_sets = [{0, 1}, {1}, {0, 1}, {0}, {0}]
+        scenes = []
+        for sequence, hidden in enumerate(hidden_sets, start=1):
+            scenes.append({
+                "type": "static_scene", "_preview_sequence": sequence, "main_size": (800, 600),
+                "images": [{"image_payload": image, "pos": pos, "size": (40, 40)} for pos in positions],
+                "overlay_dots": [{"pos": positions[i], "radius": 5} for i in sorted(hidden)],
+                "hit_boxes": [{"pos": pos, "size": (50, 50), "color": (230, 200, 40)} for pos in positions],
+                "status_boxes": ([{"pos": positions[1], "size": (60, 60), "color": (180, 80, 220)}]
+                                 if sequence == 5 else []),
+            })
+        self.render(sync_enabled=False, scenes=scenes, preserve_scene_transitions=True,
+                    render_cycles=len(scenes), local_keys=("r",))
+        visible_sets = []
+        for frame in self.frames[1:]:
+            images = {stim.pos for kind, stim in frame if kind == "image"}
+            overlays = {stim.pos for kind, stim in frame if kind == "circle"}
+            visible_sets.append(images - overlays)
+            image_indices = [i for i, (kind, _) in enumerate(frame) if kind == "image"]
+            dot_indices = [i for i, (kind, _) in enumerate(frame) if kind == "circle"]
+            self.assertLess(max(image_indices), min(dot_indices), "Hidden dots must overlay images")
+        self.assertEqual(visible_sets, [set(), {positions[0]}, set(), {positions[1]}, {positions[1]}])
+        chosen = [stim for kind, stim in self.frames[-1] if kind == "rect" and getattr(stim, "width", None) == 60]
+        self.assertEqual(len(chosen), 1)
+        self.assertEqual(chosen[0].lineColor, [180/127.5-1, 80/127.5-1, 220/127.5-1])
+        self.assertEqual(self.acknowledged_at_flip, [0, 0, 1, 2, 3, 4])
+        self.assertEqual(self.rendered_sequence.value, 5)
+        self.assertEqual([call.args for call in self.wait.call_args_list], [(0.1,)] * 5)
+        self.assertTrue(self.reward_event.is_set(), "Queued scenes must not starve preview controls")
 
     def test_sync_uses_phase_text_without_adding_bar_rectangles(self):
         enabled, drawn = self.render(sync_enabled=True)

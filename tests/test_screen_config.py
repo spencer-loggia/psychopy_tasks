@@ -602,27 +602,7 @@ class ScreenConfigTests(unittest.TestCase):
             preview._sender_stop.set()
             sender.join(timeout=0.2)
 
-    def test_preview_wait_wakes_on_scene_arrival_before_idle_refresh(self):
-        waiting = threading.Event()
-
-        class Commands(queue.Queue):
-            def get(self, *args, **kwargs):
-                waiting.set()
-                return super().get(*args, **kwargs)
-
-        commands = Commands()
-        received = []
-        receiver = threading.Thread(target=lambda: received.append(
-            _get_preview_command(commands, wait_s=5.0, preserve_order=True)
-        ), daemon=True)
-        receiver.start()
-        self.assertTrue(waiting.wait(timeout=1.0))
-        commands.put({"type": "static_scene", "images": ["revealed"]})
-        receiver.join(timeout=1.0)
-        self.assertFalse(receiver.is_alive(), "Scene arrival did not wake the preview")
-        self.assertEqual(received[0]["images"], ["revealed"])
-
-    def test_ordered_preview_sender_preserves_short_reveal_then_hide(self):
+    def test_ordered_preview_sender_keeps_each_scene_under_backpressure(self):
         preview = object.__new__(ExperimenterPreview)
         preview._queue = queue.Queue(maxsize=1)
         preview._queue.put_nowait({"type": "already_in_flight"})
@@ -633,15 +613,68 @@ class ScreenConfigTests(unittest.TestCase):
         sender = threading.Thread(target=preview._command_sender_loop)
         sender.start()
         try:
-            for scene in ("reveal", "hide", "clear"):
+            for scene in ("reveal", "hide", "chosen", "clear"):
                 preview._send({"type": scene})
-            received = [_get_preview_command(preview._queue, wait_s=1.0, preserve_order=True)
-                        for _ in range(4)]
+            received = [preview._queue.get(timeout=1.0) for _ in range(5)]
             self.assertEqual([scene["type"] for scene in received],
-                             ["already_in_flight", "reveal", "hide", "clear"])
+                             ["already_in_flight", "reveal", "hide", "chosen", "clear"])
+            self.assertEqual([scene["_preview_sequence"] for scene in received[1:]], [1, 2, 3, 4])
         finally:
             preview._sender_stop.set()
             sender.join(timeout=0.2)
+
+    def test_ordered_preview_child_consumes_only_one_scene_per_redraw(self):
+        commands = queue.Queue()
+        for scene in ("reveal", "hide", "chosen"):
+            commands.put_nowait({"type": scene})
+        self.assertEqual(_get_preview_command(commands, preserve_order=True)["type"], "reveal")
+        self.assertEqual(commands.qsize(), 2)
+        self.assertEqual(_get_preview_command(commands, preserve_order=True)["type"], "hide")
+        self.assertEqual(_get_preview_command(commands, preserve_order=True)["type"], "chosen")
+        self.assertIsNone(_get_preview_command(commands, preserve_order=True))
+
+    def test_reward_count_update_does_not_publish_an_extra_scene(self):
+        preview = object.__new__(ExperimenterPreview)
+        preview._send = Mock()
+        preview.set_reward_counts({0: 2, 1: 3, 2: 4, 3: 5})
+        preview._send.assert_not_called()
+        next_scene = preview._complete_preview_snapshot({"type": "static_scene"})
+        self.assertEqual(next_scene["reward_counts"], {0: 2, 1: 3, 2: 4, 3: 5})
+
+    def test_normal_close_waits_for_last_ordered_frame_to_be_rendered(self):
+        preview = object.__new__(ExperimenterPreview)
+        preview._closed = False
+        preview._preserve_scene_transitions = True
+        preview.update_interval_s = 0.1
+        preview._rendered_sequence = types.SimpleNamespace(value=0)
+        preview._preview_command_sequence = 1
+        preview._sender_thread = Mock()
+        preview._sender_thread.is_alive.return_value = True
+        preview._sender_stop = threading.Event()
+        preview._stop_event = threading.Event()
+        preview._exit_event = threading.Event()
+        preview._process = Mock()
+        preview._process.is_alive.side_effect = lambda: not preview._stop_event.is_set()
+        preview._queue = Mock()
+        draining = threading.Event()
+        preview._live_settings = Mock()
+        preview._live_settings.collect_requests.side_effect = draining.set
+        preview._close_calibration_actions = Mock()
+        preview._close_settings_keyboard = Mock()
+        closer = threading.Thread(target=preview.close)
+        closer.start()
+        try:
+            self.assertTrue(draining.wait(timeout=1))
+            self.assertFalse(preview._stop_event.is_set(), "Renderer stopped before its final flip")
+            self.assertFalse(preview._sender_stop.is_set())
+            preview._rendered_sequence.value = 1
+            closer.join(timeout=1)
+            self.assertFalse(closer.is_alive())
+            self.assertTrue(preview._sender_stop.is_set())
+            self.assertTrue(preview._stop_event.is_set())
+        finally:
+            preview._exit_event.set()
+            closer.join(timeout=1)
 
     def test_preview_startup_pipe_eof_becomes_structured_error(self):
         receiver = Mock()

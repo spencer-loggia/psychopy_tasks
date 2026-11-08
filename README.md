@@ -345,7 +345,14 @@ config from its original source at block launch time, sets `config_name`, `outpu
 other non-list state fields except the experiment's `git_commit`, `hostname`, `os_details`, and `python_version`
 metadata, and flattens the newest entry from every list-valued state field into top-level config fields, excluding
 history timestamps. It never injects the calibration-history lists themselves. The task subprocess is
-then launched with `--config` pointing to this generated file.
+then launched with `--config` pointing to this generated file. Before saving, known inactive settings are
+removed according to the task and its effective configuration, after all state and launcher overrides.
+For example, uniform placement omits circle geometry; disabled self-initiation omits cue/hold settings;
+disabled gaze gating, tracking, and sync omit their dependent settings. Active-foraging subject maps
+retain only the selected subject's entry. The saved file remains runnable, and source configs are unchanged.
+Unknown task scripts and extension settings are preserved. The experiment's `launch_config.json` likewise
+omits details for disabled video recording, experiment eye tracking, and sync, while retaining task menus
+and initial state as experiment provenance.
 
 Interface task entries can be nested into menu pages. A normal leaf has one launch script and an optional config:
 
@@ -831,11 +838,9 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
 - The preview is a subject-view mirror: it transposes the complete native main
   framebuffer geometry (background, positions, stimuli, hit boxes, and video
   crop), rather than merely undoing each stimulus orientation. Scene commands
-  wake the preview immediately instead of waiting for the periodic overlay refresh.
-  Ordinary previews use a bounded, sequenced latest-snapshot mailbox, and shared
-  video reads the newest committed ring frame. Gaze-gated active foraging retains
-  scene transitions in order so each brief reveal gets a preview flip before its hide;
-  the background sender keeps this transport off the subject's presentation thread.
+  use a bounded, sequenced latest-snapshot mailbox, and shared video reads the
+  newest committed ring frame, so a slow preview drops stale work instead of
+  accumulating lag.
 - During movie playback the experimenter overlay shows a separate `Video:`
   elapsed timer. Its zero is the actual main-display first-frame flip callback,
   independent of decoder preparation time and preview transport latency.
@@ -949,8 +954,15 @@ the experimenter preview, so only the main task content is shown.
 
 The `active_foraging` experimenter display shows the config name, current subject, and current trial as
 `Trial: current / total`, in addition to the current system time and elapsed task timer. An indefinite task
-(`n <= 0`) displays `∞` as its total. While stimuli are visible, their selectable hit boxes are outlined by
-reward level: red for `0`, gray for `1`, yellow for `2`, and green for `3`. Clicking `rew.` or pressing `r`
+(`n <= 0`) displays `∞` as its total. During option presentation, every option image is shown to the
+experimenter with its reward-level outline: red for `0`, gray for `1`, yellow for `2`, and green for `3`.
+An option hidden from the subject has a dot over its preview image; that overlay disappears only while
+the image is actually visible on the subject display. A separate outer outline is absent until the option
+has been revealed, blue after any reveal, and violet when chosen. These annotations appear only on the
+experimenter display. Each visibility/status change is retained in order for at least one preview flip,
+even when briefer than the preview's lower refresh interval. The preview may therefore lag during rapid
+changes, but never combines separate reveals into an all-visible array. There is no synthetic post-choice
+array or reward-colored choice highlight. Clicking `rew.` or pressing `r`
 delivers the configured manual juice-pump pulse. The keyboard command works when either the main task window or
 experimenter window has keyboard focus.
 Press `Tab` to cycle through the parameter buttons and `Enter` to edit the focused value.
@@ -1273,8 +1285,6 @@ fixation criterion requires a continuous interval of valid gaze inside that circ
 The existing sample-based fixation detector runs with eye acquisition; the presentation
 thread only reads its result. Missing, stale, and invalid samples cannot earn fixation.
 Light grey window outlines appear only in the experimenter preview.
-Stimulus reveals and hides wake that preview immediately and appear on successive
-preview flips, rather than being replaced between its periodic 100 ms updates.
 When fixation gating is enabled, the experimenter screen also has a **Fix radius**
 button. Click it, or focus it with Tab and press Enter, to edit
 `fixation_window_radius` in pixels. Confirmed edits take effect at the next trial
@@ -1290,6 +1300,14 @@ the choice window opens at the initial `options_dot` flip. The subject has exact
 that deadline. The minimum ISI still applies before a stimulus can be revealed.
 With `is_memory=true`, the stimulus timer starts with the first revealed option after
 the minimum ISI, followed by dot-only choice.
+
+In every active-foraging mode, an option touch is eligible only after at least one option image has
+actually flipped onto the subject display in that trial. Fixation acceptance alone does not unlock
+choice. Early touches are consumed and logged as `choice_touch_rejected` messages with
+`reason=no_option_revealed_at_touch`; held touches require release and a fresh press. Buffered presses
+whose onset precedes the first image flip are also rejected, even if processed after that flip.
+After the first reveal, any option can be selected, including one not yet revealed. This eligibility
+rule does not restart or extend the choice window, and trials with no reveal cannot produce a choice.
 
 `saccade_wait_timeout_s` is a positive number of seconds, or `null` to disable saccade
 timeouts. It measures time from the most recent new-dot onset until valid gaze first
@@ -1328,7 +1346,7 @@ Common `active_foraging` configurations:
 
 - Config A: `sequential=false`, `is_memory=false`
   - `isi`: all choice-location dots are shown together before the stimuli.
-  - `duration`: must be `0`.
+  - `duration`: must be `0` when specified; omitted from saved block configs because this mode defaults to `0`.
   - `choice_time`: the full array appears on the first choice frame and remains selectable for this long.
   - Total selectable time: `choice_time`.
 
@@ -1345,15 +1363,23 @@ Common `active_foraging` configurations:
 
 Active Foraging Positioning
 ---------------------------
-`active_foraging` places every stimulus center on a stimulus circle. Its `center_point` uses PsychoPy-style centered pixel coordinates in the participant's view: `[0, 0]` is screen center, positive X is right, and positive Y is up. `[-500, -500]` therefore means 500 pixels left and down from screen center. `null` also means `[0, 0]`. The task applies the display's software rotation when converting these positions to native framebuffer coordinates for rendering and logging. These settings previously used upper-left-origin native pixels; existing non-null positions authored in that convention must be converted.
+`placement_distribution` selects option placement for active foraging and match-to-cue. The default,
+`"circle"`, preserves the existing circle placement and random sampling. `"uniform"` samples X and Y
+uniformly over the allowed screen rectangle on each trial, rejecting overlaps with previously placed
+stimuli. The rectangle accounts for `display_margin` and the full rotated image dimensions, so every
+stimulus stays inside the allowed area. In uniform mode, `center_point`, `stim_range_radius`, and
+`fixed_positions` are inactive; the independent initiation-cue position still applies.
+
+In circle mode, `center_point` uses PsychoPy-style centered pixel coordinates in the participant's view: `[0, 0]` is screen center, positive X is right, and positive Y is up. `[-500, -500]` therefore means 500 pixels left and down from screen center. `null` also means `[0, 0]`. The task applies the display's software rotation when converting these positions to native framebuffer coordinates for rendering and logging. These settings previously used upper-left-origin native pixels; existing non-null positions authored in that convention must be converted.
 
 `stim_range_radius` is the circle radius in pixels. When it is `null`, it defaults to half the distance from an interior `center_point` to the closest screen edge. Circle centers on or outside the screen edge require an explicit positive radius; circles may extend off-screen.
 
-`display_margin` is the minimum clearance in pixels between **any part of the stimulus image** and each screen edge (default `0`). Before the first trial, active foraging intersects the circle with the rectangle inset by that margin plus half the rotated image dimensions. Random positions are sampled directly and uniformly along the remaining arcs, so no off-screen proposals need to be rejected at trial time. Overlap rejection between stimuli still applies. Authored image sizes remain `[width, height]`; their native axis-aligned bounds swap after a 90- or 270-degree software turn. The calculation uses the actual native framebuffer size and the same output-dependent software rotation as rendering, so the margin also holds in the participant's view. A circle with no usable arc raises a configuration error before trials begin.
+`display_margin` is the minimum clearance in pixels between **any part of the stimulus image** and each screen edge (default `0`). In circle mode, active foraging intersects the circle with the rectangle inset by that margin plus half the rotated image dimensions before the first trial. Random positions are sampled directly and uniformly along the remaining arcs, so no off-screen proposals need to be rejected at trial time. Overlap rejection between stimuli still applies. Authored image sizes remain `[width, height]`; their native axis-aligned bounds swap after a 90- or 270-degree software turn. The calculation uses the actual native framebuffer size and the same output-dependent software rotation as rendering, so the margin also holds in the participant's view. A circle with no usable arc raises a configuration error before trials begin.
 
 For example, on the rig's `1600x2560` participant-facing screen, `center_point: [-500, -500]`, `stim_range_radius: 500`, `image_size: [150, 150]`, and `display_margin: 200` produce an arc toward the central region while excluding positions too near the left edge. A radius of approximately `707.1068` would make that circle pass through `[0, 0]` exactly. The initiation cue is separate and must still have an on-screen center or `null`.
 
-Active foraging and match-to-cue require four self-initiation settings. `initiation_cue_center_position` is either
+When `self_initiation=true`, active foraging and match-to-cue require four self-initiation settings.
+They may be omitted when self-initiation is disabled. `initiation_cue_center_position` is either
 `null` for the screen center or `[x, y]` in the same participant-centered, Y-up coordinates as `center_point`.
 `initiation_cue_style` is `"checker"` for the legacy Gaussian-masked checkerboard,
 `"dotted_checker"` for that checkerboard with a centered black dot (diameter approximately 20% of cue width),
@@ -1365,8 +1391,9 @@ A missing or out-of-cue touch lasting at most 100 ms is tolerated. A longer brea
 logs `initiation_cue_release`, and starts the inter-trial interval. When a fixation cross is enabled, it is white
 before and after choice and black while the choice window is open.
 
-- `fixed_positions=true`: locations retain their evenly spaced native-framebuffer layout around the circle. The spacing angle is `2*pi / num_afc`, and the first location is offset by half that spacing from the point directly below the circle center in native coordinates. A fixed location whose full image crosses `display_margin` raises a configuration error rather than moving or dropping an option.
-- `fixed_positions=false`: locations are random points on the circle, with rejected draws when stimulus bounding boxes would overlap.
+- In circle mode, `fixed_positions=true`: locations retain their evenly spaced native-framebuffer layout around the circle. The spacing angle is `2*pi / num_afc`, and the first location is offset by half that spacing from the point directly below the circle center in native coordinates. A fixed location whose full image crosses `display_margin` raises a configuration error rather than moving or dropping an option.
+- In circle mode, `fixed_positions=false`: locations are random points on the circle, with rejected draws when stimulus bounding boxes would overlap.
+- Active foraging accepts `--placement_distribution circle` or `--placement_distribution uniform` to override JSON placement.
 - Custom `center_point`, `stim_range_radius`, and `display_margin` values can be provided in JSON or as `--center_point X Y --stim_range_radius R --display_margin M`.
 
 Active Foraging Subject Maps
@@ -1431,7 +1458,8 @@ automatically when launching the task as an experiment block.
 Each trial runs `onset cue -> match cue/tap -> optional match-cue reward -> delay -> options -> choice -> optional
 choice reward -> inter-trial interval`. The `match_cue_duration` and `delay_time` fields control the two added
 visual phases. Option presentation uses the same `sequential`, `is_memory`, `fixed_positions`, `duration`, `isi`,
-`choice_time`, `center_point`, `stim_range_radius`, and `num_afc` semantics as active foraging.
+`choice_time`, `placement_distribution`, `center_point`, `stim_range_radius`, `display_margin`, and `num_afc`
+semantics as active foraging.
 
 The cue is sampled uniformly from the complete configured shape/color/luminance stimulus space. One exact copy
 is guaranteed among the options; every other option is an independent random draw with replacement from that
@@ -1476,7 +1504,7 @@ All tasks in this repository must support loading a JSON configuration file as a
 - `images_dir` (string): path to image resources
 - `output_dir` (string): path where logs and metadata will be saved
 - `n` (int): number of trials for tasks that use this field; `play_video` uses `num_clips` instead
-- `duration` (number): stimulus presentation duration in seconds. For `active_foraging` and `match2cue`, this must be positive when `sequential=true` or `is_memory=true`, and must be `0` only when both are false.
+- `duration` (number): stimulus presentation duration in seconds. For `active_foraging` and `match2cue`, this must be positive when `sequential=true` or `is_memory=true`; when both are false, it must be `0` or omitted.
 - `isi` (number): pre-stimulus / inter-stimulus interval in seconds; exact meaning is task-specific
 - `iti` (number): inter-trial interval in seconds for trial-based tasks
 - `bg` (array of 3 ints): background RGB values in 0-255
@@ -1485,9 +1513,10 @@ All tasks in this repository must support loading a JSON configuration file as a
 - `win_size` (array of 2 ints, optional)
 - `fixation_size` (int, optional)
 - `image_size` (array of 2 ints, optional)
+- `placement_distribution` (`"circle"` or `"uniform"`, optional): active-foraging and match-to-cue option placement; default `"circle"` preserves existing behavior
 - `center_point` (array of 2 ints or null, optional): AFC-style stimulus circle center in participant-centered pixels (X right, Y up; null means `[0, 0]`)
 - `stim_range_radius` (int or null, optional): AFC-style stimulus circle radius in pixels
-- `display_margin` (non-negative number, optional): active-foraging minimum full-image clearance from each screen edge in pixels (default `0`)
+- `display_margin` (non-negative number, optional): active-foraging and match-to-cue minimum full-image clearance from each screen edge in pixels (default `0`)
 - `sync_pin` (int or null, optional): BCM GPIO pin for display-synchronized sync bar signals, default `18`; null keeps visual synchronization without GPIO
 - `sync_bar` (object, optional): shared display synchronization options described below
 - `daq.address` or `daq_address` (int, optional): DAQC2plate address for task hardware outputs

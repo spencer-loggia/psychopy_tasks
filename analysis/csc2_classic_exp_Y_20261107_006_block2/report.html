@@ -1,0 +1,233 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CSC2 classic: timing and choice analysis</title>
+<style>body{max-width:1120px;margin:40px auto;padding:0 24px;font:17px/1.6 system-ui,sans-serif;color:#213140;background:#fff}
+h1{font-size:32px;line-height:1.2}h2{font-size:23px;margin-top:36px}p{max-width:1000px}img{width:100%;height:auto}
+table{border-collapse:collapse;width:100%;font-size:14px}th,td{padding:10px;text-align:left;border-bottom:1px solid #d9e1e7}
+th{background:#eef3f7}a{color:#1262a0}code{font-size:.9em;background:#f1f4f6;padding:2px 4px}
+.lead{font-size:21px;border-left:5px solid #de7627;padding-left:20px}.note{color:#506275;font-size:15px}
+@media print{body{margin:0;max-width:none}img{max-height:850px;object-fit:contain}}</style>
+<h1>Most choices occurred before any stimulus was revealed</h1>
+<p class="note">Yuri · 7 November 2026 · experiment exp_Y_20261107_006 · block 2_csc2_foraging_classic</p>
+<p class="lead">The data support rapid selection of unrevealed dots on most trials, compatible with guessing or a spatial/motor strategy.
+They do not support rapid visual comparison of multiple color–shape stimuli. There were 72 completed trials;
+63 (87.5%) had zero logged stimulus exposure before the choice. Performance was not convincingly above the relevant chance baseline.</p>
+<p>The remaining nine trials contained ten reveals. Every reveal was of the subsequently chosen option; trial 55 revealed that same option twice.
+No trial revealed two different stimuli. Trial 73 was aborted during initiation and is excluded from completed-trial analyses.</p>
+<h2>What this configuration actually does</h2>
+<p>The saved block configuration has <code>sequential=false</code>, <code>is_memory=false</code>, <code>duration=0</code>,
+<code>wait_for_saccade_on_dot=true</code>, a 175-pixel fixation radius and a 300-ms continuous dwell criterion.
+All three dots appear together and the 2-second choice window opens on that same flip, on all 72 trials.
+Touch targets for all options are already active, even before any image has appeared.</p>
+<p>A stimulus is revealed only after continuous accepted gaze in its window; leaving that window restores its dot.
+The 100-ms ISI is a minimum waiting period, not a guaranteed image presentation.
+The 4-second saccade timeout cannot precede the 2-second choice deadline in this configuration.
+A touch ends the trial even if no fixation was accepted and no stimulus was revealed.</p>
+<p>This behavior follows <a href="../../bin/utils.py">bin/utils.py</a>:
+<code>gaze_choice_at_dot_onset</code> and the simultaneous-dot branch (around line 3331),
+<code>_match_choice_target</code> (2749), and <code>_run_gaze_contingent_options</code> (3039).
+The fixation gate is in <a href="../../bin/dot_fixation.py">bin/dot_fixation.py</a> (61–102).</p>
+<h2>Timing of choices, gaze and flips</h2>
+<ul><li>Dot onset to touch: median <b>511.5 ms</b>, interquartile range 478.6–568.5 ms, range 418.6–1097.2 ms.</li>
+<li>Trials with no reveal: median 506.9 ms. Trials with a reveal: median 901.6 ms.</li>
+<li>First valid gaze sample inside any option window: median <b>238.1 ms</b> after dots appeared, using eye reception timestamps.</li>
+<li>On no-reveal trials, the longest continuous in-window sample span was typically only <b>159.9 ms</b> (median); the maximum was 259.8 ms, below the 300-ms requirement.</li>
+<li>Accepted fixation to image-on flip: median 12.1 ms, range 11.6–19.7 ms. The rare reveals were not being held back by hundreds of milliseconds of flip latency.</li>
+<li>Touch to the post-choice gray flip: median 14.3 ms, range 10.0–42.6 ms.</li>
+<li>The nominal display rate was 59.46 Hz (16.82 ms per refresh). Dot-flip submission to callback took a median 14.6 ms;
+image-on submission to callback took 10.0 ms. These are submission latencies, not missed-frame estimates.</li></ul>
+<p>Using nearest-option ROI visits spanning approximately 60 ms or more, <b>36/72 trials</b> visited at least two option locations;
+<b>34 of those had no stimulus reveal</b>. The median retained visit lasted 119.9 ms.
+Even restricting to transitions between option windows whose centers were more than 350 pixels apart, 27 trials had a transition.
+Thus rapid movement between locations is real in the recording, but it usually samples dots.</p>
+<p><b>Trial 70 is especially clear:</b> gaze visited option 3 at 287–397 ms, option 2 at 407–507 ms, then option 1 at 527–629 ms;
+each visit spanned about 100 ms on the camera clock. The monkey touched option 1 at 645 ms and earned reward level 2.
+All three locations had remained dots throughout.</p>
+<img src="timing_overview.png" alt="All-trial gaze visits and stimulus visibility, reaction times, and exact chance reward distribution">
+<p class="note">Colored segments are retained gaze visits, black segments are stimulus exposure before the touch, and red marks are touches.
+The reward distribution conditions on each trial’s actual three reward values.</p>
+<h2>The nine trials with actual reveals</h2>
+<p>All values below are relative to that trial’s dot-on flip. Visibility ends at an explicit option-off event, or at the gray-screen outcome flip
+when no separate option-off event was logged. Exposure before touch is capped at the touch timestamp.</p>
+<table class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th>Trial</th>
+      <th>Chosen option</th>
+      <th>Reward</th>
+      <th>Touch after dots (ms)</th>
+      <th>Visible intervals after dots (ms)</th>
+      <th>Exposure before touch (ms)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>1</td>
+      <td>2</td>
+      <td>3</td>
+      <td>994.4</td>
+      <td>547.9–648.6</td>
+      <td>100.8</td>
+    </tr>
+    <tr>
+      <td>12</td>
+      <td>1</td>
+      <td>3</td>
+      <td>541.5</td>
+      <td>538.5–564.6</td>
+      <td>3.0</td>
+    </tr>
+    <tr>
+      <td>18</td>
+      <td>3</td>
+      <td>2</td>
+      <td>912.4</td>
+      <td>911.8–933.9</td>
+      <td>0.6</td>
+    </tr>
+    <tr>
+      <td>43</td>
+      <td>2</td>
+      <td>2</td>
+      <td>581.8</td>
+      <td>522.4–599.0</td>
+      <td>59.5</td>
+    </tr>
+    <tr>
+      <td>45</td>
+      <td>2</td>
+      <td>2</td>
+      <td>901.6</td>
+      <td>537.9–921.3</td>
+      <td>363.7</td>
+    </tr>
+    <tr>
+      <td>48</td>
+      <td>1</td>
+      <td>0</td>
+      <td>468.6</td>
+      <td>463.4–497.2</td>
+      <td>5.2</td>
+    </tr>
+    <tr>
+      <td>55</td>
+      <td>2</td>
+      <td>1</td>
+      <td>1097.2</td>
+      <td>569.9–611.3; 1032.1–1108.4</td>
+      <td>106.6</td>
+    </tr>
+    <tr>
+      <td>57</td>
+      <td>2</td>
+      <td>1</td>
+      <td>572.4</td>
+      <td>536.0–585.8</td>
+      <td>36.4</td>
+    </tr>
+    <tr>
+      <td>66</td>
+      <td>1</td>
+      <td>3</td>
+      <td>1006.2</td>
+      <td>615.9–1025.6</td>
+      <td>390.2</td>
+    </tr>
+  </tbody>
+</table>
+<p>Trials 12, 18 and 48 provided only 3.0, 0.6 and 5.2 ms between the image-on callback and recorded touch.
+Those times do not provide credible evidence that the newly revealed image drove the touch already being executed.
+Trials 43 and 57 had 59.5 and 36.4 ms before touch. Trials 1, 45, 55 and 66 had at least 100 ms total exposure;
+some use of stimulus information on these few trials remains possible. Across the nine reveal trials the median total pre-touch exposure was 59.5 ms.</p>
+<p>In trial 55, gaze loss caused the image to disappear after 41.5 ms, and a later accepted dwell revealed the same option again for 65.1 ms before touch.
+This was reacquisition of one option, not comparison of two visible stimuli.</p>
+<img src="gaze_examples.png" alt="Eye distance traces for trials 70, 12, 1 and 55 aligned to display flips and touch">
+<h2>Why the reward rate looked above chance</h2>
+<p>Juice reward is associated with levels 2 and 3, not with one uniquely correct option per trial. A 1/3 baseline therefore does not apply to juice reward.
+Of the 216 offered options, 143 (66.2%) carried juice. Randomly selecting one of the actual three options on each trial predicts 47.67 rewarded choices;
+51 were observed (70.8%). The exact upper-tail probability is <b>p = 0.198</b>.
+The central 95% of this null distribution spans 41–54 rewarded trials, which includes 51.</p>
+<table class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th>Measure</th>
+      <th>Observed</th>
+      <th>Random-choice expectation</th>
+      <th>Exact one-sided p</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Juice rewarded</td>
+      <td>51</td>
+      <td>47.67</td>
+      <td>0.1981</td>
+    </tr>
+    <tr>
+      <td>Best available reward, ties count</td>
+      <td>40</td>
+      <td>37.00</td>
+      <td>0.2564</td>
+    </tr>
+    <tr>
+      <td>Total pump pulses</td>
+      <td>70</td>
+      <td>64.33</td>
+      <td>0.1588</td>
+    </tr>
+    <tr>
+      <td>Sum of reward levels</td>
+      <td>134</td>
+      <td>128.00</td>
+      <td>0.2022</td>
+    </tr>
+  </tbody>
+</table>
+<p>Choosing a highest-valued option occurred on 40/72 trials (55.6%), versus 37/72 expected (51.4%), counting ties; p = 0.256.
+Mean chosen reward level was 1.861, versus 1.778 expected. Among the 63 no-reveal trials alone, 45 earned juice versus 42.33 expected; p = 0.245.
+Thus the main result persists when trials with any potential stimulus information are removed.</p>
+<p>The configured frequency map also favors rewarding items: its marginal juice probability is 60.8%; the realized block happened to contain 66.2%.
+The primary tests use the realized alternatives, avoiding an assumption that the block exactly matched the sampling distribution.
+Reward lookup uses <code>reward_space_TY.csv[shape*36 + color]</code> and reproduces every logged chosen reward (72/72).</p>
+<p class="note">The null assumes independent uniform selection among each trial’s options. Failure to reject it does not prove literal random choice:
+location preferences, a motor routine, or information use on a small subset can coexist with these results.
+An exploratory RT–reward correlation was positive (Spearman ρ = 0.248, unadjusted p = 0.035), but it was also positive in no-reveal trials
+(ρ = 0.241, p = 0.057). It does not demonstrate visual discrimination, and was not a prespecified performance test.</p>
+<h2>Why the experimenter display can be misleading</h2>
+<p>The non-memory post-choice feedback routine <code>_preview_choice_feedback</code> in
+<a href="../../task/active_foraging.py">task/active_foraging.py</a> (around line 768) draws all three images on the experimenter preview,
+including options that were never revealed to the subject, and highlights the chosen option. It runs after outcome delivery.
+Seeing those images in feedback is therefore not evidence they were available to guide the choice.</p>
+<p>The saved block also enabled the synchronization bar (147 flips), although the named source config disables it.
+Sync-only flips preserve the existing front-buffer scene in <a href="../../bin/sync_display.py">bin/sync_display.py</a>;
+they are not option reveals. Their scheduling latencies should not be interpreted as stimulus exposure durations.</p>
+<h2>Measurement limits and reproducibility</h2>
+<p>The eye recording contains 11,680 observations; its median camera interval is 19.983 ms (about 50 Hz), despite 100-Hz UART polling.
+Of the 1,955 observations received between dot onset and touch, 98.9% were valid. There are 244 unrecorded frame sequence numbers across the whole recording
+(2.05% of the spanned frames). Missing samples, invalid gaze, and gaps over 60 ms split offline visits.</p>
+<p>These are ROI visits and relocations consistent with saccades, not a validated physiological saccade detector. No explicit saccade onset/offset events were logged.
+The visit threshold uses first-to-last camera sample duration with 1-ms tolerance for the 19.983-ms period; there are 38, 36, 30 and 19 trials visiting multiple options
+at nominal 40-, 60-, 80- and 100-ms thresholds. Assignments use the nearest center within 175 pixels to avoid double-counting overlapping windows;
+40 trials had at least two overlapping fixation windows. Online gating evaluates each ROI independently.</p>
+<p>CSV <code>task_time_ns</code> records eye-sample reception time. The online gate uses an age-adjusted estimate that is not saved in this CSV.
+The camera clock is not synchronized to the task clock. Relative eye-to-display alignment therefore includes acquisition/transport uncertainty,
+and these data cannot justify millisecond-precise physiological saccade latencies.
+The saved calibration has no multi-point residual error estimate, so window crossings remain calibration-dependent.</p>
+<p>Display timings are PsychoPy flip callbacks, not photodiode measurements; touch times are task-recorded input timestamps.
+The zero-exposure finding relies on the completeness of event logging and its agreement with the inspected local task implementation.
+The run does not identify a saved source commit. The inspected checkout is recorded in <code>metrics.json</code>, along with SHA-256 hashes of inputs and relevant source files.
+The local source modifications present at analysis start were left intact; no task code or data on the volume was changed.</p>
+<p>The behavior-log “zero transition misses” values are not an independent guarantee of display timing: all 72 trials also report zero scheduled transitions,
+because this path is driven by gaze and touch. The analysis uses actual option-on/off and outcome flip timestamps instead.</p>
+<h2>Implication for the task</h2>
+<p>If the intended task requires informed visual choice, the current response rule does not enforce it.
+For gaze-contingent inspection, the direct correction is to make an option eligible only after a logged reveal and a defined minimum visible interval,
+and log attempted touches rejected for insufficient exposure. Whether all alternatives must be inspected is a separate task-design decision.
+Simply extending the choice window or reducing the dwell threshold does not prevent early blind touches.</p>
+<p>If “classic” instead means a simultaneously visible array, disabling <code>wait_for_saccade_on_dot</code> selects the ordinary simultaneous-image path.
+That changes task semantics; no configuration or task implementation was changed in this analysis.</p>
+<p><a href="trial_timing.csv">All 72 trial timings</a> · <a href="stimulus_reveals.csv">All 10 reveal intervals</a> ·
+<a href="gaze_visits_60ms.csv">Retained gaze visits</a> · <a href="gaze_roi_runs_all.csv">All ROI runs</a> ·
+<a href="metrics.json">Metrics and input hashes</a> · <a href="analyze.py">Reproducible analysis script</a></p>
+<p class="note">Run: <code>python analyze.py</code> with numpy, pandas, scipy and matplotlib installed. The source data path is set at the top of the script.
+All outputs are written beside this script. Tests here are consistency checks of timestamps, all 72 reward lookups, and exact finite-sample null calculations.</p>
+</html>

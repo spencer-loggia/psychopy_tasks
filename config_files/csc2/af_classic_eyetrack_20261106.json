@@ -23,7 +23,7 @@
   "pump_delay_time": 0.0,
   "pump_pulse_time_seconds": 0.25,
   "inter_pump_interval": 0.1, 
-  "timeout_duration_seconds": 2.50,
+  "timeout_duration_seconds": 3.5,
   "reward_to_pulse_map": {
     "0": 0,
     "1": 0,
@@ -75,15 +75,16 @@
 
   "wait_for_saccade_on_dot": true,
   "fixation_window_radius": 175,
-  "fixation_criteria_s": 0.3,
+  "fixation_criteria_s": 0.2,
   "saccade_wait_timeout_s": 4.0,
   
-  "iti": 0.2,
+  "iti": 0.75,
   "duration": 0.0,
   "num_afc": 3,
   "choice_time": 2.0,
   "isi": 0.1,
   "fixed_positions": false,
+  "placement_distribution": "uniform",
   "sequential": false,
   "is_memory": false,
   "raspi": true,

@@ -1770,18 +1770,18 @@ def _wait_for_preview_startup(startup_receiver, process, timeout_s: float):
     return None, None
 
 
-def _get_preview_command(command_queue, *, wait_s=0.0, preserve_order=False):
-    """Wake on a new scene; the timeout only controls periodic idle redraws."""
+def _get_preview_command(command_queue, *, preserve_order=False):
+    """Consume one ordered scene, or the latest snapshot for ordinary previews.
+
+    Ordered scenes are consumed once per preview redraw, never combined. The
+    caller still services input and sleeps at the configured preview cadence.
+    """
+    if not preserve_order:
+        return _get_latest_preview_command(command_queue)
     try:
-        first = command_queue.get(timeout=max(0.0, float(wait_s)))
+        return command_queue.get_nowait()
     except (queue.Empty, OSError, ValueError):
         return None
-    if preserve_order:
-        return first
-    latest = _get_latest_preview_command(command_queue, coalesce_s=0.0)
-    if latest is not None and int(latest.get("_preview_sequence", 0)) >= int(first.get("_preview_sequence", 0)):
-        return latest
-    return first
 
 
 def _experimenter_preview_process(
@@ -1810,6 +1810,7 @@ def _experimenter_preview_process(
     settings_keys_queue=None,
     settings_keyboard_state=None,
     preserve_scene_transitions=False,
+    rendered_sequence_shared=None,
 ) -> None:
     startup_reported = False
 
@@ -1967,27 +1968,27 @@ def _experimenter_preview_process(
             if stim is not None:
                 images.append(stim)
 
-        dots = []
-        for item in payload.get("dots", []) or []:
-            radius = max(
-                1.0,
-                scale_scene_length(
-                    float(item.get("radius", 4.0)),
-                    oriented_main_size,
-                    preview_size,
-                ),
-            )
-            dot = visual.Circle(
-                win,
-                radius=radius,
-                fillColor=_preview_rgb255_to_psychopy(item.get("color", (255, 255, 255))),
-                fillColorSpace="rgb",
-                lineColor=None,
-                units="pix",
-                pos=_map_pos(item.get("pos", (0, 0))),
-                autoLog=False,
-            )
-            dots.append(dot)
+        dot_layers = {"dots": [], "overlay_dots": []}
+        for layer, dots in dot_layers.items():
+            for item in payload.get(layer, []) or []:
+                radius = max(
+                    1.0,
+                    scale_scene_length(
+                        float(item.get("radius", 4.0)),
+                        oriented_main_size,
+                        preview_size,
+                    ),
+                )
+                dots.append(visual.Circle(
+                    win,
+                    radius=radius,
+                    fillColor=_preview_rgb255_to_psychopy(item.get("color", (255, 255, 255))),
+                    fillColorSpace="rgb",
+                    lineColor=None,
+                    units="pix",
+                    pos=_map_pos(item.get("pos", (0, 0))),
+                    autoLog=False,
+                ))
 
         circles = []
         for item in payload.get("circles", []) or []:
@@ -2006,31 +2007,32 @@ def _experimenter_preview_process(
                 units="pix", autoLog=False,
             ))
 
-        hit_boxes = []
-        for item in payload.get("hit_boxes", []) or []:
-            scaled_size = _map_size(item.get("size", (64, 64)))
-            hit_boxes.append(
-                visual.Rect(
-                    win,
-                    width=max(4.0, scaled_size[0]),
-                    height=max(4.0, scaled_size[1]),
-                    pos=_map_pos(item.get("pos", (0, 0))),
-                    lineColor=_preview_rgb255_to_psychopy(item.get("color", (255, 255, 255))),
-                    lineColorSpace="rgb",
-                    lineWidth=max(
-                        2.0,
-                        scale_scene_length(
-                            float(item.get("line_width", 4.0)),
-                            oriented_main_size,
-                            preview_size,
+        box_layers = {"hit_boxes": [], "status_boxes": []}
+        for layer, boxes in box_layers.items():
+            for item in payload.get(layer, []) or []:
+                scaled_size = _map_size(item.get("size", (64, 64)))
+                boxes.append(
+                    visual.Rect(
+                        win,
+                        width=max(4.0, scaled_size[0]),
+                        height=max(4.0, scaled_size[1]),
+                        pos=_map_pos(item.get("pos", (0, 0))),
+                        lineColor=_preview_rgb255_to_psychopy(item.get("color", (255, 255, 255))),
+                        lineColorSpace="rgb",
+                        lineWidth=max(
+                            2.0,
+                            scale_scene_length(
+                                float(item.get("line_width", 4.0)),
+                                oriented_main_size,
+                                preview_size,
+                            ),
                         ),
-                    ),
-                    fillColor=None,
-                    units="pix",
-                    ori=_map_ori(item),
-                    autoLog=False,
+                        fillColor=None,
+                        units="pix",
+                        ori=_map_ori(item),
+                        autoLog=False,
+                    )
                 )
-            )
 
         fixation = None
         fixation_size = payload.get("fixation_size", None)
@@ -2088,9 +2090,9 @@ def _experimenter_preview_process(
             "preview_bg_rect": preview_bg_rect,
             "preview_outline_rect": preview_outline_rect,
             "images": images,
-            "dots": dots,
+            **dot_layers,
             "circles": circles,
-            "hit_boxes": hit_boxes,
+            **box_layers,
             "fixation": fixation,
             "highlight_box": highlight_box,
             "reward_counts": _normalize_reward_counts(payload.get("reward_counts")),
@@ -2270,7 +2272,7 @@ def _experimenter_preview_process(
             }
         )
         raise
-    # Scene updates wake the preview immediately. Never let its
+    # The preview is diagnostic and updates at a low fixed rate. Never let its
     # separate drawable wait on a second output's vertical blank and contend
     # with the timing-critical subject window.
     configure_window_vsync(win, False)
@@ -2534,6 +2536,7 @@ def _experimenter_preview_process(
             }
         )
 
+        current_command_sequence = 0
         while not stop_event.is_set():
             redraw_requested = bool(
                 sync_bar_shared is not None and sync_bar_shared[0] > 0
@@ -2544,9 +2547,7 @@ def _experimenter_preview_process(
                 last_cursor_apply_s = time.perf_counter()
 
             latest_payload = _get_preview_command(
-                command_queue,
-                wait_s=0.0 if shared_movie_active else max(0.02, update_interval_ms / 1000.0),
-                preserve_order=preserve_scene_transitions,
+                command_queue, preserve_order=preserve_scene_transitions,
             )
             for payload in (() if latest_payload is None else (latest_payload,)):
                 try:
@@ -2678,6 +2679,7 @@ def _experimenter_preview_process(
                         _release_movie()
                         last_bg_rgb = tuple(payload.get("bg_rgb_255", last_bg_rgb))
                         static_scene = _build_static_scene(scene_payload)
+                    current_command_sequence = int(payload.get("_preview_sequence", 0))
                 except Exception:
                     continue
 
@@ -2783,6 +2785,8 @@ def _experimenter_preview_process(
                     _draw_gaze(movie_layout)
                     _draw_sync_status()
                     win.flip()
+                    if rendered_sequence_shared is not None:
+                        rendered_sequence_shared.value = current_command_sequence
                     last_gaze_redraw_s = time.perf_counter()
                     continue
 
@@ -2792,10 +2796,14 @@ def _experimenter_preview_process(
                     stim.draw()
                 for stim in static_scene["images"]:
                     stim.draw()
+                for dot in static_scene["overlay_dots"]:
+                    dot.draw()
                 for circle in static_scene["circles"]:
                     circle.draw()
                 for hit_box in static_scene["hit_boxes"]:
                     hit_box.draw()
+                for status_box in static_scene["status_boxes"]:
+                    status_box.draw()
                 if static_scene["fixation"] is not None:
                     static_scene["fixation"].draw()
                 if static_scene["highlight_box"] is not None:
@@ -2805,6 +2813,8 @@ def _experimenter_preview_process(
                 _draw_gaze(static_scene.get("layout"))
                 _draw_sync_status()
                 win.flip()
+                if rendered_sequence_shared is not None:
+                    rendered_sequence_shared.value = current_command_sequence
             except Exception:
                 static_scene = _build_static_scene(
                     {
@@ -2819,6 +2829,7 @@ def _experimenter_preview_process(
                         "total_trials": current_total_trials,
                     }
                 )
+            core.wait(max(0.02, float(update_interval_ms) / 1000.0))
     except Exception as exc:
         _report_startup(
             {
@@ -2882,6 +2893,7 @@ class ExperimenterPreview:
         self._preview_main_rotation_deg = 0
         self._preview_command_sequence = 0
         self._ctx = mp.get_context("spawn")
+        self._rendered_sequence = self._ctx.Value("q", 0, lock=False)
         # Geometry is set once before enabling; only the phase changes on the
         # subject side. No queue or lock enters the display callback path.
         self._sync_bar_shared = self._ctx.Array("d", [0.0] * 4, lock=False)
@@ -2889,9 +2901,9 @@ class ExperimenterPreview:
         self._settings_keyboard_state = self._ctx.Array("q", [0, 0], lock=False)
         self._settings_keyboard_sequence = 0
         self._settings_pending_edit = False
-        # The sender isolates process-queue backpressure from task timing.
-        # Gaze-gated trials retain ordered scene transitions so a short reveal
-        # gets a preview flip before its hide; other previews keep latest state.
+        # The sender isolates process-queue backpressure from subject timing.
+        # Active-foraging previews retain every ordered scene until a preview
+        # flip; ordinary previews keep only the latest pending snapshot.
         self._queue = self._ctx.Queue(maxsize=1)
         self._outbox: queue.Queue = queue.Queue(maxsize=0 if self._preserve_scene_transitions else 1)
         self._sender_stop = threading.Event()
@@ -2950,6 +2962,7 @@ class ExperimenterPreview:
                 self._settings_keys_queue,
                 self._settings_keyboard_state,
                 self._preserve_scene_transitions,
+                self._rendered_sequence,
             ),
             daemon=True,
         )
@@ -3167,6 +3180,10 @@ class ExperimenterPreview:
     def set_status_counts(self, status_counts: Optional[Dict[str, int]]) -> None:
         self.status_counts = dict(status_counts) if status_counts is not None else None
 
+    def set_reward_counts(self, reward_counts: Optional[Dict[int, int]]) -> None:
+        """Update counts for subsequent snapshots without inventing a scene."""
+        self._preview_reward_counts = dict(reward_counts) if reward_counts is not None else None
+
     def _command_sender_loop(self) -> None:
         pending = None
         while not self._sender_stop.is_set():
@@ -3176,8 +3193,8 @@ class ExperimenterPreview:
                 except queue.Empty:
                     continue
 
-            # Ordinary previews replace stale snapshots; gaze-gated previews
-            # retain each transition. The task never waits for this sender.
+            # Keep all ordered transitions even while the process queue is
+            # occupied. Ordinary previews replace a stale pending snapshot.
             while not getattr(self, "_preserve_scene_transitions", False):
                 try:
                     pending = self._outbox.get_nowait()
@@ -3293,8 +3310,10 @@ class ExperimenterPreview:
         main_size: Sequence[int],
         images: Optional[list[Dict[str, Any]]] = None,
         dots: Optional[list[Dict[str, Any]]] = None,
+        overlay_dots: Optional[list[Dict[str, Any]]] = None,
         circles: Optional[list[Dict[str, Any]]] = None,
         hit_boxes: Optional[list[Dict[str, Any]]] = None,
+        status_boxes: Optional[list[Dict[str, Any]]] = None,
         fixation_size: Optional[float] = None,
         fixation_color: Sequence[int] = (0, 0, 0),
         main_rotation_deg: float = 0,
@@ -3309,8 +3328,10 @@ class ExperimenterPreview:
             "main_rotation_deg": _quarter_turn_degrees(main_rotation_deg),
             "images": list(images or []),
             "dots": list(dots or []),
+            "overlay_dots": list(overlay_dots or []),
             "circles": list(circles or []),
             "hit_boxes": list(hit_boxes or []),
+            "status_boxes": list(status_boxes or []),
             "fixation_size": fixation_size,
             "fixation_color": list(fixation_color),
         }
@@ -3394,6 +3415,31 @@ class ExperimenterPreview:
         if getattr(self, "_closed", False):
             return
         self._closed = True
+        # A final reveal/chosen frame must not disappear merely because the
+        # task finished before the next low-rate preview refresh. Only shutdown
+        # waits for acknowledgments; subject presentation never waits here.
+        # Stop waiting if the preview stops making progress or the user exits.
+        if getattr(self, "_preserve_scene_transitions", False):
+            rendered = getattr(self, "_rendered_sequence", None)
+            target = int(getattr(self, "_preview_command_sequence", 0))
+            sender = getattr(self, "_sender_thread", None)
+            if rendered is not None and sender is not None and sender.is_alive():
+                progress = int(rendered.value)
+                stall_timeout = max(1.0, 3 * self.update_interval_s)
+                deadline = time.monotonic() + stall_timeout
+                try:
+                    while rendered.value < target and self._process.is_alive():
+                        if self._exit_event.is_set() or time.monotonic() >= deadline:
+                            break
+                        if rendered.value != progress:
+                            progress = int(rendered.value)
+                            deadline = time.monotonic() + stall_timeout
+                        settings = getattr(self, "_live_settings", None)
+                        if settings is not None:
+                            settings.collect_requests()
+                        time.sleep(0.01)
+                except (OSError, ValueError):
+                    pass
         try:
             self._sender_stop.set()
         except Exception:

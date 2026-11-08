@@ -1546,7 +1546,14 @@ configs, a top-level `sync_pin` is still used when the nested pin is absent. A n
 `sync_pin` takes precedence, including an explicit `null`. Tasks with a `--sync_pin`
 command-line option apply that explicit override to the nested setting.
 `config_files/interface/rpi_launch_config.json` enables the experiment-level bar,
-including its static version on the idle mask.
+including its static version on the idle mask, using BCM GPIO 16 (physical header pin 36).
+Choose a sync pin that is free on the rig. In particular, Pi-Plates reserves BCM GPIO 23
+(physical pin 16), so it cannot also serve as the sync output when using the DAQC2plate.
+Pi-Plates also uses BCM GPIO 7, 9, 10, 11, 22, and 25; GPIO 18 may be used by optional
+features, and GPIO 24 is reserved. GPIO signals on physical pins 27–40 are unused by
+Pi-Plates; other attached devices or enabled interfaces may still use them. See the
+[Pi-Plates pin assignments](https://pi-plates.com/getting_started/) and the
+[Raspberry Pi header map](https://www.raspberrypi.com/documentation/computers/raspberry-pi.html).
 
 The enabled bar contains five alternating black and white rectangles at the top of the
 subject's view, accounting for software rotation. The experimenter preview shows only a

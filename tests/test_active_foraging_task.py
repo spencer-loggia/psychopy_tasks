@@ -143,7 +143,19 @@ class ActiveForagingTaskTests(unittest.TestCase):
             ), patch.object(task, "run_task", return_value="done") as run:
                 task.main()
             self.assertEqual(run.call_args.kwargs["sync_pin"], expected_pin)
-            self.assertEqual(run.call_args.kwargs["sync_bar"], config["sync_bar"])
+            expected_sync = {**config["sync_bar"], **({"sync_pin": expected_pin} if extra_args else {})}
+            self.assertEqual(run.call_args.kwargs["sync_bar"], expected_sync)
+
+        for nested_pin in (24, None):
+            config["sync_bar"]["sync_pin"] = nested_pin
+            for extra_args in ([], ["--sync_pin", "23"]):
+                task = load_task()
+                with patch.object(sys, "argv", ["active_foraging", "--config", str(config_path), *extra_args]), patch.object(
+                    task, "load_config", return_value=config,
+                ), patch.object(task, "run_task", return_value="done") as run:
+                    task.main()
+                self.assertEqual(run.call_args.kwargs["sync_bar"]["sync_pin"], 23 if extra_args else nested_pin)
+                self.assertEqual(config["sync_bar"]["sync_pin"], nested_pin)
 
     def test_dot_fixation_config_reaches_task(self):
         task = load_task()

@@ -1316,7 +1316,16 @@ class PlayVideoTaskTests(unittest.TestCase):
             ):
                 module.main()
                 self.assertEqual(module.run_task.call_args.kwargs["sync_pin"], expected_pin)
-                self.assertEqual(module.run_task.call_args.kwargs["sync_bar"], sync_config)
+                expected_sync = {**sync_config, **({"sync_pin": expected_pin} if extra_args else {})}
+                self.assertEqual(module.run_task.call_args.kwargs["sync_bar"], expected_sync)
+
+        for nested_pin in (24, None):
+            sync_config["sync_pin"] = nested_pin
+            for extra_args in ([], ["--sync_pin", "23"]):
+                with patch.object(sys, "argv", ["play_video", "--config", "video.json", *extra_args]):
+                    module.main()
+                self.assertEqual(module.run_task.call_args.kwargs["sync_bar"]["sync_pin"], 23 if extra_args else nested_pin)
+                self.assertEqual(sync_config["sync_pin"], nested_pin)
 
     def test_video_abort_poll_does_not_consume_a_source_refresh(self):
         module, utils, _ = self._make_validation_harness(source_rate="30/1", monitor_rate=60)

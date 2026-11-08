@@ -12,7 +12,7 @@ import math
 import time
 
 from . import frame_timing
-from .sync_bar import SyncBar, SyncBarConfig, validate_sync_pin
+from .sync_bar import SyncBar, SyncBarConfig
 
 
 class PendingSceneBuffer:
@@ -188,8 +188,8 @@ def configure_sync_bar(
     experimenter_preview=None, rotation_degrees=0, frame_duration_s=1 / 60,
     msg_logger=None,
 ):
-    config = SyncBarConfig.from_mapping(config)
-    validate_sync_pin(sync_pin)
+    config = SyncBarConfig.from_mapping(config, sync_pin=sync_pin)
+    sync_pin = config.sync_pin
     if not config.enabled:
         return None
     if getattr(win, "_neuro_tasks_sync_display", None) is not None:

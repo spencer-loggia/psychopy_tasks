@@ -125,11 +125,12 @@ class ExperimentManagerTests(unittest.TestCase):
                 manager.finish()
 
     def test_experiment_sync_override_is_resolved_and_saved_in_every_block(self):
-        block_sync = {"enabled": True, "height": 44,
+        block_sync = {"enabled": True, "height": 44, "sync_pin": 24,
                       "interval_mean_seconds": 3.0, "interval_variance_seconds": 0.8}
-        defaults = {"enabled": False, "height": 20,
+        defaults = {"enabled": False, "height": 20, "sync_pin": 18,
                     "interval_mean_seconds": 1.0, "interval_variance_seconds": 0.2}
         for options in (None, {"enabled": True, "height": 31}, {"enabled": False},
+                        {"enabled": True, "sync_pin": 23}, {"enabled": True, "sync_pin": None},
                         {"enabled": True, "height": 25,
                          "interval_mean_seconds": 2.0, "interval_variance_seconds": 0.4}):
             with self.subTest(options=options), tempfile.TemporaryDirectory() as temporary:
@@ -138,12 +139,14 @@ class ExperimentManagerTests(unittest.TestCase):
                 source = root / "configs/demo.json"
                 payload = json.loads(source.read_text())
                 payload["sync_bar"] = block_sync
+                payload["sync_pin"] = 25
                 source.write_text(json.dumps(payload))
                 original = source.read_bytes()
                 if options is not None:
                     config["sync_bar"] = options
                     # A calibration/state injection cannot override experiment settings.
                     config["initial_state"]["sync_bar"] = {"enabled": False, "height": 55}
+                    config["initial_state"]["sync_pin"] = 26
                 path.write_text(json.dumps(config))
                 manager = ExperimentManager(working_dir=root, launch_config_path=path,
                                             launch_config=config, subject_name="Yuri", subject_code="Y")
@@ -153,21 +156,24 @@ class ExperimentManagerTests(unittest.TestCase):
                                                   config_value="configs/demo.json")
                     saved = json.loads(block.config_path.read_text())
                     self.assertEqual(saved["sync_bar"], expected)
+                    if options is not None:
+                        self.assertNotIn("sync_pin", saved)
                     manager.finish_block(block)
                 self.assertEqual(source.read_bytes(), original)
                 manager.finish()
 
     def test_invalid_experiment_sync_fails_before_allocating_or_starting_a_run(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            config, path = self._project(root)
-            config["sync_bar"] = {"enabled": True, "height": -1}
-            with patch("interface.experiment_manager.ExperimentEyeTracker") as tracker:
-                with self.assertRaisesRegex(ValueError, "sync_bar.height"):
-                    ExperimentManager(working_dir=root, launch_config_path=path, launch_config=config,
-                                      subject_name="Yuri", subject_code="Y")
-            tracker.assert_not_called()
-            self.assertFalse((root / "logs").exists())
+        for options, error in (({"height": -1}, "sync_bar.height"), ({"sync_pin": -1}, "sync_pin")):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config, path = self._project(root)
+                config["sync_bar"] = {"enabled": True, **options}
+                with patch("interface.experiment_manager.ExperimentEyeTracker") as tracker:
+                    with self.assertRaisesRegex(ValueError, error):
+                        ExperimentManager(working_dir=root, launch_config_path=path, launch_config=config,
+                                          subject_name="Yuri", subject_code="Y")
+                tracker.assert_not_called()
+                self.assertFalse((root / "logs").exists())
 
     def test_unique_ids_persist_in_state_blocks_configs_and_uart_context(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -412,6 +412,7 @@ class ExperimentManager:
         block_config.update(injected)
         if self.sync_bar is not None:
             block_config["sync_bar"] = asdict(self.sync_bar)
+            block_config.pop("sync_pin", None)
         block_config["experiment_id"] = self.experiment_id
         block_config["block_id"] = block_id
         resolve_eye_tracking_paths(block_config, self.launch_config_path.parent)

@@ -31,6 +31,7 @@
     "enabled": false,
     "height": 20,
     "interval_mean_seconds": 1.0,
-    "interval_variance_seconds": 0.2
+    "interval_variance_seconds": 0.2,
+    "sync_pin": 16
   }
 }

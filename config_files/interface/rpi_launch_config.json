@@ -10,6 +10,7 @@
     "screen_mask_rgb": [174, 165, 163],
     "sync_bar": {
         "enabled": true,
+        "sync_pin": 16,
         "height": 200,
         "interval_mean_seconds": 1.5,
         "interval_variance_seconds": 1.0

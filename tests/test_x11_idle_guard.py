@@ -227,7 +227,7 @@ class X11IdleGuardTests(unittest.TestCase):
     def test_launcher_rejects_invalid_sync_even_when_masking_is_off(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "launch.json"
-            for options in (False, {"height": 0}, {"interval_mean_seconds": 0.1}):
+            for options in (False, {"height": 0}, {"interval_mean_seconds": 0.1}, {"sync_pin": -1}):
                 with self.subTest(options=options), self.assertRaises(ValueError):
                     path.write_text(json.dumps({"sync_bar": options, "mask_main_inputs": False}))
                     load_launcher_config(path)

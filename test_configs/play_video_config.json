@@ -14,7 +14,6 @@
   },
   "fullscreen": true,
   "bg": [0, 0, 0],
-  "sync_pin": 18,
 
   "pump_pin": 0,
   "pump_pulse_time_seconds": 0.1,
@@ -22,6 +21,7 @@
 
   "eye_tracking": {"enabled": true},
   "sync_bar": {
+    "sync_pin": 18,
     "enabled": false,
     "height": 20,
     "interval_mean_seconds": 1.0,

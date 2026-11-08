@@ -1289,6 +1289,10 @@ def main():
             return val
         return cfg.get(name, default)
 
+    sync_bar = cfg.get("sync_bar")
+    if args.sync_pin is not None:
+        sync_bar = {**(sync_bar or {}), "sync_pin": args.sync_pin}
+
     screen_config = load_screen_config(
         cfg,
         cli_main=args.main_screen,
@@ -1396,7 +1400,7 @@ def main():
             touchscreen=touchscreen,
             raspi=_get("raspi", cfg.get("raspi", False)),
             sync_pin=sync_pin,
-            sync_bar=cfg.get("sync_bar"),
+            sync_bar=sync_bar,
             daq_address=daq_address,
             daq_module_name=daq_module_name,
             pump_pin=pump_pin,

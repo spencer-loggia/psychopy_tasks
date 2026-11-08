@@ -42,7 +42,6 @@
   },
   "pump_pin": 0,
   "buzz_pin": 1,
-  "sync_pin": 18,
 
   "seed": 42,
   "output_dir": "./logs",
@@ -82,6 +81,7 @@
   "raspi": true,
   "touchscreen": true,
   "sync_bar": {
+    "sync_pin": 18,
     "enabled": false,
     "height": 20,
     "interval_mean_seconds": 1.0,

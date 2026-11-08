@@ -26,6 +26,7 @@ from bin.frame_timing import plan_frame_duration
 from bin.eye_tracking_config import load_eye_tracking_settings
 from bin.fixation_reward import ScreenAutoReward
 from bin.pump_control import PumpPulseControl
+from bin.sync_bar import SyncBarConfig
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.video_playback import (
@@ -103,6 +104,7 @@ def run_task(
     video_buffer_megabytes: float = DEFAULT_BUFFER_BYTES / (1024 * 1024),
     eye_tracking_config=None,
 ):
+    sync_pin = SyncBarConfig.from_mapping(sync_bar, sync_pin=sync_pin).sync_pin
     if isinstance(num_clips, bool) or not isinstance(num_clips, int) or num_clips <= 0:
         raise ValueError("num_clips must be a positive integer")
     if clip_duration_seconds is None:
@@ -1045,6 +1047,10 @@ def main():
             return val
         return cfg.get(name, default)
 
+    sync_bar = cfg.get("sync_bar")
+    if args.sync_pin is not None:
+        sync_bar = {**(sync_bar or {}), "sync_pin": args.sync_pin}
+
     def _optional_float(name):
         value = _get(name, None)
         return None if value is None else float(value)
@@ -1083,7 +1089,7 @@ def main():
             screen_config=screen_config,
             raspi=bool(_get("raspi", is_raspberry_pi())),
             sync_pin=_get("sync_pin", 18),
-            sync_bar=cfg.get("sync_bar"),
+            sync_bar=sync_bar,
             seek_timeout_seconds=float(
                 _get("seek_timeout_seconds", cfg.get("seek_timeout_seconds", 30.0))
             ),

@@ -503,6 +503,7 @@ fields:
   "screen_mask_rgb": [174, 165, 163],
   "sync_bar": {
     "enabled": true,
+    "sync_pin": 18,
     "height": 20,
     "interval_mean_seconds": 1.0,
     "interval_variance_seconds": 0.2
@@ -870,7 +871,7 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
   otherwise correctly timed upload into a shifted, partial, or transiently
   corrupted frame.
 - `play_video` uses the shared `sync_bar` timing and display options. On Raspberry Pi,
-  `sync_pin` (default `18`) toggles once per displayed bar inversion. The earlier
+  `sync_bar.sync_pin` (default `18`) toggles once per displayed bar inversion. The earlier
   video-only `sync_interval_frames` and `sync_pulse_frames` options have been removed.
 - On Raspberry Pi, `play_video` also drives the reward pump through Pi-Plates
   DAQC2 `DOUT pump_pin`. Both `reward_interval` and
@@ -1246,7 +1247,7 @@ Active Foraging Hardware Signals
 --------------------------------
 When `active_foraging` runs with `raspi=true`, the hardware outputs are split across Raspberry Pi GPIO and the Pi-Plates DAQC2plate:
 
-- `sync_pin`: Raspberry Pi BCM GPIO pin used for sync bar signals, default `18`. The output is updated in the PsychoPy flip callback for every sync bar inversion when the bar is enabled and GPIO is available.
+- `sync_bar.sync_pin`: Raspberry Pi BCM GPIO pin used for sync bar signals, default `18`. The output is updated in the PsychoPy flip callback for every sync bar inversion when the bar is enabled and GPIO is available.
 - `daq.address` or top-level `daq_address`: DAQC2plate address for pump and buzzer output, default `0`.
 - `pump_pin`: DAQC2 DOUT bit for pump reward delivery, in the range `0` through `7`.
 - `buzz_pin`: DAQC2 DOUT bit for the timeout buzzer, in the range `0` through `7`.
@@ -1517,7 +1518,7 @@ All tasks in this repository must support loading a JSON configuration file as a
 - `center_point` (array of 2 ints or null, optional): AFC-style stimulus circle center in participant-centered pixels (X right, Y up; null means `[0, 0]`)
 - `stim_range_radius` (int or null, optional): AFC-style stimulus circle radius in pixels
 - `display_margin` (non-negative number, optional): active-foraging and match-to-cue minimum full-image clearance from each screen edge in pixels (default `0`)
-- `sync_pin` (int or null, optional): BCM GPIO pin for display-synchronized sync bar signals, default `18`; null keeps visual synchronization without GPIO
+- `sync_bar.sync_pin` (int or null, optional): BCM GPIO pin for display-synchronized sync bar signals, default `18`; null keeps visual synchronization without GPIO
 - `sync_bar` (object, optional): shared display synchronization options described below
 - `daq.address` or `daq_address` (int, optional): DAQC2plate address for task hardware outputs
 - `pump_pin` and `buzz_pin` (int, optional): DAQC2 DOUT bits, not Raspberry Pi GPIO pins
@@ -1527,6 +1528,7 @@ PsychoPy experiment tasks accept the following optional `sync_bar` block. Omitti
 ```json
 "sync_bar": {
   "enabled": false,
+  "sync_pin": 18,
   "height": 20,
   "interval_mean_seconds": 1.0,
   "interval_variance_seconds": 0.2
@@ -1535,11 +1537,16 @@ PsychoPy experiment tasks accept the following optional `sync_bar` block. Omitti
 
 The same `sync_bar` object can be set at the top level of an experiment launch config.
 When present, it replaces each block's entire `sync_bar` configuration, including values
-injected from experiment state. Omitted fields use the defaults above; `enabled: false`
+injected from experiment state and any legacy top-level `sync_pin`. Omitted fields use
+the defaults above (including BCM pin `18`); `enabled: false`
 disables the bar for every block. The resolved settings are saved in every block's logged
 `config.json`. Without a launcher-level object, blocks retain their own settings.
-`config_files/interface/rpi_launch_config.json` enables the experiment-level bar with
-the default height and intervals, including its static version on the idle mask.
+`sync_pin` belongs inside `sync_bar` in both task and experiment configs. For older task
+configs, a top-level `sync_pin` is still used when the nested pin is absent. A nested
+`sync_pin` takes precedence, including an explicit `null`. Tasks with a `--sync_pin`
+command-line option apply that explicit override to the nested setting.
+`config_files/interface/rpi_launch_config.json` enables the experiment-level bar,
+including its static version on the idle mask.
 
 The enabled bar contains five alternating black and white rectangles at the top of the
 subject's view, accounting for software rotation. The experimenter preview shows only a
@@ -1549,7 +1556,7 @@ Every scheduled flip inverts all five rectangles. Each interval is sampled unifo
 `interval_mean_seconds ± interval_variance_seconds`; both settings use seconds, so the
 defaults produce intervals from 800 ms to 1200 ms. There is no separate minimum-duration
 setting. Sync events retain separate requested and observed display times on the experiment
-clock. When hardware is available, `sync_pin` toggles HIGH/LOW once in the display flip
+clock. When hardware is available, `sync_bar.sync_pin` toggles HIGH/LOW once in the display flip
 callback for each bar inversion, producing one electrical edge per inversion.
 
 Due inversions share ordinary video or trial frame flips. During static scenes the bar can
@@ -1559,7 +1566,8 @@ flip. The GPIO edge is deferred with the bar and sent in that actual flip's call
 reaching the original requested time never sends an edge on its own.
 Input is sampled before optional sync swaps, and buffered touch timestamps and pending
 input-reset callbacks are preserved. The experimenter preview mirrors the subject's phase
-asynchronously; it does not drive the GPIO clock. Use `sync_pin: null` for visual-only sync.
+asynchronously; it does not drive the GPIO clock. Use `"sync_pin": null` inside `sync_bar`
+for visual-only sync.
 
 Tasks must validate the config when loaded and raise a helpful error if required keys are missing or types are invalid. Command-line arguments should override values in the config file when both are provided.
 

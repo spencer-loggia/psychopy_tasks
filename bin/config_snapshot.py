@@ -24,7 +24,7 @@ _DAQ_TASKS = {
 }
 _TRACKING_TASKS = _DISPLAY_TASKS - {"stim_set_gallery"}
 _OUTPUT_TEST_TASKS = {"pulse_pump", "pulse_buzzer"}
-_SYNC_DETAILS = {"height", "interval_mean_seconds", "interval_variance_seconds"}
+_SYNC_DETAILS = {"height", "interval_mean_seconds", "interval_variance_seconds", "sync_pin"}
 _EYE_DETAILS = {"calibration_file", "calibration", "uart", "filter", "show_preview"}
 _EYE_TOP_LEVEL = {
     "x_scale", "y_scale", "x_offset", "y_offset", "x_cross", "y_cross",
@@ -141,7 +141,10 @@ def build_task_config_snapshot(
         result.pop("ibi", None)
 
     _prune_disabled_details(result, "sync_bar", _SYNC_DETAILS)
-    if _disabled_section(result, "sync_bar"):
+    sync_options = result.get("sync_bar")
+    if _disabled_section(result, "sync_bar") or (
+        isinstance(sync_options, Mapping) and "sync_pin" in sync_options
+    ):
         result.pop("sync_pin", None)
     # The visual sync bar uses its GPIO independently of DAQC2's raspi flag.
     if task in _TRACKING_TASKS and task != "calibrate_eye_tracker":

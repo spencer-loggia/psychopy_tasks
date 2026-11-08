@@ -409,6 +409,10 @@ def main():
             return val
         return cfg.get(name, default)
 
+    sync_bar = cfg.get("sync_bar")
+    if args.sync_pin is not None:
+        sync_bar = {**(sync_bar or {}), "sync_pin": args.sync_pin}
+
     screen_config = load_screen_config(
         cfg,
         cli_main=args.main_screen,
@@ -461,7 +465,7 @@ def main():
             svg_size=svg_size,
             refresh_rate=refresh_rate,
             sync_pin=_get("sync_pin", cfg.get("sync_pin", 18)),
-            sync_bar=cfg.get("sync_bar"),
+            sync_bar=sync_bar,
             config_name=config_name,
             screen_config=screen_config,
         )

@@ -138,6 +138,13 @@ class ConfigSnapshotTests(unittest.TestCase):
         self.assertEqual(self.snapshot(cfg), {"raspi": False, "sync_bar": {"enabled": False}})
         self.assertNotIn("sync_pin", self.snapshot({"sync_pin": 18}))
 
+    def test_nested_sync_pin_shadows_legacy_pin_and_is_pruned_when_disabled(self):
+        for pin in (23, None):
+            cfg = {"sync_pin": 24, "sync_bar": {"enabled": True, "sync_pin": pin}}
+            self.assertEqual(self.snapshot(cfg), {"sync_bar": {"enabled": True, "sync_pin": pin}})
+            cfg["sync_bar"]["enabled"] = False
+            self.assertEqual(self.snapshot(cfg), {"sync_bar": {"enabled": False}})
+
     def test_fullscreen_drops_window_size_but_windowed_keeps_it(self):
         for fullscreen in (False, True):
             result = self.snapshot({"fullscreen": fullscreen, "win_size": [800, 600]})
@@ -252,7 +259,7 @@ class ConfigSnapshotTests(unittest.TestCase):
     def test_launch_snapshot_preserves_task_menu_and_initial_state(self):
         cfg = {"record_experiment_video": False, "video_config": "unused.json",
                "eye_tracker_experiment": {"enabled": False, "uart": {"baud": 1}, "start_timeout_s": 15, "future": 2},
-               "sync_bar": {"enabled": False, "height": 100, "interval_mean_seconds": 2, "interval_variance_seconds": .4},
+               "sync_bar": {"enabled": False, "sync_pin": 23, "height": 100, "interval_mean_seconds": 2, "interval_variance_seconds": .4},
                "tasks": {"A": {"launch": "task/a.py"}, "B": {"launch": "task/b.py"}},
                "initial_state": {"eye_tracker_calibration": [{"x_scale": 2}]}, "unknown": 7}
         original = copy.deepcopy(cfg)
@@ -269,7 +276,7 @@ class ConfigSnapshotTests(unittest.TestCase):
     def test_enabled_launch_services_keep_every_setting(self):
         cfg = {"record_experiment_video": True, "video_config": "used.json",
                "eye_tracker_experiment": {"enabled": True, "uart": {"baud": 1}, "start_timeout_s": 15},
-               "sync_bar": {"enabled": True, "height": 100, "interval_mean_seconds": 2, "interval_variance_seconds": .4}}
+               "sync_bar": {"enabled": True, "sync_pin": None, "height": 100, "interval_mean_seconds": 2, "interval_variance_seconds": .4}}
         self.assertEqual(build_launch_config_snapshot(cfg), cfg)
 
 

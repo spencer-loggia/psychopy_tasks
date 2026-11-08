@@ -387,6 +387,31 @@ class SyncDisplayTests(unittest.TestCase):
 
 
 class SyncDisplayConfigurationTests(unittest.TestCase):
+    def test_effective_pin_is_claimed_and_passed_to_the_bar(self):
+        for options, legacy_pin, expected in (
+            ({"sync_pin": 23}, 24, 23), ({"sync_pin": 0}, 24, 0),
+            ({"sync_pin": None}, 24, None), ({}, 24, 24), ({}, None, None), ({}, 18, 18),
+        ):
+            with self.subTest(options=options, legacy_pin=legacy_pin):
+                gpio = types.SimpleNamespace(gpiochip_open=Mock(return_value=4),
+                                             gpio_claim_output=Mock(return_value=0),
+                                             gpiochip_close=Mock())
+                with (
+                    patch.dict(sys.modules, {"lgpio": gpio}),
+                    patch("bin.sync_display.SyncDisplay"),
+                    patch("bin.sync_display.SyncBar") as bar,
+                    patch("bin.sync_display.frame_timing.set_background_presenter"),
+                ):
+                    configure_sync_bar(FakeWindow(), {"enabled": True, **options}, sync_pin=legacy_pin)
+                self.assertEqual(bar.call_args.kwargs["sync_pin"], expected)
+                self.assertEqual(bar.call_args.args[1].sync_pin, expected)
+                if expected is None:
+                    gpio.gpiochip_open.assert_not_called()
+                    gpio.gpio_claim_output.assert_not_called()
+                    self.assertIsNone(bar.call_args.kwargs["gpio_module"])
+                else:
+                    gpio.gpio_claim_output.assert_called_once_with(4, expected, 0)
+
     def test_disabled_never_allocates_gpu_or_gpio(self):
         with patch("bin.sync_display.SyncDisplay") as display, patch("bin.sync_display.SyncBar") as bar:
             self.assertIsNone(configure_sync_bar(object(), {"enabled": False}))

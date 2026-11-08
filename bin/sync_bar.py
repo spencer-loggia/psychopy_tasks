@@ -25,8 +25,10 @@ class SyncBarConfig:
     height: int = 20
     interval_mean_seconds: float = 1.0
     interval_variance_seconds: float = 0.2
+    sync_pin: int | None = 18
 
     def __post_init__(self) -> None:
+        validate_sync_pin(self.sync_pin)
         if not isinstance(self.enabled, bool):
             raise ValueError("sync_bar.enabled must be true or false")
         if isinstance(self.height, bool) or not isinstance(self.height, int) or self.height <= 0:
@@ -43,15 +45,18 @@ class SyncBarConfig:
             )
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, Any] | None = None) -> "SyncBarConfig":
+    def from_mapping(
+        cls, value: Mapping[str, Any] | None = None, *, sync_pin: int | None = 18,
+    ) -> "SyncBarConfig":
+        """Parse bar settings, using the legacy pin only when no nested pin is set."""
         if value is None:
-            return cls()
+            return cls(sync_pin=sync_pin)
         if not isinstance(value, Mapping):
             raise ValueError("sync_bar must be a JSON object")
         unknown = set(value) - cls.__dataclass_fields__.keys()
         if unknown:
             raise ValueError(f"Unknown sync_bar options: {', '.join(sorted(unknown))}")
-        return cls(**value)
+        return cls(**{"sync_pin": sync_pin, **value})
 
 
 def sync_bar_rectangles(native_size, height: int, rotation_degrees=0) -> list[dict]:

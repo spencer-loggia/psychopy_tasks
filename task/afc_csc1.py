@@ -1473,6 +1473,10 @@ def main():
             return val
         return cfg.get(name, default)
 
+    sync_bar = cfg.get("sync_bar")
+    if args.sync_pin is not None:
+        sync_bar = {**(sync_bar or {}), "sync_pin": args.sync_pin}
+
     daq_cfg = cfg.get("daq", {}) if isinstance(cfg.get("daq", {}), dict) else {}
     daq_address = int(_get("daq_address", daq_cfg.get("address", cfg.get("daq_address", 0))))
     daq_module_name = str(daq_cfg.get("module_name", cfg.get("daq_module_name", "piplates.DAQC2plate")))
@@ -1542,7 +1546,7 @@ def main():
             touchscreen=bool(_get("touchscreen", cfg.get("touchscreen", False))),
             raspi=bool(_get("raspi", cfg.get("raspi", False))),
             sync_pin=_get("sync_pin", 18),
-            sync_bar=cfg.get("sync_bar"),
+            sync_bar=sync_bar,
             daq_address=daq_address,
             daq_module_name=daq_module_name,
             pump_pin=int(_get("pump_pin", cfg.get("pump_pin", 0))),

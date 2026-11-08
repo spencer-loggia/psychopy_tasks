@@ -30,6 +30,14 @@ class FakeWindow:
 class SyncConfigTests(unittest.TestCase):
     def test_defaults_are_seconds_and_disabled(self):
         self.assertEqual(SyncBarConfig.from_mapping(), SyncBarConfig(False, 20, 1.0, 0.2))
+        self.assertEqual(SyncBarConfig.from_mapping().sync_pin, 18)
+
+    def test_nested_pin_overrides_legacy_pin_including_visual_only(self):
+        for pin in (0, 23, None):
+            with self.subTest(pin=pin):
+                self.assertEqual(SyncBarConfig.from_mapping({"sync_pin": pin}, sync_pin=24).sync_pin, pin)
+        self.assertEqual(SyncBarConfig.from_mapping({"enabled": True}, sync_pin=24).sync_pin, 24)
+        self.assertIsNone(SyncBarConfig.from_mapping({"enabled": True}, sync_pin=None).sync_pin)
 
     def test_invalid_and_obsolete_fields_fail_before_display_startup(self):
         invalid = [
@@ -38,6 +46,7 @@ class SyncConfigTests(unittest.TestCase):
             {"interval_mean_seconds": True}, {"interval_mean_seconds": math.inf},
             {"interval_variance_seconds": -0.1}, {"interval_variance_seconds": math.nan},
             {"interval_variance_seconds": 1}, {"minimum_duration_seconds": 0.06},
+            {"sync_pin": -1}, {"sync_pin": True}, {"sync_pin": "18"}, {"sync_pin": 18.5},
         ]
         for config in invalid:
             with self.subTest(config=config), self.assertRaises(ValueError):

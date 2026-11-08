@@ -15,7 +15,10 @@ from unittest.mock import Mock, patch
 import bin
 from bin.eye_tracking import EyeCalibration, EyeTrackerState, UARTEyeTrackerConfig
 from bin.eye_tracking_config import load_eye_tracking_settings
+from bin.logger import EVENT_LOG_FILENAME
 from bin.screen import ScreenGeometry
+from bin.sync_bar import SyncBar
+from bin.sync_display import configure_sync_bar
 
 
 def load_task():
@@ -57,6 +60,77 @@ def load_task():
 class EyeCalibrationTaskTests(unittest.TestCase):
     def setUp(self):
         self.task = load_task()
+
+    def test_active_bar_emits_gpio_edges_during_calibration_with_or_without_rewards(self):
+        for raspi in (False, True):
+            with self.subTest(raspi=raspi):
+                task = load_task()
+                now, edges = [10.0], []
+                win = types.SimpleNamespace(size=(800, 600), _toCall=[], in_flip=False)
+
+                def call_on_flip(callback, *args):
+                    win._toCall.append({"function": callback, "args": args})
+
+                def flip():
+                    now[0] += 1 / 60
+                    callbacks, win._toCall = win._toCall, []
+                    win.in_flip = True
+                    try:
+                        for item in callbacks:
+                            item["function"](*item["args"])
+                    finally:
+                        win.in_flip = False
+
+                def gpio_write(chip, pin, level):
+                    edges.append((chip, pin, level, win.in_flip))
+                    return 0
+
+                win.callOnFlip, win.flip = call_on_flip, flip
+                task.utils.setup_task_window.return_value = (
+                    win, ScreenGeometry(0, 0, 0, 800, 600), ScreenGeometry(1, 800, 0, 800, 600),
+                )
+                task.utils.configure_sync_bar.side_effect = configure_sync_bar
+                task.utils.close_task_window.side_effect = lambda win: win._neuro_tasks_sync_display.close()
+                preview, tracker, outputs = Mock(), Mock(), Mock()
+                preview.poll.side_effect = [False] * 8 + [True]
+                preview.consume_manual_reward_request.return_value = False
+                preview.get_calibration_controls.return_value = dict(
+                    x_scale=0.005, y_scale=0.005, fix_x=0, fix_y=0, revision=1, zero_count=0,
+                )
+                tracker.get_state.return_value = EyeTrackerState()
+                gpio = types.SimpleNamespace(
+                    gpiochip_open=Mock(return_value=4), gpio_claim_output=Mock(return_value=0),
+                    gpio_write=Mock(side_effect=gpio_write), gpiochip_close=Mock(),
+                )
+                with (
+                    tempfile.TemporaryDirectory() as tmp,
+                    patch.object(task, "ExperimenterPreview", return_value=preview),
+                    patch.object(task, "UARTEyeTracker", return_value=tracker),
+                    patch.object(task, "DAQC2DigitalOutputs", return_value=outputs) as daq,
+                    patch.object(task.time, "perf_counter", side_effect=lambda: now[0]),
+                    patch.object(task.time, "perf_counter_ns", side_effect=lambda: round(now[0] * 1e9)),
+                    patch.dict(sys.modules, {"lgpio": gpio}),
+                    patch("bin.sync_display.is_raspberry_pi", return_value=True),
+                    patch("bin.sync_display.PendingSceneBuffer"),
+                    patch("bin.sync_display.SyncBar", side_effect=lambda *a, **kw: SyncBar(*a, rect_factory=Mock(), **kw)),
+                ):
+                    result = task.run_task(
+                        output_dir=tmp, fullscreen=False, raspi=raspi,
+                        uart_config=UARTEyeTrackerConfig(simulate=True),
+                        sync_bar={"enabled": True, "sync_pin": 16,
+                                  "interval_mean_seconds": 0.03, "interval_variance_seconds": 0},
+                    )
+                    with (result.parent / EVENT_LOG_FILENAME).open() as handle:
+                        events = list(csv.DictReader(handle, delimiter="\t"))
+                daq.assert_called_once_with(address=0, module_name="piplates.DAQC2plate", enabled=raspi)
+                gpio.gpio_claim_output.assert_called_once_with(4, 16, 0)
+                transitions = [edge for edge in edges if edge[3]]
+                self.assertGreaterEqual(len(transitions), 3)
+                self.assertEqual(transitions, [(4, 16, (index + 1) % 2, True) for index in range(len(transitions))])
+                self.assertEqual(edges[-1], (4, 16, 0, False))
+                self.assertEqual(sum(row["event"] == "sync_bar_flip" for row in events), len(transitions))
+                self.assertEqual(sum(row["event"] in {"sync_signal_on", "sync_signal_off"} for row in events), len(transitions))
+                gpio.gpiochip_close.assert_called_once_with(4)
 
     def test_static_reward_sync_polling_protects_the_pump_off_deadline(self):
         task = self.task

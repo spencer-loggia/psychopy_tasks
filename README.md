@@ -1558,6 +1558,11 @@ defaults produce intervals from 800 ms to 1200 ms. There is no separate minimum-
 setting. Sync events retain separate requested and observed display times on the experiment
 clock. When hardware is available, `sync_bar.sync_pin` toggles HIGH/LOW once in the display flip
 callback for each bar inversion, producing one electrical edge per inversion.
+This applies to eye-tracker calibration as well as the other experiment tasks, independently
+of `raspi` (which controls reward hardware). On Raspberry Pi, an enabled bar with a configured
+pin requires successful GPIO initialization; setup errors stop the task instead of continuing
+without sync signals. GPIO write errors also stop the task. Other computers retain visual-only
+fallback when GPIO is unavailable, and an explicit `"sync_pin": null` opts out of GPIO on any host.
 
 Due inversions share ordinary video or trial frame flips. During static scenes the bar can
 swap independently, preserving both the visible scene and the prepared next scene on the

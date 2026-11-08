@@ -387,6 +387,48 @@ class SyncDisplayTests(unittest.TestCase):
 
 
 class SyncDisplayConfigurationTests(unittest.TestCase):
+    def setUp(self):
+        platform = patch("bin.sync_display.is_raspberry_pi", return_value=False)
+        self.is_raspberry_pi = platform.start()
+        self.addCleanup(platform.stop)
+
+    def test_raspberry_pi_gpio_setup_failure_stops_before_display_startup(self):
+        self.is_raspberry_pi.return_value = True
+        for failure in ("import", "open", "claim", "claim_exception"):
+            with self.subTest(failure=failure):
+                gpio = types.SimpleNamespace(
+                    gpiochip_open=Mock(return_value=-1 if failure == "open" else 4),
+                    gpio_claim_output=Mock(return_value=-1 if failure == "claim" else 0),
+                    gpiochip_close=Mock(),
+                )
+                if failure == "claim_exception":
+                    gpio.gpio_claim_output.side_effect = RuntimeError("pin busy")
+                with (
+                    patch.dict(sys.modules, {"lgpio": None if failure == "import" else gpio}),
+                    patch("bin.sync_display.SyncBar") as bar,
+                    patch("bin.sync_display.SyncDisplay") as display,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "requires GPIO output on Raspberry Pi.*BCM pin 16"):
+                        configure_sync_bar(FakeWindow(), {"enabled": True, "sync_pin": 16})
+                bar.assert_not_called()
+                display.assert_not_called()
+                if failure.startswith("claim"):
+                    gpio.gpiochip_close.assert_called_once_with(4)
+                else:
+                    gpio.gpiochip_close.assert_not_called()
+
+    def test_explicit_visual_only_sync_remains_available_on_raspberry_pi(self):
+        self.is_raspberry_pi.return_value = True
+        with (
+            patch.dict(sys.modules, {"lgpio": None}),
+            patch("bin.sync_display.SyncBar") as bar,
+            patch("bin.sync_display.SyncDisplay"),
+            patch("bin.sync_display.frame_timing.set_background_presenter"),
+        ):
+            configure_sync_bar(FakeWindow(), {"enabled": True, "sync_pin": None})
+        self.assertIsNone(bar.call_args.kwargs["sync_pin"])
+        self.assertIsNone(bar.call_args.kwargs["gpio_module"])
+
     def test_effective_pin_is_claimed_and_passed_to_the_bar(self):
         for options, legacy_pin, expected in (
             ({"sync_pin": 23}, 24, 23), ({"sync_pin": 0}, 24, 0),

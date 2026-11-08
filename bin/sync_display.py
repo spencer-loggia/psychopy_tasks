@@ -13,6 +13,7 @@ import time
 
 from . import frame_timing
 from .sync_bar import SyncBar, SyncBarConfig
+from .video_playback import is_raspberry_pi
 
 
 class PendingSceneBuffer:
@@ -209,8 +210,16 @@ def configure_sync_bar(
             if gpio is not None:
                 gpio.gpiochip_close(chip)
             gpio, chip = None, None
+            if is_raspberry_pi():
+                raise RuntimeError(
+                    f"Sync bar requires GPIO output on Raspberry Pi; "
+                    f"could not initialize BCM pin {sync_pin}: {exc}"
+                ) from exc
             if msg_logger is not None:
                 msg_logger.log("WARN", f"sync_gpio_unavailable pin={sync_pin} error={exc}")
+        else:
+            if msg_logger is not None:
+                msg_logger.log("INFO", f"sync_gpio_ready pin={sync_pin} chip=0")
     try:
         preview_callback = None
         if experimenter_preview is not None:

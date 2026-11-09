@@ -66,7 +66,7 @@
   "display_margin": 300,
 
   "initiation_cue_center_position": [300, -480],
-  "initiation_cue_style": "dot",
+  "initiation_cue_style": "dotted_checker",
 
   "self_initiation": true,
   "hold_before_choice": true,

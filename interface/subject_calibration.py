@@ -14,7 +14,7 @@ import warnings
 from pathlib import Path
 from typing import Iterable
 
-from bin.eye_tracking_config import load_eye_tracking_settings
+from bin.eye_tracking_config import OPTIONAL_CALIBRATION_DEFAULTS, load_eye_tracking_settings
 from interface.experiment_history import _sync_directory
 
 
@@ -38,7 +38,7 @@ def validate_eye_calibration(candidate: dict) -> dict:
     if (not isinstance(candidate, dict) or "interruption_error" in candidate
             or candidate.get("completion_status", "complete") != "complete"):
         raise ValueError("Expected a completed eye calibration")
-    candidate = {"x_cross": 0.0, "y_cross": 0.0, **copy.deepcopy(candidate)}
+    candidate = {**OPTIONAL_CALIBRATION_DEFAULTS, **copy.deepcopy(candidate)}
     load_eye_tracking_settings({
         "eye_tracking": {"enabled": True}, "eye_tracker_calibration": candidate,
     })

@@ -9,7 +9,9 @@ import numpy as np
 from bin.eye_calibration_fit import (
     AffineCalibrationFit,
     CalibrationPoint,
+    QuadraticCalibrationFit,
     fit_affine_calibration,
+    fit_quadratic_calibration,
 )
 from bin.eye_tracking import EyeCalibration
 
@@ -93,7 +95,7 @@ class EyeAffineCalibrationTests(unittest.TestCase):
         self.assertPosition(calibration, (100, 50), (0.2, -0.1))
         self.assertIs(fit.calibration, calibration)
 
-    def test_two_observations_preserve_unconstrained_direction(self):
+    def test_two_observations_transport_unconstrained_sensitivity(self):
         calibration = EyeCalibration(x_scale=0.003, x_cross=0.004, y_cross=-0.002)
         old_matrix = np.array([
             [calibration.x_scale, calibration.x_cross],
@@ -109,7 +111,13 @@ class EyeAffineCalibrationTests(unittest.TestCase):
             [calibration.y_cross, calibration.y_scale],
         ])
         # (-1, 2) is perpendicular to the sampled displacement (20, 10).
-        np.testing.assert_allclose(new_matrix @ [-1, 2], old_matrix @ [-1, 2])
+        old_free, new_free = old_matrix @ [-1, 2], new_matrix @ [-1, 2]
+        self.assertAlmostEqual(np.linalg.norm(new_free), np.linalg.norm(old_free))
+        # Its angle to the measured direction, including handedness, survives.
+        old_axis, new_axis = old_matrix @ [2, 1], new_matrix @ [2, 1]
+        self.assertAlmostEqual(new_axis @ new_free / np.linalg.norm(new_axis),
+                               old_axis @ old_free / np.linalg.norm(old_axis))
+        self.assertGreater(np.linalg.det(new_matrix) * np.linalg.det(old_matrix), 0)
 
     def test_three_noncollinear_points_recover_complete_affine_map(self):
         truth = EyeCalibration(
@@ -208,6 +216,182 @@ class EyeAffineCalibrationTests(unittest.TestCase):
                 fit.add_point(raw_px=raw, target_fraction=target)
             self.assertEqual(asdict(calibration), original)
             self.assertEqual(fit.points, ())
+
+
+class EyeQuadraticCalibrationTests(unittest.TestCase):
+    RAW = ((80, 30), (120, 30), (120, 70), (80, 70), (100, 50), (100, 70))
+
+    def setUp(self):
+        self.prior = EyeCalibration(
+            x_scale=0.003, x_cross=0.001, y_cross=-0.001, y_scale=-0.004,
+            x_offset=-0.4, y_offset=0.1,
+            x_quad_xx=2e-6, x_quad_xy=-3e-6, x_quad_yy=1e-6,
+            y_quad_xx=-1e-6, y_quad_xy=2e-6, y_quad_yy=-2e-6,
+        )
+        self.truth = EyeCalibration(
+            x_scale=0.004, x_cross=-0.002, y_cross=0.003, y_scale=-0.002,
+            x_offset=-0.5, y_offset=0.2,
+            x_quad_xx=1e-5, x_quad_xy=4e-6, x_quad_yy=-8e-6,
+            y_quad_xx=-7e-6, y_quad_xy=-5e-6, y_quad_yy=9e-6,
+        )
+
+    def assertMapping(self, actual, expected, raw):
+        np.testing.assert_allclose(actual.map_position(*raw), expected.map_position(*raw),
+                                   rtol=1e-9, atol=1e-11)
+
+    def test_polynomial_terms_and_one_point_translation(self):
+        calibration = EyeCalibration(
+            x_scale=0, y_scale=0, x_quad_xx=1, x_quad_xy=2, x_quad_yy=3,
+            y_quad_xx=4, y_quad_xy=5, y_quad_yy=6,
+        )
+        self.assertEqual(calibration.map_position(2, 3), (43, 100))
+        original = deepcopy(self.prior)
+        fit = QuadraticCalibrationFit(self.prior)
+        target = (0.2, -0.3)
+        shift = np.array(target) - original.map_position(100, 50)
+        fit.add_point(raw_px=(100, 50), target_fraction=target)
+        for key, value in asdict(original).items():
+            if not key.endswith('offset'):
+                self.assertEqual(getattr(self.prior, key), value)
+        for raw in self.RAW:
+            np.testing.assert_allclose(self.prior.map_position(*raw),
+                                       np.array(original.map_position(*raw)) + shift)
+
+    def test_affine_initialization_and_two_point_rotations_never_collapse(self):
+        for fit_type in (AffineCalibrationFit, QuadraticCalibrationFit):
+            for degrees in (0, 30, 89.999, 90, 135, 180, 270):
+                with self.subTest(fit=fit_type, degrees=degrees):
+                    calibration = EyeCalibration()
+                    fit = fit_type(calibration)
+                    angle = np.radians(degrees)
+                    target = np.array([np.cos(angle), np.sin(angle)]) * 0.3
+                    fit.add_point(raw_px=(100, 50), target_fraction=(0, 0))
+                    fit.add_point(raw_px=(140, 50), target_fraction=target)
+                    np.testing.assert_allclose(calibration.map_position(140, 50), target, atol=1e-12)
+                    free = np.array(calibration.map_position(100, 90))
+                    self.assertAlmostEqual(np.linalg.norm(free), 0.2)
+                    self.assertAlmostEqual(target @ free, 0, places=12)
+                    matrix = [[calibration.x_scale, calibration.x_cross],
+                              [calibration.y_cross, calibration.y_scale]]
+                    self.assertLess(np.linalg.det(matrix), -1e-6)
+                    self.assertTrue(all(value == 0 for key, value in asdict(calibration).items()
+                                        if 'quad' in key))
+
+    def test_three_points_preserve_existing_curvature(self):
+        fit = QuadraticCalibrationFit(self.prior)
+        curve = {key: value for key, value in asdict(self.prior).items() if 'quad' in key}
+        for raw in self.RAW[:3]:
+            fit.add_point(raw_px=raw, target_fraction=self.truth.map_position(*raw))
+            for key, value in curve.items():
+                self.assertEqual(getattr(self.prior, key), value)
+        for raw in self.RAW[:3]:
+            self.assertMapping(self.prior, self.truth, raw)
+
+    def test_four_and_five_points_make_minimal_curvature_changes_then_six_recover_map(self):
+        original = deepcopy(self.prior)
+        fit = QuadraticCalibrationFit(self.prior)
+        for count, raw in enumerate(self.RAW, 1):
+            fit.add_point(raw_px=raw, target_fraction=self.truth.map_position(*raw))
+            for captured in self.RAW[:count]:
+                self.assertMapping(self.prior, self.truth, captured)
+            for axis in ('x', 'y'):
+                if count == 4:
+                    # Four rectangle corners constrain xy; xx and yy remain free.
+                    for term in ('xx', 'yy'):
+                        key = f'{axis}_quad_{term}'
+                        self.assertAlmostEqual(getattr(self.prior, key), getattr(original, key), places=13)
+                    self.assertAlmostEqual(getattr(self.prior, f'{axis}_quad_xy'),
+                                           getattr(self.truth, f'{axis}_quad_xy'), places=13)
+                if count == 5:
+                    # Adding the center constrains xx+yy, preserving xx-yy.
+                    self.assertAlmostEqual(
+                        getattr(self.prior, f'{axis}_quad_xx') - getattr(self.prior, f'{axis}_quad_yy'),
+                        getattr(original, f'{axis}_quad_xx') - getattr(original, f'{axis}_quad_yy'), places=13)
+        for key, value in asdict(self.truth).items():
+            self.assertAlmostEqual(getattr(self.prior, key), value, places=11)
+        for raw in ((105, 58), (62, 88), (150, 20)):
+            self.assertMapping(self.prior, self.truth, raw)
+
+    def test_overdetermined_fit_averages_noise_and_recovers_after_manual_edits(self):
+        fit = QuadraticCalibrationFit(self.prior)
+        for raw in self.RAW:
+            for noise in (-0.02, 0.02):
+                fit.add_point(raw_px=raw, target_fraction=np.array(self.truth.map_position(*raw)) + noise)
+        self.prior.set_gains(x_scale=0.02, y_scale=-0.03, anchor_px=(100, 50))
+        fit.add_point(raw_px=(110, 60), target_fraction=self.truth.map_position(110, 60))
+        for raw in (*self.RAW, (130, 40)):
+            self.assertMapping(self.prior, self.truth, raw)
+
+    def test_repeated_and_nearly_collinear_points_remain_stable(self):
+        original = deepcopy(self.prior)
+        points = [CalibrationPoint((0.1, 0.3), (i * 0.1, -i * 0.1)) for i in range(7)]
+        result = fit_quadratic_calibration(points, previous=original)
+        for key, value in asdict(original).items():
+            if not key.endswith('offset'):
+                self.assertEqual(getattr(result, key), value)
+        np.testing.assert_allclose(result.map_position(0.1, 0.3), (0.3, -0.3))
+        points = [CalibrationPoint((100 + n * 10, 50 + n * 20 + (n % 2) * 1e-12),
+                                   (0.01 * n * n, -0.1 * n)) for n in range(7)]
+        result = fit_quadratic_calibration(points, previous=original)
+        for point in points:
+            np.testing.assert_allclose(result.map_position(*point.raw_px), point.target_fraction, atol=1e-10)
+        self.assertLess(max(abs(value) for value in asdict(result).values()), 10)
+
+    def test_large_camera_origin_does_not_ill_condition_the_fit(self):
+        shift = np.array([3000, 2000])
+        points = [CalibrationPoint(np.array(raw) + shift, self.truth.map_position(*raw))
+                  for raw in self.RAW]
+        result = fit_quadratic_calibration(points, previous=EyeCalibration())
+        for raw in (*self.RAW, (105, 58), (150, 20)):
+            np.testing.assert_allclose(result.map_position(*(np.array(raw) + shift)),
+                                       self.truth.map_position(*raw), atol=1e-10)
+
+    def test_integer_valued_initial_coefficients_can_be_refitted(self):
+        previous = EyeCalibration(**{key: 0 for key in asdict(self.prior)})
+        points = [CalibrationPoint(raw, self.truth.map_position(*raw)) for raw in self.RAW]
+        for fit in (fit_affine_calibration, fit_quadratic_calibration):
+            result = fit(points, previous=previous)
+            self.assertTrue(all(np.isfinite(value) for value in asdict(result).values()))
+        self.assertMapping(result, self.truth, (110, 60))
+
+    def test_undo_restores_curvature_and_zero_gain_metadata_exactly(self):
+        fit = QuadraticCalibrationFit(self.prior)
+        original = deepcopy(self.prior.__dict__)
+        snapshots = []
+        for raw in self.RAW:
+            self.prior.set_gains(x_scale=0, y_scale=0, anchor_px=raw)
+            snapshots.append(deepcopy(self.prior.__dict__))
+            fit.add_point(raw_px=raw, target_fraction=self.truth.map_position(*raw))
+        for snapshot in reversed(snapshots):
+            fit.remove_last_point()
+            self.assertEqual(self.prior.__dict__, snapshot)
+        self.assertEqual(fit.points, ())
+        # A fresh capture with no intervening edits restores the initial map.
+        self.prior.__dict__.clear()
+        self.prior.__dict__.update(original)
+        fit.add_point(raw_px=self.RAW[0], target_fraction=(0, 0))
+        fit.remove_last_point()
+        self.assertEqual(self.prior.__dict__, original)
+
+    def test_gain_changes_scale_entire_curve_around_anchor_through_zero(self):
+        anchor = (100, 50)
+        original = deepcopy(self.prior)
+        target = np.array(original.map_position(*anchor))
+        gains = self.prior.x_gain, self.prior.y_gain
+        for factors in ((2, 0.5), (0, 0), (-1, -2)):
+            self.prior.set_gains(x_scale=gains[0] * factors[0], y_scale=gains[1] * factors[1], anchor_px=anchor)
+            for raw in self.RAW:
+                expected = target + (np.array(original.map_position(*raw)) - target) * factors
+                np.testing.assert_allclose(self.prior.map_position(*raw), expected, atol=1e-12)
+
+    def test_invalid_capture_does_not_mutate_points_or_mapping(self):
+        fit = QuadraticCalibrationFit(self.prior)
+        fit.add_point(raw_px=self.RAW[0], target_fraction=(0, 0))
+        original, points = deepcopy(self.prior.__dict__), fit.points
+        with self.assertRaises(ValueError):
+            fit.add_point(raw_px=(float('nan'), 0), target_fraction=(0, 0))
+        self.assertEqual(self.prior.__dict__, original)
+        self.assertEqual(fit.points, points)
 
 
 if __name__ == "__main__":

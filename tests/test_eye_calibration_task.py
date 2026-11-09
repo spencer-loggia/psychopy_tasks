@@ -223,6 +223,53 @@ class EyeCalibrationTaskTests(unittest.TestCase):
         self.assertEqual(task.visual.Circle.call_args.kwargs["fillColor"], (1, -1, -1))
         self.assertEqual(marker_positions[-4:], [(0, 0), (80, -180), (320, 60), (400, -120)])
 
+    def test_six_nonlinear_captures_save_reload_and_drive_preview_from_affine_start(self):
+        task = self.task
+        win = Mock(size=(800, 600))
+        task.utils.setup_task_window.return_value = (
+            win, ScreenGeometry(0, 0, 0, 800, 600), ScreenGeometry(1, 800, 0, 800, 600),
+        )
+        raw_points = ((80, 30), (120, 30), (120, 70), (80, 70), (100, 50), (100, 70))
+        truth = EyeCalibration(
+            x_scale=0.004, y_scale=-0.003, x_cross=0.001, y_cross=-0.002,
+            x_offset=-0.5, y_offset=0.3, x_quad_xx=1e-5, x_quad_xy=-2e-5,
+            x_quad_yy=3e-5, y_quad_xx=-1e-5, y_quad_xy=2e-5, y_quad_yy=-3e-5,
+        )
+        initial = EyeCalibration(x_cross=0.002, y_cross=-0.001)
+        preview, tracker = Mock(), Mock()
+        preview.poll.side_effect = lambda: win.flip.call_count >= len(raw_points)
+        preview.consume_manual_reward_request.return_value = False
+
+        def controls():
+            index = win.flip.call_count
+            x, y = truth.map_position(*raw_points[index])
+            return dict(x_scale=initial.x_gain, y_scale=initial.y_gain,
+                        fix_x=x, fix_y=y, revision=index + 1, zero_count=index + 1)
+
+        preview.get_calibration_controls.side_effect = controls
+        tracker.get_state.side_effect = [
+            EyeTrackerState(valid=True, frame_sequence=i + 1, x_smooth_px=x, y_smooth_px=y)
+            for i, (x, y) in enumerate(raw_points)
+        ]
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            task, 'ExperimenterPreview', return_value=preview,
+        ), patch.object(task, 'UARTEyeTracker', return_value=tracker):
+            path = task.run_task(output_dir=tmp, fullscreen=False, initial_calibration=initial)
+            saved = json.loads(path.read_text())['eye_tracker_calibration']
+            loaded = load_eye_tracking_settings(
+                {'eye_tracking': {'enabled': True, 'calibration_file': str(path)}}
+            ).calibration
+        self.assertEqual(saved['completion_status'], 'complete')
+        self.assertEqual(len(saved['calibration_points']), 6)
+        self.assertEqual(saved['gain_anchor_px'], list(raw_points[-1]))
+        for name in truth.__dataclass_fields__:
+            self.assertAlmostEqual(getattr(loaded, name), getattr(truth, name), places=11)
+        for call, raw in zip(preview.show_calibration_state.call_args_list, raw_points):
+            for actual, expected in zip(call.kwargs['eye_fraction'], truth.map_position(*raw)):
+                self.assertAlmostEqual(actual, expected)
+        for actual, expected in zip(loaded.map_position(110, 40), truth.map_position(110, 40)):
+            self.assertAlmostEqual(actual, expected)
+
     def test_delete_from_either_window_removes_point_and_restores_prior_mapping(self):
         for source in ("main", "preview"):
             with self.subTest(source=source):

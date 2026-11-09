@@ -116,6 +116,8 @@ class ConfigSnapshotTests(unittest.TestCase):
                                 "uart": {"device": "unused"}, "filter": {"ema_gamma": .5},
                                 "calibration": {"x_scale": 1}, "show_preview": True, "future": "keep"},
                "x_scale": 1, "y_scale": 2, "x_offset": 3, "y_offset": 4, "x_cross": 5, "y_cross": 6,
+               "x_quad_xx": 1, "x_quad_xy": 2, "x_quad_yy": 3,
+               "y_quad_xx": 4, "y_quad_xy": 5, "y_quad_yy": 6,
                "eye_tracker_calibration": [{"x_scale": 2}], "uart": {"baud": 123},
                "eye_filter": {"ema_gamma": .1}, "gain_directions": {"x": [1, 0]}, "extension": 9}
         self.assertEqual(self.snapshot(cfg), {"eye_tracking": {"enabled": False, "future": "keep"}, "extension": 9})

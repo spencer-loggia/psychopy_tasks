@@ -27,7 +27,9 @@ from bin.eye_tracking import (
     EXPERIMENT_UART_PENDING_ENV,
     EXPERIMENT_UART_READY_ENV,
 )
-from bin.eye_tracking_config import resolve_eye_tracking_paths
+from bin.eye_tracking_config import (
+    CALIBRATION_KEYS, OPTIONAL_CALIBRATION_DEFAULTS, resolve_eye_tracking_paths,
+)
 from bin.logger import (
     CALIBRATION_FILENAME,
     EVENT_LIBRARY_ENV,
@@ -47,9 +49,7 @@ from interface.subject_calibration import SubjectCalibrationStore, validate_eye_
 BLOCKS_FILENAME = "blocks.tsv"
 STATE_FILENAME = "state.json"
 BLOCK_CONFIG_FILENAME = "config.json"
-_EYE_CALIBRATION_COEFFICIENTS = (
-    "x_scale", "y_scale", "x_offset", "y_offset", "x_cross", "y_cross",
-)
+_EYE_CALIBRATION_COEFFICIENTS = CALIBRATION_KEYS
 BLOCK_FIELDS = (
     "block_name",
     "block_num",
@@ -416,7 +416,7 @@ class ExperimentManager:
         block_config["experiment_id"] = self.experiment_id
         block_config["block_id"] = block_id
         resolve_eye_tracking_paths(block_config, self.launch_config_path.parent)
-        # History retains declared scalar fields and all affine eye coefficients.
+        # History retains declared scalar fields and all eye coefficients.
         # Also reference the accepted source artifact so enabled eye tracking
         # inherits UART/filter settings, units and the gain anchor losslessly.
         if self._eye_calibration_path is not None:
@@ -516,11 +516,10 @@ class ExperimentManager:
             required_fields = [key for key in history[-1] if key not in {"set_time", "task_time_ns"}]
             if state_name == "eye_tracker_calibration":
                 # Older launch configs declare only diagonal gains and offsets.
-                # Keep fitted cross terms in state so block-level overrides do
-                # not silently reduce a full affine calibration to that schema.
-                # A later legacy calibration must explicitly clear cross terms
-                # from the previous fit, rather than inheriting stale values.
-                candidate = {"x_cross": 0.0, "y_cross": 0.0, **candidate}
+                # Keep every fitted term even with legacy state schemas. A later
+                # legacy calibration clears absent cross/quadratic terms rather
+                # than inheriting stale coefficients from the previous fit.
+                candidate = {**OPTIONAL_CALIBRATION_DEFAULTS, **candidate}
                 required_fields = list(dict.fromkeys(
                     [*required_fields, *_EYE_CALIBRATION_COEFFICIENTS]
                 ))

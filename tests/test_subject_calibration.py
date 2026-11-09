@@ -12,6 +12,8 @@ from interface.subject_calibration import CALIBRATION_CACHE_DIRECTORY, SubjectCa
 def calibration(offset=0.1):
     return dict(x_scale=0.002, y_scale=-0.003, x_offset=offset, y_offset=-0.2,
                 x_cross=0.001, y_cross=-0.0005, gain_anchor_px=[100, 50],
+                x_quad_xx=1e-5, x_quad_xy=-2e-5, x_quad_yy=3e-5,
+                y_quad_xx=-4e-5, y_quad_xy=5e-5, y_quad_yy=-6e-5,
                 gain_directions={"x": [1, 0], "y": [1, 0]},
                 input_units="crop_local_pixels", coordinate_units="screen_fraction_centered",
                 uart={"simulate": True}, filter={"ema_gamma": 0.2})

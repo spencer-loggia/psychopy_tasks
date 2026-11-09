@@ -328,7 +328,7 @@ histories to be added to `initial_state` without adding task-specific manager co
 Accepted gaze calibrations are also saved locally per full subject name in
 `logs/.subject_calibrations/`. This cache is excluded from data sync and experiment deletion.
 Each new experiment starts with that subject's latest accepted calibration, selected by experiment
-date/number and then block number. It preserves all six affine coefficients and the complete saved
+date/number and then block number. It preserves all twelve quadratic coefficients and the complete saved
 metadata, including the gain anchor and axis directions. The experiment keeps its own
 `initial_eye_calibration.json` snapshot, so later calibration updates cannot change its starting settings.
 Subjects without a saved calibration continue to use the launch config's initial values.
@@ -1036,12 +1036,14 @@ Eye data and calibration:
   invalidates the session and requires restarting calibration; its ROI coordinates may have changed.
 - `eye_filter.ema_gamma` defaults to 0 (no added smoothing); higher values below 1 retain more of the previous
   sample. Filtering occurs at the camera frame rate, not the UART poll rate.
-- The affine calibration maps camera crop pixels to subject-relative fractions:
-  `subject_x = x_scale * eye_x + x_cross * eye_y + x_offset` and
-  `subject_y = y_cross * eye_x + y_scale * eye_y + y_offset`.
+- The quadratic calibration maps camera crop pixels to subject-relative fractions:
+  `subject_x = x_scale * eye_x + x_cross * eye_y + x_offset + x_quad_xx * eye_x² + x_quad_xy * eye_x * eye_y + x_quad_yy * eye_y²` and
+  `subject_y = y_cross * eye_x + y_scale * eye_y + y_offset + y_quad_xx * eye_x² + y_quad_xy * eye_x * eye_y + y_quad_yy * eye_y²`.
   The corresponding `initial_` coefficient settings initialize calibration; non-null runtime coefficients
   supplied by the experiment manager take precedence. Defaults are +0.005 for `x_scale`, -0.005 for
-  `y_scale`, and zero for cross terms and offsets. Existing four-coefficient files load with zero cross terms.
+  `y_scale`, and zero for cross terms, offsets and quadratic terms. Existing four- or six-coefficient files
+  load with zero for missing terms and initialize the new calibration without changing their mapping.
+  The six quadratic coefficients are the only new calibration parameters; there is no model switch.
   These are starting values to calibrate, not a measured mapping. **Old analog-voltage calibration values must
   be cleared/replaced in the experiment state before use.** Changing camera ROI or analysis resolution also
   requires recalibration. Analog DAQ input configuration is rejected rather than silently reused.
@@ -1055,18 +1057,29 @@ Click the preview to move the fixation target, or use **number-pad 8/6/2/4** for
 with either calibration window focused. Each keypress moves it by 2.5% of the subject-scene width or
 height, stopping at the screen edges. Plain 8/6/2/4 also work. Moving the target resets auto-reward
 fixation history just as clicking does. When the subject looks at the target, **Z** (or **Add point**)
-captures the current valid, smoothed eye position and refits the affine transform using all points collected
+captures the current valid, smoothed eye position and refits the quadratic transform using all points collected
 in this calibration session. A persistent red dot marks each captured target on both displays. One point
-changes only offsets; two points adjust the constrained direction while preserving the remaining sensitivity.
-Three noncollinear points determine a full affine transform. Additional points use a least-squares fit;
-collinear or repeated points preserve directions that the observations cannot determine.
+changes only offsets. Two points adjust the measured direction and rotate the unmeasured direction with it,
+preserving its sensitivity and the mapping's handedness. This avoids the flat-line collapse that can occur
+when the unmeasured direction stays fixed during a camera-axis rotation.
+The fit preserves existing curvature whenever an affine correction can satisfy the points; three
+noncollinear points determine that affine correction. Further points make the smallest necessary curvature
+change, preserving unconstrained curvature. Six points with independent `[1, x, y, x², xy, y²]` rows
+determine the full quadratic map; four rectangle corners, the center and one edge midpoint are one such
+layout. Six points on a single circle or line are insufficient. Additional or inconsistent points use
+least squares; repeated points average their targets. Numerically singular directions are left unchanged.
+Minimum curvature change is measured by the squared entries of each symmetric quadratic matrix, followed
+by minimum change to the linear mapping at the sample center (with the two-point rotation rule above).
+The solve centers and scales camera coordinates internally; files retain raw-pixel coefficients.
 **Delete** (or Backspace) removes the last point and restores the transform and anchor from before that capture.
 Removing every point restores the pre-collection mapping. Invalid/stale eye samples cannot add points.
 
 The bottom and left sliders show signed subject-X/Y gains from the latest fit and update automatically
-after capture or undo. Each gain is the signed length of its affine row (the largest-magnitude coefficient
-sets its sign; the diagonal wins ties), so it controls that subject axis even when the camera axes are mixed.
-Manual changes scale the entire row around the last captured eye position, keeping that position fixed.
+after capture or undo. Each gain is the signed length of its nonconstant coefficient row, including quadratic
+terms (the largest-magnitude coefficient sets its sign; the diagonal wins ties). This is a coefficient gain,
+not a constant screen sensitivity, since a quadratic map's local sensitivity varies across the screen.
+Manual changes scale the entire curve for that subject axis around the last captured eye position,
+keeping that position fixed. The curve's shape survives zero gain and sign reversal, including after reload.
 Adding another point refits the collected data and snaps the sliders to the resulting gains. Slider ranges
 expand when necessary to display an automatic fit. Before the first capture, the first valid sample provides
 the gain anchor; moving the target does not change it. The anchor and axis directions are saved with the
@@ -1135,10 +1148,12 @@ Reward and fixation settings:
   `fix_accept_percent` is superseded by the two fixed thresholds; an older positive `fix_accept_time` is
   used as the interval only when `reward_interval` is absent.
 
-On normal exit, `calibration.json` retains the top-level `eye_tracker_calibration` object with all six
-affine coefficients and the collected `calibration_points` (smoothed camera pixels and subject-fraction targets).
-The experiment manager preserves all six coefficients in state and later block configs, including when its
-initial state declared only the older four coefficients. Additional metadata records pixel input units, `eye_id: 0`,
+On normal exit, `calibration.json` retains the top-level `eye_tracker_calibration` object with all twelve
+coefficients and the collected `calibration_points` (smoothed camera pixels and subject-fraction targets).
+The experiment manager preserves all twelve coefficients in state and later block configs, including when its
+initial state declared only the older four or six coefficients. Loading a later legacy calibration clears
+missing quadratic/cross terms rather than inheriting them from the previous calibration.
+Additional metadata records pixel input units, `eye_id: 0`,
 UART/filter settings, gain anchor, oriented/native screen dimensions, rotation and latest sample validity. The session
 also contains message and pump event logs.
 
@@ -1216,7 +1231,7 @@ The CSV columns are:
 | --- | --- |
 | `task_time_ns` | Local acquisition time in integer nanoseconds from the experiment origin, captured when the UART response is received. Same clock as events; never the writer/flush time or an age-adjusted estimate. |
 | `camera_time_ns` | Original `sensor_timestamp_ns` from the UART status, retained exactly as an integer. This is the camera's clock and must not be subtracted directly from `task_time_ns`. |
-| `x_screen_px`, `y_screen_px` | Calibrated, filtered position in native PsychoPy pixel coordinates: `x = screen_x - W/2`, `y = H/2 - screen_y`, where screen coordinates start at the top left. The full affine transform, scene size and display rotation are applied, matching stimulus positions. Offscreen positions are retained without clamping. |
+| `x_screen_px`, `y_screen_px` | Calibrated, filtered position in native PsychoPy pixel coordinates: `x = screen_x - W/2`, `y = H/2 - screen_y`, where screen coordinates start at the top left. The full quadratic transform, scene size and display rotation are applied, matching stimulus positions. Offscreen positions are retained without clamping. |
 | `pupil_diameter_px` | Eye 0 pupil diameter in camera pixels, as supplied by the tracker. |
 | `eye_valid`, `rejection_reason` | Eye validity (`1`/`0`) and reason such as `blink`, `lost`, `stale`, or `tracker_error`. Invalid samples write `nan` for both position coordinates and pupil diameter. |
 | `screen_ready` | `1` once the task has supplied its screen geometry. During setup, `0` means screen coordinates are still `nan`; a valid pupil measurement can already be recorded. |

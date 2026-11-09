@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 import json
 import math
 from pathlib import Path
@@ -10,8 +10,11 @@ from typing import Optional
 
 from .eye_tracking import EyeCalibration, EyeFilterConfig, UARTEyeTrackerConfig
 
-CALIBRATION_KEYS = ("x_scale", "y_scale", "x_offset", "y_offset", "x_cross", "y_cross")
-_OPTIONAL_CALIBRATION_KEYS = ("x_cross", "y_cross")
+CALIBRATION_KEYS = tuple(item.name for item in fields(EyeCalibration))
+OPTIONAL_CALIBRATION_DEFAULTS = {
+    key: 0.0 for key in CALIBRATION_KEYS
+    if key not in ("x_scale", "y_scale", "x_offset", "y_offset")
+}
 
 
 @dataclass(frozen=True)
@@ -62,8 +65,8 @@ def load_eye_tracking_settings(cfg, *, for_calibration=False):
     Precedence: saved calibration file, embedded calibration/history, explicit
     task UART/filter settings, then non-null flattened runtime coefficients.
     Defaults are allowed for the calibration task, but presentation tasks require
-    all four legacy measured coefficients; missing affine cross terms default
-    to zero. Merely having state fields never opens UART.
+    all four legacy measured coefficients; missing cross and quadratic terms
+    default to zero. Merely having state fields never opens UART.
     """
     section = _object(cfg.get("eye_tracking"), "eye_tracking")
     if "record_rate_hz" in section:
@@ -106,8 +109,8 @@ def load_eye_tracking_settings(cfg, *, for_calibration=False):
             value = cfg.get(f"initial_{key}")
             if value is None:
                 value = getattr(defaults, key)
-        if value is None and key in _OPTIONAL_CALIBRATION_KEYS:
-            value = 0.0
+        if value is None and key in OPTIONAL_CALIBRATION_DEFAULTS:
+            value = OPTIONAL_CALIBRATION_DEFAULTS[key]
         if value is None:
             raise ValueError(
                 f"Eye tracking is enabled but calibration {key} is missing; calibrate first"

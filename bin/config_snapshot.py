@@ -12,6 +12,8 @@ import copy
 from pathlib import Path
 from typing import Any, Mapping
 
+from .eye_tracking_config import CALIBRATION_KEYS
+
 
 _DISPLAY_TASKS = {
     "active_foraging", "match2cue", "afc_csc1", "afc_trial_sequence",
@@ -27,7 +29,7 @@ _OUTPUT_TEST_TASKS = {"pulse_pump", "pulse_buzzer"}
 _SYNC_DETAILS = {"height", "interval_mean_seconds", "interval_variance_seconds", "sync_pin"}
 _EYE_DETAILS = {"calibration_file", "calibration", "uart", "filter", "show_preview"}
 _EYE_TOP_LEVEL = {
-    "x_scale", "y_scale", "x_offset", "y_offset", "x_cross", "y_cross",
+    *CALIBRATION_KEYS,
     "eye_tracker_calibration", "uart", "eye_filter", "input_units",
     "coordinate_units", "eye_id", "gain_directions",
 }

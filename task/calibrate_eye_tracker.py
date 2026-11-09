@@ -20,7 +20,7 @@ from bin import utils
 from bin.config import load_config
 from bin.daqc2_outputs import DAQC2DigitalOutputs
 from bin.eye_calibration_keys import CALIBRATION_KEYS, fixation_key_steps
-from bin.eye_calibration_fit import AffineCalibrationFit
+from bin.eye_calibration_fit import QuadraticCalibrationFit
 from bin.eye_calibration_preview import _make_fixation_cross, _draw_fixation_cross
 from bin.eye_calibration_reward import CalibrationAutoReward
 from bin.eye_calibration_video import CalibrationVideoClips
@@ -204,7 +204,7 @@ def run_task(
     # that calibration must preserve it and keep both gains reachable.
     x_scale_limits = (min(x_scale_limits[0], calibration.x_gain), max(x_scale_limits[1], calibration.x_gain))
     y_scale_limits = (min(y_scale_limits[0], calibration.y_gain), max(y_scale_limits[1], calibration.y_gain))
-    point_fit = AffineCalibrationFit(calibration)
+    point_fit = QuadraticCalibrationFit(calibration)
     point_anchors = []
     videos = CalibrationVideoClips(
         video_files=video_files, video_size=video_size,

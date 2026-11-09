@@ -8,7 +8,7 @@ import unittest
 
 from bin.config import load_config
 from bin.eye_tracking import EyeCalibration
-from bin.eye_tracking_config import load_eye_tracking_settings
+from bin.eye_tracking_config import CALIBRATION_KEYS, load_eye_tracking_settings
 
 
 class EyeTrackingConfigTests(unittest.TestCase):
@@ -76,7 +76,9 @@ class EyeTrackingConfigTests(unittest.TestCase):
 
     def test_latest_embedded_history_or_flat_calibration(self):
         calibration = EyeCalibration(
-            x_offset=-0.5, y_offset=0.3, x_cross=0.001, y_cross=-0.002
+            x_offset=-0.5, y_offset=0.3, x_cross=0.001, y_cross=-0.002,
+            x_quad_xx=1e-5, x_quad_xy=-2e-5, x_quad_yy=3e-5,
+            y_quad_xx=-4e-5, y_quad_xy=5e-5, y_quad_yy=-6e-5,
         )
         for fields in (
             asdict(calibration),
@@ -121,6 +123,25 @@ class EyeTrackingConfigTests(unittest.TestCase):
             self.assertEqual(loaded.x_cross, -0.002)
             self.assertEqual(loaded.y_cross, -0.004)
 
+    def test_quadratic_file_round_trip_overrides_and_affine_initialization(self):
+        calibration = EyeCalibration(x_quad_xx=1e-5, x_quad_xy=-2e-5, x_quad_yy=3e-5,
+                                     y_quad_xx=-4e-5, y_quad_xy=5e-5, y_quad_yy=-6e-5)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'calibration.json'
+            path.write_text(json.dumps({'eye_tracker_calibration': calibration.to_json_dict()}))
+            config = {'eye_tracking': {'enabled': True, 'calibration_file': str(path)}}
+            self.assertEqual(load_eye_tracking_settings(config).calibration, calibration)
+            config.update(x_quad_xx=-1e-5, y_quad_xx=None)
+            loaded = load_eye_tracking_settings(config).calibration
+            self.assertEqual(loaded.x_quad_xx, -1e-5)
+            self.assertEqual(loaded.y_quad_xx, -4e-5)
+        affine = EyeCalibration(x_cross=0.003, y_cross=-0.004, x_offset=-0.5)
+        legacy = {key: value for key, value in asdict(affine).items() if 'quad' not in key}
+        self.assertEqual(load_eye_tracking_settings({'eye_tracker_calibration': legacy},
+                                                    for_calibration=True).calibration, affine)
+        initial = load_eye_tracking_settings({'initial_x_quad_xy': 3e-5}, for_calibration=True)
+        self.assertEqual(initial.calibration.x_quad_xy, 3e-5)
+
     def test_calibration_initial_cross_terms_are_supported(self):
         settings = load_eye_tracking_settings(
             {"initial_x_cross": 0.003, "initial_y_cross": -0.002},
@@ -134,6 +155,9 @@ class EyeTrackingConfigTests(unittest.TestCase):
             (EyeCalibration(x_scale=0, y_scale=0, x_cross=0.01, y_cross=-0.02), (0, 0)),
             (EyeCalibration(x_scale=0.003, x_cross=-0.004, y_cross=0.006, y_scale=0.008), (0, 0)),
             (EyeCalibration(x_scale=0.003, x_cross=0.004, y_cross=-0.006, y_scale=0.008), (0, 0.01)),
+            (EyeCalibration(x_quad_xx=1e-5, x_quad_xy=-3e-5, x_quad_yy=2e-5,
+                            y_quad_xx=4e-5, y_quad_xy=5e-5, y_quad_yy=-6e-5), (0, 0)),
+            (EyeCalibration(x_scale=0, y_scale=0, x_quad_xy=-1e-5, y_quad_yy=2e-5), (0, 0)),
         ):
             with self.subTest(initial=initial, zero_gains=zero_gains):
                 anchor = (100, 50)
@@ -143,7 +167,7 @@ class EyeTrackingConfigTests(unittest.TestCase):
                 # Runtime direction caches must not change the coefficient API.
                 self.assertEqual(
                     set(asdict(initial)),
-                    {"x_scale", "y_scale", "x_offset", "y_offset", "x_cross", "y_cross"},
+                    set(CALIBRATION_KEYS),
                 )
                 initial.set_gains(x_scale=-0.025, y_scale=0.012, anchor_px=anchor)
                 with tempfile.TemporaryDirectory() as tmp:
@@ -182,6 +206,9 @@ class EyeTrackingConfigTests(unittest.TestCase):
             {"x": [1, 0], "y": [0, -1]}, {"x": [float("nan"), 0], "y": [0, 1]},
             {"x": [1, 0], "y": [float("inf"), 0]}, {"x": [True, 0], "y": [0, 1]},
             {"x": [None, 0], "y": [0, 1]},
+            {"x": [1, 0, 0], "y": [0, 1]},
+            {"x": [0, 0, float("nan"), 0, 0], "y": [0, 1]},
+            {"x": [0, 0, -1, 0, 0], "y": [0, 1]},
         ):
             with self.subTest(directions=directions), self.assertRaisesRegex(ValueError, "gain_directions"):
                 load_eye_tracking_settings({
@@ -206,6 +233,7 @@ class EyeTrackingConfigTests(unittest.TestCase):
             {"x_scale": float("nan")},
             {"x_cross": float("inf")},
             {"y_cross": float("nan")},
+            *({key: float('nan')} for key in CALIBRATION_KEYS if 'quad' in key),
             {"gain_anchor_px": [1]},
             {"gain_anchor_px": [1, float("inf")]},
             {"uart": {"simulate": "false"}},

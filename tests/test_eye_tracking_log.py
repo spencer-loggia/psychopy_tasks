@@ -101,6 +101,19 @@ class EyeDataRecorderTests(unittest.TestCase):
         self.assertAlmostEqual(float(rows[0]["x_screen_px"]), 512 - 800 / 2)
         self.assertAlmostEqual(float(rows[0]["y_screen_px"]), 600 / 2 - 432)
 
+    def test_quadratic_mapping_is_recorded_with_display_rotation(self):
+        calibration = EyeCalibration(
+            x_scale=0, y_scale=0, x_quad_xx=1e-5, x_quad_xy=-2e-5, x_quad_yy=3e-5,
+            y_quad_xx=-4e-5, y_quad_xy=5e-5, y_quad_yy=-6e-5,
+        )
+        # (120,60) gives subject (.108,-.432). Clockwise display rotation maps
+        # subject y to native x, and subject x to negative native y.
+        rows, _, _ = self.record(
+            [self.valid_state()], geometry=((800, 600), 90), calibration=calibration,
+        )
+        self.assertAlmostEqual(float(rows[0]['x_screen_px']), -0.432 * 800)
+        self.assertAlmostEqual(float(rows[0]['y_screen_px']), -0.108 * 600)
+
     def test_invalid_rows_use_nan_instead_of_last_valid_gaze_or_zero_pupil(self):
         valid = self.valid_state()
         reasons = ("blink", "lost", "stale", "uart_error", "service_restarted")

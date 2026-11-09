@@ -79,6 +79,10 @@
             "headfix_train": {
                 "launch": "task/active_foraging.py",
                 "config": "config_files/csc2/yuri_headfix_train_noseq_nomem_20260930.json"
+            },
+            "headfix_train_hold": {
+                "launch": "task/active_foraging.py",
+                "config": "config_files/csc2/yuri_headfix_train_seq_mem_hold_20261109.json"
             }
             
         },

@@ -1,0 +1,99 @@
+{ 
+  "config_name": "csc2_foraging_classic",
+  "subject": "test",
+  "n_colors": 36,
+  "n_shapes": 36, 
+  "n_lum_levels": 11,
+  "shapes_tsv": "./task/resources/csc2/shape_definitions.tsv",
+  "colors_tsv": "./task/resources/csc2/mt2_062026_amoledB_colors.tsv",
+  "freq_space_tsv": {
+    "Test": "./task/resources/csc2/freq_space_TY.csv",
+    "Yuri": "./task/resources/csc2/freq_space_TY.csv",
+    "Tina": "./task/resources/csc2/freq_space_TY.csv",
+    "Buzz": "./task/resources/csc2/freq_space_SB.csv",
+    "Sally": "./task/resources/csc2/freq_space_SB.csv"
+  },
+  "reward_space_tsv": {
+    "Test": "./task/resources/csc2/reward_space_TY.csv",
+    "Yuri": "./task/resources/csc2/reward_space_TY.csv",
+    "Tina": "./task/resources/csc2/reward_space_TY.csv",
+    "Buzz": "./task/resources/csc2/reward_space_SB.csv",
+    "Sally": "./task/resources/csc2/reward_space_SB.csv"
+  },
+  "pump_delay_time": 0.0,
+  "pump_pulse_time_seconds": 0.25,
+  "inter_pump_interval": 0.1, 
+  "timeout_duration_seconds": 6.0,
+  "reward_to_pulse_map": {
+    "0": 0,
+    "1": 0,
+    "2": 1,
+    "3": 2
+  },
+  "reward_to_timeout_map": {
+    "0": 1,
+    "1": 0,
+    "2": 0,
+    "3": 0
+  },
+
+  "daq": {
+    "address": 0
+  },
+  "pump_pin": 0,
+  "buzz_pin": 1,
+
+  "seed": null,
+  "output_dir": "./logs",
+  "screens": {
+    "main": null,
+    "experimenter": null
+  },
+  "n": 120,
+
+  "fullscreen": true,
+  "fixation_size": 20,
+  "dot_size": 40,
+  "dot_color": [50, 50, 50],
+  "init_dot_color": [50, 50, 50],
+  "center_point": [300, -480],
+  "stim_range_radius": 700,
+  "stroke_width": 0.2,
+  "stroke_color": [0, 0, 0],
+  "stroke_linejoin": "round",
+  "stroke_linecap": "round",
+  "image_size": [150, 150],
+  "display_margin": 300,
+
+  "initiation_cue_center_position": [300, -480],
+  "initiation_cue_style": "dot",
+
+  "self_initiation": true,
+  "hold_before_choice": false,
+  "hold_cue_to_init_time_s": 0.25,
+
+  "wait_for_saccade_on_dot": true,
+  "fixation_window_radius": 200,
+  "fixation_criteria_s": 0.1,
+  "saccade_wait_timeout_s": 2.0,
+  
+  "iti": 0.75,
+  "duration": 0.25,
+  "num_afc": 2,
+  "choice_time": 2.0,
+  "isi": 0.1,
+  "fixed_positions": false,
+  "sequential": true,
+  "is_memory": true,
+  "raspi": true,
+  "touchscreen": true,
+
+  "eye_tracking": {"enabled": true},
+  "sync_bar": {
+    "sync_pin": 16,
+    "enabled": false,
+    "height": 20,
+    "interval_mean_seconds": 1.0,
+    "interval_variance_seconds": 0.2
+  }
+}

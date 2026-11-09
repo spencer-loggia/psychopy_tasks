@@ -77,7 +77,7 @@
   "fixation_criteria_s": 0.2,
   "saccade_wait_timeout_s": 4.0,
   
-  "iti": 2.0,
+  "iti": 4.0,
   "duration": 0.0,
   "num_afc": 3,
   "choice_time": 2.0,

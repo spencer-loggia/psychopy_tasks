@@ -363,6 +363,7 @@ def run_task(
     fixation_criteria_s: float = 0.1,
     fixation_window_radius: float = 150.0,
     choice_period_idicator_tone: bool = False,
+    require_saccade_to_all_options: bool = True,
 ):
     validate_choice_tone(choice_period_idicator_tone)
     placement_distribution = normalize_placement_distribution(placement_distribution)
@@ -373,6 +374,8 @@ def run_task(
         saccade_wait_timeout_s=saccade_wait_timeout_s,
         fixation_criteria_s=fixation_criteria_s,
         fixation_window_radius=fixation_window_radius,
+        require_saccade_to_all_options=require_saccade_to_all_options,
+        sequential=sequential,
     )
     dot_fixation_gate = (
         DotFixationGate(
@@ -1097,6 +1100,7 @@ def run_task(
                 stimulus_rotation_degrees=stimulus_rotation_degrees,
                 dot_fixation_gate=dot_fixation_gate,
                 saccade_wait_timeout_s=saccade_wait_timeout_s,
+                require_saccade_to_all_options=require_saccade_to_all_options,
                 on_choice_start=(lambda: choice_tone.start(trial_num)) if choice_tone is not None else None,
             )
             if aborted:
@@ -1408,6 +1412,7 @@ def main():
             isi=isi,
             wait_for_saccade_on_dot=cfg.get("wait_for_saccade_on_dot", False),
             saccade_wait_timeout_s=cfg.get("saccade_wait_timeout_s", 1.0),
+            require_saccade_to_all_options=cfg.get("require_saccade_to_all_options", True),
             fixation_criteria_s=cfg.get("fixation_criteria_s", 0.1),
             fixation_window_radius=cfg.get("fixation_window_radius", 150.0),
             init_dot_color=init_dot_color,

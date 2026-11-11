@@ -23,10 +23,13 @@ def _positive_setting(value, name):
 def validate_dot_fixation_config(
     wait_for_saccade_on_dot, *, isi, eye_tracking_enabled,
     fixation_criteria_s, fixation_window_radius, saccade_wait_timeout_s,
+    require_saccade_to_all_options=True, sequential=True,
 ):
     """Reject an enabled gate without visible dots, tracking, or valid limits."""
     if not isinstance(wait_for_saccade_on_dot, bool):
         raise ValueError("wait_for_saccade_on_dot must be true or false")
+    if not isinstance(require_saccade_to_all_options, bool):
+        raise ValueError("require_saccade_to_all_options must be true or false")
     if not wait_for_saccade_on_dot:
         return
     if not eye_tracking_enabled:
@@ -36,6 +39,8 @@ def validate_dot_fixation_config(
     _positive_setting(fixation_window_radius, "fixation_window_radius")
     if saccade_wait_timeout_s is not None:
         _positive_setting(saccade_wait_timeout_s, "saccade_wait_timeout_s")
+    elif sequential and not require_saccade_to_all_options:
+        raise ValueError("saccade_wait_timeout_s must be finite when require_saccade_to_all_options=false")
 
 
 class DotFixationGate:

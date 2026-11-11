@@ -2052,6 +2052,7 @@ def present_trial_with_persistent_dots(
     dot_fixation_gate=None,
     saccade_wait_timeout_s: Optional[float] = 1.0,
     on_choice_start: Optional[Callable[[], None]] = None,
+    require_saccade_to_all_options: bool = True,
 ):
     """Present stimuli one at a time, leave faint dots at their locations,
     show all dots for `choice_time`, then clear.
@@ -2096,6 +2097,7 @@ def present_trial_with_persistent_dots(
     preview_option_phase = False
     visible_option_indices: set[int] = set()
     revealed_option_indices: set[int] = set()
+    skipped_option_indices: set[int] = set()
     chosen_preview_index: Optional[int] = None
     first_option_flip_perf_ns: Optional[int] = None
     preview_reward_levels: Optional[list[int]] = None
@@ -3082,28 +3084,36 @@ def present_trial_with_persistent_dots(
         )
 
     def _wait_for_dot_fixation(dot_timing, option_index):
-        """Poll memory only; the dot remains in the front buffer while waiting."""
+        """Return accepted, skipped, or aborted while retaining the static dot."""
         nonlocal next_visual_target_perf_s
         deadline = dot_timing.actual_perf_s + saccade_timeout_s
+        required = require_saccade_to_all_options or option_index == 1
         try:
             while True:
                 if _abort_from_input("experimenter_exit_during_dot_fixation"):
-                    return False
+                    return "aborted"
                 now = time.perf_counter()
-                if dot_fixation_gate.reached_dot_before(deadline):
+                if required and dot_fixation_gate.reached_dot_before(deadline):
                     deadline = math.inf
                 if now >= deadline:
-                    _timeout_dot_fixation(now)
-                    return False
-                if dot_fixation_gate.status(now_s=now) is not None:
+                    if required:
+                        _timeout_dot_fixation(now)
+                        return "aborted"
+                    _log_message(msg_logger, "INFO", f"option_skipped trial_num={trial_num} "
+                                 f"option_index={option_index} reason=saccade_timeout")
+                    result = "skipped"
+                elif dot_fixation_gate.status(now_s=now) is not None:
                     _log_fixation_accepted(option_index, now)
-                    # An extended gaze wait is response-driven, not a missed
-                    # scheduled transition. Preserve the ISI minimum otherwise.
-                    if now >= flip_submission_time(next_visual_target_perf_s, frame_dur):
-                        next_visual_target_perf_s = None
-                    return True
-                service_sync_bar(win, deadline_perf_s=deadline)
-                _core.wait(min(poll_interval_s, max(0.0, deadline - time.perf_counter())))
+                    result = "accepted"
+                else:
+                    service_sync_bar(win, deadline_perf_s=deadline)
+                    _core.wait(min(poll_interval_s, max(0.0, deadline - time.perf_counter())))
+                    continue
+                # Gaze waits and optional skips are not missed scheduled
+                # transitions. Retain the minimum ISI when it has not elapsed.
+                if now >= flip_submission_time(next_visual_target_perf_s, frame_dur):
+                    next_visual_target_perf_s = None
+                return result
         finally:
             dot_fixation_gate.stop()
 
@@ -3293,8 +3303,15 @@ def present_trial_with_persistent_dots(
                     dot_perf,
                     isi_plan,
                 )
-                if dot_fixation_gate is not None and not _wait_for_dot_fixation(dot_timing, idx):
-                    return _interrupted_result()
+                if dot_fixation_gate is not None:
+                    fixation_result = _wait_for_dot_fixation(dot_timing, idx)
+                    if fixation_result == "aborted":
+                        return _interrupted_result()
+                    if fixation_result == "skipped":
+                        skipped_option_indices.add(idx)
+                        cue_dot.fillColor = rgb255_to_psychopy(dot_color)
+                        dot_records[-1]["color"] = tuple(dot_color)
+                        continue
 
             current_preview_image = [
                 _make_preview_image_entry(pil_img, stim, reward_level)
@@ -3369,26 +3386,6 @@ def present_trial_with_persistent_dots(
             if not is_memory and cue_dot is not None and dots:
                 dots.pop()
                 dot_records.pop()
-
-            if (not is_memory) and idx == len(trial_options):
-                _prepare_choice_display()
-                bg_rect.draw()
-                for s in stims_for_choice:
-                    s.draw()
-                if fix is not None:
-                    fix.draw()
-                off_timing = _flip_prepared_scene(
-                    next_visual_target_perf_s,
-                    "experimenter_exit_during_choice_start",
-                    before_flip_callback=_open_choice_input,
-                )
-                if off_timing is None:
-                    return _interrupted_result()
-                _record_option_scene(off_timing, range(1, len(trial_options) + 1))
-                next_visual_target_perf_s = None
-                _build_choice_hit_targets()
-                _start_choice_window(off_timing)
-                _show_preview(stims_for_choice_preview)
 
     else:
         for item_index, (p, pos) in enumerate(zip(trial_options, positions)):
@@ -3517,14 +3514,16 @@ def present_trial_with_persistent_dots(
     if not click_registered:
         fixation_positions.clear()
         if not choice_started:
+            choice_indices = [index for index in range(1, len(trial_options) + 1)
+                              if index not in skipped_option_indices]
             _prepare_choice_display()
             bg_rect.draw()
-            if is_memory:
-                for d in dots:
-                    d.draw()
-            else:
-                for s in (stims_for_choice if sequential else stims):
-                    s.draw()
+            for d in dots:
+                d.draw()
+            if not is_memory:
+                choice_stims = stims_for_choice if sequential else stims
+                for index in choice_indices:
+                    choice_stims[index - 1].draw()
             if fix is not None:
                 fix.draw()
             choice_timing = _flip_prepared_scene(
@@ -3535,12 +3534,13 @@ def present_trial_with_persistent_dots(
             if choice_timing is None:
                 return _interrupted_result()
             _record_option_scene(
-                choice_timing, [] if is_memory else range(1, len(trial_options) + 1),
+                choice_timing, [] if is_memory else choice_indices,
             )
             next_visual_target_perf_s = None
             _build_choice_hit_targets()
             _start_choice_window(choice_timing)
-            _show_preview([] if is_memory else (stims_for_choice_preview if sequential else preview_images))
+            choice_preview = stims_for_choice_preview if sequential else preview_images
+            _show_preview([] if is_memory else [choice_preview[index - 1] for index in choice_indices])
 
         # Prepare the static gray scene once while the choice remains visible
         # in the front buffer. A response can therefore transition on the next

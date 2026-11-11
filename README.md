@@ -1336,6 +1336,7 @@ Optional fixation gating uses these active-foraging settings:
 
 ```json
 "wait_for_saccade_on_dot": true,
+"require_saccade_to_all_options": true,
 "fixation_window_radius": 150,
 "fixation_criteria_s": 0.1,
 "saccade_wait_timeout_s": 1.0
@@ -1353,8 +1354,17 @@ button. Click it, or focus it with Tab and press Enter, to edit
 for both gaze detection and the grey outlines. The existing `live_setting` message
 logs record the initial value, confirmations, and applied changes.
 
-In sequential mode, every dot remains visible for at least the configured ISI and until
-its fixation is accepted. The stimulus then follows the normal duration and memory rules.
+In sequential mode, `require_saccade_to_all_options` defaults to `true`: every dot
+requires gaze arrival before its saccade deadline and accepted fixation before revealing
+its stimulus. With `false`, only the first dot is required. Later dots offer an optional
+fixation window of `saccade_wait_timeout_s`; if fixation is not accepted by that deadline,
+the concealed stimulus is skipped and the trial continues to the next dot or choice.
+A brief gaze arrival does not extend this optional window. Skipped options remain dots
+and can still be chosen after the first option has been revealed, including in non-memory
+mode. Skips are recorded as `option_skipped` messages, without an aborting `saccade_timeout`
+event. Every dot retains the minimum configured ISI; skipped stimuli add no stimulus-duration
+or inter-stimulus hold. This option applies only when sequential fixation gating is enabled;
+it does not enable eye tracking or `wait_for_saccade_on_dot` by itself.
 In non-sequential mode, each option appears only while that option is fixated, returning
 to its dot when fixation is lost. With `is_memory=false`, `duration` must be `0.0` and
 the choice window opens at the initial `options_dot` flip. The subject has exactly
@@ -1374,11 +1384,13 @@ rule does not restart or extend the choice window, and trials with no reveal can
 `saccade_wait_timeout_s` is a positive number of seconds, or `null` to disable saccade
 timeouts. It measures time from the most recent new-dot onset until valid gaze first
 enters an option's fixation window; the fixation-duration criterion may finish later.
-Sequential trials get a fresh deadline for each new option dot. Simultaneous trials
+Required sequential dots get a fresh deadline for gaze arrival. Optional later dots
+instead use that duration as a fixed window to complete fixation before skipping;
+this mode requires a finite timeout (`null` is rejected). Simultaneous trials
 have one deadline from the initial `options_dot` flip until gaze reaches any option.
 Subsequent gaze loss does not restart that deadline. In non-memory mode, a timeout
 equal to or longer than `choice_time` has no effect; a shorter timeout can end the trial
-early if no dot is reached. A saccade timeout clears the display and starts the full ITI
+early if no dot is reached. A required saccade timeout clears the display and starts the full ITI
 immediately, without a reward or punishment interval; the next trial proceeds normally.
 
 Every completed non-timeout trial reserves a fixed reward interval from the actual post-choice gray-screen

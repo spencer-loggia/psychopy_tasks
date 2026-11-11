@@ -186,8 +186,9 @@ class ActiveForagingTaskTests(unittest.TestCase):
         config.update(wait_for_saccade_on_dot=True, saccade_wait_timeout_s=2.5,
                       fixation_criteria_s=0.15, fixation_window_radius=75)
         settings = object()
-        for timeout in (2.5, None):
+        for timeout, require_all in ((2.5, True), (2.5, False), (None, True)):
             config["saccade_wait_timeout_s"] = timeout
+            config["require_saccade_to_all_options"] = require_all
             with self.subTest(timeout=timeout):
                 with patch.object(sys, "argv", ["active_foraging", "--config", str(config_path)]), patch.object(
                     task, "load_config", return_value=config,
@@ -195,7 +196,8 @@ class ActiveForagingTaskTests(unittest.TestCase):
                     task, "run_task", return_value="done",
                 ) as run:
                     task.main()
-                for key in ("wait_for_saccade_on_dot", "saccade_wait_timeout_s", "fixation_criteria_s", "fixation_window_radius"):
+                for key in ("wait_for_saccade_on_dot", "saccade_wait_timeout_s", "fixation_criteria_s",
+                            "fixation_window_radius", "require_saccade_to_all_options"):
                     self.assertEqual(run.call_args.kwargs[key], config[key])
                 self.assertIs(run.call_args.kwargs["eye_tracking_config"], settings)
 
@@ -233,6 +235,11 @@ class ActiveForagingTaskTests(unittest.TestCase):
     def test_fixation_timeout_skips_outcome_interval_and_continues_after_full_iti(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._exercise_task(Path(tmp), True, True, saccade_timeout=True)
+
+    def test_optional_saccade_policy_reaches_presenter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._exercise_task(Path(tmp), True, True, change_fixation=True,
+                                placement_options={"require_saccade_to_all_options": False})
 
     def test_all_preview_modes_preserve_events_without_synthetic_postchoice_images(self):
         for sequential, memory in ((False, False), (False, True), (True, False), (True, True)):
@@ -308,6 +315,8 @@ class ActiveForagingTaskTests(unittest.TestCase):
         cue_times, gray_times = [], []
 
         def present(**kwargs):
+            self.assertIs(kwargs["require_saccade_to_all_options"],
+                          placement_options.get("require_saccade_to_all_options", True))
             if tone_enabled:
                 kwargs["on_choice_start"]()
                 tone_factory.return_value.start.assert_called_with(kwargs["trial_num"])

@@ -66,16 +66,17 @@
   "display_margin": 300,
 
   "initiation_cue_center_position": [300, -480],
-  "initiation_cue_style": "checker",
+  "initiation_cue_style": "dotted_checker",
 
   "self_initiation": true,
-  "hold_before_choice": false,
-  "hold_cue_to_init_time_s": 0.25,
+  "hold_before_choice": true,
+  "hold_cue_to_init_time_s": 0.1,
 
   "wait_for_saccade_on_dot": true,
   "fixation_window_radius": 175,
   "fixation_criteria_s": 0.2,
   "saccade_wait_timeout_s": 4.0,
+  "require_saccade_to_all_options": false,
   
   "iti": 4.0,
   "duration": 0.0,

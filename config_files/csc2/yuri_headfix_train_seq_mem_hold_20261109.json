@@ -76,7 +76,8 @@
   "wait_for_saccade_on_dot": false,
   "fixation_window_radius": 200,
   "fixation_criteria_s": 0.1,
-  "saccade_wait_timeout_s": 2.0,
+  "saccade_wait_timeout_s": 0.5,
+  
   
   "iti": 0.75,
   "duration": 0.25,

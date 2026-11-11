@@ -92,19 +92,23 @@ class Gate:
                 if now_s - self.onset_s >= onset - 1e-9:
                     accepted = value
             return accepted
-        if self.accept_after_s is None:
+        delay = self._per_dot(self.accept_after_s)
+        if delay is None:
             return None
-        return 1 if now_s - self.onset_s >= self.accept_after_s - 1e-9 else None
+        return 1 if now_s - self.onset_s >= delay - 1e-9 else None
+
+    def _per_dot(self, value):
+        return value[len(self.starts) - 1] if isinstance(value, tuple) else value
 
     def stop(self):
         self.stopped = True
 
     def reached_dot_before(self, deadline_perf_s):
-        arrival = self.arrival_after_s
+        arrival = self._per_dot(self.arrival_after_s)
         if arrival is ...:
             arrival = (
                 next((onset for onset, target in self.schedule if target is not None), None)
-                if self.schedule is not None else self.accept_after_s
+                if self.schedule is not None else self._per_dot(self.accept_after_s)
             )
         return arrival is not None and self.onset_s + arrival <= min(
             time.perf_counter(), deadline_perf_s,
@@ -139,7 +143,8 @@ class ActiveForagingFixationTests(unittest.TestCase):
                 schedule=None, duration=0.1, choice_time=0.1, event_logger=None,
                 sync_service=None, arrival_after=..., click_after=None,
                 click_intervals=None, click_index=1, buffered_touch=None,
-                on_choice_start=None, event_profile="active_foraging", hold_cue=False):
+                on_choice_start=None, event_profile="active_foraging", hold_cue=False,
+                require_saccade_to_all_options=True, num_options=2, msg_logger=None):
         clock = FakeClock()
         module, psychopy = load_presenter(clock)
         window = Display(clock)
@@ -147,8 +152,8 @@ class ActiveForagingFixationTests(unittest.TestCase):
         logger = Mock() if event_logger is None else event_logger
         preview = Mock()
         metadata = {}
-        options = [(1, 1), (2, 1)]
-        positions = [(-100, 0), (100, 0)]
+        options = [(index + 1, 1) for index in range(num_options)]
+        positions = [(index * 200 - 100, 0) for index in range(num_options)]
         tone_times = []
 
         def choice_callback():
@@ -209,8 +214,10 @@ class ActiveForagingFixationTests(unittest.TestCase):
                 sequential=sequential, is_memory=memory, trial_meta=metadata,
                 experimenter_preview=preview, external_abort_checker=abort,
                 scene_main_size=window.size, event_profile=event_profile,
-                reward_levels=[3, 0],
+                reward_levels=[3] + [0] * (num_options - 1),
                 dot_fixation_gate=gate, saccade_wait_timeout_s=timeout,
+                require_saccade_to_all_options=require_saccade_to_all_options,
+                msg_logger=msg_logger,
                 on_choice_start=choice_callback if on_choice_start is not None or hold_cue else None,
                 onset_cue=Stimulus() if hold_cue else None,
                 pressed_onset_cue=Stimulus() if hold_cue else None,
@@ -605,6 +612,86 @@ class ActiveForagingFixationTests(unittest.TestCase):
         timeout = next(event for event in events if event["event"] == "saccade_timeout")
         self.assertAlmostEqual((timeout["timestamp_perf_ns"] - second_dot["timestamp_perf_ns"]) / 1e9, 0.15, delta=0.002)
         self.assertNotIn("option_2_on", [event["event"] for event in events])
+
+    def test_optional_later_dot_skips_to_choice_without_revealing_or_aborting(self):
+        for memory in (False, True):
+            for isi, timeout in ((0.1, 0.15), (0.2, 0.05)):
+                with self.subTest(memory=memory, isi=isi, timeout=timeout):
+                    messages, choice_callback = Mock(), Mock()
+                    result, events, metadata, gate, window, preview = self.present(
+                        memory=memory, accepted_after=(0.02, None), timeout=timeout, isi=isi,
+                        require_saccade_to_all_options=False, msg_logger=messages,
+                        on_choice_start=choice_callback, hold_cue=True,
+                    )
+                    self.assertEqual(result, (False, None))
+                    self.assertFalse(metadata.get("saccade_timeout"))
+                    names = [event["event"] for event in events]
+                    self.assertIn("option_1_on", names)
+                    self.assertNotIn("option_2_on", names)
+                    self.assertNotIn("saccade_timeout", names)
+                    self.assertEqual(names.count("fixation_accepted"), 1)
+                    choice_callback.assert_called_once_with()
+                    dot = next(event for event in events if event["event"] == "option_2_dot")
+                    choice = next(event for event in events if event["event"] == "choice_start")
+                    elapsed = (choice["timestamp_perf_ns"] - dot["timestamp_perf_ns"]) / 1e9
+                    self.assertGreaterEqual(elapsed, max(isi, timeout) - 1e-9)
+                    self.assertLess(elapsed, max(isi, timeout) + 1 / 60 + 1e-9)
+                    self.assertFalse(any((100, 0) in scene for scene in window.scenes))
+                    self.assertEqual(metadata["main_display_transition_misses"], 0)
+                    self.assertTrue(gate.stopped)
+                    self.assertEqual(len(gate.starts), 2)
+                    self.assertTrue(any("option_skipped trial_num=3 option_index=2" in call.args[1]
+                                        for call in messages.log.call_args_list))
+                    self.assertTrue(any(
+                        (100.0, 0.0) in [tuple(dot["pos"]) for dot in call.kwargs.get("overlay_dots", [])]
+                        for call in preview.show_static_scene.call_args_list
+                    ))
+
+    def test_optional_skip_continues_to_later_options_and_still_requires_the_first(self):
+        for memory in (False, True):
+            with self.subTest(memory=memory):
+                result, events, metadata, gate, window, _ = self.present(
+                    memory=memory, accepted_after=(0.02, None, 0.02), num_options=3,
+                    timeout=0.15, require_saccade_to_all_options=False,
+                )
+                self.assertEqual(result, (False, None))
+                self.assertFalse(metadata.get("saccade_timeout"))
+                names = [event["event"] for event in events]
+                self.assertIn("option_1_on", names)
+                self.assertIn("option_3_on", names)
+                self.assertNotIn("option_2_on", names)
+                self.assertFalse(any((100, 0) in scene for scene in window.scenes))
+                self.assertEqual(len(gate.starts), 3)
+        _, events, metadata, gate, _, _ = self.present(
+            accepted_after=None, timeout=0.05, require_saccade_to_all_options=False,
+        )
+        self.assertTrue(metadata["saccade_timeout"])
+        self.assertNotIn("choice_start", [event["event"] for event in events])
+        self.assertEqual(len(gate.starts), 1)
+
+    def test_optional_gaze_wait_is_bounded_even_after_a_brief_arrival(self):
+        for second_acceptance, revealed in ((0.04, True), (0.2, False), (None, False)):
+            with self.subTest(second_acceptance=second_acceptance):
+                _, events, metadata, _, _, _ = self.present(
+                    accepted_after=(0.02, second_acceptance), arrival_after=(0.01, 0.01),
+                    timeout=0.1, require_saccade_to_all_options=False,
+                )
+                names = [event["event"] for event in events]
+                self.assertEqual("option_2_on" in names, revealed)
+                self.assertIn("choice_start", names)
+                self.assertFalse(metadata.get("saccade_timeout"))
+
+    def test_skipped_sequential_option_remains_selectable_without_being_revealed(self):
+        for memory in (False, True):
+            with self.subTest(memory=memory):
+                result, events, _, _, window, _ = self.present(
+                    memory=memory, accepted_after=(0.02, None), timeout=0.15,
+                    choice_time=0.3, require_saccade_to_all_options=False,
+                    click_after=0.55, click_index=2,
+                )
+                self.assertEqual(result[1]["chosen_index"], 2)
+                self.assertNotIn("option_2_on", [event["event"] for event in events])
+                self.assertFalse(any((100, 0) in scene for scene in window.scenes))
 
     def test_null_timeout_allows_long_gaze_loss_during_simultaneous_choice(self):
         result, events, metadata, _, window, _ = self.present(

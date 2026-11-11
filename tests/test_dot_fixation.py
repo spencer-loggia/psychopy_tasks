@@ -44,6 +44,21 @@ class DotFixationConfigTests(unittest.TestCase):
                 saccade_wait_timeout_s=None, fixation_criteria_s=None,
             ))
 
+    def test_optional_sequential_options_require_boolean_policy_and_finite_timeout(self):
+        for required in (False, True):
+            validate_dot_fixation_config(**self.settings(require_saccade_to_all_options=required))
+        for required in (None, 0, 1, "false"):
+            with self.subTest(required=required), self.assertRaisesRegex(ValueError, "require_saccade_to_all_options"):
+                validate_dot_fixation_config(**self.settings(require_saccade_to_all_options=required))
+        with self.assertRaisesRegex(ValueError, "saccade_wait_timeout_s must be finite"):
+            validate_dot_fixation_config(**self.settings(
+                require_saccade_to_all_options=False, saccade_wait_timeout_s=None,
+            ))
+        for options in ({"sequential": False}, {"wait_for_saccade_on_dot": False}):
+            validate_dot_fixation_config(**self.settings(
+                require_saccade_to_all_options=False, saccade_wait_timeout_s=None, **options,
+            ))
+
 
 class DotFixationGateTests(unittest.TestCase):
     def gate(self, positions=((0, 0),), *, size=(1000, 600), rotation=0,

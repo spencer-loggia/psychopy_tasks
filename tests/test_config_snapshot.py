@@ -52,7 +52,8 @@ class ConfigSnapshotTests(unittest.TestCase):
 
     def test_gaze_parameters_removed_only_when_gate_disabled(self):
         params = {"fixation_criteria_s": .3, "fixation_window_radius": 175,
-                  "saccade_wait_timeout_s": 4, "eye_tracking": {"enabled": True}}
+                  "saccade_wait_timeout_s": 4, "require_saccade_to_all_options": False,
+                  "eye_tracking": {"enabled": True}}
         for enabled in (False, True):
             cfg = {**params, "wait_for_saccade_on_dot": enabled}
             result = self.snapshot(cfg)

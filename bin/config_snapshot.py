@@ -37,7 +37,10 @@ _INITIATION_KEYS = {
     "initiation_cue_center_position", "initiation_cue_style",
     "hold_before_choice", "hold_cue_to_init_time_s",
 }
-_GAZE_KEYS = {"fixation_criteria_s", "fixation_window_radius", "saccade_wait_timeout_s"}
+_GAZE_KEYS = {
+    "fixation_criteria_s", "fixation_window_radius", "saccade_wait_timeout_s",
+    "require_saccade_to_all_options",
+}
 
 
 def _drop(config: dict[str, Any], keys) -> None:

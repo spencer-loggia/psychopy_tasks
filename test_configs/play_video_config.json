@@ -16,8 +16,8 @@
   "bg": [0, 0, 0],
 
   "pump_pin": 0,
-  "pump_pulse_time_seconds": 0.1,
-  "reward_interval": 5.0,
+  "pump_pulse_time_seconds": 0.05,
+  "reward_interval": 7.0,
 
   "eye_tracking": {"enabled": true},
   "sync_bar": {

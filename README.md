@@ -130,9 +130,11 @@ Selecting a subject starts a new experiment under `logs`:
 
 **Debug Mode** opens a touch-compatible hardware menu on the experimenter screen, with a fallback to the
 remaining connected display if a saved display selector is unavailable. It needs no main display, subject,
-eye tracker, camera, network connection, or successful system diagnostic. Experiment configuration validation,
-main-screen masking, mode initialization, and startup code updates are deferred until Start Experiment or
-Run System Diagnostic is selected. Even an unreadable launcher config leaves Debug Mode available.
+eye tracker, camera, network connection, or successful system diagnostic. With a valid dual-display setup,
+the configured main-screen mask and static sync bar appear when the manager opens. Mask setup is best-effort:
+a missing main display, bad mask configuration, or unavailable touchscreen never blocks Debug Mode.
+Experiment configuration validation, mode initialization, and startup code updates remain deferred until
+Start Experiment or Run System Diagnostic is selected. Even an unreadable launcher config leaves Debug Mode available.
 Missing files, malformed JSON, invalid configuration fields, and unresolvable config paths all leave the
 manager's opening menu accessible. A broken screen selector falls back to another valid selector (including
 `SECONDARY_SCREEN`), then the detected secondary display or the only connected display. Configured working
@@ -569,7 +571,7 @@ fields:
   `main_touchscreen_xinput` is not required.
 - Masking requires Linux with a real X11 `DISPLAY`. It intentionally does not support Xwayland.
 
-After experiment/diagnostic setup, while the interface is idle, the manager runs `xinput disable` only for that named touchscreen and covers the main
+When the manager opens with a valid dual-display mask configuration, it runs `xinput disable` only for that named touchscreen and covers the main
 display with a fullscreen window colored by `screen_mask_rgb`. The experimenter touchscreen and physical mouse are not modified. A task
 subprocess creates its main window, then emits a private readiness marker. The manager removes the mask window,
 maps the touchscreen to the resolved main RandR output with `xinput map-to-output`, enables it, and acknowledges

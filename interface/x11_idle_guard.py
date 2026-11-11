@@ -15,6 +15,9 @@ from bin.screen import (
 from bin.sync_bar import SyncBarConfig, sync_bar_rectangles
 
 
+XINPUT_COMMAND_TIMEOUT_SECONDS = 2.0
+
+
 class XInputControlError(RuntimeError):
     """Raised when the configured touchscreen cannot be controlled safely."""
 
@@ -87,6 +90,7 @@ class XInputTouchscreen:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                timeout=XINPUT_COMMAND_TIMEOUT_SECONDS,
             )
         except FileNotFoundError as exc:
             raise XInputControlError("The 'xinput' command is not installed") from exc
@@ -94,6 +98,10 @@ class XInputTouchscreen:
             detail = (exc.stderr or exc.stdout or str(exc)).strip()
             raise XInputControlError(
                 f"XInput command failed ({' '.join(args)}): {detail}"
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise XInputControlError(
+                f"XInput command timed out after {XINPUT_COMMAND_TIMEOUT_SECONDS:g}s: {' '.join(args)}"
             ) from exc
 
     def resolve_device_id(self) -> str:

@@ -21,7 +21,7 @@
     "Sally": "./task/resources/csc2/reward_space_SB.csv"
   },
   "pump_delay_time": 0.0,
-  "pump_pulse_time_seconds": 0.25,
+  "pump_pulse_time_seconds": 0.1,
   "inter_pump_interval": 0.1, 
   "timeout_duration_seconds": 6.0,
   "reward_to_pulse_map": {
@@ -88,7 +88,8 @@
   "raspi": true,
   "touchscreen": true,
 
-  "eye_tracking": {"enabled": true},
+  "eye_tracking": {"enabled": true, 
+                   "calibrate_online": true},
   "sync_bar": {
     "sync_pin": 16,
     "enabled": false,

@@ -556,6 +556,45 @@ class TouchInterfaceApp:
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._exit_to_desktop)
+        self._initialize_startup_mask()
+
+    def _initialize_startup_mask(self) -> None:
+        """Cover a configured subject display without gating the recovery menu."""
+        if self.config_error:
+            return
+        try:
+            if self.idle_guard is None:
+                if self.cfg.get("mask_main_inputs") is not True:
+                    return
+                screen_cfg = load_screen_config(
+                    self.cfg, cli_main=self.main_selector,
+                    cli_experimenter=self.experimenter_selector,
+                )
+                main_screen, experimenter_screen = resolve_task_screens(
+                    screen_cfg, allow_same_screen=True,
+                )
+                if experimenter_screen is None:
+                    return
+                # The launcher may have fallen back to the only attached
+                # display. Never cover or disable that recovery interface,
+                # even if a stale selector invents a second screen index.
+                operator = self.screen_info
+                if (
+                    min(main_screen.x + main_screen.width, operator.x + operator.width)
+                    > max(main_screen.x, operator.x)
+                    and min(main_screen.y + main_screen.height, operator.y + operator.height)
+                    > max(main_screen.y, operator.y)
+                ):
+                    return
+                self.idle_guard = create_experiment_idle_guard(
+                    self.root, self.cfg, main_screen, experimenter_screen, tk_module=tk,
+                )
+            if self.idle_guard is not None:
+                self.idle_guard.enter_idle()
+        except Exception as exc:
+            # No modal warning or experiment initialization here. Explicit
+            # experiment/diagnostic actions still retry and enforce setup.
+            print(f"Startup main-screen mask unavailable; Debug Mode remains available: {exc}", file=sys.stderr)
 
     def _prepare_experiment_environment(self) -> bool:
         """Keep strict experiment checks behind experiment/diagnostic actions."""

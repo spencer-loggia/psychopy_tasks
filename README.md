@@ -1620,7 +1620,17 @@ The enabled bar contains five alternating black and white rectangles at the top 
 subject's view, accounting for software rotation. The experimenter preview shows only a
 small `sync ON` / `sync OFF` phase indicator. Each rectangle is
 `subject_screen_width // 5` pixels wide; `height` is in pixels.
-Every scheduled flip inverts all five rectangles. Each interval is sampled uniformly from
+
+At the start of every task/block with the bar enabled, a fixed start signal runs before
+task presentation: **four cycles of 500 ms ON followed by 500 ms OFF** (four seconds total,
+quantized to display refreshes). ON is bar phase 1 / GPIO HIGH; OFF is bar phase 0 / GPIO LOW.
+All five rectangles invert on each edge, with the GPIO updated in the same display flip
+callback. The first eight sync transitions record this signal using the usual `sync_bar_flip`
+and `sync_signal_on` / `sync_signal_off` events. The final OFF interval completes before
+the task proceeds, then the normal randomized sync schedule begins. Visual-only configurations
+emit the same screen signal; a disabled bar adds no signal or startup delay.
+
+Every subsequent scheduled flip inverts all five rectangles. Each interval is sampled uniformly from
 `interval_mean_seconds ± interval_variance_seconds`; both settings use seconds, so the
 defaults produce intervals from 800 ms to 1200 ms. There is no separate minimum-duration
 setting. Sync events retain separate requested and observed display times on the experiment

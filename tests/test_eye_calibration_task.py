@@ -109,6 +109,7 @@ class EyeCalibrationTaskTests(unittest.TestCase):
                     patch.object(task, "DAQC2DigitalOutputs", return_value=outputs) as daq,
                     patch.object(task.time, "perf_counter", side_effect=lambda: now[0]),
                     patch.object(task.time, "perf_counter_ns", side_effect=lambda: round(now[0] * 1e9)),
+                    patch.object(task.time, "sleep", side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)),
                     patch.dict(sys.modules, {"lgpio": gpio}),
                     patch("bin.sync_display.is_raspberry_pi", return_value=True),
                     patch("bin.sync_display.PendingSceneBuffer"),
@@ -125,7 +126,7 @@ class EyeCalibrationTaskTests(unittest.TestCase):
                 daq.assert_called_once_with(address=0, module_name="piplates.DAQC2plate", enabled=raspi)
                 gpio.gpio_claim_output.assert_called_once_with(4, 16, 0)
                 transitions = [edge for edge in edges if edge[3]]
-                self.assertGreaterEqual(len(transitions), 3)
+                self.assertGreaterEqual(len(transitions), 11)  # Eight start-marker edges, then task sync.
                 self.assertEqual(transitions, [(4, 16, (index + 1) % 2, True) for index in range(len(transitions))])
                 self.assertEqual(edges[-1], (4, 16, 0, False))
                 self.assertEqual(sum(row["event"] == "sync_bar_flip" for row in events), len(transitions))

@@ -1,4 +1,5 @@
 import ctypes
+import math
 import sys
 import types
 import unittest
@@ -386,6 +387,93 @@ class SyncDisplayTests(unittest.TestCase):
         gpio.gpiochip_close.assert_called_once_with(9)
 
 
+class BlockStartSignalTests(unittest.TestCase):
+    def tearDown(self):
+        frame_timing.set_background_presenter(None)
+
+    def test_configure_finishes_marker_before_task_callbacks_with_and_without_gpio(self):
+        for pin in (16, None):
+            with self.subTest(pin=pin):
+                now = [10.0]
+                win, preview, logger = FakeWindow(), Mock(), Mock()
+                original_flip = win.flip
+                task_callback = Mock()
+                win.callOnFlip(task_callback)
+                pending = {name: getattr(win, name) for name in
+                           ("_toCall", "_toLog", "_toDraw", "_toDrawDepths")}
+                bars, frames, edges = [], [], []
+
+                def make_bar(*args, **kwargs):
+                    bar = SyncBar(*args, **kwargs, rect_factory=lambda *a, **kw: Mock(),
+                                  clock=lambda: round(now[0] * 1e9))
+                    bars.append(bar)
+                    return bar
+
+                def swap():
+                    # Simulate a vblank-locked display with 100 ms frames.
+                    now[0] = (math.floor(now[0] * 10 + 1e-8) + 1) / 10
+                    colors = [rect.fillColor[0] for rect in bars[0].rectangles]
+                    frames.append((now[0], colors))
+                    return original_flip()
+
+                def gpio_write(chip, gpio_pin, level):
+                    self.assertEqual(win.front, "currently visible scene" if len(edges) < 8 else "upcoming task scene")
+                    self.assertEqual(frames[-1][1][0], 255 * level)
+                    edges.append((now[0], chip, gpio_pin, level))
+                    return 0
+
+                gpio = types.SimpleNamespace(
+                    gpiochip_open=Mock(return_value=4), gpio_claim_output=Mock(return_value=0),
+                    gpio_write=Mock(side_effect=gpio_write), gpiochip_close=Mock(),
+                )
+                win.flip = swap
+                with (
+                    patch.dict(sys.modules, {"lgpio": gpio}),
+                    patch("bin.sync_display.PendingSceneBuffer", side_effect=FakeSceneBuffer),
+                    patch("bin.sync_display.SyncBar", side_effect=make_bar),
+                    patch("bin.sync_display.time.perf_counter", side_effect=lambda: now[0]),
+                    patch("bin.sync_display.time.sleep", side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)),
+                ):
+                    display = configure_sync_bar(
+                        win, {"enabled": True, "sync_pin": pin,
+                              "interval_mean_seconds": 0.125, "interval_variance_seconds": 0},
+                        frame_duration_s=0.1, experimenter_preview=preview, event_logger=logger,
+                    )
+                    try:
+                        self.assertEqual([frame[0] for frame in frames],
+                                         [10.1 + edge * 0.5 for edge in range(8)])
+                        self.assertEqual([frame[1] for frame in frames],
+                                         [[255, 0, 255, 0, 255], [0, 255, 0, 255, 0]] * 4)
+                        self.assertAlmostEqual(now[0], 14.1)
+                        self.assertEqual(display.bar.phase, 0)
+                        self.assertAlmostEqual(display.bar.next_flip_perf_s, 14.225)
+                        self.assertEqual(display.extra_flip_count, 8)
+                        self.assertEqual(win.scene, "upcoming task scene")
+                        self.assertEqual(win.front, "currently visible scene")
+                        task_callback.assert_not_called()
+                        for name, value in pending.items():
+                            self.assertIs(getattr(win, name), value)
+                        self.assertEqual([call.args[0] for call in preview.set_sync_bar_phase.call_args_list],
+                                         [1, 0] * 4)
+                        rows = [call.kwargs for call in logger.log_event.call_args_list]
+                        self.assertEqual([row["sync_transition_num"] for row in rows
+                                          if row["event"] == "sync_bar_flip"], list(range(1, 9)))
+                        self.assertEqual(edges, [] if pin is None else [
+                            (10.1 + edge * 0.5, 4, pin, (edge + 1) % 2) for edge in range(8)
+                        ])
+                        self.assertEqual(len(rows), 8 if pin is None else 16)
+                        display.start_block_signal()  # Never repeat the marker within a block.
+                        self.assertEqual(len(frames), 8)
+                        win.flip()
+                        task_callback.assert_called_once_with()
+                        self.assertEqual(win.front, "upcoming task scene")
+                        self.assertEqual(display.bar.transition_num, 9)
+                        self.assertEqual(display.bar.phase, 1)
+                    finally:
+                        gpio.gpio_write.side_effect = None
+                        display.close()
+
+
 class SyncDisplayConfigurationTests(unittest.TestCase):
     def setUp(self):
         platform = patch("bin.sync_display.is_raspberry_pi", return_value=False)
@@ -471,6 +559,7 @@ class SyncDisplayConfigurationTests(unittest.TestCase):
             result = configure_sync_bar(win, {"enabled": True}, experimenter_preview=preview,
                                         rotation_degrees=90, msg_logger=logger)
         self.assertIs(result, display.return_value)
+        result.start_block_signal.assert_called_once_with()
         self.assertIsNone(bar.call_args.kwargs["gpio_module"])
         preview.configure_sync_bar.assert_called_once_with(20, win.size, 90)
         self.assertEqual(bar.call_args.kwargs["preview_callback"], preview.set_sync_bar_phase)
@@ -502,6 +591,35 @@ class SyncDisplayConfigurationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "unsupported display"):
                 configure_sync_bar(FakeWindow(), {"enabled": True})
         gpio.gpiochip_close.assert_called_once_with(4)
+
+    def test_failed_start_signal_cleans_up_display_before_task_startup(self):
+        win = FakeWindow()
+        original_flip, callback = win.flip, Mock()
+        win.callOnFlip(callback)
+        buffer, logger = FakeSceneBuffer(win), Mock()
+        gpio = types.SimpleNamespace(
+            gpiochip_open=Mock(return_value=4), gpio_claim_output=Mock(return_value=0),
+            gpio_write=Mock(side_effect=[-1, 0]), gpiochip_close=Mock(),
+        )
+        with (
+            patch.dict(sys.modules, {"lgpio": gpio}),
+            patch("bin.sync_display.SyncBar", side_effect=lambda *a, **kw: SyncBar(
+                *a, **kw, rect_factory=lambda *a, **kw: Mock(),
+            )),
+            patch("bin.sync_display.PendingSceneBuffer", return_value=buffer),
+            patch("bin.sync_display.frame_timing.set_background_presenter") as install,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Synchronization GPIO failed"):
+                configure_sync_bar(win, {"enabled": True, "sync_pin": 16}, event_logger=logger)
+        self.assertEqual([call.args for call in gpio.gpio_write.call_args_list], [(4, 16, 1), (4, 16, 0)])
+        gpio.gpiochip_close.assert_called_once_with(4)
+        self.assertEqual(win.flip, original_flip)
+        self.assertTrue(buffer.closed)
+        self.assertEqual(win.scene, "upcoming task scene")
+        callback.assert_not_called()
+        self.assertEqual(logger.log_event.call_args.kwargs["event"], "sync_bar_flip")
+        install.assert_called_once_with(None)
+        self.assertFalse(hasattr(win, "_neuro_tasks_sync_display"))
 
     def test_driver_specific_exception_keeps_visual_sync(self):
         class DriverError(Exception):

@@ -151,6 +151,21 @@ class SyncDisplay:
         # preparation. A due bar inversion joins the ordinary task swap.
         if deadline_perf_s is not None and refresh + self.frame_duration_s >= deadline_perf_s:
             return
+        self._flip_sync_only()
+
+    def start_block_signal(self):
+        """Finish four 500 ms ON/OFF pulses before allowing task presentation."""
+        if self.closed or not self.bar.start(block_start=True):
+            return
+        while self.bar.block_start_end_perf_s is None:
+            frame_timing.wait_until_flip_submission(
+                self.bar.next_flip_perf_s, self.frame_duration_s,
+            )
+            self._flip_sync_only()
+        frame_timing.wait_until(self.bar.block_start_end_perf_s)
+
+    def _flip_sync_only(self):
+        """Swap just the bar, leaving the next task scene and callbacks queued."""
         pending = {}
         for name in ("_toCall", "_toLog", "_toDraw", "_toDrawDepths"):
             if hasattr(self.win, name):
@@ -220,6 +235,7 @@ def configure_sync_bar(
         else:
             if msg_logger is not None:
                 msg_logger.log("INFO", f"sync_gpio_ready pin={sync_pin} chip=0")
+    display = None
     try:
         preview_callback = None
         if experimenter_preview is not None:
@@ -231,8 +247,11 @@ def configure_sync_bar(
             sync_pin=sync_pin, preview_callback=preview_callback,
         )
         display = SyncDisplay(win, bar, frame_duration_s, gpio_module=gpio, gpio_chip=chip)
+        display.start_block_signal()
     except BaseException:
-        if gpio is not None:
+        if display is not None:
+            display.close()
+        elif gpio is not None:
             gpio.gpiochip_close(chip)
         raise
     win._neuro_tasks_sync_display = display

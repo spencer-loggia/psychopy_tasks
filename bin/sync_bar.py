@@ -13,6 +13,10 @@ import time
 from typing import Any, Mapping
 
 
+BLOCK_START_PULSES = 4
+BLOCK_START_HALF_PERIOD_NS = 500_000_000
+
+
 def validate_sync_pin(pin):
     if pin is not None and (isinstance(pin, bool) or not isinstance(pin, int) or pin < 0):
         raise ValueError("sync_pin must be a non-negative BCM GPIO integer or null")
@@ -131,6 +135,8 @@ class SyncBar:
         self.transition_num = 0
         self._drawn_phase = None
         self._next_perf_ns = None
+        self._block_start_edges_remaining = 0
+        self._block_start_end_ns = None
         self._pending = False
         self._records: list[SyncFlipRecord] = []
         self._gpio_error = None
@@ -160,11 +166,19 @@ class SyncBar:
         spread = self.config.interval_variance_seconds
         return max(1, round(self._rng.uniform(mean - spread, mean + spread) * 1_000_000_000))
 
-    def start(self, now_perf_s: float | None = None) -> None:
-        """Start once, after startup measurements and before the first scene."""
+    def start(self, now_perf_s: float | None = None, *, block_start: bool = False) -> bool:
+        """Start once, optionally prefacing the random schedule with four pulses."""
         if self.config.enabled and self._next_perf_ns is None and not self._closed:
             now_ns = self._clock() if now_perf_s is None else round(now_perf_s * 1_000_000_000)
-            self._next_perf_ns = now_ns + self._interval_ns()
+            self._block_start_edges_remaining = 2 * BLOCK_START_PULSES if block_start else 0
+            self._next_perf_ns = now_ns if block_start else now_ns + self._interval_ns()
+            return True
+        return False
+
+    @property
+    def block_start_end_perf_s(self) -> float | None:
+        """End of the final 500 ms OFF hold, known after the eighth edge."""
+        return None if self._block_start_end_ns is None else self._block_start_end_ns / 1_000_000_000
 
     @property
     def next_flip_perf_s(self) -> float:
@@ -183,7 +197,13 @@ class SyncBar:
         if not self._pending and target_ns >= self._next_perf_ns:
             self._pending = True
             # Draw-time work stays out of the display/GPIO callback.
-            next_interval_ns = self._interval_ns()
+            if self._block_start_edges_remaining:
+                next_interval_ns = BLOCK_START_HALF_PERIOD_NS
+                if self._block_start_edges_remaining == 1:
+                    # The random schedule starts after the final OFF hold.
+                    next_interval_ns += self._interval_ns()
+            else:
+                next_interval_ns = self._interval_ns()
             # The GPIO edge belongs to this realized swap, including when the
             # original requested deadline was deferred for a task transition.
             self.win.callOnFlip(self._on_flip, self._next_perf_ns, next_interval_ns)
@@ -218,6 +238,10 @@ class SyncBar:
         self._records.append(SyncFlipRecord(
             requested_ns, actual_ns, self.phase, self.transition_num, gpio_ns, gpio_requested_ns,
         ))
+        if self._block_start_edges_remaining:
+            self._block_start_edges_remaining -= 1
+            if not self._block_start_edges_remaining:
+                self._block_start_end_ns = actual_ns + BLOCK_START_HALF_PERIOD_NS
         self._next_perf_ns = actual_ns + next_interval_ns
         self._pending = False
 

@@ -158,6 +158,53 @@ class SyncTimingTests(unittest.TestCase):
         self.assertEqual(gpio_event["requested_timestamp_perf_ns"], self.now_ns)
         self.preview.assert_called_once_with(1)
 
+    def test_block_start_has_four_fixed_pulses_then_resumes_random_intervals(self):
+        rng = Mock()
+        rng.uniform.return_value = 0.123
+        self.bar._rng = rng
+        self.assertTrue(self.bar.start(block_start=True))
+        self.assertFalse(self.bar.start(block_start=True))
+        rng.uniform.assert_not_called()
+        for edge in range(8):
+            target_ns = 10_000_000_000 + edge * 500_000_000
+            self.assertEqual(self.bar.next_flip_perf_s, target_ns / 1e9)
+            self.assertIsNone(self.bar.block_start_end_perf_s)
+            self.assertTrue(self.bar.prepare_flip(target_ns / 1e9))
+            self.assertEqual(self.gpio.gpio_write.call_count, edge)
+            self.assertEqual([r.fillColor[0] for r in self.bar.rectangles],
+                             [255, 0, 255, 0, 255] if edge % 2 == 0 else [0, 255, 0, 255, 0])
+            self.now_ns = target_ns
+            self.window.flip()
+            record, = self.bar.flush_events()
+            self.assertEqual(record.phase, (edge + 1) % 2)
+            self.assertEqual(record.transition_num, edge + 1)
+            self.assertEqual(record.actual_perf_ns, target_ns)
+        self.assertEqual(self.bar.phase, 0)
+        self.assertEqual(self.bar.block_start_end_perf_s, 14.0)
+        self.assertEqual(self.bar.next_flip_perf_s, 14.123)
+        rng.uniform.assert_called_once_with(1.0, 1.0)
+        self.assertFalse(self.bar.start(block_start=True))
+        self.assertFalse(self.bar.prepare_flip(14.0))
+        self.assertTrue(self.bar.prepare_flip(14.123))
+        self.now_ns = 14_123_000_000
+        self.window.flip()
+        record, = self.bar.flush_events()
+        self.assertEqual((record.transition_num, record.phase), (9, 1))
+        self.assertEqual(self.bar.next_flip_perf_s, 14.246)
+        self.assertEqual([call.args[2] for call in self.gpio.gpio_write.call_args_list], [1, 0] * 4 + [1])
+
+    def test_delayed_block_start_edge_preserves_full_following_half_period(self):
+        self.bar.start(block_start=True)
+        for actual_ns in (10_020_000_000, 11_200_000_000):
+            self.assertTrue(self.bar.prepare_flip(actual_ns / 1e9))
+            self.assertTrue(self.bar.prepare_flip(actual_ns / 1e9))
+            self.assertEqual(len(self.window.callbacks), 1)
+            self.now_ns = actual_ns
+            self.window.flip()
+            self.assertEqual(self.bar.next_flip_perf_s, (actual_ns + 500_000_000) / 1e9)
+            self.assertFalse(self.bar.prepare_flip((actual_ns + 100_000_000) / 1e9))
+        self.assertEqual([call.args[2] for call in self.gpio.gpio_write.call_args_list], [1, 0])
+
     def test_one_edge_per_refresh_and_no_overdue_catchup_burst(self):
         self.bar.start()
         self.assertTrue(self.bar.prepare_flip(20))
@@ -190,6 +237,7 @@ class SyncTimingTests(unittest.TestCase):
     def test_disabled_needs_neither_psychopy_nor_clock_callbacks(self):
         factory, clock = Mock(), Mock()
         bar = SyncBar(object(), rect_factory=factory, clock=clock)
+        self.assertFalse(bar.start(block_start=True))
         self.assertFalse(bar.prepare_flip())
         self.assertEqual(bar.next_flip_perf_s, math.inf)
         self.assertEqual(bar.flush_events(), [])

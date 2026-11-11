@@ -17,7 +17,7 @@ Config keys required/additional:
 - num_afc, n, duration, isi, iti, choice_time, dot_size, dot_color, init_dot_color
 - initiation_cue_center_position, initiation_cue_style, hold_before_choice,
   hold_cue_to_init_time_s
-- choice_period_idicator_tone: optional 50 ms buzzer pulse at choice onset (default false)
+- choice_period_idicator_tone: optional 100 ms buzzer pulse at choice onset (default false)
 - pump_delay_time: delay in seconds between a rewarded choice and the first pump pulse
 - inter_pump_interval: optional delay in seconds between pump pulses; defaults to pump_pulse_time_seconds
 - The reward interval reserves the longest configured pump train for every non-timeout

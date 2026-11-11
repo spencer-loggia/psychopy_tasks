@@ -43,23 +43,23 @@ class ChoiceToneTests(unittest.TestCase):
         self.timers.append(timer)
         return timer
 
-    def test_pulse_returns_immediately_and_logs_50_ms_edges_on_main_thread(self):
+    def test_pulse_returns_immediately_and_logs_100_ms_edges_on_main_thread(self):
         self.tone.start(7)
         self.assertEqual(self.clock.ns, 10_000_000_000)
         self.assertEqual(self.edges, [(True, self.clock.ns)])
-        self.assertEqual(self.timers[0].interval, 0.050)
+        self.assertEqual(self.timers[0].interval, 0.100)
         self.assertTrue(self.timers[0].started)
         self.assertTrue(self.timers[0].daemon)
         self.logger.log_signal.assert_not_called()
-        self.clock.sleep(0.050)
+        self.clock.sleep(0.100)
         self.timers[0].fire()
         self.tone.flush_events(self.logger)
-        self.assertEqual(self.edges, [(True, 10_000_000_000), (False, 10_050_000_000)])
+        self.assertEqual(self.edges, [(True, 10_000_000_000), (False, 10_100_000_000)])
         rows = [call.kwargs for call in self.logger.log_signal.call_args_list]
         self.assertEqual([row["event"] for row in rows], ["buzzer_on", "buzzer_off"])
         self.assertEqual([row["trial_num"] for row in rows], [7, 7])
-        self.assertEqual(rows[0]["requested_duration"], 0.050)
-        self.assertEqual(rows[1]["timestamp_perf_ns"] - rows[0]["timestamp_perf_ns"], 50_000_000)
+        self.assertEqual(rows[0]["requested_duration"], 0.100)
+        self.assertEqual(rows[1]["timestamp_perf_ns"] - rows[0]["timestamp_perf_ns"], 100_000_000)
         self.tone.stop()
         self.assertEqual(len(self.edges), 2)
 
@@ -76,7 +76,7 @@ class ChoiceToneTests(unittest.TestCase):
         old.fire()
         self.assertTrue(self.edges[-1][0])
         self.assertEqual(len(self.edges), 4)
-        self.clock.sleep(0.050)
+        self.clock.sleep(0.100)
         self.timers[-1].fire()
         self.assertFalse(self.edges[-1][0])
 
@@ -120,6 +120,6 @@ class ChoiceToneThreadTests(unittest.TestCase):
             tone.start(1)
             self.assertTrue(finished.wait(1.0))
             self.assertEqual([active for active, _ in edges], [True, False])
-            self.assertGreaterEqual(edges[1][1] - edges[0][1], 0.050)
+            self.assertGreaterEqual(edges[1][1] - edges[0][1], 0.100)
         finally:
             tone.stop()

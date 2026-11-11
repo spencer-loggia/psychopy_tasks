@@ -1454,7 +1454,7 @@ logs `initiation_cue_release`, and starts the inter-trial interval. When a fixat
 before and after choice and black while the choice window is open.
 
 Active foraging and match-to-cue also accept `"choice_period_idicator_tone": true`
-(default `false`; the spelling shown is the config key). This produces a 50 ms pulse
+(default `false`; the spelling shown is the config key). This produces a 100 ms pulse
 on `buzz_pin` (DAQC2 DOUT bit, default `1`) in the display flip callback that opens
 the choice period. With `hold_before_choice=true`, it signals that the subject may
 release the cue. It also works without cue holding, across sequential, simultaneous,
@@ -1462,7 +1462,7 @@ memory, and non-memory modes, including gaze-gated choice onset.
 The offset runs independently so the pulse does not block responses or extend the
 choice window. A timeout or task exit cancels a remaining pulse; its timer cannot
 truncate the timeout buzzer. Edges use the existing `buzzer_on` / `buzzer_off` events,
-with a requested ON duration of `0.050` seconds. As with other task outputs, physical
+with a requested ON duration of `0.100` seconds. As with other task outputs, physical
 sound requires `raspi=true` and available DAQC2 hardware; otherwise only events are logged.
 The option is currently enabled only in
 `config_files/csc2/yuri_headfix_train_seq_mem_hold_saccade_20261111.json` and

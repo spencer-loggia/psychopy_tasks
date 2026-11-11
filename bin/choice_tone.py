@@ -12,7 +12,7 @@ def validate_choice_tone(value):
 
 
 class ChoicePeriodTone:
-    duration_s = 0.050
+    duration_s = 0.100
 
     def __init__(self, set_buzzer):
         self._set_buzzer = set_buzzer

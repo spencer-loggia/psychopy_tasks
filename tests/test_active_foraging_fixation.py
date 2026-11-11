@@ -138,7 +138,8 @@ class ActiveForagingFixationTests(unittest.TestCase):
                 isi=0.1, timeout=0.5, gated=True, abort_after=None,
                 schedule=None, duration=0.1, choice_time=0.1, event_logger=None,
                 sync_service=None, arrival_after=..., click_after=None,
-                click_intervals=None, click_index=1, buffered_touch=None):
+                click_intervals=None, click_index=1, buffered_touch=None,
+                on_choice_start=None, event_profile="active_foraging", hold_cue=False):
         clock = FakeClock()
         module, psychopy = load_presenter(clock)
         window = Display(clock)
@@ -148,6 +149,18 @@ class ActiveForagingFixationTests(unittest.TestCase):
         metadata = {}
         options = [(1, 1), (2, 1)]
         positions = [(-100, 0), (100, 0)]
+        tone_times = []
+
+        def choice_callback():
+            tone_times.append(clock.ns)
+            if on_choice_start is not None:
+                on_choice_start()
+
+        if hold_cue:
+            mouse = psychopy.event.Mouse.return_value
+            mouse.getPressed.side_effect = lambda **kwargs: (
+                (bool(window.flips and not tone_times), False, False), (0, 0, 0),
+            )
         if click_after is not None or click_intervals is not None:
             mouse = psychopy.event.Mouse.return_value
             mouse.getPos.return_value = positions[click_index - 1]
@@ -195,9 +208,13 @@ class ActiveForagingFixationTests(unittest.TestCase):
                 isi=isi, bg_rgb_255=(128, 128, 128), fps=60,
                 sequential=sequential, is_memory=memory, trial_meta=metadata,
                 experimenter_preview=preview, external_abort_checker=abort,
-                scene_main_size=window.size, event_profile="active_foraging",
+                scene_main_size=window.size, event_profile=event_profile,
                 reward_levels=[3, 0],
                 dot_fixation_gate=gate, saccade_wait_timeout_s=timeout,
+                on_choice_start=choice_callback if on_choice_start is not None or hold_cue else None,
+                onset_cue=Stimulus() if hold_cue else None,
+                pressed_onset_cue=Stimulus() if hold_cue else None,
+                hold_before_choice=hold_cue,
             )
         events = (
             [call.kwargs for call in logger.method_calls if "event" in call.kwargs]
@@ -207,6 +224,35 @@ class ActiveForagingFixationTests(unittest.TestCase):
             if "timestamp_perf_ns" not in event and "timestamp_perf_s" in event:
                 event["timestamp_perf_ns"] = round(event["timestamp_perf_s"] * 1e9)
         return result, events, metadata, gate, window, preview
+
+    def test_choice_callback_matches_opening_flip_in_all_modes(self):
+        for profile in ("active_foraging", "match2cue"):
+            for sequential, memory in ((False, False), (False, True), (True, False), (True, True)):
+                for gated in (False, True):
+                    with self.subTest(profile=profile, sequential=sequential, memory=memory, gated=gated):
+                        times = []
+
+                        def tone():
+                            times.append(time.perf_counter_ns())
+                            time.sleep(0.004)  # Hardware latency cannot move the captured flip time.
+
+                        result, events, _, _, window, _ = self.present(
+                            sequential=sequential, memory=memory, gated=gated,
+                            event_profile=profile, on_choice_start=tone,
+                        )
+                        choice = next(row for row in events if row["event"] == "choice_start")
+                        self.assertEqual(times, [choice["timestamp_perf_ns"]])
+                        self.assertIn(times[0], window.flips)
+
+    def test_tone_allows_immediate_held_cue_release_and_skips_unreached_choice(self):
+        callback = Mock()
+        result, events, *_ = self.present(hold_cue=True, on_choice_start=callback)
+        self.assertEqual(result, (False, None))
+        callback.assert_called_once_with()
+        self.assertNotIn("initiation_cue_release", [event["event"] for event in events])
+        callback.reset_mock()
+        self.present(accepted_after=None, timeout=0.05, on_choice_start=callback)
+        callback.assert_not_called()
 
     def test_each_sequential_dot_waits_for_fixation_and_logs_once(self):
         result, events, metadata, gate, window, preview = self.present()

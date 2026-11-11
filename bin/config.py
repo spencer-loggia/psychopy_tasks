@@ -97,6 +97,9 @@ def validate_config(
     validate_sync_pin(cfg.get("sync_pin"))
     if required is None:
         required = []
+    if "choice_period_idicator_tone" in cfg:
+        from .choice_tone import validate_choice_tone
+        validate_choice_tone(cfg["choice_period_idicator_tone"])
     for k in required:
         _expect_key(cfg, k)
 

@@ -34,6 +34,7 @@ from .screen import (
 )
 from .frame_timing import (
     FrameTransitionScheduler,
+    arm_flip_timestamp,
     capture_perf_counter_on_flip,
     flip_submission_time,
     flip_with_timestamps,
@@ -2050,6 +2051,7 @@ def present_trial_with_persistent_dots(
     pre_options_cue_touch_event: str = "match_cue_touch",
     dot_fixation_gate=None,
     saccade_wait_timeout_s: Optional[float] = 1.0,
+    on_choice_start: Optional[Callable[[], None]] = None,
 ):
     """Present stimuli one at a time, leave faint dots at their locations,
     show all dots for `choice_time`, then clear.
@@ -2068,7 +2070,8 @@ def present_trial_with_persistent_dots(
     cue's configured frame duration and after it has been cleared from the main
     display. A truthy callback return value aborts the trial. In sequential
     mode, ``isi`` also controls an unchanged dot-scene hold between consecutive
-    stimuli.
+    stimuli. ``on_choice_start`` runs once in the display flip callback that
+    opens choice input, after capturing the display timestamp. It must not wait.
     """
     from psychopy import core as _core
 
@@ -2899,6 +2902,9 @@ def present_trial_with_persistent_dots(
     def _open_choice_input() -> None:
         nonlocal enforce_initiation_hold
         enforce_initiation_hold = False
+        if not choice_input_armed and on_choice_start is not None:
+            arm_flip_timestamp(win)
+            win.callOnFlip(on_choice_start)
         _arm_choice_input()
 
     def _start_choice_window(timing) -> None:

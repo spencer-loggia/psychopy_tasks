@@ -45,6 +45,27 @@ def load_task():
 
 
 class ActiveForagingTaskTests(unittest.TestCase):
+    def test_choice_tone_config_defaults_to_false_and_reaches_task(self):
+        path = Path(__file__).resolve().parents[1] / "config_files/csc2/af_classic_eyetrack_20261106.json"
+        for configured in (None, False, True):
+            with self.subTest(configured=configured):
+                task = load_task()
+                cfg = json.loads(path.read_text())
+                cfg["screens"] = {"main": 0, "experimenter": 1}
+                if configured is not None:
+                    cfg["choice_period_idicator_tone"] = configured
+                with patch.object(sys, "argv", ["active_foraging", "--config", str(path)]), patch.object(
+                    task, "load_config", return_value=cfg,
+                ), patch.object(task, "load_eye_tracking_settings", return_value=None), patch.object(
+                    task, "run_task", return_value="done",
+                ) as run:
+                    task.main()
+                self.assertIs(run.call_args.kwargs["choice_period_idicator_tone"], configured is True)
+
+    def test_choice_tone_callback_and_timeout_handoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._exercise_task(Path(tmp), True, True, tone_enabled=True)
+
     def test_placement_distribution_defaults_and_cli_override_reach_task(self):
         path = Path(__file__).resolve().parents[1] / "config_files/csc2/af_classic_eyetrack_20261106.json"
         for configured, cli, expected in (
@@ -250,8 +271,9 @@ class ActiveForagingTaskTests(unittest.TestCase):
     def _exercise_task(self, root, sequential, memory, *, gap=0.1,
                        image_size=(10, 10), output_rotation="normal", placement_options=None,
                        change_pulse=False, saccade_timeout=False, change_fixation=False,
-                       with_preview=False):
+                       with_preview=False, tone_enabled=False):
         task = load_task()
+        tone_factory = task.ChoicePeriodTone = Mock()
         control = PumpPulseControl(0.25, fixation_window_radius=150 if change_fixation else None)
         task.PumpPulseControl = Mock(return_value=control)
         widths = [0.25] * 6
@@ -286,6 +308,11 @@ class ActiveForagingTaskTests(unittest.TestCase):
         cue_times, gray_times = [], []
 
         def present(**kwargs):
+            if tone_enabled:
+                kwargs["on_choice_start"]()
+                tone_factory.return_value.start.assert_called_with(kwargs["trial_num"])
+            else:
+                self.assertIsNone(kwargs["on_choice_start"])
             sync_calls = utils.service_sync_bar.call_count
             self.assertFalse(kwargs["external_abort_checker"]())
             self.assertEqual(utils.service_sync_bar.call_count, sync_calls)
@@ -351,6 +378,7 @@ class ActiveForagingTaskTests(unittest.TestCase):
                 sequential=sequential, is_memory=memory, self_initiation=True, fixation_size=0,
                 pump_delay_time=0.2, pump_pulse_time_seconds=0.25, inter_pump_interval=gap,
                 timeout_duration_seconds=1.5,
+                choice_period_idicator_tone=tone_enabled,
                 reward_to_pulse_map={"0": 0, "1": 0, "2": 1, "3": 2},
                 reward_to_timeout_map={"0": 1, "1": 0, "2": 0, "3": 0},
                 wait_for_saccade_on_dot=change_fixation,
@@ -372,6 +400,12 @@ class ActiveForagingTaskTests(unittest.TestCase):
             placement_options.get("initiation_cue_center_position", (0, 0)),
         )
         self.assertEqual(result, "done")
+        if tone_enabled:
+            tone_factory.assert_called_once()
+            self.assertEqual(tone_factory.return_value.start.call_count, len(choices))
+            self.assertEqual(tone_factory.return_value.stop.call_count, 2)  # Timeout handoff and cleanup.
+        else:
+            tone_factory.assert_not_called()
         if with_preview:
             task.ExperimenterPreview.assert_called_once()
             self.assertTrue(task.ExperimenterPreview.call_args.kwargs["preserve_scene_transitions"])

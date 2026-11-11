@@ -750,7 +750,7 @@ Active-foraging event naming:
   definition and code remain reserved for historical logs. Earlier sessions retain their own
   event-code-library snapshots, including the earlier `lifecycle` types for codes 3 and 4.
 - `cue_touch` and `option_touch` are the current touch interaction events.
-- `pump_on/off` and `buzzer_on/off` record reward and timeout output edges; sync bar events record display synchronization. Historical trial-start signal event codes remain reserved.
+- `pump_on/off` and `buzzer_on/off` record reward, timeout, and optional choice-onset tone output edges; sync bar events record display synchronization. Historical trial-start signal event codes remain reserved.
 - `event_name_library.json` is shared across tasks. For active-foraging sequential runs it defines `option_{n}_dot` and `option_{n}_on` through templates rather than duplicating a separate static entry for each possible option index.
 
 Active-foraging behavior log columns:
@@ -1452,6 +1452,21 @@ Gaussian mask and darken when pressed; the dotted checker's center dot stays bla
 A missing or out-of-cue touch lasting at most 100 ms is tolerated. A longer break aborts only the current trial,
 logs `initiation_cue_release`, and starts the inter-trial interval. When a fixation cross is enabled, it is white
 before and after choice and black while the choice window is open.
+
+Active foraging and match-to-cue also accept `"choice_period_idicator_tone": true`
+(default `false`; the spelling shown is the config key). This produces a 50 ms pulse
+on `buzz_pin` (DAQC2 DOUT bit, default `1`) in the display flip callback that opens
+the choice period. With `hold_before_choice=true`, it signals that the subject may
+release the cue. It also works without cue holding, across sequential, simultaneous,
+memory, and non-memory modes, including gaze-gated choice onset.
+The offset runs independently so the pulse does not block responses or extend the
+choice window. A timeout or task exit cancels a remaining pulse; its timer cannot
+truncate the timeout buzzer. Edges use the existing `buzzer_on` / `buzzer_off` events,
+with a requested ON duration of `0.050` seconds. As with other task outputs, physical
+sound requires `raspi=true` and available DAQC2 hardware; otherwise only events are logged.
+The option is currently enabled only in
+`config_files/csc2/yuri_headfix_train_seq_mem_hold_saccade_20261111.json` and
+`config_files/csc2/yuri_headfix_train_seq_mem_hold_20261109.json`.
 
 - In circle mode, `fixed_positions=true`: locations retain their evenly spaced native-framebuffer layout around the circle. The spacing angle is `2*pi / num_afc`, and the first location is offset by half that spacing from the point directly below the circle center in native coordinates. A fixed location whose full image crosses `display_margin` raises a configuration error rather than moving or dropping an option.
 - In circle mode, `fixed_positions=false`: locations are random points on the circle, with rejected draws when stimulus bounding boxes would overlap.

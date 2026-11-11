@@ -17,6 +17,7 @@ Config keys required/additional:
 - num_afc, n, duration, isi, iti, choice_time, dot_size, dot_color, init_dot_color
 - initiation_cue_center_position, initiation_cue_style, hold_before_choice,
   hold_cue_to_init_time_s
+- choice_period_idicator_tone: optional 50 ms buzzer pulse at choice onset (default false)
 - pump_delay_time: delay in seconds between a rewarded choice and the first pump pulse
 - inter_pump_interval: optional delay in seconds between pump pulses; defaults to pump_pulse_time_seconds
 - The reward interval reserves the longest configured pump train for every non-timeout
@@ -30,6 +31,7 @@ import os
 import sys
 import time
 import random
+import threading
 from pathlib import Path
 from typing import Tuple, Optional, List, Dict, Any, Mapping
 import pandas as pd
@@ -47,6 +49,7 @@ from bin.affinity import (
     set_process_cpu_affinity,
 )
 from bin.daqc2_outputs import DAQC2DigitalOutputs
+from bin.choice_tone import ChoicePeriodTone, validate_choice_tone
 from bin.afc_geometry import (
     normalize_placement_distribution,
     prepare_afc_placement,
@@ -359,7 +362,9 @@ def run_task(
     saccade_wait_timeout_s: Optional[float] = 1.0,
     fixation_criteria_s: float = 0.1,
     fixation_window_radius: float = 150.0,
+    choice_period_idicator_tone: bool = False,
 ):
+    validate_choice_tone(choice_period_idicator_tone)
     placement_distribution = normalize_placement_distribution(placement_distribution)
     validate_dot_fixation_config(
         wait_for_saccade_on_dot,
@@ -822,6 +827,8 @@ def run_task(
     else:
         msg_logger.log("INFO", "raspi=False; DAQC2 pump/buzzer signals will not be sent (events will be logged only)")
 
+    daq_output_lock = threading.Lock()
+
     def _set_daqc2_output(bit: int, active: bool, *, signal_name: str, context: str) -> None:
         if raspi and daqc2_outputs is not None:
             if signal_name == "pump":
@@ -833,7 +840,8 @@ def run_task(
             if output_fn is None:
                 return
             try:
-                output_fn()
+                with daq_output_lock:
+                    output_fn()
             except Exception as e:
                 state = "on" if active else "off"
                 msg_logger.log(
@@ -849,6 +857,13 @@ def run_task(
 
     def _set_buzzer_pin(value: int, *, context: str) -> None:
         _set_daqc2_output(buzz_pin, bool(value), signal_name="buzzer", context=context)
+
+    def _set_choice_buzzer(active):
+        with daq_output_lock:
+            if daqc2_outputs is not None:
+                (buzzer_output_on if active else buzzer_output_off)()
+
+    choice_tone = ChoicePeriodTone(_set_choice_buzzer) if choice_period_idicator_tone else None
 
     def _deliver_manual_reward() -> None:
         pulse_duration = max(0.0, float(pump_pulse_time_seconds))
@@ -876,6 +891,8 @@ def run_task(
             )
 
     def _poll_experimenter_controls(*, allow_manual_reward=True, service_sync=True) -> bool:
+        if choice_tone is not None:
+            choice_tone.flush_events(logger)
         if experimenter_preview is not None:
             experimenter_preview.poll_settings_keyboard()
         if service_sync:
@@ -954,6 +971,8 @@ def run_task(
 
     def _flush_between_trials() -> None:
         try:
+            if choice_tone is not None:
+                choice_tone.flush_events(logger)
             session_logs.flush()
         except Exception:
             pass
@@ -1078,6 +1097,7 @@ def run_task(
                 stimulus_rotation_degrees=stimulus_rotation_degrees,
                 dot_fixation_gate=dot_fixation_gate,
                 saccade_wait_timeout_s=saccade_wait_timeout_s,
+                on_choice_start=(lambda: choice_tone.start(trial_num)) if choice_tone is not None else None,
             )
             if aborted:
                 if task_end_notes == "done" and _poll_experimenter_controls():
@@ -1116,6 +1136,10 @@ def run_task(
                 timeout_duration_seconds if apply_timeout > 0 else reward_interval_s
             )
             gray_start_ns = trial_meta["gray_flip_perf_ns"]
+            if choice_tone is not None and apply_timeout > 0:
+                # A pending tone offset must never switch off the timeout buzzer.
+                choice_tone.stop()
+                choice_tone.flush_events(logger)
             iti_start_ns = gray_start_ns if saccade_timeout else run_outcome_interval(
                 trial_num=trial_num, onset_perf_ns=gray_start_ns,
                 onset_requested_perf_ns=trial_meta.get("gray_flip_requested_perf_ns"),
@@ -1230,6 +1254,12 @@ def run_task(
             trial_num += 1
 
     finally:
+        if choice_tone is not None:
+            try:
+                choice_tone.stop()
+                choice_tone.flush_events(logger)
+            except Exception as exc:
+                msg_logger.log("ERROR", f"choice_tone_cleanup_failed: {exc}")
         if dot_fixation_gate is not None:
             dot_fixation_gate.stop()
         try:
@@ -1394,6 +1424,7 @@ def main():
             initiation_cue_center_position=initiation_config.cue_center_position,
             initiation_cue_style=initiation_config.cue_style,
             hold_before_choice=initiation_config.hold_before_choice,
+            choice_period_idicator_tone=cfg.get("choice_period_idicator_tone", False),
             hold_cue_to_init_time_s=initiation_config.hold_cue_to_init_time_s,
             fixation_size=_get("fixation_size", cfg.get("fixation_size", None)),
             refresh_rate=refresh_rate,

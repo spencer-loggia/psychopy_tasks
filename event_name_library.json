@@ -328,6 +328,8 @@
       "trial_start_signal_off",
       "pump_on",
       "pump_off",
+      "buzzer_on",
+      "buzzer_off",
       "options_dot",
       "options_on",
       "inter_stimulus_interval",

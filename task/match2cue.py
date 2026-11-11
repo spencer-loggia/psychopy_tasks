@@ -14,6 +14,7 @@ import argparse
 import os
 import random
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -45,6 +46,7 @@ from bin.afc_stimuli import (
 from bin.config import load_config, validate_config
 from bin.initiation import INITIATION_CONFIG_KEYS, resolve_initiation_config
 from bin.daqc2_outputs import DAQC2DigitalOutputs
+from bin.choice_tone import ChoicePeriodTone, validate_choice_tone
 from bin.frame_timing import (
     plan_frame_duration,
     validate_requested_durations,
@@ -206,6 +208,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
+    choice_period_idicator_tone = validate_choice_tone(cfg.get("choice_period_idicator_tone", False))
     self_initiation = bool(cfg.get("self_initiation", True))
     initiation_config = resolve_initiation_config(
         cfg if self_initiation else {}, require_keys=self_initiation,
@@ -272,6 +275,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
         daq_cfg.get("module_name", cfg.get("daq_module_name", "piplates.DAQC2plate"))
     )
     pump_pin = int(cfg.get("pump_pin", 0))
+    buzz_pin = int(cfg.get("buzz_pin", 1)) if choice_period_idicator_tone else 1
     pump_delay_time = max(0.0, float(cfg.get("pump_delay_time", 0.0)))
     pump_pulse_time = max(0.0, float(cfg.get("pump_pulse_time_seconds", 0.25)))
     pump_control = PumpPulseControl(pump_pulse_time)
@@ -286,6 +290,10 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     if raspi:
         DAQC2DigitalOutputs.validate_address(daq_address)
         DAQC2DigitalOutputs.validate_bit(pump_pin)
+        if choice_period_idicator_tone:
+            DAQC2DigitalOutputs.validate_bit(buzz_pin)
+            if pump_pin == buzz_pin:
+                raise ValueError("pump_pin and buzz_pin must refer to different DAQC2 DOUT bits")
 
     config_name = str(cfg.get("config_name", "match2cue")).strip() or "match2cue"
     session_logs = SessionLogBundle(
@@ -450,6 +458,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     daqc2_outputs: Optional[DAQC2DigitalOutputs] = None
     pump_on = None
     pump_off = None
+    buzzer_on = buzzer_off = None
     if raspi:
         try:
             daqc2_outputs = DAQC2DigitalOutputs(
@@ -459,20 +468,37 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
             daqc2_outputs.open()
             pump_on, pump_off = daqc2_outputs.bind_bit(pump_pin)
             pump_off()
+            if choice_period_idicator_tone:
+                buzzer_on, buzzer_off = daqc2_outputs.bind_bit(buzz_pin)
+                buzzer_off()
         except Exception as exc:
             daqc2_outputs = None
             pump_on = pump_off = None
-            msg_logger.log("WARN", f"DAQC2 unavailable: {exc}; pump events will be logged only")
+            buzzer_on = buzzer_off = None
+            msg_logger.log("WARN", f"DAQC2 unavailable: {exc}; pump/buzzer events will be logged only")
+
+    daq_output_lock = threading.Lock()
 
     def set_pump(active: bool) -> None:
         callback = pump_on if active else pump_off
         if callback is not None:
-            callback()
+            with daq_output_lock:
+                callback()
+
+    def set_choice_buzzer(active):
+        callback = buzzer_on if active else buzzer_off
+        if callback is not None:
+            with daq_output_lock:
+                callback()
+
+    choice_tone = ChoicePeriodTone(set_choice_buzzer) if choice_period_idicator_tone else None
 
     task_end_status = "done"
 
     def poll_controls(*, allow_manual_reward: bool = True, service_sync: bool = True) -> bool:
         nonlocal task_end_status
+        if choice_tone is not None:
+            choice_tone.flush_events(logger)
         if service_sync:
             utils.service_sync_bar(win)
         if experimenter_preview is not None:
@@ -732,6 +758,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 external_abort_checker=lambda: poll_controls(service_sync=False),
                 scene_main_size=effective_win_size,
                 event_profile="match2cue",
+                on_choice_start=(lambda: choice_tone.start(trial_num)) if choice_tone is not None else None,
                 pre_options_cue_image=cue_image,
                 pre_options_cue_duration=match_cue_duration,
                 pre_options_delay=delay_time,
@@ -881,16 +908,29 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
             )
             if task_end_status != "done":
                 break
+            if choice_tone is not None:
+                choice_tone.flush_events(logger)
             session_logs.flush()
             trial_num += 1
     except Exception:
         task_end_status = "error"
         raise
     finally:
+        if choice_tone is not None:
+            try:
+                choice_tone.stop()
+                choice_tone.flush_events(logger)
+            except Exception as exc:
+                msg_logger.log("ERROR", f"choice_tone_cleanup_failed: {exc}")
         try:
             set_pump(False)
         except Exception:
             pass
+        if choice_tone is not None:
+            try:
+                set_choice_buzzer(False)
+            except Exception:
+                pass
         try:
             buffer_manager.close()
         except Exception:

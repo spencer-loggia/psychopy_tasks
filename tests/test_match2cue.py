@@ -146,6 +146,66 @@ class Match2CueConfigurationTests(unittest.TestCase):
         self.assertEqual(placement.call_args.kwargs["display_margin"], 37.5)
         task.utils.make_initiation_cue_stims.assert_not_called()
 
+    def test_choice_tone_wires_configured_buzzer_and_cleans_up_after_abort(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                task = load_task_without_display()
+                cfg = self.config(self_initiation=False, num_afc=2, raspi=True, pump_pin=2,
+                                  buzz_pin=5, choice_period_idicator_tone=enabled)
+                space = types.SimpleNamespace(bg=(128, 128, 128), stimuli=((1, None), (2, None)),
+                                              shapes={}, colors={})
+                trial = Match2CueTrial(cue=(1, None), options=space.stimuli, reward_draw=0)
+                preloaded = {option: Image.new("RGB", (20, 20)) for option in trial.options}
+                task.utils.setup_task_window.return_value = (
+                    types.SimpleNamespace(size=(800, 600)), types.SimpleNamespace(rotation="normal"), None,
+                )
+                task.utils.resolve_frame_rate.return_value = (60, 1 / 60)
+                task.utils.make_fixation_cross.return_value = None
+                task.utils.TrialBufferManager.return_value.get_next_trial.return_value = {"trial_idx": 1}
+                pump_on, pump_off, buzzer_on, buzzer_off = Mock(), Mock(), Mock(), Mock()
+
+                def present(**kwargs):
+                    if enabled:
+                        kwargs["on_choice_start"]()
+                        tone.return_value.start.assert_called_once_with(1)
+                    else:
+                        self.assertIsNone(kwargs["on_choice_start"])
+                    return True, None
+
+                task.utils.present_trial_with_persistent_dots = Mock(side_effect=present)
+                with ExitStack() as stack:
+                    stack.enter_context(patch.object(task, "load_afc_stimulus_space", return_value=space))
+                    stack.enter_context(patch.object(task, "SessionLogBundle", return_value=Mock()))
+                    stack.enter_context(patch.object(task, "describe_screen", return_value="test screen"))
+                    stack.enter_context(patch.object(task, "resolve_scene_size", return_value=(800, 600)))
+                    stack.enter_context(patch.object(task, "_decode_trial_payload", return_value=(trial, preloaded)))
+                    stack.enter_context(patch.object(task, "compute_afc_positions", return_value=([], [(-50, 0), (50, 0)])))
+                    daq = stack.enter_context(patch.object(task, "DAQC2DigitalOutputs"))
+                    daq.return_value.bind_bit.side_effect = lambda bit: (
+                        (pump_on, pump_off) if bit == 2 else (buzzer_on, buzzer_off)
+                    )
+                    tone = stack.enter_context(patch.object(task, "ChoicePeriodTone"))
+                    self.assertEqual(task.run_task(cfg, screen_config={}), "aborted")
+                    if enabled:
+                        setter = tone.call_args.args[0]
+                        setter(True)
+                        setter(False)
+                self.assertEqual([call.args[0] for call in daq.return_value.bind_bit.call_args_list],
+                                 [2, 5] if enabled else [2])
+                if enabled:
+                    tone.return_value.stop.assert_called_once_with()
+                    buzzer_on.assert_called_once_with()
+                    self.assertGreaterEqual(buzzer_off.call_count, 2)
+                else:
+                    tone.assert_not_called()
+                    buzzer_on.assert_not_called()
+
+    def test_invalid_tone_value_fails_before_display_or_hardware(self):
+        task = load_task_without_display()
+        with self.assertRaisesRegex(ValueError, "choice_period_idicator_tone must be true or false"):
+            task.run_task(self.config(choice_period_idicator_tone="false"), screen_config={})
+        task.utils.setup_task_window.assert_not_called()
+
 
 class Match2CueLogicTests(unittest.TestCase):
     def test_trial_always_contains_a_cue_match(self):
@@ -468,6 +528,8 @@ class Match2CueEventTests(unittest.TestCase):
         self.assertEqual(definitions["initiation_cue_release"].code, 203)
         self.assertEqual(definitions["delay_start"].code, 114)
         self.assertEqual(definitions["inter_stimulus_interval"].code, 117)
+        self.assertEqual(definitions["buzzer_on"].code, 320)
+        self.assertEqual(definitions["buzzer_off"].code, 321)
         self.assertEqual(library.ensure("option_3_dot", "frame_flip").code, 1003)
         self.assertEqual(library.ensure("option_3_on", "frame_flip").code, 1103)
 

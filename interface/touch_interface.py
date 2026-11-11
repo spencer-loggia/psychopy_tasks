@@ -619,7 +619,7 @@ class TouchInterfaceApp:
         # depend on an unplugged display/touchscreen. It owns no output pins.
         self.debug_panel = HardwareDebugPanel(
             self.root, self.cfg, scroll_frame_class=ScrollableButtonFrame,
-            on_close=self._debug_closed,
+            on_close=self._debug_closed, config_dir=self.config_dir,
         )
 
     def _debug_closed(self) -> None:
@@ -1770,7 +1770,8 @@ def main() -> None:
     finally:
         if app is not None and app.debug_panel is not None:
             app.debug_panel.controller.stop_all()
-            deadline = time.monotonic() + 2.0
+            app.debug_panel.controller.close()
+            deadline = time.monotonic() + 8.0
             while app.debug_panel.controller.busy and time.monotonic() < deadline:
                 time.sleep(0.01)
             if app.debug_panel.controller.busy or app.debug_panel.controller.uncleared:

@@ -63,17 +63,19 @@ class DebugOutputTests(unittest.TestCase):
         module.gpiochip_close.assert_called_once_with(12)
         self.assertIn("GPIO busy", self.events(controller)[-1][2])
 
-    def test_daq_bit_and_address_and_disconnected_plate(self):
-        module = SimpleNamespace(getADC=Mock(return_value=5.0), setDOUTbit=Mock(return_value=None), clrDOUTbit=Mock(return_value=None))
+    def test_daq_uses_task_adapter_without_extra_board_or_adc_checks(self):
+        module = SimpleNamespace(
+            getADC=Mock(side_effect=AssertionError("No ADC check in tasks")),
+            getADDR=Mock(side_effect=AssertionError("No address probe in tasks")),
+            setDOUTbit=Mock(return_value=None), clrDOUTbit=Mock(return_value=None),
+        )
         with patch("bin.debug_outputs.importlib.import_module", return_value=module):
             output = DAQC2Output(OutputPin("daqc2", 7, 3), DAQC2Bus())
             output.open()
             output.write(True)
             output.write(False)
-            module.getADC.return_value = 0
-            with self.assertRaisesRegex(RuntimeError, "No DAQC2 response"):
-                output.open()
-        module.getADC.assert_called_with(3, 8)
+        module.getADC.assert_not_called()
+        module.getADDR.assert_not_called()
         module.setDOUTbit.assert_called_once_with(3, 7)
         module.clrDOUTbit.assert_called_once_with(3, 7)
 
@@ -95,7 +97,7 @@ class DebugOutputTests(unittest.TestCase):
         module = SimpleNamespace(
             getADDR=Mock(return_value=3), daqc2sPresent=[0] * 8,
             CMD=SimpleNamespace(DataGood=True), getADC=Mock(), quietPoll=Mock(),
-            setDOUTbit=Mock(return_value=None),
+            setDOUTbit=Mock(return_value=None), clrDOUTbit=Mock(return_value=None),
         )
         with patch("bin.debug_outputs.importlib.import_module", return_value=module):
             output = DAQC2Output(OutputPin("daqc2", 7, 3), DAQC2Bus())
@@ -219,6 +221,22 @@ class DebugOutputTests(unittest.TestCase):
         self.wait_idle(controller)
         self.assertFalse(controller.uncleared)
         self.assertEqual(output.close.call_count, 2)
+
+    def test_clear_only_retry_never_sends_on_even_if_open_failed(self):
+        output = Mock()
+        output.open.side_effect = OSError("temporary open failure")
+        output.write.side_effect = OSError("still disconnected")
+        controller = DebugPulseController(output_factory=lambda pin: output)
+        target = OutputPin("daqc2", 1)
+        controller.clear(target)
+        self.wait_idle(controller)
+        self.assertTrue(controller.uncleared)
+        output.open.side_effect = None
+        output.write.side_effect = None
+        controller.stop_all()
+        self.wait_idle(controller)
+        self.assertFalse(controller.uncleared)
+        self.assertTrue(all(args == call(False) for args in output.write.call_args_list))
 
 
 if __name__ == "__main__":

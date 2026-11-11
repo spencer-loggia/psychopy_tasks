@@ -151,8 +151,17 @@ Tap a **GPIO 0–27** button to drive that BCM GPIO HIGH for five seconds, then 
 and tap **DOUT 0–7** for a five-second logical ON pulse. DAQC2 outputs are open-drain: ON pulls the terminal
 low, and OFF releases it. The **Chip** and **Address** buttons cycle through 0–7; the initial GPIO chip and
 DAQC2 address default to 0. Only the selected GPIO is claimed; busy/unavailable pins report inline errors
-without disabling other pins. Drivers load on demand in background workers, so a missing DAQC2 board or
-driver cannot prevent GPIO pulses. Install `lgpio` and `Pi-Plates` in the launcher's Python environment.
+without disabling other pins. Hardware helpers run with the interface config's `environment.python`, including
+the configured virtual environment's packages and executable search path. For the rig this is currently
+`/opt/psychopy/PsychoPy-2025.1.1-Python3.10/.venv/bin/python`; shell activation before launching the manager
+is not required. The touch menu keeps its own Python environment and does not need `piplates` installed there.
+
+Each hardware backend loads its driver on its helper's main thread. DOUT uses the same `DAQC2DigitalOutputs`
+adapter as experiments, calling `setDOUTbit(address, bit)` for ON and `clrDOUTbit(address, bit)` for OFF,
+without an extra ADC check. If the configured interpreter cannot start or import that backend's driver,
+Debug Mode also tries the launcher's interpreter. A missing or broken environment never prevents the menu
+from opening, and a DAQC2 failure does not block GPIO. Per-pin status includes the interpreter actually used.
+Returning from Debug Mode releases the helper processes before experiments can start.
 
 **Stop All** cancels this menu's pulses and retries failed OFF commands. **Back** stops outputs before
 returning to the launcher; if OFF fails, the menu stays open with the failure visible and retryable. Repeated

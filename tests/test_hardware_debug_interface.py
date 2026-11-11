@@ -192,6 +192,7 @@ class DebugPanelTests(unittest.TestCase):
         panel.destroy = Mock()
         panel.on_close = Mock()
         panel.closing = True
+        panel.releasing = False
         panel.close_started = 0
         return panel
 
@@ -201,6 +202,20 @@ class DebugPanelTests(unittest.TestCase):
         panel.controller.uncleared = False
         panel._poll()
         panel.destroy.assert_called_once()
+        panel.on_close.assert_called_once()
+        panel.controller.close.assert_called_once()
+
+    def test_back_waits_for_helper_processes_to_release_hardware(self):
+        panel = self.panel()
+        panel.controller.busy = False
+        panel.controller.uncleared = False
+        panel.controller.close.side_effect = lambda: setattr(panel.controller, "busy", True)
+        panel._poll()
+        panel.destroy.assert_not_called()
+        panel._poll()
+        self.assertTrue(panel.closing)
+        panel.controller.busy = False
+        panel._poll()
         panel.on_close.assert_called_once()
 
     def test_off_failure_keeps_debug_open_and_other_pins_usable(self):

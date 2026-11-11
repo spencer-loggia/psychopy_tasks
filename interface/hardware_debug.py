@@ -6,7 +6,8 @@ import sys
 import time
 import tkinter as tk
 
-from bin.debug_outputs import DebugPulseController, OutputPin
+from bin.debug_outputs import OutputPin
+from interface.debug_hardware_process import DebugHardwareController
 
 
 def debug_settings(cfg):
@@ -33,15 +34,18 @@ def debug_settings(cfg):
 class HardwareDebugPanel(tk.Frame):
     """Overlay the experimenter menu without opening or resolving task screens."""
 
-    def __init__(self, root, cfg, *, scroll_frame_class, on_close):
+    def __init__(self, root, cfg, *, scroll_frame_class, on_close, config_dir=None):
         super().__init__(root, bg="#e9ecef")
         settings = debug_settings(cfg)
-        self.controller = DebugPulseController(daq_module=settings["daq_module"])
+        self.controller = DebugHardwareController(
+            cfg, config_dir=config_dir, daq_module=settings["daq_module"],
+        )
         self.on_close = on_close
         self.backend = "gpio"
         self.gpio_chip = settings["gpio_chip"]
         self.daq_address = settings["daq_address"]
         self.closing = False
+        self.releasing = False
         self.close_started = 0.0
         self.buttons = {}
         self.states = {}
@@ -181,7 +185,7 @@ class HardwareDebugPanel(tk.Frame):
             summary = detail if len(detail) <= 200 else detail[:197] + "…"
             self.status.set(f"{target.label}: {summary}")
             self._update_button(target)
-        if self.closing and self.controller.busy and time.monotonic() - self.close_started >= 2.0:
+        if self.closing and not self.releasing and self.controller.busy and time.monotonic() - self.close_started >= 2.0:
             self.closing = False
             self.status.set("A driver is still busy stopping. Other pins remain available; tap Back to retry.")
             for target in self.buttons:
@@ -193,6 +197,12 @@ class HardwareDebugPanel(tk.Frame):
                 for target in self.buttons:
                     self._update_button(target)
             else:
+                if not self.releasing:
+                    self.releasing = True
+                    self.controller.close()
+                if self.controller.busy:
+                    self.after_id = self.after(50, self._poll)
+                    return
                 self.destroy()
                 self.on_close()
                 return

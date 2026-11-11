@@ -6,12 +6,13 @@ tracker setup belongs here. Hardware calls never run on Tk's event thread.
 from __future__ import annotations
 
 import importlib
-import math
 import queue
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+
+from bin.daqc2_outputs import DAQC2DigitalOutputs
 
 
 PULSE_SECONDS = 5.0
@@ -115,25 +116,31 @@ class DAQC2Bus:
                 if isinstance(present, list) and len(present) > address:
                     present[address] = 1
             else:
-                # Compatibility with alternate drivers exposing only the ADC
-                # presence check used by the existing system diagnostic.
-                supply = float(module.getADC(address, 8))
-                self._check_reply(module)
-                if not math.isfinite(supply) or supply <= 0:
-                    raise RuntimeError(f"No DAQC2 response at address {address}")
+                # Tasks need only the digital-output API. A missing/broken ADC
+                # must not prevent an otherwise usable DOUT from being driven.
+                return
 
 
 class DAQC2Output:
     def __init__(self, target, bus):
         self.target = target
         self.bus = bus
+        self.outputs = DAQC2DigitalOutputs(address=target.device, module_name=bus.module_name)
 
     def open(self):
-        # An imported Pi-Plates module alone does not establish board presence.
-        self.bus.prepare(self.target.device)
+        # Use the same adapter initialization as tasks. Only refresh a known
+        # absent import-time cache entry when retrying a reconnected board.
+        with self.bus._access() as module:
+            self.outputs.open()
+            present = getattr(module, "daqc2sPresent", None)
+            reconnect = isinstance(present, list) and len(present) > self.target.device and not present[self.target.device]
+        if reconnect:
+            self.bus.prepare(self.target.device)
 
     def write(self, active):
-        self.bus.call("setDOUTbit" if active else "clrDOUTbit", self.target.device, self.target.pin)
+        with self.bus._access() as module:
+            self.outputs.write(self.target.pin, active)
+            self.bus._check_reply(module)
 
     def close(self):
         pass  # Never reset a whole board or disturb a different active bit.
@@ -173,25 +180,38 @@ class DebugPulseController:
         self._start_worker(target, stop)
         return True
 
-    def _start_worker(self, target, stop, output=None):
+    def clear(self, target):
+        """Clear a selected output, including after replacing a failed worker."""
+        with self._lock:
+            if target in self._jobs:
+                self._jobs[target].set()
+                return
+            stop = threading.Event()
+            stop.set()
+            self._jobs[target] = stop
+            output = self._uncleared.get(target)
+        self._start_worker(target, stop, output, clear_only=True)
+
+    def _start_worker(self, target, stop, output=None, *, clear_only=False):
         try:
             threading.Thread(
-                target=self._run, args=(target, stop, output),
+                target=self._run, args=(target, stop, output), kwargs={"clear_only": clear_only},
                 name=f"debug-{target.backend}-{target.device}-{target.pin}", daemon=True,
             ).start()
         except HARDWARE_ERRORS as exc:
             with self._lock:
                 self._jobs.pop(target, None)
-            self.events.put((target, "error", str(exc)))
+            self.events.put((target, "uncleared" if clear_only else "error", str(exc)))
 
-    def _run(self, target, stop, output=None):
+    def _run(self, target, stop, output=None, *, clear_only=False):
         errors = []
-        must_clear = output is not None
+        must_clear = output is not None or clear_only
         try:
             if output is None:
                 output = self.output_factory(target)
                 output.open()
-                if not stop.is_set():
+                must_clear = clear_only
+                if not clear_only and not stop.is_set():
                     # Even a failed ON call may have reached the physical output.
                     must_clear = True
                     output.write(True)
@@ -249,4 +269,4 @@ class DebugPulseController:
                     self._jobs[target] = stop
                     retries.append((target, stop, output))
         for target, stop, output in retries:
-            self._start_worker(target, stop, output)
+            self._start_worker(target, stop, output, clear_only=True)

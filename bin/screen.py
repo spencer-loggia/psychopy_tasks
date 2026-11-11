@@ -426,6 +426,7 @@ def _run_monitor_query(cmd: Sequence[str]) -> str:
             check=True,
             capture_output=True,
             text=True,
+            timeout=2.0,
         )
     except Exception:
         return ""

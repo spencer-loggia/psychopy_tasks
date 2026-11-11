@@ -121,12 +121,46 @@ Launch the touch interface with an interface configuration:
 python interface/touch_interface.py --config config_files/interface/rpi_launch_config.json
 ```
 
-The interface opens on a root menu with Start Experiment, Run System Diagnostic, Shell, the context-dependent Rig
+The interface opens on a root menu with Start Experiment, Debug Mode, Run System Diagnostic, Shell, the context-dependent Rig
 Mode/Portable Mode switch, Desktop, and Shutdown actions. Start Experiment opens subject selection. The launch
 config's `subjects` object maps each displayed full name to the short subject code used in directory names.
 Selecting a subject starts a new experiment under `logs`:
 
 `exp_[subject_code]_[YYYYMMDD]_[incrementing_id]`
+
+**Debug Mode** opens a touch-compatible hardware menu on the experimenter screen, with a fallback to the
+remaining connected display if a saved display selector is unavailable. It needs no main display, subject,
+eye tracker, camera, network connection, or successful system diagnostic. Experiment configuration validation,
+main-screen masking, mode initialization, and startup code updates are deferred until Start Experiment or
+Run System Diagnostic is selected. Even an unreadable launcher config leaves Debug Mode available.
+Missing files, malformed JSON, invalid configuration fields, and unresolvable config paths all leave the
+manager's opening menu accessible. A broken screen selector falls back to another valid selector (including
+`SECONDARY_SCREEN`), then the detected secondary display or the only connected display. Configured working
+directories are not accessed until an experiment, shell, or cleanup action needs them.
+
+The manager can also open without any configuration file:
+
+```bash
+python interface/touch_interface.py
+python interface/touch_interface.py --debug-mode
+```
+
+Both commands support Debug Mode; starting an experiment still requires a valid `--config`.
+
+Tap a **GPIO 0–27** button to drive that BCM GPIO HIGH for five seconds, then LOW, or select **DAQC2 DOUT**
+and tap **DOUT 0–7** for a five-second logical ON pulse. DAQC2 outputs are open-drain: ON pulls the terminal
+low, and OFF releases it. The **Chip** and **Address** buttons cycle through 0–7; the initial GPIO chip and
+DAQC2 address default to 0. Only the selected GPIO is claimed; busy/unavailable pins report inline errors
+without disabling other pins. Drivers load on demand in background workers, so a missing DAQC2 board or
+driver cannot prevent GPIO pulses. Install `lgpio` and `Pi-Plates` in the launcher's Python environment.
+
+**Stop All** cancels this menu's pulses and retries failed OFF commands. **Back** stops outputs before
+returning to the launcher; if OFF fails, the menu stays open with the failure visible and retryable. Repeated
+taps on an active pin do not extend its pulse. Errors remain local to each pin and can be retried after fixing
+the connection. No physical-output state is inferred from a successful driver call; check the signal on the rig.
+Optional launcher settings are `debug_mode.gpio_chip`, `debug_mode.daq_address`, and `debug_mode.daq_module`.
+The DAQC2 address/module also inherit `system_diagnostic.daq_address` / `daq_module` when supplied.
+To enter the same menu directly, add `--debug-mode` to the launcher command above.
 
 For example, Yuri's first experiment on August 13, 2026 is `logs/exp_Y_20260813_001`. The experiment directory
 contains:
@@ -415,9 +449,10 @@ in the permanent local history; a history read/write failure prevents pruning. T
 alongside the retained experiment. Generated data directories, including this local history, are excluded by
 `.gitignore`.
 
-Code updates use `remote_git_url` from the same interface config (normally an NFS-mounted repository path). At
-startup the launcher makes a bounded update attempt; a failure or timeout is logged without preventing the interface
-from opening. Each later cleanup also runs `git reset --hard` and pulls from that explicit URL before data
+Code updates use `remote_git_url` from the same interface config (normally an NFS-mounted repository path). When
+Start Experiment or Run System Diagnostic first passes setup, the launcher makes a bounded update attempt;
+a failure or timeout is logged without preventing experiment selection. Each later cleanup also runs
+`git reset --hard` and pulls from that explicit URL before data
 synchronization starts.
 
 Cleanup reports data copying and code updating separately. A failed Git update can therefore report
@@ -525,7 +560,7 @@ fields:
   `main_touchscreen_xinput` is not required.
 - Masking requires Linux with a real X11 `DISPLAY`. It intentionally does not support Xwayland.
 
-While the interface is idle, the manager runs `xinput disable` only for that named touchscreen and covers the main
+After experiment/diagnostic setup, while the interface is idle, the manager runs `xinput disable` only for that named touchscreen and covers the main
 display with a fullscreen window colored by `screen_mask_rgb`. The experimenter touchscreen and physical mouse are not modified. A task
 subprocess creates its main window, then emits a private readiness marker. The manager removes the mask window,
 maps the touchscreen to the resolved main RandR output with `xinput map-to-output`, enables it, and acknowledges

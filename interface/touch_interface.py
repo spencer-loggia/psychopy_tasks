@@ -28,9 +28,12 @@ from bin.screen import (
     MAIN_SCREEN_ENV,
     SCREEN_ENV_OVERRIDE_ENV,
     SECONDARY_SCREEN_ENV,
+    ScreenGeometry,
+    get_tk_screens,
     load_screen_config,
-    resolve_interface_screen,
+    parse_screen_selector,
     resolve_task_screens,
+    select_screen,
     set_tk_window_fullscreen,
 )
 from interface.rig_mode import (
@@ -57,6 +60,7 @@ from interface.experiment_manager import (
 )
 from interface.experiment_quiet_mode import create_experiment_quiet_mode
 from interface.experiment_eye_tracker import request_eye_tracker_shutdown
+from interface.hardware_debug import HardwareDebugPanel
 from bin.eye_tracker_warnings import show_eye_tracker_warning
 from bin.task_lifecycle import (
     TASK_WINDOW_READY_ENV,
@@ -123,9 +127,12 @@ class CleanupReport:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Touch launcher for neuro_tasks")
-    parser.add_argument("--config", required=True, help="Path to launcher config JSON")
+    parser.add_argument(
+        "--config", help="Path to launcher config JSON; omit for the recovery/debug menu",
+    )
     parser.add_argument("--main_screen", default=None, help="Main task screen index or output name")
     parser.add_argument("--experimenter_screen", default=None, help="Experimenter screen index or output name")
+    parser.add_argument("--debug-mode", action="store_true", help="Open hardware Debug Mode directly")
     return parser.parse_args()
 
 
@@ -135,17 +142,63 @@ def _expect_dict(value: Any, name: str) -> Dict[str, Any]:
     return value
 
 
-def load_launcher_config(path: Path) -> Dict[str, Any]:
+def load_launcher_config(path: Path, *, validate_experiment: bool = True) -> Dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
+    if not path.is_file():
+        raise ValueError(f"Config path must be a regular JSON file: {path}")
 
     with path.open("r", encoding="utf-8") as config_fh:
         cfg = json.load(config_fh)
 
     if not isinstance(cfg, dict):
         raise ValueError("Launcher config must contain a top-level JSON object")
-    SyncBarConfig.from_mapping(cfg.get("sync_bar"))
+    if validate_experiment:
+        SyncBarConfig.from_mapping(cfg.get("sync_bar"))
     return cfg
+
+
+def resolve_launcher_screen(root, cfg, *, experimenter_selector=None):
+    """Resolve only the operator display; stale task selectors cannot gate the menu."""
+    screens = cfg.get("screens")
+    screens = screens if isinstance(screens, dict) else {}
+    configured_experimenter = screens.get(
+        "experimenter",
+        screens.get("secondary", cfg.get("experimenter_screen", cfg.get("secondary_screen"))),
+    )
+    interface_cfg = {"screens": {"experimenter": configured_experimenter}}
+    candidates = []
+    try:
+        # Preserve normal CLI/config/environment precedence when it is valid.
+        candidates.append(load_screen_config(
+            interface_cfg, cli_main=0, cli_experimenter=experimenter_selector,
+        )["experimenter"])
+    except Exception as exc:
+        print(f"Launcher display fallback: {exc}", file=sys.stderr)
+    # A malformed selector must not hide a valid selector from another source.
+    candidates.extend((experimenter_selector, configured_experimenter, os.environ.get(SECONDARY_SCREEN_ENV)))
+    try:
+        attached_screens = [
+            screen for screen in get_tk_screens(root)
+            if screen.width > 1 and screen.height > 1
+        ]
+        for candidate in candidates:
+            try:
+                selector = parse_screen_selector(candidate, "experimenter")
+                if selector is not None:
+                    screen = select_screen(attached_screens, selector, role="experimenter")
+                    if screen is not None:
+                        return screen
+            except Exception as exc:
+                print(f"Ignoring unavailable launcher display selector: {exc}", file=sys.stderr)
+        if attached_screens:
+            return attached_screens[1 if len(attached_screens) > 1 else 0]
+    except Exception as exc:
+        print(f"Using default Tk display: {exc}", file=sys.stderr)
+    return ScreenGeometry(
+        0, 0, 0, max(1, root.winfo_screenwidth()),
+        max(1, root.winfo_screenheight()), "primary",
+    )
 
 
 def format_diagnostic_report(result: Mapping[str, Any]) -> str:
@@ -463,30 +516,32 @@ class TouchInterfaceApp:
     def __init__(
         self,
         root: tk.Tk,
-        config_path: Path,
+        config_path: Optional[Path],
         cfg: Dict[str, Any],
         *,
         screen_info,
         idle_guard: Optional[ExperimentIdleGuard] = None,
+        main_selector=None,
+        experimenter_selector=None,
+        config_error: str = "",
     ):
         self.root = root
-        self.config_path = config_path.resolve()
-        self.config_dir = self.config_path.parent
+        # main() handles path resolution inside its recovery boundary. Do not
+        # resolve a broken path a second time while building the recovery menu.
+        self.config_path = config_path
+        self.config_dir = config_path.parent if config_path is not None else _project_root
         self.cfg = cfg
         self.screen_info = screen_info
         self.idle_guard = idle_guard
-        self.environment_cfg = _expect_dict(cfg.get("environment"), "environment")
-        self.tasks_cfg = _expect_dict(cfg.get("tasks"), "tasks")
-        self.subjects_cfg = _expect_dict(cfg.get("subjects"), "subjects")
-        if not self.subjects_cfg:
-            raise ValueError("Config field 'subjects' must include at least one subject")
-        for subject_name, subject_code in self.subjects_cfg.items():
-            if not str(subject_name).strip() or not str(subject_code).strip():
-                raise ValueError("Subject names and codes must be non-empty strings")
-        self.working_dir = _get_working_directory(self.environment_cfg, self.config_dir)
-        self.python_cmd = str(self.environment_cfg.get("python", "")).strip()
-        if not self.python_cmd:
-            raise KeyError("Config must define environment.python")
+        self.main_selector = main_selector
+        self.experimenter_selector = experimenter_selector
+        self.config_error = config_error
+        self.environment_cfg = cfg.get("environment") if isinstance(cfg.get("environment"), dict) else {}
+        self.tasks_cfg = cfg.get("tasks") if isinstance(cfg.get("tasks"), dict) else {}
+        self.subjects_cfg = cfg.get("subjects") if isinstance(cfg.get("subjects"), dict) else {}
+        # Do not probe configured directories/mounts just to show Debug Mode.
+        self.working_dir = _project_root
+        self.python_cmd = str(self.environment_cfg.get("python") or sys.executable).strip()
 
         self.task_active = False
         self.cleanup_active = False
@@ -494,14 +549,82 @@ class TouchInterfaceApp:
         self.page_title_var = tk.StringVar(value="Task Launcher")
         self.page_stack: list[tuple[str, Dict[str, Any]]] = []
         self.experiment: Optional[ExperimentManager] = None
-        self.quiet_mode = create_experiment_quiet_mode(cfg)
-        self.is_rig = self._initialize_is_rig_mode()
+        self.quiet_mode = None
+        self.debug_panel = None
+        self._startup_done = False
+        self.is_rig = normalize_is_rig(os.environ.get(IS_RIG_ENV_VAR)) or PORTABLE_MODE_VALUE
 
-        if self.idle_guard is not None:
-            self.idle_guard.enter_idle()
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._exit_to_desktop)
-        self.startup()
+
+    def _prepare_experiment_environment(self) -> bool:
+        """Keep strict experiment checks behind experiment/diagnostic actions."""
+        try:
+            if self.config_error:
+                raise ValueError(self.config_error)
+            if self.config_path is None:
+                raise ValueError("Supply --config with a valid launcher configuration to run experiments")
+            self.environment_cfg = _expect_dict(self.cfg.get("environment"), "environment")
+            self.tasks_cfg = _expect_dict(self.cfg.get("tasks"), "tasks")
+            self.subjects_cfg = _expect_dict(self.cfg.get("subjects"), "subjects")
+            if not self.subjects_cfg or any(
+                not str(name).strip() or not str(code).strip()
+                for name, code in self.subjects_cfg.items()
+            ):
+                raise ValueError("Config must include non-empty subject names and codes")
+            self.working_dir = _get_working_directory(self.environment_cfg, self.config_dir)
+            self.python_cmd = str(self.environment_cfg.get("python", "")).strip()
+            if not self.python_cmd:
+                raise KeyError("Config must define environment.python")
+            SyncBarConfig.from_mapping(self.cfg.get("sync_bar"))
+            screen_cfg = load_screen_config(
+                self.cfg, cli_main=self.main_selector,
+                cli_experimenter=self.experimenter_selector,
+            )
+            main_screen, experimenter_screen = resolve_task_screens(
+                screen_cfg, allow_same_screen=True,
+            )
+            if self.idle_guard is None:
+                self.idle_guard = create_experiment_idle_guard(
+                    self.root, self.cfg, main_screen, experimenter_screen, tk_module=tk,
+                )
+            if self.idle_guard is not None:
+                self.idle_guard.enter_idle()
+            # Child tasks retain the strict, canonical physical-output policy.
+            os.environ[MAIN_SCREEN_ENV] = str(main_screen.name or main_screen.index)
+            os.environ[SECONDARY_SCREEN_ENV] = (
+                "" if experimenter_screen is None
+                else str(experimenter_screen.name or experimenter_screen.index)
+            )
+            os.environ[SCREEN_ENV_OVERRIDE_ENV] = "1"
+            if self.quiet_mode is None:
+                self.quiet_mode = create_experiment_quiet_mode(self.cfg)
+            if not self._startup_done:
+                self.is_rig = self._initialize_is_rig_mode()
+                self.startup()
+                self._startup_done = True
+            return True
+        except Exception as exc:
+            self.status_var.set(f"Experiment setup unavailable: {exc}. Debug Mode is available.")
+            print(f"Experiment setup unavailable: {exc}", file=sys.stderr)
+            return False
+
+    def _open_debug_mode(self) -> None:
+        if self.task_active or self.experiment is not None or getattr(self, "cleanup_active", False):
+            return
+        if self.debug_panel is not None:
+            self.debug_panel.tkraise()
+            return
+        # Do not touch an existing main-screen guard here: even its cleanup may
+        # depend on an unplugged display/touchscreen. It owns no output pins.
+        self.debug_panel = HardwareDebugPanel(
+            self.root, self.cfg, scroll_frame_class=ScrollableButtonFrame,
+            on_close=self._debug_closed,
+        )
+
+    def _debug_closed(self) -> None:
+        self.debug_panel = None
+        self._render_root_menu()
 
     def _is_launchable_task(self, task_cfg: Dict[str, Any]) -> bool:
         return "launch" in task_cfg
@@ -606,6 +729,18 @@ class TouchInterfaceApp:
             return CleanupResult.UNAVAILABLE
         self.cleanup_active = True
         try:
+            if not getattr(self, "_startup_done", True):
+                try:
+                    self.working_dir = _get_working_directory(self.environment_cfg, self.config_dir)
+                except Exception as exc:
+                    # Recovery defaults must never become a target for Git
+                    # reset/data cleanup when the configured checkout is bad.
+                    self.cleanup_report = CleanupReport(
+                        False, CleanupResult.UNAVAILABLE,
+                        f"Cleanup unavailable: {exc}", "No configured working directory",
+                    )
+                    self.status_var.set(self.cleanup_report.summary)
+                    return CleanupResult.UNAVAILABLE
             self._code_update_detail = "No code-update details available"
             self._data_sync_detail = "No data-sync details available"
             code_available = self.pull_latest_code()
@@ -892,7 +1027,10 @@ class TouchInterfaceApp:
 
     def _build_ui(self) -> None:
         self.root.title("Experiment Manager")
-        set_tk_window_fullscreen(self.root, self.screen_info)
+        try:
+            set_tk_window_fullscreen(self.root, self.screen_info)
+        except Exception as exc:
+            print(f"Launcher fullscreen unavailable; using windowed menu: {exc}", file=sys.stderr)
 
         self.root.configure(bg="#e9ecef")
         self.root.grid_rowconfigure(1, weight=1)
@@ -925,6 +1063,8 @@ class TouchInterfaceApp:
             anchor="w",
             padx=24,
             pady=12,
+            wraplength=max(200, self.screen_info.width - 48),
+            justify="left",
         )
         footer.grid(row=2, column=0, sticky="ew")
 
@@ -962,10 +1102,12 @@ class TouchInterfaceApp:
     def _on_menu_key(self, event: tk.Event) -> str:
         if self.task_active or self.cleanup_active or self.root.grab_current() is not None:
             return "break"
+        panel = getattr(self, "debug_panel", None)
+        frame = panel.scroller if panel is not None else self.button_frame
         if event.keysym in {"Up", "Down"}:
-            self.button_frame.move_selection(-1 if event.keysym == "Up" else 1)
+            frame.move_selection(-1 if event.keysym == "Up" else 1)
         else:
-            self.button_frame.invoke_selection()
+            frame.invoke_selection()
         return "break"
 
     def _render_root_menu(self) -> None:
@@ -975,11 +1117,19 @@ class TouchInterfaceApp:
         self.status_var.set("Choose an action")
 
         self._create_start_experiment_button(0)
-        self._create_diagnostic_button(1)
-        self._create_shell_button(2)
-        self._create_rig_mode_button(3)
-        self._create_desktop_button(4)
-        self._create_shutdown_button(5)
+        self._create_debug_button(1)
+        self._create_diagnostic_button(2)
+        self._create_shell_button(3)
+        self._create_rig_mode_button(4)
+        self._create_desktop_button(5)
+        self._create_shutdown_button(6)
+
+    def _create_debug_button(self, row_idx: int) -> None:
+        button = tk.Button(
+            self.button_container, text="Debug Mode",
+            command=self._open_debug_mode, **self._button_kwargs(),
+        )
+        self._place_button(button, row_idx)
 
     def _create_start_experiment_button(self, row_idx: int) -> None:
         button = tk.Button(
@@ -1015,6 +1165,8 @@ class TouchInterfaceApp:
             return
 
         try:
+            if getattr(self, "environment_cfg", None):
+                self.working_dir = _get_working_directory(self.environment_cfg, self.config_dir)
             python_path = Path(self.python_cmd).expanduser()
             if not python_path.is_absolute():
                 python_path = (self.working_dir / python_path).resolve()
@@ -1083,6 +1235,9 @@ class TouchInterfaceApp:
     def _run_system_diagnostic(self) -> None:
         if self.task_active or getattr(self, "cleanup_active", False):
             self.status_var.set("Cannot run diagnostic during another operation")
+            return
+
+        if not self._prepare_experiment_environment():
             return
 
         diagnostic_path = self.working_dir / "task" / "system_diagnostic.py"
@@ -1181,6 +1336,8 @@ class TouchInterfaceApp:
     def _render_subject_selection(self) -> None:
         if getattr(self, "cleanup_active", False):
             return
+        if not self._prepare_experiment_environment():
+            return
         self._clear_buttons()
         self.page_title_var.set("Select Subject")
         self.status_var.set("Choose the subject to start a new experiment")
@@ -1276,6 +1433,9 @@ class TouchInterfaceApp:
         self._place_button(button, row_idx)
 
     def _exit_to_desktop(self) -> None:
+        if getattr(self, "debug_panel", None) is not None:
+            self.debug_panel.close()
+            return
         if getattr(self, "cleanup_active", False):
             return
         if self.task_active:
@@ -1296,7 +1456,7 @@ class TouchInterfaceApp:
             self.status_var.set("Could not restore main touchscreen")
             messagebox.showerror("Desktop Error", str(exc))
             return
-        if self.experiment is not None:
+        if getattr(self, "experiment", None) is not None:
             self.experiment.finish()
         self.root.destroy()
 
@@ -1579,49 +1739,42 @@ class TouchInterfaceApp:
 
 def main() -> None:
     args = parse_args()
-    config_path = Path(args.config).expanduser().resolve()
-    cfg = load_launcher_config(config_path)
+    config_path = None
+    config_error = ""
+    try:
+        if not args.config:
+            raise ValueError("No launcher config supplied; Debug Mode can run without one")
+        config_path = Path(args.config).expanduser().resolve()
+        cfg = load_launcher_config(config_path, validate_experiment=False)
+    except Exception as exc:
+        cfg = {}
+        config_error = str(exc)
+        print(f"Launcher config unavailable; Debug Mode remains available: {exc}", file=sys.stderr)
 
     root = tk.Tk()
-    idle_guard = None
     app = None
     try:
-        screen_cfg = load_screen_config(
-            cfg,
-            cli_main=args.main_screen,
-            cli_experimenter=args.experimenter_screen,
-        )
-        main_screen, experimenter_screen = resolve_task_screens(
-            screen_cfg,
-            allow_same_screen=True,
-        )
-        screen_info = resolve_interface_screen(root, screen_cfg)
-        # Child diagnostics and task configs must resolve the exact same
-        # physical outputs as the launcher, even when a source task config
-        # contains stale numeric selectors. Export stable resolved names.
-        os.environ[MAIN_SCREEN_ENV] = str(main_screen.name or main_screen.index)
-        os.environ[SECONDARY_SCREEN_ENV] = (
-            ""
-            if experimenter_screen is None
-            else str(experimenter_screen.name or experimenter_screen.index)
-        )
-        os.environ[SCREEN_ENV_OVERRIDE_ENV] = "1"
-        idle_guard = create_experiment_idle_guard(
-            root,
-            cfg,
-            main_screen,
-            experimenter_screen,
-            tk_module=tk,
-        )
+        screen_info = resolve_launcher_screen(root, cfg, experimenter_selector=args.experimenter_screen)
         app = TouchInterfaceApp(
             root,
             config_path,
             cfg,
             screen_info=screen_info,
-            idle_guard=idle_guard,
+            main_selector=args.main_screen,
+            experimenter_selector=args.experimenter_screen,
+            config_error=config_error,
         )
+        if args.debug_mode:
+            app._open_debug_mode()
         root.mainloop()
     finally:
+        if app is not None and app.debug_panel is not None:
+            app.debug_panel.controller.stop_all()
+            deadline = time.monotonic() + 2.0
+            while app.debug_panel.controller.busy and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if app.debug_panel.controller.busy or app.debug_panel.controller.uncleared:
+                print("Debug Mode: could not confirm all outputs OFF", file=sys.stderr)
         if app is not None and app.experiment is not None:
             app.experiment.finish()
         if app is not None and app.quiet_mode is not None:
@@ -1629,9 +1782,9 @@ def main() -> None:
                 app.quiet_mode.exit()
             except Exception as exc:
                 print(f"Could not restore quiet-mode services: {exc}", file=sys.stderr)
-        if idle_guard is not None:
+        if app is not None and app.idle_guard is not None:
             try:
-                idle_guard.release_for_desktop()
+                app.idle_guard.release_for_desktop()
             except Exception as exc:
                 print(f"Could not restore main touchscreen: {exc}", file=sys.stderr)
 

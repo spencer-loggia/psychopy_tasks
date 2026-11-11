@@ -20,10 +20,11 @@ class TouchInterfaceNavigationTests(unittest.TestCase):
         app.cleanup = Mock()
         return app
 
-    def test_root_menu_has_six_system_actions_in_order(self):
+    def test_root_menu_has_debug_mode_before_diagnostic(self):
         app = self._app()
         app.page_stack = [("Tasks", {})]
         app._create_start_experiment_button = Mock()
+        app._create_debug_button = Mock()
         app._create_diagnostic_button = Mock()
         app._create_shell_button = Mock()
         app._create_rig_mode_button = Mock()
@@ -35,11 +36,12 @@ class TouchInterfaceNavigationTests(unittest.TestCase):
         self.assertEqual(app.page_stack, [])
         app.page_title_var.set.assert_called_once_with("Experiment Manager")
         app._create_start_experiment_button.assert_called_once_with(0)
-        app._create_diagnostic_button.assert_called_once_with(1)
-        app._create_shell_button.assert_called_once_with(2)
-        app._create_rig_mode_button.assert_called_once_with(3)
-        app._create_desktop_button.assert_called_once_with(4)
-        app._create_shutdown_button.assert_called_once_with(5)
+        app._create_debug_button.assert_called_once_with(1)
+        app._create_diagnostic_button.assert_called_once_with(2)
+        app._create_shell_button.assert_called_once_with(3)
+        app._create_rig_mode_button.assert_called_once_with(4)
+        app._create_desktop_button.assert_called_once_with(5)
+        app._create_shutdown_button.assert_called_once_with(6)
 
     def test_top_level_task_menu_has_shell_and_end_experiment(self):
         app = self._app()

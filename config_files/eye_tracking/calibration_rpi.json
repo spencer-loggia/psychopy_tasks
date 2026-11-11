@@ -8,7 +8,7 @@
     "module_name": "piplates.DAQC2plate"
   },
   "pump_pin": 0,
-  "pump_pulse_time_seconds": 0.25,
+  "pump_pulse_time_seconds": 0.07,
   "uart": {
     "device": "/dev/ttyAMA10",
     "baud": 460800

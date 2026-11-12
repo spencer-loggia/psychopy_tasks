@@ -1548,6 +1548,18 @@ class TouchInterfaceApp:
         if self.task_active or getattr(self, "cleanup_active", False):
             self.status_var.set("Cannot end experiment while a task is running")
             return
+        if (self.experiment is not None
+                and self.experiment.state.get("associated_external_data", False) is True):
+            confirmed = choose_dialog(
+                self.root, "External Acquisition",
+                "Please ensure external acquisition system is stopped, the data is saved, "
+                "and uploaded with the following name:\n\n"
+                f"{self.experiment.external_data_name}",
+                [("Confirm", True), ("Cancel", False)], cancel_value=False,
+            )
+            if confirmed is not True:
+                self.status_var.set("End experiment cancelled")
+                return
         quiet_mode = getattr(self, "quiet_mode", None)
         try:
             if quiet_mode is not None:
@@ -1735,6 +1747,30 @@ class TouchInterfaceApp:
                         finally:
                             self.experiment.finish_block(block)
 
+    def _confirm_external_acquisition_start(self) -> bool:
+        """Gate the first block on the experiment's external recording choice."""
+        experiment = self.experiment
+        if experiment is None:
+            raise RuntimeError("Select a subject before launching a task")
+        if (experiment.launch_config.get("external_aquisition", False)
+                and not experiment.external_acquisition_answered):
+            associated = choose_dialog(
+                self.root, "External Acquisition",
+                "Does this experiment use external acquisition hardware?",
+                [("Yes", True), ("No", False)], cancel_value=None,
+            )
+            if associated is None:
+                return False
+            experiment.set_associated_external_data(associated)
+        if not experiment.blocks and experiment.state.get("associated_external_data", False):
+            return choose_dialog(
+                self.root, "Confirm External Recording",
+                "Please confirm external acquisition system is recording to directory named:\n\n"
+                f"{experiment.external_data_name} !",
+                [("Confirm", True), ("Cancel", False)], cancel_value=False,
+            ) is True
+        return True
+
     def _run_task(self, task_name: str, task_cfg: Dict[str, Any]) -> None:
         if self.task_active or getattr(self, "cleanup_active", False):
             return
@@ -1746,6 +1782,9 @@ class TouchInterfaceApp:
         blocks_run = 0
         try:
             for launch_value, config_value in task_run_sequence(task_name, task_cfg):
+                if not self._confirm_external_acquisition_start():
+                    self.status_var.set(f"Launch cancelled: {task_name}")
+                    return
                 block = self.experiment.prepare_block(
                     task_name=task_name,
                     launch_value=launch_value,

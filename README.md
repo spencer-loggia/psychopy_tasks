@@ -340,6 +340,17 @@ The launch config must contain `subjects`, `tasks`, and `initial_state` objects.
 calibration updates; it identifies the commit, not uncommitted edits. It is `null` if Git or a committed
 checkout is unavailable. Existing experiment records are not backfilled with today's commit.
 
+Set the top-level launcher option `"external_aquisition": true` to ask whether the experiment
+uses external acquisition hardware when its first task is launched. This option defaults to `false`.
+The touch-sized blocking dialog saves the Yes/No answer as `associated_external_data` in `state.json`
+(initially `false` for every new experiment). A Yes answer requires confirmation that external
+recording is running before the first block is prepared or launched. **End Experiment** then requires
+confirmation that external recording has stopped and its data is saved and uploaded. Both reminders
+use `subject_name_YYYYMMDD_NNN`, with the full subject name, the experiment's local start date, and its
+three-digit experiment number, for example `Yuri_20261112_001`. Escape, closing a dialog, or Cancel
+cancels the pending launch/end action; a cancelled recording confirmation is shown again on retry.
+The hardware choice applies to all blocks, including loops, and is asked only once per experiment.
+
 The manager also captures these launch-time fields once and preserves them through state updates:
 
 - `hostname`: the local machine's hostname.

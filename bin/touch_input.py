@@ -17,7 +17,7 @@ from typing import Any, Callable, Optional, Sequence
 # Shared AFC presenter constants, also recorded in each active-foraging block.
 AFC_INPUT_POLL_INTERVAL_S = 0.002
 AFC_TOUCH_ACQUIRE_WINDOW_S = 0.050
-AFC_HOLD_MAX_BREAK_S = 0.070
+AFC_HOLD_MAX_BREAK_S = 0.120
 
 
 @dataclass(frozen=True)
@@ -65,6 +65,8 @@ class TouchHoldTracker:
     ``touch_registered`` should be true only while a touch is both down and
     within its required target. Tolerated gaps remain part of the elapsed hold
     because they represent presumed registration errors rather than releases.
+    Qualification additionally requires current contact, even within a gap's
+    grace period; ``touch_registered`` exposes the latest contact state.
     """
 
     def __init__(
@@ -90,6 +92,7 @@ class TouchHoldTracker:
         self._missing_since_s: Optional[float] = None
         self._missing_since_perf_ns: Optional[int] = None
         self._released = False
+        self.touch_registered = False
 
     def start(self, timestamp_s: Optional[float] = None) -> None:
         now = self._resolve_time(timestamp_s)
@@ -97,6 +100,7 @@ class TouchHoldTracker:
         self._missing_since_s = None
         self._missing_since_perf_ns = None
         self._released = False
+        self.touch_registered = False
 
     def update(
         self,
@@ -106,13 +110,19 @@ class TouchHoldTracker:
         timestamp_perf_ns: Optional[int] = None,
     ) -> TouchHoldSample:
         now = self._resolve_time(timestamp_s)
+        self.touch_registered = bool(touch_registered)
         if self._started_s is None:
             if touch_registered:
                 self._started_s = now
             return self._sample(now)
 
         if not self._released:
-            if touch_registered:
+            # A late returning touch cannot erase a break that already exceeded
+            # tolerance while the display or event loop was busy.
+            if (self._missing_since_s is not None
+                    and now - self._missing_since_s > self.max_break_s + 1e-9):
+                self._released = True
+            elif touch_registered:
                 self._missing_since_s = None
                 self._missing_since_perf_ns = None
             else:
@@ -122,8 +132,6 @@ class TouchHoldTracker:
                         round(now * 1_000_000_000) if timestamp_perf_ns is None
                         else timestamp_perf_ns
                     )
-                if now - self._missing_since_s > self.max_break_s:
-                    self._released = True
         return self._sample(now)
 
     def _resolve_time(self, timestamp_s: Optional[float]) -> float:
@@ -136,7 +144,8 @@ class TouchHoldTracker:
         started = self._started_s is not None
         elapsed_s = max(0.0, now - self._started_s) if started else 0.0
         return TouchHoldSample(
-            qualified=bool(started and not self._released and elapsed_s >= self.required_hold_s),
+            qualified=bool(started and self.touch_registered and not self._released
+                           and elapsed_s >= self.required_hold_s),
             released=self._released,
             missing_since_s=self._missing_since_s,
             missing_since_perf_ns=self._missing_since_perf_ns,

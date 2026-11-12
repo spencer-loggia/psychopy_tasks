@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from bin.touch_input import (
+    AFC_HOLD_MAX_BREAK_S,
     MousePressTracker,
     TouchHoldTracker,
 )
@@ -164,6 +165,28 @@ class MousePressTrackerTests(unittest.TestCase):
 
 
 class TouchHoldTrackerTests(unittest.TestCase):
+    def test_afc_tolerance_includes_120_ms_but_never_qualifies_without_contact(self):
+        self.assertEqual(AFC_HOLD_MAX_BREAK_S, .120)
+        for recovered in (False, True):
+            tracker = TouchHoldTracker(.1, max_break_s=AFC_HOLD_MAX_BREAK_S)
+            tracker.update(True, 10)
+            missing = tracker.update(False, 10.1)
+            self.assertFalse(missing.qualified)
+            self.assertFalse(missing.released)
+            final = tracker.update(recovered, 10.22)
+            self.assertFalse(final.released)
+            self.assertEqual(final.qualified, recovered)
+
+    def test_return_after_120_ms_cannot_rescue_hold_even_without_intermediate_polls(self):
+        for recovered in (False, True):
+            tracker = TouchHoldTracker(.1, max_break_s=AFC_HOLD_MAX_BREAK_S)
+            tracker.update(True, 10)
+            tracker.update(False, 10.1, timestamp_perf_ns=10_100_000_000)
+            final = tracker.update(recovered, 10.220001)
+            self.assertTrue(final.released)
+            self.assertFalse(final.qualified)
+            self.assertEqual(final.missing_since_perf_ns, 10_100_000_000)
+
     def test_release_retains_first_detection_ns_across_grace_period(self):
         tracker = TouchHoldTracker(0.5, max_break_s=0.1)
         tracker.start(20.0)

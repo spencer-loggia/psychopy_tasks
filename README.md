@@ -785,13 +785,14 @@ For `active_foraging`:
 
 - Each block writes one `active_foraging_settings` JSON message with effective gate,
   hold, and presentation settings, including defaults. Its implementation section records
-  the 70 ms hold-break tolerance, 2 ms input poll interval, 50 ms touch-target acquisition
+  the 120 ms hold-break tolerance, 2 ms input poll interval, 50 ms touch-target acquisition
   window, fixation acceptance/radius tolerances, and flip-submission lead fraction.
   Initial values and timestamped `live_setting` confirmations/applications remain in
   `message_log.tsv`; trial rows record the values actually applied to that trial.
-- `cue_touch` and `option_touch` preserve the buffered press timestamp when available,
-  otherwise the first button-state detection before position lookup. Choice-attempt and
-  rejection messages use that same timestamp. `initiation_cue_release` and its behavior
+- `cue_touch` for required holds records the first current contact detected inside the
+  displayed cue. Tap-only initiation and `option_touch` preserve the buffered press timestamp
+  when available, otherwise the first button-state detection before position lookup.
+  Choice-attempt and rejection messages use that same timestamp. `initiation_cue_release` and its behavior
   column preserve the first missing-touch detection, even though failure is confirmed
   only after the grace period. This event describes a failed required hold before choice;
   permitted releases after choice opens are not hold failures.
@@ -1516,8 +1517,13 @@ or `"blob"` for a Gaussian-faded cue in `init_dot_color`. All styles have the sa
 Gaussian mask and darken when pressed; the dotted checker's center dot stays black.
 `hold_cue_to_init_time_s` is the continuous cue-hold duration required to initiate a trial.
 `hold_before_choice=true` keeps the pressed cue visible and requires that hold through the pre-choice phases.
-A missing or out-of-cue touch lasting at most 70 ms is tolerated. A longer break aborts only the current trial
-and logs `initiation_cue_release` at the first missing-touch detection. In active foraging, the normal
+A current touch anywhere inside the cue counts, including a finger already down when the cue
+appears or sliding into it. Required hold time starts when that contact is observed with the
+cue visible; buffered taps and cursor position without contact cannot satisfy a required hold.
+A missing or out-of-cue touch lasting at most 120 ms is tolerated. During that gap, initiation
+cannot qualify and a required pre-choice hold pauses progression until contact returns.
+A longer break aborts only the current trial and logs `initiation_cue_release` at the first
+missing-touch detection. In active foraging, the normal
 outcome interval without pump pulses precedes the full inter-trial interval. When a fixation cross is enabled, it is white
 before and after choice and black while the choice window is open.
 

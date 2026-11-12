@@ -461,7 +461,7 @@ class ActiveForagingTaskTests(unittest.TestCase):
             self_initiation=True, hold_before_choice=placement_options.get("hold_before_choice", False),
             hold_cue_to_init_time_s=placement_options.get("hold_cue_to_init_time_s", 0.0),
         ))
-        self.assertEqual(block_settings["implementation"]["hold_max_break_s"], 0.070)
+        self.assertEqual(block_settings["implementation"]["hold_max_break_s"], 0.120)
         self.assertEqual(block_settings["implementation"]["input_poll_interval_s"], 0.002)
         self.assertEqual(block_settings["implementation"]["touch_acquire_window_s"], 0.050)
         if change_fixation:

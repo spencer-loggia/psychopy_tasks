@@ -2442,6 +2442,23 @@ def present_trial_with_persistent_dots(
             return True
         return False
 
+    def _poll_pre_choice_input(reason: str) -> bool:
+        # A short registration gap preserves the hold, but is not permission
+        # to reveal the next stimulus or open choice without actual contact.
+        # Poll until contact returns or the bounded release tolerance expires.
+        while True:
+            if experimenter_preview is not None:
+                experimenter_preview.poll_settings_keyboard()
+            if _event.getKeys(["escape"]):
+                _log_message(msg_logger, "WARN", f"escape_pressed trial_num={trial_num} reason={reason}")
+                return True
+            if _poll_held_initiation_cue() or _should_abort(reason):
+                return True
+            if not enforce_initiation_hold or initiation_hold.touch_registered:
+                return False
+            service_sync_bar(win)
+            _core.wait(AFC_INPUT_POLL_INTERVAL_S)
+
     def _interrupted_result() -> Tuple[bool, None]:
         if dot_fixation_gate is not None:
             dot_fixation_gate.stop()
@@ -2476,8 +2493,8 @@ def present_trial_with_persistent_dots(
             )
         except Exception:
             pass
-        # Reset immediately before the response-opening flip. A press already
-        # held here is ignored; a new press or short tap during the flip is not.
+        # Discard old buffered taps. Current contact in the cue can initiate,
+        # including a finger already down or sliding in from outside the cue.
         mouse_presses.reset()
         oc_timing = flip_with_timestamps(win)
         oc_perf = oc_timing.actual_perf_s
@@ -2489,6 +2506,7 @@ def present_trial_with_persistent_dots(
         )
         initiation_started = False
         initiation_target_perf = None
+        initiation_requires_contact = hold_before_choice or hold_cue_to_init_time_s > 0
         while True:
             if experimenter_preview is not None:
                 experimenter_preview.poll_settings_keyboard()
@@ -2503,17 +2521,25 @@ def present_trial_with_persistent_dots(
             now = touch_sample.observed_perf_s
             if (
                 not initiation_started
-                and touch_sample.press_started
+                and (touch_sample.down or (touch_sample.press_started and not initiation_requires_contact))
                 and _cue_contains(click_pos)
             ):
                 initiation_started = True
-                initiation_hold.start(touch_sample.timestamp_perf_s)
-                initiation_target_perf = touch_sample.timestamp_perf_s + hold_cue_to_init_time_s
-                _set_initiation_time(perf_ns=touch_sample.timestamp_perf_ns)
+                # Required holds earn time only from observed contact with the
+                # displayed cue, never from an old/buffered press timestamp.
+                start_perf_ns = max(
+                    oc_timing.actual_perf_ns,
+                    touch_sample.observed_perf_ns if initiation_requires_contact or not touch_sample.press_started
+                    else touch_sample.timestamp_perf_ns,
+                )
+                start_perf_s = start_perf_ns / 1_000_000_000
+                initiation_hold.start(start_perf_s)
+                initiation_target_perf = start_perf_s + hold_cue_to_init_time_s
+                _set_initiation_time(perf_ns=start_perf_ns)
                 logger.log_interaction(
                     trial_num=trial_num,
                     event=_interaction_event_name("cue_touch"),
-                    timestamp_perf_ns=touch_sample.timestamp_perf_ns,
+                    timestamp_perf_ns=start_perf_ns,
                 )
                 bg_rect.draw()
                 pressed_onset_cue.draw()
@@ -2535,13 +2561,18 @@ def present_trial_with_persistent_dots(
                     )
                 except Exception:
                     pass
+                if initiation_requires_contact:
+                    # The pressed-feedback flip may have dispatched a release.
+                    touch_sample = mouse_presses.poll()
+                    click_pos = touch_sample.position
+                    now = touch_sample.observed_perf_s
 
             if initiation_started:
                 hold_sample = initiation_hold.update(
                     touch_sample.down and _cue_contains(click_pos),
                     now, timestamp_perf_ns=touch_sample.observed_perf_ns,
                 )
-                if hold_sample.qualified:
+                if hold_sample.qualified or not initiation_requires_contact:
                     held_initiation_cue_visible = hold_before_choice
                     _show_preview([])
                     break
@@ -2666,8 +2697,8 @@ def present_trial_with_persistent_dots(
         bg_rect.draw()
         cue_stim.draw()
         _draw_pre_choice_overlay()
-        if _poll_held_initiation_cue():
-            return _finish_incomplete_trial()
+        if _poll_pre_choice_input("experimenter_exit_during_match_cue"):
+            return _interrupted_result()
         cue_timing = flip_with_timestamps(win)
         cue_perf = cue_timing.actual_perf_s
         _set_initiation_time(perf_ns=cue_timing.actual_perf_ns)
@@ -2680,18 +2711,7 @@ def present_trial_with_persistent_dots(
         )
 
         def _poll_pre_options_cue_phase() -> bool:
-            if experimenter_preview is not None:
-                experimenter_preview.poll_settings_keyboard()
-            if _event.getKeys(["escape"]):
-                _log_message(
-                    msg_logger,
-                    "WARN",
-                    f"escape_pressed trial_num={trial_num} during_match_cue=1",
-                )
-                return True
-            if _should_abort("experimenter_exit_during_match_cue"):
-                return True
-            if _poll_held_initiation_cue():
+            if _poll_pre_choice_input("experimenter_exit_during_match_cue"):
                 return True
             _poll_pre_options_cue_touch()
             return False
@@ -2971,14 +2991,7 @@ def present_trial_with_persistent_dots(
                 _commit_choice(chosen_idx, start_click_pos_acquired, start_touch.timestamp_perf_ns)
 
     def _abort_from_input(reason: str) -> bool:
-        if experimenter_preview is not None:
-            experimenter_preview.poll_settings_keyboard()
-        if _event.getKeys(["escape"]):
-            _log_message(msg_logger, "WARN", f"escape_pressed trial_num={trial_num} reason={reason}")
-            return True
-        if _poll_held_initiation_cue():
-            return True
-        return _should_abort(reason)
+        return _poll_pre_choice_input(reason)
 
     def _poll_choice_until(deadline_perf: float, *, sync_deadline_perf=None) -> bool:
         nonlocal click_registered, click_perf_capture, click_meta, chosen_info

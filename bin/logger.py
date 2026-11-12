@@ -537,6 +537,7 @@ class SessionLogBundle:
         event_name_library_path: Optional[str | Path] = None,
         eye_tracking_config=None,
         on_eye_state=None,
+        eye_recalibration=None,
         live_settings=None,
     ):
         self.session_clock = TaskClock(started_at=when)
@@ -613,6 +614,7 @@ class SessionLogBundle:
                     output_dir=self.session_dir,
                     task_clock=self.session_clock,
                     on_state=on_eye_state,
+                    recalibration=eye_recalibration,
                     block_id=self.identity["block_id"],
                 )
                 self.message_logger.log(

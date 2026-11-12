@@ -43,6 +43,9 @@ Every trial behavior row contains `pump_pulse_time` in seconds; touch-and-hold a
 reward-enabled video also record `reward_interval`. A video block without reward
 output leaves these columns blank. Calibration and continuous training have no trial
 rows. Their pulse events still record the requested pulse width.
+Active foraging also records the applied `fixation_window_radius` in subject-display
+pixels on each trial row (blank when gaze gating is disabled). Edits confirmed during
+a trial appear in the next trial's snapshot.
 
 All tasks, including pump-only tasks, write `live_setting` JSON records in
 `message_log.tsv`: `initial`, `confirmed`, and `applied` phases. Records identify the
@@ -733,11 +736,16 @@ Active-foraging event naming:
 - With gaze gating enabled, simultaneous runs instead log each revealed or hidden option
   as `option_{n}_on` or `option_{n}_off`. Hiding a stimulus restores its existing dot;
   it does not start another saccade deadline. `fixation_accepted` (205) records each accepted
-  fixation; the message log identifies the option. `saccade_timeout` (206) marks a fixation
-  failure, followed directly by `inter_trial_interval` at the gray-screen flip.
+  fixation; the message log identifies the option. Repeated appearances retain every
+  on/off row. `saccade_timeout` (206) marks a fixation failure, followed by the normal
+  unrewarded `reward_interval` at the gray-screen flip, then the full `inter_trial_interval`.
+- Each option still visible at a removal flip gets `option_{n}_off`, including the
+  final clear to gray, incomplete-trial clears, and a memory trial's switch to dot-only
+  choice. These rows share the removal flip's requested and observed timestamps with
+  its phase event. Already hidden options do not receive duplicate offsets.
 - `choice_start` marks the first frame where a choice can be made.
-- `reward_interval` (3), or `timeout_interval` (4) on timeout trials, is the single `frame_flip`
-  event for the post-choice transition to gray. It carries that flip's requested and observed
+- `reward_interval` (3), or `timeout_interval` (4) on punishment trials, is the phase `frame_flip`
+  event for the post-choice transition to gray, alongside any option offsets. It carries that flip's requested and observed
   timestamps and only the reward/timeout interval's requested duration. Zero-pulse outcomes
   still receive the reward interval. A configured zero-duration outcome retains this event with
   duration `0` because the choice-clear flip still occurred.
@@ -756,7 +764,10 @@ Active-foraging event naming:
 Active-foraging behavior log columns:
 
 - `trial_num`
+- `pump_pulse_time`
+- `fixation_window_radius` (applied pixels; blank when gating is disabled)
 - `initiation_task_time_ns`
+- `initiation_cue_release_task_time_ns` (first missing-touch detection for a failed required hold; otherwise blank)
 - `reaction_time`
 - `shape_0 ... shape_(k-1)`
 - `color_0 ... color_(k-1)`
@@ -772,6 +783,18 @@ Active-foraging behavior log columns:
 
 For `active_foraging`:
 
+- Each block writes one `active_foraging_settings` JSON message with effective gate,
+  hold, and presentation settings, including defaults. Its implementation section records
+  the 70 ms hold-break tolerance, 2 ms input poll interval, 50 ms touch-target acquisition
+  window, fixation acceptance/radius tolerances, and flip-submission lead fraction.
+  Initial values and timestamped `live_setting` confirmations/applications remain in
+  `message_log.tsv`; trial rows record the values actually applied to that trial.
+- `cue_touch` and `option_touch` preserve the buffered press timestamp when available,
+  otherwise the first button-state detection before position lookup. Choice-attempt and
+  rejection messages use that same timestamp. `initiation_cue_release` and its behavior
+  column preserve the first missing-touch detection, even though failure is confirmed
+  only after the grace period. This event describes a failed required hold before choice;
+  permitted releases after choice opens are not hold failures.
 - `choice_made_index` is zero-based.
 - `reaction_time` is the time from `choice_start` until `option_touch`.
 - `choice_reaction_time` is currently the same quantity as `reaction_time`, retained because it is part of the requested task-specific schema.
@@ -1250,6 +1273,8 @@ state without serial I/O on the presentation thread. `"show_preview": false` dis
 that API available. The session owns tracker startup/shutdown; gaze updates do not alter stimulus commands.
 Tasks needing continuous fixation history can pass `on_eye_state` to `SessionLogBundle`; it runs on the
 UART worker independently of preview visibility, display flips and pump pulses, and must not block on I/O.
+Tasks using `DotFixationGate` should also pass its `recalibration` as `eye_recalibration` to
+`SessionLogBundle`, so automatic offset corrections reach gaze access, preview, CSV and exit-time saving.
 
 Every enabled presentation block also writes **`eye_tracking.csv` directly in that block's directory**,
 alongside `event_log.tsv` and `behavior_log.tsv`, for example:
@@ -1342,11 +1367,41 @@ Optional fixation gating uses these active-foraging settings:
 "saccade_wait_timeout_s": 1.0
 ```
 
+Automatic offset recalibration is optional and defaults to `false`:
+
+```json
+"eye_tracking": {
+  "enabled": true,
+  "automatic_recalibration": true
+}
+```
+
+It requires enabled, calibrated eye tracking and takes effect at accepted pre-stimulus
+dot fixations (`wait_for_saccade_on_dot` in active foraging). Other tasks using the shared
+dot gate can use the same setting; tasks without that gate make no automatic corrections.
+At the first accepted fixation on each displayed dot, the gate treats the target's
+position as ground truth for the smoothed eye sample at or immediately before **50 ms
+before acceptance**. It moves `x_offset` and `y_offset` **5% toward** the offsets that
+would map that sample to the target. Gains, cross terms and quadratic terms stay unchanged.
+Repeated polls or refixations on an already accepted dot do not apply more corrections;
+a new dot presentation starts a fresh opportunity. Missing, stale, invalid or pre-dot
+samples are ignored; fixations without sufficient history at the reference time are skipped.
+
+Corrected mappings are shared immediately with gaze reads, preview and subsequent CSV
+samples. The extra history is bounded, and no fitting, serial calls or disk writes happen
+during correction. After any corrections, normal completion or experimenter exit writes
+one `calibration.json` in the block directory. The manager imports it for the next block
+and the subject's saved calibration; standalone tasks can load it with
+`eye_tracking.calibration_file`. The flag itself is not inherited from a saved calibration.
+
 `wait_for_saccade_on_dot` defaults to `false`. Enabling it requires `isi > 0` and
 enabled, calibrated eye tracking. The radius is in subject-display pixels, and the
 fixation criterion requires a continuous interval of valid gaze inside that circle.
 The existing sample-based fixation detector runs with eye acquisition; the presentation
 thread only reads its result. Missing, stale, and invalid samples cannot earn fixation.
+An unavailable read while the acquisition lock is busy preserves the previous acceptance
+and visibility. That acceptance still expires from its last verified camera sample;
+unavailable reads neither renew freshness nor postpone saccade or choice deadlines.
 Light grey window outlines appear only in the experimenter preview.
 When fixation gating is enabled, the experimenter screen also has a **Fix radius**
 button. Click it, or focus it with Tab and press Enter, to edit
@@ -1390,8 +1445,8 @@ this mode requires a finite timeout (`null` is rejected). Simultaneous trials
 have one deadline from the initial `options_dot` flip until gaze reaches any option.
 Subsequent gaze loss does not restart that deadline. In non-memory mode, a timeout
 equal to or longer than `choice_time` has no effect; a shorter timeout can end the trial
-early if no dot is reached. A required saccade timeout clears the display and starts the full ITI
-immediately, without a reward or punishment interval; the next trial proceeds normally.
+early if no dot is reached. A required saccade timeout clears the display, waits the normal
+outcome interval without pump pulses (as for hold failure), then starts the full ITI.
 
 Every completed non-timeout trial reserves a fixed reward interval from the actual post-choice gray-screen
 flip. Its duration is derived from the largest pulse count in `reward_to_pulse_map`, across all
@@ -1461,8 +1516,9 @@ or `"blob"` for a Gaussian-faded cue in `init_dot_color`. All styles have the sa
 Gaussian mask and darken when pressed; the dotted checker's center dot stays black.
 `hold_cue_to_init_time_s` is the continuous cue-hold duration required to initiate a trial.
 `hold_before_choice=true` keeps the pressed cue visible and requires that hold through the pre-choice phases.
-A missing or out-of-cue touch lasting at most 100 ms is tolerated. A longer break aborts only the current trial,
-logs `initiation_cue_release`, and starts the inter-trial interval. When a fixation cross is enabled, it is white
+A missing or out-of-cue touch lasting at most 70 ms is tolerated. A longer break aborts only the current trial
+and logs `initiation_cue_release` at the first missing-touch detection. In active foraging, the normal
+outcome interval without pump pulses precedes the full inter-trial interval. When a fixation cross is enabled, it is white
 before and after choice and black while the choice window is open.
 
 Active foraging and match-to-cue also accept `"choice_period_idicator_tone": true`

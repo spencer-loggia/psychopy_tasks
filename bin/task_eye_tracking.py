@@ -9,7 +9,11 @@ another worker so serial acquisition and rendering never wait on CSV writes.
 from __future__ import annotations
 
 import atexit
+from dataclasses import asdict
+from datetime import datetime, timezone
+import json
 import multiprocessing as mp
+import os
 from pathlib import Path
 import threading
 import time
@@ -18,6 +22,7 @@ from .task_clock import TaskClock
 from .eye_tracking import UARTEyeTracker
 from .eye_tracking_log import EYE_DATA_FILENAME, EyeDataRecorder
 from .eye_tracker_warnings import EyeTrackerWarnings
+from .screen import oriented_size
 
 
 def read_preview_gaze(shared, *, now_s=None):
@@ -39,8 +44,12 @@ def read_preview_gaze(shared, *, now_s=None):
 class TaskEyeTrackingSession:
     """Own an optional Eye 0 tracker, recorder, and calibrated preview mailbox."""
 
-    def __init__(self, settings, *, output_dir=None, task_clock=None, on_state=None, block_id=None):
+    def __init__(self, settings, *, output_dir=None, task_clock=None, on_state=None, block_id=None,
+                 recalibration=None):
         self.settings = settings
+        self.recalibration = recalibration
+        self._output_dir = Path(output_dir) if output_dir is not None else None
+        self._screen_geometry = None
         self._on_state = on_state
         self.preview_state = (
             mp.get_context("spawn").Array(
@@ -82,7 +91,12 @@ class TaskEyeTrackingSession:
 
     def _record_measurement(self, state):
         if self.recorder is not None:
-            self.recorder.submit(state)
+            self.recorder.submit(state, calibration=self.calibration)
+
+    @property
+    def calibration(self):
+        """Read one complete mapping snapshot, shared by gaze, preview and CSV."""
+        return self.recalibration.calibration if self.recalibration is not None else self.settings.calibration
 
     def _update_preview(self, state):
         with self._preview_lock:
@@ -96,7 +110,7 @@ class TaskEyeTrackingSession:
                 return
             self._last_state = state
             fraction = (
-                self.settings.calibration.map_position(*state.smoothed_position)
+                self.calibration.map_position(*state.smoothed_position)
                 if state.valid
                 else None
             )
@@ -117,6 +131,7 @@ class TaskEyeTrackingSession:
     def set_screen_geometry(self, native_size, rotation_degrees=0):
         if self.recorder is not None:
             self.recorder.set_screen_geometry(native_size, rotation_degrees)
+        self._screen_geometry = (tuple(native_size), rotation_degrees)
 
     def check_recording_error(self):
         if self.recorder is not None:
@@ -136,10 +151,46 @@ class TaskEyeTrackingSession:
             return None
         state = self.get_state()
         return (
-            self.settings.calibration.map_position(*state.smoothed_position)
+            self.calibration.map_position(*state.smoothed_position)
             if state.valid
             else None
         )
+
+    def _save_recalibration(self):
+        if self.recalibration is None or not self.recalibration.update_count or self._output_dir is None:
+            return
+        saved = {
+            **self.settings.calibration_metadata,
+            **self.calibration.to_json_dict(),
+            "uart": asdict(self.settings.uart),
+            "filter": asdict(self.settings.filter),
+            "gain_anchor_px": self.settings.gain_anchor_px,
+            "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "completion_status": "complete",
+            "automatic_recalibration": {
+                "update_count": self.recalibration.update_count,
+                "lookback_s": self.recalibration.LOOKBACK_S,
+                "adjustment_fraction": self.recalibration.ADJUSTMENT_FRACTION,
+            },
+        }
+        saved.pop("interruption_error", None)
+        if self._screen_geometry is not None:
+            native_size, rotation = self._screen_geometry
+            saved.update(
+                main_native_size_px=list(native_size), main_rotation_deg=rotation,
+                main_screen_size_px=list(oriented_size(native_size, rotation)),
+            )
+        path = self._output_dir / "calibration.json"
+        temporary = path.with_name(f".{path.name}.tmp")
+        try:
+            with temporary.open("w", encoding="utf-8") as handle:
+                json.dump({"eye_tracker_calibration": saved}, handle, indent=2, allow_nan=False)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def close(self):
         if self._closed:
@@ -163,3 +214,8 @@ class TaskEyeTrackingSession:
                     with self.preview_state.get_lock():
                         self.preview_state[3] = 0
             atexit.unregister(self.close)
+            try:
+                self._save_recalibration()
+            except Exception as exc:
+                self.warnings.warn("calibration", f"Could not save automatic eye recalibration: {exc}")
+                raise

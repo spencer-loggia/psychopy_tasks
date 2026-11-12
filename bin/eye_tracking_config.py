@@ -24,6 +24,8 @@ class EyeTrackingSettings:
     calibration: EyeCalibration = field(default_factory=EyeCalibration)
     show_preview: bool = True
     gain_anchor_px: Optional[tuple[float, float]] = None
+    automatic_recalibration: bool = False
+    calibration_metadata: dict = field(default_factory=dict, repr=False, compare=False)
 
 
 def _object(value, name):
@@ -72,6 +74,11 @@ def load_eye_tracking_settings(cfg, *, for_calibration=False):
     if "record_rate_hz" in section:
         raise ValueError("eye_tracking.record_rate_hz was removed; recording follows new camera measurements")
     enabled = _boolean(section.get("enabled", False), "eye_tracking.enabled")
+    automatic_recalibration = _boolean(
+        section.get("automatic_recalibration", False), "eye_tracking.automatic_recalibration"
+    )
+    if automatic_recalibration and not enabled:
+        raise ValueError("automatic_recalibration requires eye_tracking.enabled=true")
     if not for_calibration and not enabled:
         return None
 
@@ -151,6 +158,8 @@ def load_eye_tracking_settings(cfg, *, for_calibration=False):
                 section.get("show_preview", True), "eye_tracking.show_preview"
             ),
             gain_anchor_px=anchor,
+            automatic_recalibration=automatic_recalibration,
+            calibration_metadata=saved,
         )
     except TypeError as exc:
         raise ValueError(f"Invalid eye-tracking configuration: {exc}") from exc

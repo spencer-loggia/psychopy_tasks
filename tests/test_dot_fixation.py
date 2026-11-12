@@ -2,7 +2,7 @@
 
 import unittest
 
-from bin.dot_fixation import DotFixationGate, validate_dot_fixation_config
+from bin.dot_fixation import DotFixationGate, FIXATION_UNAVAILABLE, validate_dot_fixation_config
 from bin.eye_tracking import EyeCalibration, EyeTrackerState, UARTEyeTrackerConfig
 from bin.eye_tracking_config import EyeTrackingSettings
 from bin.screen import oriented_size, rotate_centered_point
@@ -214,8 +214,28 @@ class DotFixationGateTests(unittest.TestCase):
         gate = self.gate()
         self.feed(gate)
         with gate._lock:
-            self.assertIsNone(gate.status(now_s=1.11))
+            self.assertIs(gate.status(now_s=1.11), FIXATION_UNAVAILABLE)
         self.assertEqual(gate.status(now_s=1.11), 1)
+
+    def test_busy_reads_preserve_fresh_acceptance_but_cannot_extend_sample_lifetime(self):
+        gate = self.gate()
+        self.feed(gate)
+        self.assertEqual(gate.status(now_s=1.13), 1)
+        with gate._lock:
+            for now in (1.13, 1.14, 1.149):
+                self.assertIs(gate.status(now_s=now), FIXATION_UNAVAILABLE)
+            self.assertIsNone(gate.status(now_s=1.151))
+            self.assertIsNone(gate.status(now_s=1.2))
+        self.assertIsNone(gate.status(now_s=1.2))
+
+    def test_new_gate_discards_cached_freshness_after_contention(self):
+        gate = self.gate()
+        self.feed(gate)
+        self.assertEqual(gate.status(now_s=1.11), 1)
+        gate.start(((0, 0),), native_size=(1000, 600), rotation_degrees=0, onset_perf_s=2)
+        with gate._lock:
+            self.assertIs(gate.status(now_s=2), FIXATION_UNAVAILABLE)
+        self.assertIsNone(gate.status(now_s=2))
 
 
 if __name__ == "__main__":

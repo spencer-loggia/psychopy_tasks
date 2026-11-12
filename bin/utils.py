@@ -65,9 +65,13 @@ from .stimulus_files import (
     split_background_from_palette as _split_background_from_palette,
 )
 from .touch_input import (
+    AFC_HOLD_MAX_BREAK_S,
+    AFC_INPUT_POLL_INTERVAL_S,
+    AFC_TOUCH_ACQUIRE_WINDOW_S,
     MousePressTracker,
     TouchHoldTracker,
 )
+from .dot_fixation import FIXATION_UNAVAILABLE
 from .initiation import build_initiation_cue_image
 
 # Global debug flag: when True, utilities may write debug files (PNG) to logs/
@@ -2146,7 +2150,7 @@ def present_trial_with_persistent_dots(
     mouse_presses = MousePressTracker(mouse)
     initiation_hold = TouchHoldTracker(
         hold_cue_to_init_time_s,
-        max_break_s=0.070,
+        max_break_s=AFC_HOLD_MAX_BREAK_S,
     )
     held_initiation_cue_visible = False
     enforce_initiation_hold = hold_before_choice
@@ -2332,10 +2336,18 @@ def present_trial_with_persistent_dots(
             **option_overlays,
         )
 
-    def _record_option_scene(timing, visible_indices) -> None:
+    def _record_option_scene(timing, visible_indices, *, option_phase=True) -> None:
         """Record a successfully displayed option scene, never a planned one."""
         nonlocal preview_option_phase, first_option_flip_perf_ns
-        preview_option_phase = True
+        visible_indices = set(visible_indices)
+        if is_active_foraging:
+            for index in sorted(visible_option_indices - visible_indices):
+                logger.log_frame_flip(
+                    trial_num=trial_num, event=f"option_{index}_off",
+                    timestamp_perf_ns=timing.actual_perf_ns,
+                    requested_timestamp_perf_ns=timing.requested_perf_ns,
+                )
+        preview_option_phase = option_phase
         visible_option_indices.clear()
         visible_option_indices.update(visible_indices)
         revealed_option_indices.update(visible_option_indices)
@@ -2372,6 +2384,10 @@ def present_trial_with_persistent_dots(
         if trial_meta is not None:
             trial_meta["initiation_cue_released"] = True
             trial_meta["initiation_cue_release_perf_s"] = float(release_perf_s)
+            trial_meta["initiation_cue_release_perf_ns"] = release_perf_ns
+            trial_meta["initiation_cue_release_task_time_ns"] = logger.task_time_ns(
+                timestamp_perf_ns=release_perf_ns,
+            )
         _log_message(
             msg_logger,
             "INFO",
@@ -2387,6 +2403,7 @@ def present_trial_with_persistent_dots(
         if fix is not None:
             fix.draw()
         gray_timing = flip_with_timestamps(win)
+        _record_option_scene(gray_timing, [], option_phase=False)
         dots.clear()
         dot_records.clear()
         fixation_positions.clear()
@@ -2561,7 +2578,7 @@ def present_trial_with_persistent_dots(
                         pass
 
             service_sync_bar(win, deadline_perf_s=initiation_target_perf if initiation_started else None)
-            _core.wait(0.002)
+            _core.wait(AFC_INPUT_POLL_INTERVAL_S)
 
     cue_frames = cue_plan.frame_count
     cue_s = cue_plan.scheduled_s
@@ -2771,8 +2788,8 @@ def present_trial_with_persistent_dots(
     click_registered = False
     click_perf_capture = None
     click_meta = None
-    poll_interval_s = 0.002
-    touch_acquire_window_s = 0.050
+    poll_interval_s = AFC_INPUT_POLL_INTERVAL_S
+    touch_acquire_window_s = AFC_TOUCH_ACQUIRE_WINDOW_S
     choice_started = False
     choice_flip = None
     choice_perf = None
@@ -2839,7 +2856,9 @@ def present_trial_with_persistent_dots(
                 _core.wait(min(poll_interval_s, remaining_acquire))
         return click_pos, chosen_idx
 
-    def _log_choice_touch_attempt(click_pos: Tuple[float, float], chosen_idx: Optional[int], origin: str) -> None:
+    def _log_choice_touch_attempt(
+        click_pos: Tuple[float, float], chosen_idx: Optional[int], origin: str, timestamp_perf_ns: int,
+    ) -> None:
         if msg_logger is None:
             return
         try:
@@ -2850,6 +2869,7 @@ def present_trial_with_persistent_dots(
                     f"click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f}) "
                     f"matched_idx={chosen_idx} origin={origin}"
                 ),
+                timestamp_perf_ns=timestamp_perf_ns,
             )
         except Exception:
             pass
@@ -2860,11 +2880,11 @@ def present_trial_with_persistent_dots(
         if is_active_foraging and (
             first_option_flip_perf_ns is None or click_perf_ns < first_option_flip_perf_ns
         ):
-            _log_message(
-                msg_logger, "INFO",
-                f"choice_touch_rejected trial_num={trial_num} option_index={chosen_idx} "
-                "reason=no_option_revealed_at_touch",
-            )
+            if msg_logger is not None:
+                msg_logger.log(
+                    "INFO", f"choice_touch_rejected trial_num={trial_num} option_index={chosen_idx} "
+                    "reason=no_option_revealed_at_touch", timestamp_perf_ns=click_perf_ns,
+                )
             return False
         click_perf_capture = float(click_perf)
         chosen_info = {
@@ -2945,7 +2965,8 @@ def present_trial_with_persistent_dots(
                 if start_touch.buffered_press and not start_touch.down
                 else "choice_start_active_touch"
             )
-            _log_choice_touch_attempt(start_click_pos_acquired, chosen_idx, origin=start_origin)
+            _log_choice_touch_attempt(start_click_pos_acquired, chosen_idx, origin=start_origin,
+                                      timestamp_perf_ns=start_touch.timestamp_perf_ns)
             if chosen_idx is not None:
                 _commit_choice(chosen_idx, start_click_pos_acquired, start_touch.timestamp_perf_ns)
 
@@ -2974,7 +2995,8 @@ def present_trial_with_persistent_dots(
                 if chosen_idx is None:
                     click_pos, chosen_idx = _acquire_choice_target(click_pos, chosen_idx, touch_onset_perf)
 
-                _log_choice_touch_attempt(click_pos, chosen_idx, origin="touch_start")
+                _log_choice_touch_attempt(click_pos, chosen_idx, origin="touch_start",
+                                          timestamp_perf_ns=touch_sample.timestamp_perf_ns)
 
                 if chosen_idx is not None:
                     if _commit_choice(chosen_idx, click_pos, touch_sample.timestamp_perf_ns):
@@ -3102,13 +3124,15 @@ def present_trial_with_persistent_dots(
                     _log_message(msg_logger, "INFO", f"option_skipped trial_num={trial_num} "
                                  f"option_index={option_index} reason=saccade_timeout")
                     result = "skipped"
-                elif dot_fixation_gate.status(now_s=now) is not None:
-                    _log_fixation_accepted(option_index, now)
-                    result = "accepted"
                 else:
-                    service_sync_bar(win, deadline_perf_s=deadline)
-                    _core.wait(min(poll_interval_s, max(0.0, deadline - time.perf_counter())))
-                    continue
+                    accepted = dot_fixation_gate.status(now_s=now)
+                    if accepted is not None and accepted is not FIXATION_UNAVAILABLE:
+                        _log_fixation_accepted(option_index, now)
+                        result = "accepted"
+                    else:
+                        service_sync_bar(win, deadline_perf_s=deadline)
+                        _core.wait(min(poll_interval_s, max(0.0, deadline - time.perf_counter())))
+                        continue
                 # Gaze waits and optional skips are not missed scheduled
                 # transitions. Retain the minimum ISI when it has not elapsed.
                 if now >= flip_submission_time(next_visual_target_perf_s, frame_dur):
@@ -3148,10 +3172,14 @@ def present_trial_with_persistent_dots(
                     _timeout_dot_fixation(now)
                     return False
                 accepted = dot_fixation_gate.status(now_s=now)
-                if accepted is not None:
-                    if accepted != accepted_previous:
+                if accepted is FIXATION_UNAVAILABLE:
+                    # Preserve the displayed scene while acquisition is busy.
+                    # status() still expires previously accepted stale samples.
+                    accepted = accepted_previous
+                else:
+                    if accepted is not None and accepted != accepted_previous:
                         _log_fixation_accepted(accepted, now)
-                accepted_previous = accepted
+                    accepted_previous = accepted
                 if (
                     is_memory and stimulus_started and not choice_started
                     and now >= flip_submission_time(stimulus_deadline, frame_dur)
@@ -3205,12 +3233,6 @@ def present_trial_with_persistent_dots(
                     )
                     if timing is None:
                         return False
-                    if visible_index is not None:
-                        logger.log_frame_flip(
-                            trial_num=trial_num, event=f"option_{visible_index}_off",
-                            timestamp_perf_ns=timing.actual_perf_ns,
-                            requested_timestamp_perf_ns=timing.requested_perf_ns,
-                        )
                     visible_index = desired_index
                     _record_option_scene(timing, [visible_index] if visible_index is not None else [])
                     if visible_index is not None:
@@ -3569,6 +3591,7 @@ def present_trial_with_persistent_dots(
         clear_timing = transition_scheduler.flip_at(win, choice_deadline)
         if clear_timing is None:
             return True, None
+    _record_option_scene(clear_timing, [], option_phase=False)
     dots.clear()
     dot_records.clear()
     fixation_positions.clear()

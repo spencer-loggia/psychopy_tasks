@@ -140,7 +140,7 @@
     "initiation_cue_release": {
       "code": 203,
       "event_type": "interaction",
-      "description": "The required initiation-cue hold was released for more than 100 milliseconds before choice."
+      "description": "The required initiation-cue hold failed before choice. Timestamp is the first missing-touch detection, before the release grace period; effective tolerance is recorded in block settings."
     },
     "trial_start_signal_on": {
       "code": 300,
@@ -385,7 +385,7 @@
       "code_base": 1200,
       "code_group": "option_index",
       "event_type": "frame_flip",
-      "description_template": "Stimulus for option {option_index} was hidden, restoring its existing dot cue."
+      "description_template": "Stimulus for option {option_index} was hidden on the main display, including the final clear to gray."
     },
     "afc_option_on": {
       "task_names": [

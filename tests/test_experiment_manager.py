@@ -693,6 +693,54 @@ class ExperimentManagerTests(unittest.TestCase):
             self.assertEqual(settings.gain_anchor_px, (100, 50))
             self.assertEqual(settings.calibration.x_scale, 0.1)
 
+    def test_automatic_offset_calibration_is_loaded_by_next_block_and_subject_cache(self):
+        from bin.dot_fixation import DotFixationGate
+        from bin.eye_tracking import EyeCalibration, EyeTrackerState
+        from bin.eye_tracking_config import EyeTrackingSettings
+        from bin.task_eye_tracking import TaskEyeTrackingSession
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            launch_config, launch_path = self._project(root)
+            manager = ExperimentManager(
+                working_dir=root, launch_config_path=launch_path,
+                launch_config=launch_config, subject_name="Subject One",
+                subject_code="S1", now=dt.datetime(2026, 8, 13),
+            )
+            first = manager.prepare_block(
+                task_name="demo", launch_value="task/demo.py", config_value="configs/demo.json",
+            )
+            settings = EyeTrackingSettings(
+                calibration=EyeCalibration(x_scale=1, y_scale=1, x_quad_xx=.01),
+                automatic_recalibration=True, show_preview=False,
+            )
+            gate = DotFixationGate(settings, fixation_criteria_s=.1, fixation_window_radius=100)
+            with patch("bin.task_eye_tracking.UARTEyeTracker"):
+                session = TaskEyeTrackingSession(settings, output_dir=first.output_dir,
+                                                 recalibration=gate.recalibration)
+                try:
+                    gate.start(((0, 0),), native_size=(1000, 1000), rotation_degrees=0, onset_perf_s=1)
+                    for index in range(12):
+                        gate.observe(EyeTrackerState(timestamp_perf_s=1 + index / 100,
+                                                    frame_sequence=index, valid=True,
+                                                    x_smooth_px=.02, y_smooth_px=-.02))
+                    self.assertEqual(gate.status(now_s=1.11), 1)
+                finally:
+                    gate.stop()
+                    session.close()
+            manager.finish_block(first)
+            (root / "configs" / "demo.json").write_text(json.dumps({"eye_tracking": {"enabled": True}}))
+            second = manager.prepare_block(
+                task_name="demo", launch_value="task/demo.py", config_value="configs/demo.json",
+            )
+            loaded = load_eye_tracking_settings(json.loads(second.config_path.read_text()))
+            self.assertEqual(loaded.calibration, gate.recalibration.calibration)
+            self.assertNotEqual(loaded.calibration.x_offset, 0)
+            cached = manager.subject_calibrations.load("Subject One")["eye_tracker_calibration"]
+            self.assertEqual(cached["x_offset"], loaded.calibration.x_offset)
+            self.assertEqual(cached["x_quad_xx"], .01)
+            self.assertEqual(cached["automatic_recalibration"]["update_count"], 1)
+
     def test_quadratic_calibration_survives_legacy_state_schema_and_block_injection(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

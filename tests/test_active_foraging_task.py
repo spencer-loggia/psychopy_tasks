@@ -232,9 +232,14 @@ class ActiveForagingTaskTests(unittest.TestCase):
             with self.subTest(gap=gap), tempfile.TemporaryDirectory() as tmp:
                 self._exercise_task(Path(tmp), False, False, gap=gap, change_pulse=True)
 
-    def test_fixation_timeout_skips_outcome_interval_and_continues_after_full_iti(self):
+    def test_fixation_timeout_runs_unrewarded_outcome_then_full_iti(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._exercise_task(Path(tmp), True, True, saccade_timeout=True)
+
+    def test_hold_failure_runs_unrewarded_outcome_and_records_release_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._exercise_task(Path(tmp), True, True, hold_failure=True,
+                                placement_options={"hold_before_choice": True, "hold_cue_to_init_time_s": 0.15})
 
     def test_optional_saccade_policy_reaches_presenter(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -277,7 +282,7 @@ class ActiveForagingTaskTests(unittest.TestCase):
 
     def _exercise_task(self, root, sequential, memory, *, gap=0.1,
                        image_size=(10, 10), output_rotation="normal", placement_options=None,
-                       change_pulse=False, saccade_timeout=False, change_fixation=False,
+                       change_pulse=False, saccade_timeout=False, change_fixation=False, hold_failure=False,
                        with_preview=False, tone_enabled=False):
         task = load_task()
         tone_factory = task.ChoicePeriodTone = Mock()
@@ -364,6 +369,9 @@ class ActiveForagingTaskTests(unittest.TestCase):
                                         gray_flip_requested_perf_ns=clock.ns - 100)
             if saccade_timeout and kwargs["trial_num"] == 5:
                 kwargs["trial_meta"]["saccade_timeout"] = True
+            if hold_failure and kwargs["trial_num"] == 5:
+                kwargs["trial_meta"]["initiation_cue_released"] = True
+                kwargs["trial_meta"]["initiation_cue_release_task_time_ns"] = 123_456_789
             index = choices[kwargs["trial_num"] - 1]
             return False, None if index is None else {"chosen_index": index}
 
@@ -431,11 +439,31 @@ class ActiveForagingTaskTests(unittest.TestCase):
             ])
             preview.close.assert_called_once()
         for trial, duration_ns in enumerate(
-            round(((0 if saccade_timeout and i == 4 else 1.5 if i == 3 else reward_durations[i]) + 0.2) * 1e9) for i in range(5)
+            round(((1.5 if i == 3 else reward_durations[i]) + 0.2) * 1e9) for i in range(5)
         ):
             self.assertEqual(cue_times[trial + 1] - gray_times[trial], duration_ns)
 
         event_path = next((root / "logs").rglob("event_log.tsv"))
+        with (event_path.parent / "message_log.tsv").open() as handle:
+            block_settings = [json.loads(row["message"].removeprefix("active_foraging_settings "))
+                              for row in csv.DictReader(handle, delimiter="\t")
+                              if row["message"].startswith("active_foraging_settings ")]
+        self.assertEqual(len(block_settings), 1)
+        block_settings = block_settings[0]
+        self.assertEqual(block_settings["gate"]["wait_for_saccade_on_dot"], change_fixation)
+        self.assertEqual(block_settings["gate"]["initial_fixation_window_radius_px"],
+                         150 if change_fixation else None)
+        self.assertEqual(block_settings["gate"]["fixation_criteria_s"], 0.1 if change_fixation else None)
+        self.assertEqual(block_settings["gate"]["require_saccade_to_all_options"],
+                         placement_options.get("require_saccade_to_all_options", True)
+                         if change_fixation and sequential else None)
+        self.assertEqual(block_settings["hold"], dict(
+            self_initiation=True, hold_before_choice=placement_options.get("hold_before_choice", False),
+            hold_cue_to_init_time_s=placement_options.get("hold_cue_to_init_time_s", 0.0),
+        ))
+        self.assertEqual(block_settings["implementation"]["hold_max_break_s"], 0.070)
+        self.assertEqual(block_settings["implementation"]["input_poll_interval_s"], 0.002)
+        self.assertEqual(block_settings["implementation"]["touch_acquire_window_s"], 0.050)
         if change_fixation:
             with (event_path.parent / "message_log.tsv").open() as handle:
                 edits = [dict(json.loads(row["message"].removeprefix("live_setting ")),
@@ -454,6 +482,10 @@ class ActiveForagingTaskTests(unittest.TestCase):
         with (event_path.parent / "behavior_log.tsv").open() as handle:
             behavior = list(csv.DictReader(handle, delimiter="\t"))
         self.assertEqual([float(row["pump_pulse_time"]) for row in behavior], widths)
+        self.assertEqual([row["fixation_window_radius"] for row in behavior],
+                         ["150.0"] * 2 + ["225.0"] * 4 if change_fixation else [""] * 6)
+        self.assertEqual([row["initiation_cue_release_task_time_ns"] for row in behavior],
+                         [""] * 4 + ["123456789", ""] if hold_failure else [""] * 6)
         self.assertNotIn("grey_inter_trial_interval", [row["event"] for row in rows])
         self.assertNotIn("109", [row["event_code"] for row in rows])
         for trial in range(1, len(choices) + 1):
@@ -465,13 +497,8 @@ class ActiveForagingTaskTests(unittest.TestCase):
             timeout = trial == 4
             phases = [row for row in events if row["event"] in (
                 "reward_interval", "timeout_interval", "inter_trial_interval")]
-            if saccade_timeout and trial == 5:
-                self.assertEqual([row["event"] for row in phases], ["inter_trial_interval"])
-                self.assertEqual(float(phases[0]["requested_duration"]), 0.2)
-                cue_event = next(row for row in events if row["event"] == "onset_cue_on")
-                self.assertEqual(int(phases[0]["task_time_ns"]) - int(cue_event["task_time_ns"]), 50_000_000)
+            if (saccade_timeout or hold_failure) and trial == 5:
                 self.assertFalse(any(row["event"] in ("pump_on", "buzzer_on") for row in events))
-                continue
             self.assertEqual([row["event"] for row in phases],
                              ["timeout_interval" if timeout else "reward_interval", "inter_trial_interval"])
             self.assertEqual([row["event_code"] for row in phases], ["4" if timeout else "3", "5"])

@@ -59,7 +59,7 @@ class EyeDataRecorder:
         with self._lock:
             self._geometry = (oriented_size(size, rotation_degrees), rotation_degrees)
 
-    def submit(self, state):
+    def submit(self, state, *, calibration=None):
         """Enqueue a measurement without waiting for disk or queue capacity.
 
         Freeze the calibration and geometry in effect at acquisition, rather
@@ -72,7 +72,8 @@ class EyeDataRecorder:
             if key == self._last_key:
                 return
             self._last_key = key
-            fraction = self._calibration.map_position(*state.smoothed_position) if state.valid else None
+            mapping = self._calibration if calibration is None else calibration
+            fraction = mapping.map_position(*state.smoothed_position) if state.valid else None
             try:
                 self._queue.put_nowait((state, self._geometry, fraction))
             except queue.Full:

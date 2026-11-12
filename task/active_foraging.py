@@ -27,6 +27,7 @@ Config keys required/additional:
 
 """
 import argparse
+import json
 import os
 import sys
 import time
@@ -57,12 +58,17 @@ from bin.afc_geometry import (
 )
 from bin.afc_stimuli import render_afc_stimulus
 from bin.frame_timing import (
+    DEFAULT_FLIP_SUBMISSION_LEAD_FRACTION,
     plan_frame_duration,
     validate_requested_durations,
     wait_until,
 )
 from bin.eye_tracking_config import load_eye_tracking_settings
-from bin.dot_fixation import DotFixationGate, validate_dot_fixation_config
+from bin.dot_fixation import (
+    DotFixationGate, validate_dot_fixation_config,
+    FIXATION_ACCEPT_FRACTION, FIXATION_RADIUS_EPSILON_PX,
+)
+from bin.touch_input import AFC_HOLD_MAX_BREAK_S, AFC_INPUT_POLL_INTERVAL_S, AFC_TOUCH_ACQUIRE_WINDOW_S
 from bin.pump_control import PumpPulseControl
 from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
@@ -188,7 +194,8 @@ def _decode_trial_payload(payload: dict) -> Tuple[List[Tuple[int, int]], List[Tu
 
 
 def _build_behavior_fieldnames(num_afc: int) -> List[str]:
-    fieldnames = ["trial_num", "pump_pulse_time", "initiation_task_time_ns"]
+    fieldnames = ["trial_num", "pump_pulse_time", "fixation_window_radius",
+                  "initiation_task_time_ns", "initiation_cue_release_task_time_ns"]
     for opt_idx in range(int(num_afc)):
         fieldnames.extend([f"shape_{opt_idx}", f"color_{opt_idx}", f"lum_{opt_idx}"])
     fieldnames.extend(
@@ -434,6 +441,7 @@ def run_task(
     session_logs = SessionLogBundle(
         eye_tracking_config=eye_tracking_config,
         on_eye_state=dot_fixation_gate.observe if dot_fixation_gate is not None else None,
+        eye_recalibration=dot_fixation_gate.recalibration if dot_fixation_gate is not None else None,
         output_root=output_dir,
         task_name="active_foraging",
         config_name=resolved_config_name,
@@ -985,6 +993,38 @@ def run_task(
     msg_logger.log("INFO", f"outcome_timing reward_interval_s={reward_interval_s:.9f} "
                    f"timeout_interval_s={timeout_duration_seconds:.9f} "
                    f"iti_s={iti_plan.scheduled_s:.9f}")
+    # Record resolved defaults and implementation constants once per block.
+    # Applied live values belong to each trial row; edits retain their existing
+    # initial/confirmed/applied timestamped message history.
+    gate_enabled = dot_fixation_gate is not None
+    msg_logger.log("INFO", "active_foraging_settings " + json.dumps({
+        "gate": {
+            "wait_for_saccade_on_dot": gate_enabled,
+            "fixation_criteria_s": dot_fixation_gate.fixation_criteria_s if gate_enabled else None,
+            "initial_fixation_window_radius_px": dot_fixation_gate.fixation_window_radius if gate_enabled else None,
+            "max_sample_age_s": eye_tracking_config.uart.max_sample_age_s if gate_enabled else None,
+            "saccade_wait_timeout_s": saccade_wait_timeout_s if gate_enabled else None,
+            "require_saccade_to_all_options": require_saccade_to_all_options if gate_enabled and sequential else None,
+        },
+        "hold": {
+            "self_initiation": bool(self_initiation),
+            "hold_before_choice": bool(self_initiation and hold_before_choice),
+            "hold_cue_to_init_time_s": float(hold_cue_to_init_time_s) if self_initiation else 0.0,
+        },
+        "presentation": {
+            "sequential": bool(sequential), "is_memory": bool(is_memory),
+            "isi_s": float(isi), "duration_s": float(duration), "choice_time_s": float(choice_time),
+            "choice_hitbox_scale": 1.25 if touchscreen else 1.0,
+        },
+        "implementation": {
+            "hold_max_break_s": AFC_HOLD_MAX_BREAK_S,
+            "input_poll_interval_s": AFC_INPUT_POLL_INTERVAL_S,
+            "touch_acquire_window_s": AFC_TOUCH_ACQUIRE_WINDOW_S,
+            "fixation_accept_fraction": FIXATION_ACCEPT_FRACTION,
+            "fixation_radius_epsilon_px": FIXATION_RADIUS_EPSILON_PX,
+            "flip_submission_lead_fraction": DEFAULT_FLIP_SUBMISSION_LEAD_FRACTION,
+        },
+    }, sort_keys=True, separators=(",", ":")))
 
     def _fmt_optional(value: Any) -> str:
         if value == "" or value is None:
@@ -1033,6 +1073,7 @@ def run_task(
                 # The gate is stopped between trials. Its next start creates
                 # fresh histories; detection and preview use this same radius.
                 dot_fixation_gate.fixation_window_radius = settings["fixation_window_radius"]
+            trial_fixation_radius = dot_fixation_gate.fixation_window_radius if gate_enabled else ""
             if inter_pump_interval is None:
                 inter_pump_interval_seconds = pump_pulse_time_seconds
             reward_interval_s = reward_interval_duration(
@@ -1134,9 +1175,7 @@ def run_task(
                 if reward_to_timeout_map is not None:
                     apply_timeout = reward_to_timeout_map.get(str(reward_level), 0)
 
-            saccade_timeout = trial_meta.get("saccade_timeout", False)
             outcome_duration_s = (
-                0.0 if saccade_timeout else
                 timeout_duration_seconds if apply_timeout > 0 else reward_interval_s
             )
             gray_start_ns = trial_meta["gray_flip_perf_ns"]
@@ -1144,7 +1183,7 @@ def run_task(
                 # A pending tone offset must never switch off the timeout buzzer.
                 choice_tone.stop()
                 choice_tone.flush_events(logger)
-            iti_start_ns = gray_start_ns if saccade_timeout else run_outcome_interval(
+            iti_start_ns = run_outcome_interval(
                 trial_num=trial_num, onset_perf_ns=gray_start_ns,
                 onset_requested_perf_ns=trial_meta.get("gray_flip_requested_perf_ns"),
                 num_pulses=num_pulses, apply_timeout=apply_timeout > 0,
@@ -1161,7 +1200,7 @@ def run_task(
                 task_end_notes = "experimenter_exit"
                 msg_logger.log("WARN", f"experimenter_exit_during_outcome_interval trial_num={trial_num}")
                 break
-            if iti_frames > 0 or saccade_timeout:
+            if iti_frames > 0:
                 logger.log_event(
                     trial_num=trial_num, event="inter_trial_interval", event_type="lifecycle",
                     timestamp_perf_ns=iti_start_ns, requested_duration=iti,
@@ -1191,7 +1230,9 @@ def run_task(
             behavior_row: Dict[str, Any] = {
                 "trial_num": trial_num,
                 "pump_pulse_time": pump_pulse_time_seconds,
+                "fixation_window_radius": trial_fixation_radius,
                 "initiation_task_time_ns": trial_meta.get("initiation_task_time_ns", ""),
+                "initiation_cue_release_task_time_ns": trial_meta.get("initiation_cue_release_task_time_ns", ""),
                 "choice_made_index": chosen_idx_row,
                 "choice_made_color": "",
                 "choice_made_shape": "",

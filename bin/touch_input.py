@@ -14,6 +14,12 @@ import time
 from typing import Any, Callable, Optional, Sequence
 
 
+# Shared AFC presenter constants, also recorded in each active-foraging block.
+AFC_INPUT_POLL_INTERVAL_S = 0.002
+AFC_TOUCH_ACQUIRE_WINDOW_S = 0.050
+AFC_HOLD_MAX_BREAK_S = 0.070
+
+
 @dataclass(frozen=True)
 class MousePressSample:
     """One sampled pointer position and button state."""

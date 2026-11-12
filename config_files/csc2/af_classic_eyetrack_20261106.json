@@ -78,6 +78,7 @@
   "saccade_wait_timeout_s": 4.0,
   "require_saccade_to_all_options": false,
   
+  
   "iti": 4.0,
   "duration": 0.0,
   "num_afc": 3,

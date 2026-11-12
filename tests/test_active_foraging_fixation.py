@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from bin.logger import EventCodeLibrary, EventLogger, load_task_event_definitions
+from bin.dot_fixation import FIXATION_UNAVAILABLE
 from bin.task_clock import TaskClock
 from tests.test_active_foraging_timing import FakeClock
 
@@ -144,7 +145,8 @@ class ActiveForagingFixationTests(unittest.TestCase):
                 sync_service=None, arrival_after=..., click_after=None,
                 click_intervals=None, click_index=1, buffered_touch=None,
                 on_choice_start=None, event_profile="active_foraging", hold_cue=False,
-                require_saccade_to_all_options=True, num_options=2, msg_logger=None):
+                require_saccade_to_all_options=True, num_options=2, msg_logger=None,
+                hold_cue_to_init_time_s=0.0, setup_mouse=None):
         clock = FakeClock()
         module, psychopy = load_presenter(clock)
         window = Display(clock)
@@ -192,6 +194,9 @@ class ActiveForagingFixationTests(unittest.TestCase):
 
             mouse.getPressed.side_effect = buffered_buttons
 
+        if setup_mouse is not None:
+            setup_mouse(clock, window, psychopy.event.Mouse.return_value)
+
         def abort():
             return bool(abort_after is not None and gate.starts
                         and clock.seconds() - gate.onset_s >= abort_after)
@@ -222,6 +227,7 @@ class ActiveForagingFixationTests(unittest.TestCase):
                 onset_cue=Stimulus() if hold_cue else None,
                 pressed_onset_cue=Stimulus() if hold_cue else None,
                 hold_before_choice=hold_cue,
+                hold_cue_to_init_time_s=hold_cue_to_init_time_s,
             )
         events = (
             [call.kwargs for call in logger.method_calls if "event" in call.kwargs]
@@ -343,6 +349,128 @@ class ActiveForagingFixationTests(unittest.TestCase):
         self.assertAlmostEqual((choice["timestamp_perf_ns"] - first["timestamp_perf_ns"]) / 1e9, 0.15, places=8)
         self.assertAlmostEqual((metadata["gray_flip_perf_ns"] - choice["timestamp_perf_ns"]) / 1e9, 0.2, places=8)
         self.assertEqual(window.scenes, [(), ((-100, 0),), ((100, 0),), (), ()])
+
+    def test_unavailable_fixation_does_not_hide_or_log_another_acceptance(self):
+        _, events, metadata, _, window, _ = self.present(
+            sequential=False, memory=False, choice_time=0.4,
+            schedule=[(0.02, 1), (0.14, FIXATION_UNAVAILABLE), (0.20, 1),
+                      (0.25, None), (0.30, 1)],
+        )
+        self.assertEqual(window.scenes, [(), ((-100, 0),), (), ((-100, 0),), ()])
+        names = [event["event"] for event in events]
+        self.assertEqual(names.count("fixation_accepted"), 2)
+        self.assertEqual(names.count("option_1_on"), 2)
+        self.assertEqual(names.count("option_1_off"), 2)
+        choice = next(event for event in events if event["event"] == "choice_start")
+        self.assertEqual(metadata["gray_flip_perf_ns"] - choice["timestamp_perf_ns"], 400_000_000)
+
+    def test_unavailable_fixation_cannot_accept_or_suspend_deadlines(self):
+        for sequential in (False, True):
+            with self.subTest(sequential=sequential):
+                result, events, metadata, _, window, _ = self.present(
+                    sequential=sequential, memory=False, choice_time=0.3,
+                    timeout=0.15, arrival_after=None, schedule=[(0, FIXATION_UNAVAILABLE)],
+                )
+                self.assertEqual(result, (False, None))
+                self.assertTrue(metadata["saccade_timeout"])
+                self.assertNotIn("fixation_accepted", [event["event"] for event in events])
+                self.assertEqual(window.scenes, [(), ()])
+        _, events, metadata, _, window, _ = self.present(
+            sequential=False, memory=False, choice_time=0.3,
+            schedule=[(0.02, 1), (0.14, FIXATION_UNAVAILABLE)],
+        )
+        choice = next(event for event in events if event["event"] == "choice_start")
+        self.assertEqual(metadata["gray_flip_perf_ns"] - choice["timestamp_perf_ns"], 300_000_000)
+        self.assertEqual(window.scenes, [(), ((-100, 0),), ()])
+
+    def test_gray_clear_logs_offsets_for_exactly_the_visible_options(self):
+        cases = (
+            (dict(sequential=False, memory=False, schedule=[(0.02, 1)]), [1]),
+            (dict(sequential=False, memory=False, schedule=[(0.02, 1), (0.14, None)]), []),
+            (dict(sequential=False, memory=False, schedule=[(0.02, 1)], click_after=0.2), [1]),
+            (dict(sequential=False, memory=False, gated=False), [1, 2]),
+            (dict(sequential=True, memory=False, gated=False), [1, 2]),
+            (dict(sequential=False, memory=True, schedule=[(0.02, 1)]), []),
+            (dict(sequential=True, memory=True, gated=False), []),
+        )
+        for options, indices in cases:
+            with self.subTest(options=options):
+                _, events, metadata, _, _, _ = self.present(choice_time=0.3, **options)
+                final_off = [event for event in events if event["event"].endswith("_off")
+                             and event["timestamp_perf_ns"] == metadata["gray_flip_perf_ns"]]
+                self.assertEqual([event["event"] for event in final_off],
+                                 [f"option_{index}_off" for index in indices])
+                for event in final_off:
+                    self.assertEqual(event["requested_timestamp_perf_ns"], metadata["gray_flip_requested_perf_ns"])
+
+    def test_memory_choice_logs_offset_at_dot_flip_without_duplicate_at_gray(self):
+        _, events, _, _, _, _ = self.present(
+            sequential=False, memory=True, schedule=[(0.02, 1)], choice_time=0.2,
+        )
+        choice = next(event for event in events if event["event"] == "choice_start")
+        offsets = [event for event in events if event["event"] == "option_1_off"]
+        self.assertEqual(len(offsets), 1)
+        self.assertEqual(offsets[0]["timestamp_perf_ns"], choice["timestamp_perf_ns"])
+
+    def test_touch_and_failed_hold_log_original_detection_times_with_real_logger(self):
+        for during_initiation in (False, True):
+            with self.subTest(during_initiation=during_initiation), tempfile.TemporaryDirectory() as tmp:
+                definitions, patterns = load_task_event_definitions("active_foraging")
+                logger = EventLogger(tmp, TaskClock(origin_perf_ns=10_000_000_000),
+                                     EventCodeLibrary(definitions, event_patterns=patterns), auto_flush=False)
+                captures = {}
+
+                def setup(clock, window, mouse):
+                    def buttons(**kwargs):
+                        down = bool(window.flips and clock.ns < window.flips[0] + 170_000_003)
+                        if down:
+                            captures.setdefault("press", clock.ns)
+                        elif "press" in captures:
+                            captures.setdefault("release", clock.ns)
+                        return ((down, False, False), (0, 0, 0))
+
+                    def position():
+                        clock.ns += 3_000_007  # Position lookup must not shift either capture.
+                        return (0, 0)
+
+                    mouse.getPressed.side_effect = buttons
+                    mouse.getPos.side_effect = position
+
+                try:
+                    result, _, metadata, _, _, _ = self.present(
+                        hold_cue=True, setup_mouse=setup, event_logger=logger,
+                        hold_cue_to_init_time_s=1.0 if during_initiation else 0.0,
+                        accepted_after=0.02, duration=0.5,
+                    )
+                finally:
+                    logger.close()
+                self.assertEqual(result, (False, None))
+                with logger.path.open() as handle:
+                    rows = list(csv.DictReader(handle, delimiter="\t"))
+                press = next(row for row in rows if row["event"] == "cue_touch")
+                release = next(row for row in rows if row["event"] == "initiation_cue_release")
+                self.assertEqual(int(press["task_time_ns"]), captures["press"] - 10_000_000_000)
+                self.assertEqual(int(release["task_time_ns"]), captures["release"] - 10_000_000_000)
+                self.assertEqual(metadata["initiation_cue_release_perf_ns"], captures["release"])
+                self.assertEqual(metadata["initiation_cue_release_task_time_ns"], int(release["task_time_ns"]))
+                self.assertGreater(metadata["gray_flip_perf_ns"] - captures["release"], 70_000_000)
+                if not during_initiation:
+                    offsets = [row for row in rows if row["event"] == "option_1_off"]
+                    self.assertEqual(len(offsets), 1)
+                    self.assertEqual(int(offsets[0]["task_time_ns"]), metadata["gray_flip_perf_ns"] - 10_000_000_000)
+
+    def test_buffered_choice_touch_keeps_press_timestamp_in_event_and_attempt_log(self):
+        messages = Mock()
+        _, events, _, _, window, _ = self.present(
+            sequential=False, memory=False, choice_time=0.4, accepted_after=0.02,
+            buffered_touch=(0.25, 0.20), msg_logger=messages,
+        )
+        press_ns = window.flips[0] + 200_000_000
+        touch = next(event for event in events if event["event"] == "option_touch")
+        self.assertEqual(touch["timestamp_perf_ns"], press_ns)
+        attempts = [call for call in messages.log.call_args_list if call.args[1].startswith("choice_touch_attempt ")]
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0].kwargs["timestamp_perf_ns"], press_ns)
 
     def test_late_fixation_does_not_rescue_initial_timeout(self):
         for sequential in (False, True):
@@ -750,7 +878,11 @@ class ActiveForagingFixationTests(unittest.TestCase):
             ({"sequential": False, "memory": False, "choice_time": 0.3,
               "schedule": [(0.02, 1), (0.14, None), (0.20, 2)]},
              {"fixation_accepted": ("205", "interaction"),
-              "option_1_off": ("1201", "frame_flip"), "option_2_on": ("1102", "frame_flip")}),
+              "option_1_off": ("1201", "frame_flip"), "option_2_on": ("1102", "frame_flip"),
+              "option_2_off": ("1202", "frame_flip")}),
+            ({"sequential": False, "memory": False, "choice_time": 0.3,
+              "schedule": [(0.02, 1), (0.14, None), (0.20, 1)]},
+             {"option_1_on": ("1101", "frame_flip"), "option_1_off": ("1201", "frame_flip")}),
         )
         for options, expected in cases:
             with self.subTest(options=options), tempfile.TemporaryDirectory() as tmp:
@@ -774,6 +906,11 @@ class ActiveForagingFixationTests(unittest.TestCase):
                 used = json.loads(used_path.read_text())
                 for row in rows:
                     self.assertEqual(used[row["event_code"]]["event"], row["event"])
+                if options.get("schedule", [])[-1:] == [(0.20, 1)]:
+                    for name in ("option_1_on", "option_1_off"):
+                        repeated = [row for row in rows if row["event"] == name]
+                        self.assertEqual(len(repeated), 2)
+                        self.assertLess(int(repeated[0]["task_time_ns"]), int(repeated[1]["task_time_ns"]))
 
     def test_disabled_gate_preserves_scheduled_dot_duration(self):
         _, events, _, _, _, preview = self.present(gated=False)

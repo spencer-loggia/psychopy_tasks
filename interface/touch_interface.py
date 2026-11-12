@@ -1393,6 +1393,18 @@ class TouchInterfaceApp:
     def _select_subject(self, subject_name: str, subject_code: str) -> None:
         if self.experiment is not None or getattr(self, "cleanup_active", False):
             return
+        associated_external_data = False
+        # The config enables the choice; only this experiment's Yes answer
+        # enables the recording and end-of-experiment confirmations.
+        if self.cfg.get("external_aquisition", False):
+            associated_external_data = choose_dialog(
+                self.root, "External Acquisition",
+                "Does this experiment need external data acquisition?",
+                [("Yes", True), ("No", False)], cancel_value=None,
+            )
+            if associated_external_data is None:
+                self.status_var.set("Experiment start cancelled")
+                return
         quiet_mode = getattr(self, "quiet_mode", None)
         try:
             if quiet_mode is not None:
@@ -1403,6 +1415,7 @@ class TouchInterfaceApp:
                 launch_config=self.cfg,
                 subject_name=subject_name,
                 subject_code=subject_code,
+                associated_external_data=associated_external_data,
             )
         except Exception as exc:
             if quiet_mode is not None:
@@ -1747,21 +1760,11 @@ class TouchInterfaceApp:
                         finally:
                             self.experiment.finish_block(block)
 
-    def _confirm_external_acquisition_start(self) -> bool:
-        """Gate the first block on the experiment's external recording choice."""
+    def _confirm_external_recording_start(self) -> bool:
+        """Gate the first block on confirmation that external recording is running."""
         experiment = self.experiment
         if experiment is None:
             raise RuntimeError("Select a subject before launching a task")
-        if (experiment.launch_config.get("external_aquisition", False)
-                and not experiment.external_acquisition_answered):
-            associated = choose_dialog(
-                self.root, "External Acquisition",
-                "Does this experiment use external acquisition hardware?",
-                [("Yes", True), ("No", False)], cancel_value=None,
-            )
-            if associated is None:
-                return False
-            experiment.set_associated_external_data(associated)
         if not experiment.blocks and experiment.state.get("associated_external_data", False):
             return choose_dialog(
                 self.root, "Confirm External Recording",
@@ -1782,7 +1785,7 @@ class TouchInterfaceApp:
         blocks_run = 0
         try:
             for launch_value, config_value in task_run_sequence(task_name, task_cfg):
-                if not self._confirm_external_acquisition_start():
+                if not self._confirm_external_recording_start():
                     self.status_var.set(f"Launch cancelled: {task_name}")
                     return
                 block = self.experiment.prepare_block(

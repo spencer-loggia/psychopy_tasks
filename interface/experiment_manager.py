@@ -210,6 +210,7 @@ class ExperimentManager:
         launch_config: Mapping[str, Any],
         subject_name: str,
         subject_code: str,
+        associated_external_data: bool = False,
         now: Optional[dt.datetime] = None,
         perf_counter_ns: Callable[[], int] = time.perf_counter_ns,
     ):
@@ -242,8 +243,7 @@ class ExperimentManager:
                         entry.setdefault("task_time_ns", round(float(milliseconds) * 1_000_000))
         self.state["subject"] = self.subject_name
         # Hardware association is a fresh operator choice for each experiment.
-        self.state["associated_external_data"] = False
-        self.external_acquisition_answered = False
+        self.state["associated_external_data"] = associated_external_data
         self.experiment_id = new_run_id()
         self.state["experiment_id"] = self.experiment_id
 
@@ -298,13 +298,6 @@ class ExperimentManager:
     def external_data_name(self) -> str:
         """Stable recording/upload name, using the experiment's local start date."""
         return f"{self.subject_name}_{self.started_at:%Y%m%d}_{self.experiment_number:03d}"
-
-    def set_associated_external_data(self, associated: bool) -> None:
-        """Persist the hardware choice before allowing any block to start."""
-        state = {**self.state, "associated_external_data": associated}
-        _write_json_atomic(self.state_path, state)
-        self.state = state
-        self.external_acquisition_answered = True
 
     def finish(self) -> None:
         """Save the final local summary and request remote recording closure."""

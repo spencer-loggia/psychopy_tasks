@@ -266,10 +266,12 @@ These commands run in order on a background worker. START is queued once the exp
 number and required files exist, before Git and interpreter metadata probes (which can each
 take five seconds). State commands retry a missing/invalid acknowledgement after
 `uart.response_timeout_s` (0.25 s), plus a 0.02 s retry delay, using the identical packet.
-Only the final attempt waits the full action timeout: 15 seconds for experiment start
+Only the final normal attempt waits the full action timeout: 15 seconds for experiment start
 (`eye_tracker_experiment.start_timeout_s`), or 10 seconds for other state commands
-(`uart.state_timeout_s`). With the default one retry, each experiment start or ID command waits at most
-about 15.27 seconds on the transport, and a single dropped request can be resent after
+(`uart.state_timeout_s`). With retries enabled, a final timeout triggers one additional short exchange using the
+identical request and sequence to retrieve a cached acknowledgement without restarting acquisition.
+With the default one retry, each experiment start or ID command waits at most
+about 15.52 seconds on the transport, and a single dropped request can be resent after
 about 0.27 seconds instead of 15 seconds. When omitted, the start timeout is the greater of
 15 seconds and `uart.state_timeout_s`. `uart.state_retries` controls the number of retries;
 zero disables the short retry window and waits the full action timeout on the first attempt.
@@ -277,8 +279,17 @@ The UART is closed after each start/ID exchange or stop command. Task eye acquis
 handoff in its own worker, so the launcher and task rendering remain responsive.
 If experiment start is not confirmed, task eye acquisition stays off for that experiment
 to avoid writing numbered blocks into a previously active tracker experiment.
-Missing hardware, rejected commands, unexpected status flags, or recording failures show
-nonmodal warning dialogs and write warnings to stderr; experiments and tasks continue.
+Missing hardware, rejected commands, unexpected status flags, or recording failures write warnings
+and show nonmodal diagnostics. Before presentation, an enabled task eye tracker must confirm
+active tracking/configuration and (when expected) recording, plus fresh camera telemetry and
+healthy local eye CSV acquisition. A blink or missing pupil does not block readiness. Transient
+missing tracking/recording flags during startup are allowed to settle; health errors and sustained
+communication failures remain visible.
+If acquisition cannot be confirmed, a blocking **Eye acquisition unavailable** dialog appears on
+the experimenter screen. **Cancel block** is the default; closing/Escape also cancels. Only an
+explicit **Continue without confirmed eye data** choice allows that block to proceed, and the
+choice is recorded in `message_log.tsv`. The worker may recover later, so accepted blocks can
+contain partial eye data. This gate also applies when the sync bar is disabled.
 Command acknowledgement requires a checksum-valid reply with the exact request sequence
 and status `OK`. The `ERROR` flag separately reports tracker health: it does not undo a
 successful command acknowledgement. An acknowledged active experiment releases task
@@ -295,15 +306,41 @@ Repeated warnings of the same kind are suppressed within each session. Missing r
 does not invalidate otherwise valid gaze, but stopped, unconfigured, calibrating, stale,
 or error telemetry is unusable. Local eye CSV failures also warn without aborting the task.
 
-For latency diagnosis, enable Python INFO logging for `interface.experiment_eye_tracker`
-and `bin.eye_tracker_wire.controller`. State commands report executor queue wait, submission
-of all 64 bytes to the local tty, retries, and time until the response. Submission is not proof
-of remote receipt or completion; only a matching successful acknowledgement confirms the
-action. POLL traffic is not logged. The tty uses nonblocking writes and raw 8-N-1 with no
-flow control or deliberate pre-send sleep. Quiet-mode preparation and experiment-number
-reservation still precede experiment creation; pending earlier STOP commands must finish
-before the next START. Task recording uses START_TRACKING and the tracker's
-`record_on_tracking` setting, rather than a separate START_RECORDING command.
+Experiment START/UUID/STOP diagnostics are automatically appended to **`eye_tracker_uart.log`**
+in the local experiment directory. The trace includes queue wait, command name, request sequence,
+timeout budget, retries, UART submission/response times, status/flags, and whether block tracking
+was authorized. It uses a scoped logger without enabling high-volume POLL logging. If the trace
+file cannot be opened, acquisition still runs and diagnostics fall back to Python logging.
+Timeout/rejection dialogs identify the command, distinguishing `START_EXPERIMENT` from
+`SET_EXPERIMENT_ID`. INFO logging for `bin.eye_tracker_wire.controller` can also be enabled for
+standalone/task command diagnosis. Submission of 64 bytes is not proof of remote completion;
+a matching successful acknowledgement confirms the action.
+
+A tracker can visibly enter an experiment while the task computer reports startup failure:
+startup requires **both** `START_EXPERIMENT` and `SET_EXPERIMENT_ID` acknowledgements. If either
+is unconfirmed, the task worker deliberately sends **no `START_TRACKING`** for that experiment.
+The block warning identifies this handoff failure and points to the experiment UART trace.
+STOP uses an independent command, so a successful close followed by a successful new experiment
+is consistent with this failure sequence; it does not prove that the first block command was lost.
+The final identical-request retry can recover a lost final ACK, but not an explicit rejection or
+an outage that lasts beyond all attempts.
+
+When investigating a first-experiment-only failure, retain this trace from both the failed and
+successful experiments, plus the tracker's saved experiment `state.json` (`git_commit` and
+`git_dirty`). Those fields identify the tracker launcher build at startup, even if its checkout
+was updated later. One confirmed older-server cause, fixed in companion `eye_tracker` commit
+`9334243`, was rejection of `SET_EXPERIMENT_ID` while replacing an already-active experiment
+triggered data synchronization. The experiment had already opened, but its ID handshake failed;
+the cached rejection survived identical retries. That cause requires an already-active tracker
+experiment and enabled data sync; a timeout instead requires examining the recorded command and
+elapsed time. Cold camera initialization cannot delay `START_EXPERIMENT` in the current tracker:
+the camera opens later, on tracking start.
+
+The tty uses nonblocking writes and raw 8-N-1 with no flow control or deliberate pre-send sleep.
+Quiet-mode preparation and experiment-number reservation still precede experiment creation;
+pending earlier STOP commands must finish before the next START. Task recording uses
+START_TRACKING and the tracker's `record_on_tracking` setting, rather than a separate
+START_RECORDING command.
 
 Experiment synchronization defaults to disabled when this launcher section is absent;
 set `enabled` to `false` (or `uart.simulate` to `true`) for hardware-free operation.
@@ -503,7 +540,8 @@ End Experiment keeps the cleanup summary visible on the root menu and shows deta
 fails. Before shutdown, the details dialog offers **Retry**, **Shut down anyway**, and **Cancel shutdown**.
 Escape or closing this dialog cancels shutdown. Interface error/warning dialogs support arrow keys to select
 a button, Enter or keypad Enter to activate it, and Escape to dismiss. The same keys work in the sync-cancel
-dialog and the separate nonmodal eye-tracker warnings; tracker warnings never block task execution.
+dialog and the separate nonmodal eye-tracker warnings. The acquisition-readiness confirmation
+described above blocks presentation until the operator chooses whether to continue.
 
 Run System Diagnostic uses the configured `environment.python` interpreter and does not create an experiment or
 block. It checks that PsychoPy can import, `lgpio` can open GPIO chip 0, and the Pi-Plates DAQC2 driver can read the
@@ -1730,23 +1768,69 @@ Pi-Plates; other attached devices or enabled interfaces may still use them. See 
 [Raspberry Pi header map](https://www.raspberrypi.com/documentation/computers/raspberry-pi.html).
 
 The enabled bar contains five alternating black and white rectangles at the top of the
-subject's view, accounting for software rotation. The experimenter preview shows only a
-small `sync ON` / `sync OFF` phase indicator. Each rectangle is
+subject's view, accounting for software rotation. The experimenter preview shows a
+small sync status indicator (including a static codeword status, described below). Each rectangle is
 `subject_screen_width // 5` pixels wide; `height` is in pixels.
 
-At the start of every task/block with the bar enabled, a fixed start signal runs before
-task presentation: **four cycles of 500 ms ON followed by 500 ms OFF** (four seconds total,
-quantized to display refreshes). ON is bar phase 1 / GPIO HIGH; OFF is bar phase 0 / GPIO LOW.
-All five rectangles invert on each edge, with the GPIO updated in the same display flip
-callback. The first eight sync transitions record this signal using the usual `sync_bar_flip`
-and `sync_signal_on` / `sync_signal_off` events. The final OFF interval completes before
-the task proceeds, then the normal randomized sync schedule begins. Visual-only configurations
-emit the same screen signal; a disabled bar adds no signal or startup delay.
+With the bar enabled, every block uses this framing protocol (replacing the older four slow pulses):
+
+| Packet | Fields, transmitted left to right | Duration at 15 bits/s |
+| --- | --- | --- |
+| Start | `111001010110010010` (18-bit start marker), experiment number (8 bits), block number (8 bits) | 34/15 s ≈ 2.267 s |
+| End | `110110101001100010` (18-bit end marker), year minus 2000 (7 bits), month (4 bits), day (5 bits) | 34/15 s ≈ 2.267 s |
+
+All numeric fields are unsigned, **most-significant bit first**, with leading zeros. The marker
+hex values are `0x39592` and `0x36A62`; transmit exactly 18 bits, not a padded 24-bit word.
+`1` is phase 1 (white/black/white/black/white) and GPIO HIGH; `0` is phase 0
+(black/white/black/white/black) and GPIO LOW. A bit is a held level for 1/15 second;
+repeated identical bits hold that level without extra edges. Screen and GPIO changes share the
+same display-flip callback. Each bit occupies an integer number of display refreshes rounded
+up to at least 1/15 second (four refreshes at 60 Hz); other refresh rates or missed refreshes
+can lengthen a packet. There are no faster catch-up pulses and the final bit gets its full hold.
+
+The start marker occurs once per **block**, not once per behavioral trial. Stimulus presentation
+waits for the entire start packet. Immediately before the first bit, enabled eye acquisition is
+gated as described above. Enabled experiment video must supply actual encoded picture data,
+including fresh output after task/window setup; a spawned process, a file header, or a startup
+sleep does not count as readiness. Failed video readiness aborts the launch. Recording can include
+setup time; the marker identifies the beginning of the encoded block.
+
+When task presentation ends (including an orderly user exit), the task window becomes a blank
+background mask and sends the end/date packet before stopping eye acquisition, closing event
+logs, or releasing the display/GPIO. The date is the **experiment's local start date**, matching
+its folder name, even across midnight. After the last data bit is held, a synchronized flip
+returns the bar and GPIO to phase 0. Experiment video remains running through this footer.
+The launcher keeps the block busy through footer completion and cleanup; loops and rapid
+selections cannot launch another block early. An incomplete footer stops the loop and blocks
+further manual launches in that experiment; end the experiment before starting a new one.
+Forced termination/power loss can leave a packet incomplete and is not a valid end marker.
+
+Managed experiment and block numbers must fit 1–255; overflow is rejected rather than wrapped.
+Standalone tasks use experiment/block `0/0` and their local session start date. Years must fall
+within 2000–2127. `sync_protocol.json` records the marker definitions, encoded identity/date,
+and whether the footer completed. Event-log lifecycle codes 121–124 (`sync_start_begin`,
+`sync_start_end`, `sync_end_begin`, `sync_end_end`) distinguish first displayed bits and completed
+final holds. Ordinary visual/GPIO transition events continue throughout both packets, only on
+actual changes. `block_end` remains the final log row and occurs after the footer.
+
+These 18-bit markers are intended for this **structured stream**, not arbitrary binary noise.
+Their shifted boundaries have been checked against every possible 16-bit payload, including
+slow normal-train transitions, adjacent packets, and the return to idle. Normal intervals must
+be at least three encoded-bit periods (at least 200 ms); incompatible settings are rejected.
+The enabled launch config's minimum is 500 ms. Decode complete markers with their bit timing
+and then exactly 16 payload bits; damaged timing/markers should be rejected, not guessed.
+The payload has no checksum or error correction. Physical display/video/GPIO timing still
+requires validation on the recording rig.
+
+The experimenter preview shows **Sending codeword…** for each packet instead of mirroring
+its fast individual bits; normal `sync ON` / `sync OFF` indication resumes afterward.
+Visual-only configurations send identical screen packets. A disabled bar adds no packets or
+sync delay; the eye-acquisition confirmation still applies when eye tracking is enabled.
 
 Every subsequent scheduled flip inverts all five rectangles. Each interval is sampled uniformly from
 `interval_mean_seconds ± interval_variance_seconds`; both settings use seconds, so the
 defaults produce intervals from 800 ms to 1200 ms. There is no separate minimum-duration
-setting. Sync events retain separate requested and observed display times on the experiment
+setting; the configured lower bound must meet the framing constraint above. Sync events retain separate requested and observed display times on the experiment
 clock. When hardware is available, `sync_bar.sync_pin` toggles HIGH/LOW once in the display flip
 callback for each bar inversion, producing one electrical edge per inversion.
 This applies to eye-tracker calibration as well as the other experiment tasks, independently

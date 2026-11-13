@@ -169,6 +169,7 @@ def run_task(
         utils.verify_task_window_vblank(win)
     utils.configure_sync_bar(
         win, sync_bar, sync_pin=sync_pin, event_logger=logger,
+        session_logs=session_logs, screen_config=screen_config,
         experimenter_preview=preview, rotation_degrees=rotation,
         frame_duration_s=frame_dur, msg_logger=msg_logger,
     )
@@ -344,6 +345,7 @@ def run_task(
             "scope=scheduled_visual_transitions"
         ),
     )
+    utils.finish_block_sync(win, suppress_errors=True)
     msg_logger.log("INFO", f"session_end status={'aborted' if aborted else 'done'}")
     if preview is not None:
         preview.close()

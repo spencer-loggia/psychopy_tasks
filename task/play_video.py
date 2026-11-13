@@ -750,6 +750,7 @@ def run_task(
 
         utils.configure_sync_bar(
             win, sync_bar, sync_pin=sync_pin, event_logger=logger,
+            session_logs=session_logs, screen_config=screen_config,
             experimenter_preview=experimenter_preview,
             rotation_degrees=main_rotation_deg,
             frame_duration_s=frame_duration, msg_logger=msg_logger,
@@ -997,6 +998,7 @@ def run_task(
             except Exception as exc:
                 msg_logger.log("ERROR", f"periodic_pump_cleanup_failed error={exc}")
             _drain_pump_edges()
+        utils.finish_block_sync(win, suppress_errors=True)
         if experimenter_preview is not None:
             try:
                 experimenter_preview.close()

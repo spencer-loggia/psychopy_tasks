@@ -366,6 +366,7 @@ def run_task(
         )
         utils.configure_sync_bar(
             main_win, sync_bar, sync_pin=sync_pin, event_logger=logger,
+            session_logs=session_logs, screen_config=screen_config, eye_tracker=tracker,
             experimenter_preview=preview, rotation_degrees=rotation,
             frame_duration_s=sync_frame_duration_s, msg_logger=msg_logger,
         )
@@ -650,6 +651,7 @@ def run_task(
                 save_calibration(recovery_path, error=interrupted_error)
             except Exception as exc:
                 msg_logger.log("ERROR", f"eye_calibration_recovery_failed: {exc}")
+        utils.finish_block_sync(main_win, suppress_errors=True)
         if tracker is not None:
             try:
                 tracker.stop()

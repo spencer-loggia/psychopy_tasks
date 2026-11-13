@@ -43,19 +43,23 @@ class ResponseTimeout(ControllerError):
 
 
 class AcknowledgementTimeout(ControllerError):
-    def __init__(self, sequence: int, attempts: int) -> None:
+    def __init__(self, sequence: int, attempts: int, code: CommandCode | None = None) -> None:
+        command = f"{code.name} command" if code is not None else "command"
         super().__init__(
-            f"No acknowledgement for command sequence {sequence} after {attempts} attempt(s)"
+            f"No acknowledgement for {command} sequence {sequence} after {attempts} attempt(s)"
         )
         self.sequence = sequence
         self.attempts = attempts
+        self.code = code
 
 
 class CommandRejected(ControllerError):
-    def __init__(self, sequence: int, status: StatusCode) -> None:
-        super().__init__(f"Command sequence {sequence} was rejected: {status.name}")
+    def __init__(self, sequence: int, status: StatusCode, code: CommandCode | None = None) -> None:
+        command = code.name if code is not None else "Command"
+        super().__init__(f"{command} sequence {sequence} was rejected: {status.name}")
         self.sequence = sequence
         self.status = status
+        self.code = code
 
 
 class PacketChannel(Protocol):
@@ -69,9 +73,10 @@ class PacketChannel(Protocol):
 class SerialPacketChannel:
     """Raw 8-N-1 UART channel implemented with the Python standard library."""
 
-    def __init__(self, path: str | Path, *, baud: int = DEFAULT_BAUD) -> None:
+    def __init__(self, path: str | Path, *, baud: int = DEFAULT_BAUD, logger=None) -> None:
         self.path = Path(path)
         self.baud = baud
+        self._log = logger if logger is not None else _LOG
         self._lock = threading.Lock()
         self._closed = False
         try:
@@ -100,7 +105,7 @@ class SerialPacketChannel:
                 if command.code is not CommandCode.POLL:
                     # write() confirms submission to the local tty, not receipt
                     # or completion on the tracker. Keep these timings separate.
-                    _LOG.info(
+                    self._log.info(
                         "Eye UART %s sequence=%d submitted 64 bytes in %.3fs; waiting for ACK",
                         command.code.name, expected_sequence, written_at - started,
                     )
@@ -108,12 +113,19 @@ class SerialPacketChannel:
                     response = _read_status_packet(self._fd, self._pending, deadline)
                     if _response_matches_request(response, expected_sequence):
                         if command.code is not CommandCode.POLL:
-                            _LOG.info(
-                                "Eye UART %s sequence=%d response after %.3fs (write %.3fs)",
+                            status = decode_status(response)
+                            self._log.info(
+                                "Eye UART %s sequence=%d response after %.3fs (write %.3fs) status=%s flags=%#x",
                                 command.code.name, expected_sequence,
                                 time.monotonic() - written_at, written_at - started,
+                                status.status.name, int(status.flags),
                             )
                         return response
+                    if command.code is not CommandCode.POLL:
+                        status = decode_status(response)
+                        self._log.info("Eye UART %s sequence=%d ignored response sequence=%d status=%s flags=%#x",
+                                       command.code.name, expected_sequence, status.request_sequence,
+                                       status.status.name, int(status.flags))
             except OSError as exc:
                 raise ControllerError(f"UART transaction failed: {exc}") from exc
 
@@ -153,6 +165,7 @@ class EyeTrackerController:
         retries: int = 3,
         retry_delay_s: float = DEFAULT_RETRY_DELAY_S,
         sleep: Callable[[float], None] = time.sleep,
+        logger=None,
     ) -> None:
         if initial_sequence is None:
             initial_sequence = secrets.randbelow(0xFFFFFFFF) + 1
@@ -167,6 +180,7 @@ class EyeTrackerController:
         if retry_delay_s < 0.0:
             raise ValueError("retry_delay_s cannot be negative")
         self.channel = channel
+        self._log = logger if logger is not None else _LOG
         self.response_timeout_s = response_timeout_s
         self.state_timeout_s = state_timeout_s
         self.retries = retries
@@ -263,11 +277,21 @@ class EyeTrackerController:
                 min(self.response_timeout_s, self.state_timeout_s)
                 if attempt + 1 < attempts else self.state_timeout_s
             )
+            started = time.monotonic()
+            self._log.info("Eye UART %s sequence=%d attempt=%d timeout_s=%.3f experiment_number=%s block_number=%s",
+                           command.code.name, sequence, attempt + 1, timeout,
+                           command.experiment_number, command.block_number)
             try:
                 status = self._exchange(command_packet, timeout)
-            except (ProtocolError, ResponseTimeout):
+            except (ProtocolError, ResponseTimeout) as exc:
+                self._log.info("Eye UART %s sequence=%d attempt=%d unconfirmed after %.3fs: %s",
+                                  command.code.name, sequence, attempt + 1, time.monotonic() - started, exc)
                 status = None
-            acknowledged = self._matching_ack(sequence, status)
+            if status is not None:
+                self._log.info("Eye UART %s sequence=%d reply after %.3fs status=%s flags=%#x",
+                               command.code.name, sequence, time.monotonic() - started,
+                               status.status.name, int(status.flags))
+            acknowledged = self._matching_ack(sequence, status, command.code)
             if acknowledged is not None:
                 return acknowledged
             # A state action is synchronous. If its response was lost or corrupt,
@@ -275,13 +299,32 @@ class EyeTrackerController:
             # idempotent and preserves a rejection outcome. A POLL is never used
             # as proof that a state command succeeded.
             if attempt + 1 < attempts:
-                _LOG.info(
+                self._log.info(
                     "Eye UART %s sequence=%d retry %d/%d after missing/invalid ACK",
                     command.code.name, sequence, attempt + 1, self.retries,
                 )
                 if self.retry_delay_s:
                     self._sleep(self.retry_delay_s)
-        raise AcknowledgementTimeout(sequence, attempts)
+        if self.retries:
+            # The slow action may have completed just as its last ACK was lost.
+            # Retrieve the cached result with the SAME packet/sequence: never
+            # infer success from POLL or allocate another experiment/block.
+            self._log.info("Eye UART %s sequence=%d recovering final ACK timeout_s=%.3f",
+                           command.code.name, sequence, self.response_timeout_s)
+            try:
+                status = self._exchange(command_packet, self.response_timeout_s)
+            except (ProtocolError, ResponseTimeout) as exc:
+                self._log.info("Eye UART %s sequence=%d final ACK recovery unconfirmed: %s",
+                                  command.code.name, sequence, exc)
+                status = None
+            if status is not None:
+                self._log.info("Eye UART %s sequence=%d recovered reply status=%s flags=%#x",
+                               command.code.name, sequence, status.status.name, int(status.flags))
+            acknowledged = self._matching_ack(sequence, status, command.code)
+            if acknowledged is not None:
+                return acknowledged
+            attempts += 1
+        raise AcknowledgementTimeout(sequence, attempts, command.code)
 
     def _exchange(self, packet: bytes, timeout_s: float | None = None) -> DecodedStatus:
         timeout = self.response_timeout_s if timeout_s is None else timeout_s
@@ -300,11 +343,11 @@ class EyeTrackerController:
         return status
 
     @staticmethod
-    def _matching_ack(sequence: int, status: DecodedStatus | None) -> DecodedStatus | None:
+    def _matching_ack(sequence: int, status: DecodedStatus | None, code: CommandCode | None = None) -> DecodedStatus | None:
         if status is None or status.request_sequence != sequence:
             return None
         if status.status is not StatusCode.OK:
-            raise CommandRejected(sequence, status.status)
+            raise CommandRejected(sequence, status.status, code)
         return status
 
     def _take_sequence(self) -> int:

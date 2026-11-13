@@ -1,7 +1,7 @@
 """Record the Arducam B0267 aggregate stream with minimal Python overhead.
 
-The camera and encoder stay in ``rpicam-vid``. Python only starts and stops that
-process; no frame is copied through Python.
+The camera and encoder stay in ``rpicam-vid``. Python starts and stops that
+process and can inspect its initial encoded output to confirm readiness.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ import argparse
 import json
 import math
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -25,6 +26,7 @@ from typing import Sequence
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
 RAW_H264_SUFFIXES = {".264", ".h264"}
+_NAL_START = re.compile(rb"\x00\x00(?:\x00)?\x01([\x00-\xff])")
 
 
 class RecordingError(RuntimeError):
@@ -155,6 +157,7 @@ class RecorderConfig:
                 "--timeout",
                 str(timeout_ms),
                 "--nopreview",
+                "--flush",
                 "--mode",
                 self.sensor_mode,
                 "--width",
@@ -212,6 +215,92 @@ def _require_executable(name: str) -> None:
         raise RecordingError(f"Required executable was not found on PATH: {name}")
 
 
+def _file_signature(path: Path):
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+class _PictureProbe:
+    """Recognize a completed H.264 picture-slice NAL with bounded memory.
+
+    Annex B start codes delimit NAL units; types 1 and 5 carry picture slices.
+    SPS/PPS headers alone do not establish that the camera has delivered data.
+    Only five bytes carry over between reads, even for very large I-frames.
+    """
+
+    def __init__(self):
+        self.tail = b""
+        self.offset = 0
+        self.picture_end_header = None
+
+    def feed(self, chunk: bytes) -> bool:
+        data = self.tail + chunk
+        origin = self.offset - len(self.tail)
+        for match in _NAL_START.finditer(data):
+            start = origin + match.start()
+            if self.picture_end_header is not None and start > self.picture_end_header:
+                return True
+            header = match[1][0]
+            self.picture_end_header = (
+                origin + match.end()
+                if not header & 0x80 and header & 0x1F in (1, 5) else None
+            )
+        self.offset += len(chunk)
+        self.tail = data[-5:]
+        return False
+
+
+def _wait_for_picture(destination, timeout, *, start_offset=0, process=None,
+                      initial_signature=None, error=RecordingError):
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout must be positive and finite")
+    deadline = time.monotonic() + timeout
+    probe = _PictureProbe()
+    stream = None
+    try:
+        while True:
+            if process is not None and process.poll() is not None:
+                raise error(f"Recorder exited before acquisition was ready (status {process.returncode})")
+            if stream is None:
+                signature = _file_signature(destination)
+                if signature is not None and signature != initial_signature:
+                    stream = destination.open("rb")
+                    stream.seek(start_offset)
+            chunk = stream.read(32768) if stream is not None else b""
+            if chunk and probe.feed(chunk):
+                if process is not None and process.poll() is not None:
+                    raise error("Recorder stopped while acquisition readiness was checked")
+                return destination
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise error("Timed out waiting for encoded camera picture data")
+            if not chunk:
+                time.sleep(min(0.02, remaining))
+    except OSError as exc:
+        raise error(f"Could not check camera acquisition: {exc}") from exc
+    finally:
+        if stream is not None:
+            stream.close()
+
+
+def wait_for_fresh_picture(destination: str | Path, timeout: float = 15.0) -> Path:
+    """Confirm new picture data immediately before emitting a block start code.
+
+    Tasks use this after window setup and eye-tracker confirmation, because a
+    recorder that was ready before the task launched might since have stalled.
+    Previously recorded pictures never satisfy this check.
+    """
+    destination = Path(destination)
+    try:
+        offset = destination.stat().st_size
+    except OSError as exc:
+        raise RecordingError(f"Cannot check fresh camera acquisition: {exc}") from exc
+    return _wait_for_picture(destination, timeout, start_offset=offset)
+
+
 class Recording:
     """A running ``rpicam-vid`` child process.
 
@@ -224,10 +313,13 @@ class Recording:
         process: subprocess.Popen[str],
         destination: Path,
         command: Sequence[str],
+        *,
+        initial_signature=None,
     ) -> None:
         self.process = process
         self.destination = destination
         self.command = tuple(command)
+        self._initial_signature = initial_signature
         self._stderr_lines: deque[str] = deque(maxlen=100)
         self._stop_lock = threading.Lock()
         self._stop_requested = False
@@ -288,6 +380,17 @@ class Recording:
         self.process.wait(timeout=timeout)
         self._stderr_thread.join(timeout=1)
         return self._validate_completed(allow_interrupted=self._stop_requested)
+
+    def wait_until_ready(self, timeout: float = 15.0) -> Path:
+        """Wait for encoded picture data while the recorder remains running.
+
+        This reads only startup output, in bounded chunks, without decoding or
+        monitoring frames during the task. A complete picture-slice NAL must
+        reach disk; process startup, file creation and codec headers do not
+        count. The caller still owns ``stop()`` if this raises.
+        """
+        return _wait_for_picture(self.destination, timeout, process=self.process,
+                                 initial_signature=self._initial_signature, error=self._error)
 
     def stop(self, timeout: float = 15.0) -> Path:
         """Gracefully stop and flush the recording, escalating only if stuck."""
@@ -379,6 +482,7 @@ def record(
         _require_executable("nice")
 
     command = config.command(output_path, duration_seconds)
+    initial_signature = _file_signature(output_path)
     try:
         process = subprocess.Popen(
             command,
@@ -392,7 +496,7 @@ def record(
     except OSError as exc:
         raise RecordingError(f"Could not start recorder: {exc}") from exc
 
-    recording = Recording(process, output_path, command)
+    recording = Recording(process, output_path, command, initial_signature=initial_signature)
     if config.startup_check_seconds:
         time.sleep(config.startup_check_seconds)
     if process.poll() not in {None, 0}:

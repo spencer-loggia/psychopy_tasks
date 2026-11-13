@@ -1856,7 +1856,10 @@ def _experimenter_preview_process(
         if sync_bar_shared is None or sync_bar_shared[0] <= 0:
             return
         sync_drawn_phase = int(sync_bar_shared[3])
-        set_preview_text(sync_status_text, "sync ON" if sync_drawn_phase else "sync OFF")
+        label = "Sending codeword…" if sync_drawn_phase == 2 else (
+            "sync ON" if sync_drawn_phase else "sync OFF"
+        )
+        set_preview_text(sync_status_text, label)
         sync_status_text.draw()
 
     def _read_settings_keys():
@@ -3029,9 +3032,16 @@ class ExperimenterPreview:
         width, screen_height = oriented_size(native_size, rotation_degrees)
         self._sync_bar_shared[1:] = (width, screen_height, 0)
         self._sync_bar_shared[0] = height
+        self._sync_bar_phase = 0
 
     def set_sync_bar_phase(self, phase: int) -> None:
-        self._sync_bar_shared[3] = phase
+        self._sync_bar_phase = phase
+        if self._sync_bar_shared[3] != 2:
+            self._sync_bar_shared[3] = phase
+
+    def set_sync_codeword(self, active: bool) -> None:
+        """Show one status during fast packets instead of redrawing every bit."""
+        self._sync_bar_shared[3] = 2 if active else self._sync_bar_phase
 
     def poll_settings_keyboard(self) -> None:
         """Forward settings input when the subject window owns keyboard focus.

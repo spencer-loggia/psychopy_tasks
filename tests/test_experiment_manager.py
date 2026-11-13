@@ -51,6 +51,25 @@ class FakeClock:
 
 
 class ExperimentManagerTests(unittest.TestCase):
+    def test_incomplete_footer_blocks_manual_relaunch_as_well_as_loops(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            launch_config, launch_path = self._project(root)
+            manager = ExperimentManager(
+                working_dir=root, launch_config_path=launch_path, launch_config=launch_config,
+                subject_name="Subject One", subject_code="S1",
+            )
+            kwargs = dict(task_name="demo", launch_value="task/demo.py", config_value="configs/demo.json")
+            block = manager.prepare_block(**kwargs)
+            protocol = block.output_dir / "sync_protocol.json"
+            protocol.write_text('{"end_complete": false}')
+            manager.finish_block(block)
+            with self.assertRaisesRegex(RuntimeError, "date code did not complete"):
+                manager.prepare_block(**kwargs)
+            self.assertEqual(len(manager.blocks), 1)
+            protocol.write_text('{"end_complete": true}')
+            self.assertEqual(manager.prepare_block(**kwargs).block_num, 2)
+
     def test_saved_configs_prune_inactive_settings_after_runtime_overrides(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

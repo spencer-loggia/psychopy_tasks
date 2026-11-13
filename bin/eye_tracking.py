@@ -73,9 +73,9 @@ class UARTEyeTrackerConfig:
             raise ValueError("uart.state_retries must be nonnegative")
 
     def command_wait_s(self, *, state_timeout_s=None):
-        """Transport budget for short retries followed by the final full wait."""
+        """Budget for retries, the slow action wait and final cached-ACK recovery."""
         timeout = self.state_timeout_s if state_timeout_s is None else state_timeout_s
-        return timeout + self.state_retries * (
+        return timeout + (self.response_timeout_s if self.state_retries else 0) + self.state_retries * (
             min(self.response_timeout_s, timeout) + DEFAULT_RETRY_DELAY_S
         )
 
@@ -399,10 +399,52 @@ class UARTEyeTracker:
         self._on_state = on_state
         self._callback_error = None
         self.warnings = EyeTrackerWarnings()
+        self._ready = threading.Event()
+        self._ready_perf_s = 0.0
+        self._startup_error = None
+        self._worker_done = threading.Event()
+        self._ever_ready = False
+        self._startup_deadline = 0.0
+
+    def wait_until_ready(self, timeout_s=None):
+        """Wait for live acquisition, independently of pupil detection validity.
+
+        START/UUID acknowledgements alone do not establish camera readiness.
+        The worker must also receive a fresh frame with the required tracking
+        and recording flags. Call before presenting any block sync code.
+        """
+        if timeout_s is None:
+            timeout_s = self._experiment_start_timeout_s() + 3 * self.config.command_wait_s() + 2
+        if not math.isfinite(timeout_s) or timeout_s < 0:
+            raise ValueError("Eye tracker readiness timeout must be finite and non-negative")
+        deadline = time.monotonic() + timeout_s
+        while True:
+            with self._lock:
+                ready = self._ready.is_set() and (
+                    time.perf_counter() - self._ready_perf_s <= self.config.max_sample_age_s
+                )
+                error = self._startup_error
+            if ready and not self._stop.is_set():
+                return
+            if error is not None:
+                raise RuntimeError(f"Eye tracker acquisition could not be confirmed: {error}")
+            if self._worker_done.is_set() or self._thread is None or self._stop.is_set():
+                raise RuntimeError("Eye tracker acquisition is not running")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "Eye tracker has not supplied a fresh frame with tracking/configuration"
+                    + (" and recording" if self.config.expect_recording else "")
+                    + " confirmed"
+                )
+            self._worker_done.wait(min(0.02, remaining))
 
     def start(self):
         if self._thread is not None:
             raise RuntimeError("Eye tracker already started")
+        self._startup_deadline = time.monotonic() + (
+            self._experiment_start_timeout_s() + 3 * self.config.command_wait_s() + 2
+        )
         self._thread = threading.Thread(target=self._run, name="eye-uart", daemon=True)
         self._thread.start()
 
@@ -425,7 +467,7 @@ class UARTEyeTracker:
         if self._callback_error is not None:
             self.warnings.warn("consumer", f"Eye sample consumer failed: {self._callback_error}")
 
-    def _check_status(self, status):
+    def _check_status(self, status, *, starting=False):
         problems = {}
         if status.status != StatusCode.OK or status.flags & StatusFlag.ERROR:
             problems["status"] = (
@@ -437,11 +479,11 @@ class UARTEyeTracker:
             problems["calibrating"] = "Eye tracker is in calibration mode; tracking/recording may not have started."
         if status.flags & StatusFlag.SHUTTING_DOWN:
             problems["shutdown"] = "Eye tracker is shutting down; eye measurements are unavailable."
-        if not status.flags & StatusFlag.TRACKING:
+        if not starting and not status.flags & StatusFlag.TRACKING:
             problems["tracking"] = "Eye tracker did not start tracking, or tracking has stopped."
         if not status.flags & StatusFlag.CONFIGURED or status.configured_eye_count < 1:
             problems["configuration"] = "Eye tracker is not configured; eye measurements are unavailable."
-        if self.config.expect_recording and not status.flags & StatusFlag.RECORDING:
+        if not starting and self.config.expect_recording and not status.flags & StatusFlag.RECORDING:
             problems["recording"] = "Eye tracker recording did not start, or has stopped. Check the tracker Pi's recording settings and storage."
         if self.get_state().rejection_reason == "service_restarted":
             problems["restart"] = "Eye tracker restarted; gaze will remain unavailable for this task. Check calibration before the next task."
@@ -451,27 +493,35 @@ class UARTEyeTracker:
         pending = os.environ.get(EXPERIMENT_UART_PENDING_ENV)
         if not pending:
             return
+        timeout = self._experiment_start_timeout_s()
+        deadline = time.monotonic() + timeout
+        while Path(pending).exists() and not self._stop.is_set():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Experiment START_EXPERIMENT is still pending")
+            self._stop.wait(0.05)
+        ready = os.environ.get(EXPERIMENT_UART_READY_ENV)
+        if ready and not self._stop.is_set() and not Path(ready).is_file():
+            raise RuntimeError(
+                "Eye tracker experiment start was not confirmed; START_TRACKING was not sent. "
+                "Check eye_tracker_uart.log in the experiment directory."
+            )
+
+    def _experiment_start_timeout_s(self):
+        pending = os.environ.get(EXPERIMENT_UART_PENDING_ENV)
+        if not pending:
+            return 0.0
         timeout = 2 * self.config.command_wait_s(
             state_timeout_s=max(15.0, self.config.state_timeout_s),
         ) + 2
         try:
             budget = Path(pending).read_text(encoding="ascii").strip()
         except FileNotFoundError:
-            budget = ""
+            return 0.0  # The launcher already completed its handoff.
         if budget:
             timeout = float(budget)
             if not math.isfinite(timeout) or timeout <= 0:
                 raise ValueError("Invalid experiment UART handoff timeout")
-        deadline = time.monotonic() + timeout
-        while Path(pending).exists() and not self._stop.is_set():
-            if time.monotonic() >= deadline:
-                raise TimeoutError("Experiment START_EXPERIMENT is still pending; task continues without eye tracking")
-            self._stop.wait(0.05)
-        ready = os.environ.get(EXPERIMENT_UART_READY_ENV)
-        if ready and not self._stop.is_set() and not Path(ready).is_file():
-            raise RuntimeError(
-                "Eye tracker experiment start was not confirmed; task continues without eye tracking"
-            )
+        return timeout
 
     def _publish_state(self):
         """Optional worker-side consumer; never perform serial/file I/O on flip."""
@@ -495,6 +545,23 @@ class UARTEyeTracker:
                 task_time_ns=self.task_clock.task_time_ns(timestamp_perf_ns=received_perf_ns),
             )
             is_new = self.filter._last_key != previous_key
+            required = StatusFlag.TRACKING | StatusFlag.CONFIGURED
+            if self.config.expect_recording:
+                required |= StatusFlag.RECORDING
+            ready = (
+                status.status == StatusCode.OK and status.flags & required == required
+                and not status.flags & (StatusFlag.ERROR | StatusFlag.RESULT_STALE
+                                        | StatusFlag.CALIBRATING | StatusFlag.SHUTTING_DOWN)
+                and status.configured_eye_count > 0 and status.sensor_timestamp_ns > 0
+                and state.rejection_reason not in ("service_restarted", "out_of_order")
+                and received_perf_ns / 1_000_000_000 - state.timestamp_perf_s <= self.config.max_sample_age_s
+            )
+            if ready:
+                self._ready_perf_s = state.timestamp_perf_s
+                self._ready.set()
+                self._ever_ready = True
+            else:
+                self._ready.clear()
         # Pass the exact acquisition snapshot, never a later get_state() read.
         if is_new and self._on_measurement is not None:
             self._on_measurement(state)
@@ -526,7 +593,7 @@ class UARTEyeTracker:
                     status = controller.start_tracking(block_number=block_number, **identity)
                     received_perf_ns = time.perf_counter_ns()
                     self._consume_measurement(status, received_perf_ns=received_perf_ns)
-                    self._check_status(status)
+                    self._check_status(status, starting=not self._ever_ready)
                     self._publish_state()
             next_poll = time.perf_counter()
             consecutive_link_errors = 0
@@ -547,6 +614,9 @@ class UARTEyeTracker:
                                 rejection_reason=None,
                                 error=None,
                             )
+                            self._ready_perf_s = sent_s
+                            self._ready.set()
+                            self._ever_ready = True
                         if self._on_measurement is not None:
                             self._on_measurement(self.filter.state)
                     else:
@@ -556,10 +626,13 @@ class UARTEyeTracker:
                             status, received_perf_ns=received_perf_ns,
                             round_trip_s=(received_perf_ns - sent_ns) / 1_000_000_000,
                         )
-                        self._check_status(status)
+                        self._check_status(status, starting=(
+                            not self._ever_ready and time.monotonic() < self._startup_deadline
+                        ))
                     consecutive_link_errors = 0
                 except Exception as exc:
                     with self._lock:
+                        self._ready.clear()
                         self.filter.invalidate("uart_error", error=str(exc))
                     consecutive_link_errors += 1
                     _LOG.info("Eye UART poll failed (%d consecutive): %s", consecutive_link_errors, exc)
@@ -578,10 +651,14 @@ class UARTEyeTracker:
                 self._stop.wait(max(0, next_poll - time.perf_counter()))
         except Exception as exc:
             with self._lock:
+                self._ready.clear()
+                self._startup_error = str(exc)
                 self.filter.invalidate("uart_error", error=str(exc))
             self.warnings.warn("link", f"Eye tracker is unavailable or tracking/recording start could not be confirmed: {exc}")
             self._publish_state()
         finally:
+            self._worker_done.set()
+            self._ready.clear()
             try:
                 if start_attempted and controller is not None:
                     status = controller.send_state_command(CommandCode.STOP_TRACKING)

@@ -765,6 +765,7 @@ def run_task(
         )
         utils.configure_sync_bar(
             win, sync_bar, sync_pin=sync_pin, event_logger=logger,
+            session_logs=session_logs, screen_config=screen_config,
             experimenter_preview=experimenter_preview,
             rotation_degrees=software_stimulus_rotation(main_screen.rotation),
             frame_duration_s=frame_dur, msg_logger=msg_logger,
@@ -1425,6 +1426,7 @@ def run_task(
             _set_buzzer_pin(0, context="task_cleanup")
         except Exception:
             pass
+        utils.finish_block_sync(win, suppress_errors=True)
         msg = f"session_end status={task_end_notes}"
         try:
             msg_logger.log("INFO", msg)

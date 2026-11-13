@@ -248,6 +248,8 @@ class TaskEyeTrackingTests(unittest.TestCase):
         ):
             session = TaskEyeTrackingSession(EyeTrackingSettings(show_preview=False), output_dir="unused")
             self.assertEqual(session.get_position(), (0, 0))
+            with self.assertRaisesRegex(RuntimeError, "disk full"):
+                session.wait_until_ready(0)
             session.close()
         self.warning.assert_called_once()
         tracker.stop.assert_called_once()

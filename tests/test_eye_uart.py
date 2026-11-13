@@ -48,6 +48,26 @@ def status_bytes(*, sequence=42, code=0, edits=()):
 
 
 class UARTProtocolTests(unittest.TestCase):
+    def test_start_and_uuid_ack_failures_name_the_command(self):
+        identifier = "00112233-4455-4677-8899-aabbccddeeff"
+        for failed_code in (CommandCode.START_EXPERIMENT, CommandCode.SET_EXPERIMENT_ID):
+            for rejected in (False, True):
+                with self.subTest(code=failed_code, rejected=rejected):
+                    channel = Mock()
+                    def exchange(packet, timeout):
+                        command = decode_command(packet)
+                        if command.code == failed_code:
+                            if not rejected:
+                                raise ResponseTimeout("missing response")
+                            return status_bytes(sequence=command.sequence, code=StatusCode.INVALID_STATE)
+                        return status_bytes(sequence=command.sequence)
+                    channel.exchange.side_effect = exchange
+                    controller = EyeTrackerController(channel, initial_sequence=42, retries=0)
+                    kind = CommandRejected if rejected else AcknowledgementTimeout
+                    with self.assertRaisesRegex(kind, failed_code.name) as failure:
+                        controller.start_experiment("Yuri", experiment_number=7, experiment_id=identifier)
+                    self.assertEqual(failure.exception.code, failed_code)
+
     def test_run_identity_packets_preserve_uuid_number_and_padding(self):
         identifier = "00112233-4455-4677-8899-aabbccddeeff"
         for code, field, number_field in (
@@ -376,9 +396,9 @@ class UARTProtocolTests(unittest.TestCase):
     def test_state_retry_budget_and_slow_action_timeout(self):
         for retries, response_timeout, state_timeout, expected in (
             (0, 0.25, 15, [15]),
-            (1, 0.25, 15, [0.25, 15]),
-            (2, 0.25, 10, [0.25, 0.25, 10]),
-            (1, 0.25, 0.1, [0.1, 0.1]),
+            (1, 0.25, 15, [0.25, 15, 0.25]),
+            (2, 0.25, 10, [0.25, 0.25, 10, 0.25]),
+            (1, 0.25, 0.1, [0.1, 0.1, 0.25]),
         ):
             with self.subTest(retries=retries, state_timeout=state_timeout):
                 channel = Mock()
@@ -389,10 +409,25 @@ class UARTProtocolTests(unittest.TestCase):
                 )
                 with self.assertRaises(AcknowledgementTimeout) as failure:
                     controller.start_recording(block_number=7)
-                self.assertEqual(failure.exception.attempts, retries + 1)
+                self.assertEqual(failure.exception.attempts, retries + 1 + bool(retries))
                 calls = channel.exchange.call_args_list
                 self.assertEqual([call.args[1] for call in calls], expected)
                 self.assertEqual(len({call.args[0] for call in calls}), 1)
+
+    def test_lost_final_ack_recovers_cached_outcome_without_restarting(self):
+        for outcome in (StatusCode.OK, StatusCode.INVALID_STATE):
+            channel = Mock()
+            channel.exchange.side_effect = [ResponseTimeout("early"), ResponseTimeout("lost final ACK"),
+                                            status_bytes(code=outcome)]
+            controller = EyeTrackerController(channel, initial_sequence=42, retries=1, retry_delay_s=0)
+            if outcome == StatusCode.OK:
+                self.assertEqual(controller.start_experiment("Yuri").status, StatusCode.OK)
+            else:
+                with self.assertRaises(CommandRejected):
+                    controller.start_experiment("Yuri")
+            calls = channel.exchange.call_args_list
+            self.assertEqual(len({call.args[0] for call in calls}), 1)
+            self.assertEqual([call.args[1] for call in calls], [0.25, 10, 0.25])
 
     def test_start_commands_reach_serial_peer_promptly_after_dropped_packet(self):
         for method, kwargs in (
@@ -406,7 +441,11 @@ class UARTProtocolTests(unittest.TestCase):
     def test_slow_start_ack_survives_early_retry_and_late_duplicate(self):
         self._serial_start_exchange("start_tracking", {"block_number": 3}, slow_ack=True)
 
-    def _serial_start_exchange(self, method, kwargs, *, slow_ack):
+    def test_final_start_ack_is_recovered_over_serial_without_new_sequence(self):
+        self._serial_start_exchange("start_experiment", {"subject": "Yuri"},
+                                    slow_ack=False, lost_final_ack=True)
+
+    def _serial_start_exchange(self, method, kwargs, *, slow_ack, lost_final_ack=False):
         master, slave = pty.openpty()
         errors, received = [], []
         started = time.monotonic()
@@ -429,6 +468,8 @@ class UARTProtocolTests(unittest.TestCase):
                 first = read_command()  # Simulate a lost first request/ACK.
                 second = read_command()
                 self.assertEqual(first, second)
+                if lost_final_ack:
+                    self.assertEqual(read_command(), first)
                 if slow_ack:
                     # Longer than the fast retry timeout, shorter than the
                     # action timeout: completion must still be accepted.
@@ -445,7 +486,7 @@ class UARTProtocolTests(unittest.TestCase):
             channel = SerialPacketChannel(os.ttyname(slave), baud=9600)
             controller = EyeTrackerController(
                 channel, initial_sequence=42, retries=1,
-                response_timeout_s=0.05, state_timeout_s=1.0,
+                response_timeout_s=0.05, state_timeout_s=0.12 if lost_final_ack else 1.0,
                 retry_delay_s=0.01,
             )
             worker = threading.Thread(target=peer, daemon=True)

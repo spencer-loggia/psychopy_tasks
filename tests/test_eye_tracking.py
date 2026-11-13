@@ -39,6 +39,42 @@ def sample(frame=1, **kwargs):
 
 
 class EyeTrackingTests(unittest.TestCase):
+    def test_readiness_requires_fresh_recording_but_accepts_blinks(self):
+        tracker = UARTEyeTracker()
+        tracker._thread = Mock()
+        now = time.perf_counter_ns()
+        status = sample(flags=StatusFlag.TRACKING | StatusFlag.CONFIGURED | StatusFlag.RECORDING)
+        blink = replace(status.eyes[0], valid=False, blink=True)
+        tracker._consume_measurement(replace(status, eyes=(blink, status.eyes[1])), received_perf_ns=now)
+        self.assertFalse(tracker.get_state().valid)
+        tracker.wait_until_ready(0)
+        for flag in (StatusFlag.RECORDING, StatusFlag.TRACKING, StatusFlag.CONFIGURED):
+            with self.subTest(missing_flag=flag):
+                tracker._consume_measurement(replace(status, flags=status.flags & ~flag), received_perf_ns=now)
+                with self.assertRaises(TimeoutError):
+                    tracker.wait_until_ready(0)
+        tracker._consume_measurement(status, received_perf_ns=now)
+        with patch("bin.eye_tracking.time.perf_counter", return_value=now / 1e9 + 1):
+            with self.assertRaises(TimeoutError):
+                tracker.wait_until_ready(0)
+
+    def test_readiness_reports_startup_failure_and_simulation_waits_for_sample(self):
+        tracker = UARTEyeTracker()
+        with patch("bin.eye_tracking.SerialPacketChannel", side_effect=OSError("no UART")):
+            tracker.start()
+            try:
+                with self.assertRaisesRegex(RuntimeError, "no UART"):
+                    tracker.wait_until_ready(1)
+            finally:
+                tracker.stop()
+        tracker = UARTEyeTracker(uart_config=UARTEyeTrackerConfig(simulate=True))
+        tracker.start()
+        try:
+            tracker.wait_until_ready(1)
+            self.assertGreater(tracker.get_state().frame_sequence, 0)
+        finally:
+            tracker.stop()
+
     def test_poll_warnings_require_sustained_failure_and_reset_after_recovery(self):
         for failures, warn in (([1, 1], False), ([2, 2], False), ([3], True)):
             with self.subTest(failures=failures):
@@ -144,6 +180,18 @@ class EyeTrackingTests(unittest.TestCase):
         tracker = UARTEyeTracker(uart_config=UARTEyeTrackerConfig(expect_recording=False))
         tracker._check_status(sample())
         self.warning.assert_not_called()
+
+    def test_startup_defers_missing_active_flags_but_not_health_errors(self):
+        tracker = UARTEyeTracker()
+        tracker._check_status(sample(flags=StatusFlag.CONFIGURED), starting=True)
+        self.warning.assert_not_called()
+        tracker._check_status(sample(flags=StatusFlag.CONFIGURED | StatusFlag.ERROR), starting=True)
+        self.warning.assert_called_once()
+        self.assertIn("health error", self.warning.call_args.args[0])
+        self.assertNotIn("did not start", self.warning.call_args.args[0])
+        tracker._check_status(sample(flags=StatusFlag.CONFIGURED))
+        self.assertEqual(self.warning.call_count, 2)
+        self.assertIn("recording did not start", self.warning.call_args.args[0])
 
     def test_shutting_down_flag_warns_and_invalidates_gaze(self):
         tracker = UARTEyeTracker()

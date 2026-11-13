@@ -1,4 +1,6 @@
 import csv
+import datetime as dt
+from itertools import groupby
 import math
 import os
 import random
@@ -8,7 +10,8 @@ from unittest.mock import Mock, patch
 
 from bin.logger import SessionLogBundle
 from bin.screen import ExperimenterPreview, oriented_size, rotate_centered_point
-from bin.sync_bar import SyncBar, SyncBarConfig, sync_bar_rectangles
+from bin.sync_bar import (BIT_PERIOD_NS, START_CODE, END_CODE, SyncBar, SyncBarConfig,
+                          start_codeword, end_codeword, sync_bar_rectangles)
 from bin.task_clock import EXPERIMENT_ORIGIN_ENV
 
 
@@ -54,6 +57,64 @@ class SyncConfigTests(unittest.TestCase):
         for config in (True, [], "enabled"):
             with self.subTest(config=config), self.assertRaises(ValueError):
                 SyncBarConfig.from_mapping(config)
+
+
+class SyncCodewordTests(unittest.TestCase):
+    def test_payload_order_width_and_ranges(self):
+        self.assertEqual(''.join(map(str, start_codeword(128, 1))), START_CODE + '10000000' + '00000001')
+        self.assertEqual(''.join(map(str, end_codeword(dt.date(2026, 11, 13)))),
+                         END_CODE + '0011010' + '1011' + '01101')
+        for value in (-1, 256, True, 1.5):
+            with self.assertRaises(ValueError):
+                start_codeword(value, 1)
+            with self.assertRaises(ValueError):
+                start_codeword(1, value)
+        for date in (dt.date(1999, 12, 31), dt.date(2128, 1, 1)):
+            with self.assertRaises(ValueError):
+                end_codeword(date)
+        with self.assertRaises(ValueError):
+            SyncBarConfig(enabled=True, interval_mean_seconds=0.3, interval_variance_seconds=0.2)
+
+    def test_markers_cannot_occur_at_wrong_offset_for_any_payload(self):
+        # '?' ranges independently over both levels, covering all 65536 payloads.
+        words = (START_CODE, END_CODE)
+        for target in words:
+            for left in words:
+                for right in words:
+                    stream = left + '?' * 16 + right
+                    for offset in range(1, 34):
+                        candidate = stream[offset:offset + 18]
+                        self.assertFalse(all(b == '?' or a == b for a, b in zip(target, candidate)),
+                                         (target, left, right, offset))
+                # Footer resets to idle low immediately after its final bit.
+                stream = left + '?' * 16 + '0' * 18
+                for offset in range(1, 34):
+                    candidate = stream[offset:offset + 18]
+                    self.assertFalse(all(b == '?' or a == b for a, b in zip(target, candidate)),
+                                     (target, left, "idle", offset))
+                # Slow train / marker / arbitrary payload / slow train.
+                # Rounding a minimum three-cell random interval to a refresh
+                # can leave only TWO whole sampled cells. After the payload,
+                # its final full cell plus that interval guarantees THREE.
+                # Use those weaker bounds so refresh phase cannot fake a marker.
+                for offset in range(-17, 34):
+                    if offset == 0:
+                        continue
+                    before, after, conflict = [], [], False
+                    for index, bit in enumerate(target):
+                        position = offset + index
+                        if 0 <= position < 18 and bit != left[position]:
+                            conflict = True
+                        if position < 0:
+                            before.append(bit)
+                        if position >= 33:
+                            after.append(bit)
+                    runs_before = [len(list(g)) for _, g in groupby(before)]
+                    runs_after = [len(list(g)) for _, g in groupby(after)]
+                    conflict |= any(n < 2 for n in runs_before[1:-1])
+                    conflict |= len(runs_after) > 1 and runs_after[0] < 3
+                    conflict |= any(n < 2 for n in runs_after[1:-1])
+                    self.assertTrue(conflict, (target, left, offset))
 
 
 class SyncGeometryTests(unittest.TestCase):
@@ -158,42 +219,43 @@ class SyncTimingTests(unittest.TestCase):
         self.assertEqual(gpio_event["requested_timestamp_perf_ns"], self.now_ns)
         self.preview.assert_called_once_with(1)
 
-    def test_block_start_has_four_fixed_pulses_then_resumes_random_intervals(self):
-        rng = Mock()
-        rng.uniform.return_value = 0.123
-        self.bar._rng = rng
-        self.assertTrue(self.bar.start(block_start=True))
+    def test_codewords_hold_repeated_bits_and_resume_only_after_final_hold(self):
+        bits = start_codeword(255, 1)
+        self.assertTrue(self.bar.start(block_start=True, experiment_number=255, block_number=1))
         self.assertFalse(self.bar.start(block_start=True))
-        rng.uniform.assert_not_called()
-        for edge in range(8):
-            target_ns = 10_000_000_000 + edge * 500_000_000
-            self.assertEqual(self.bar.next_flip_perf_s, target_ns / 1e9)
-            self.assertIsNone(self.bar.block_start_end_perf_s)
+        changes = []
+        previous = 0
+        for index, bit in enumerate(bits):
+            target_ns = 10_000_000_000 + index * BIT_PERIOD_NS
+            self.assertAlmostEqual(self.bar.next_flip_perf_s, target_ns / 1e9)
+            self.assertIsNone(self.bar.word_end_perf_s)
             self.assertTrue(self.bar.prepare_flip(target_ns / 1e9))
-            self.assertEqual(self.gpio.gpio_write.call_count, edge)
-            self.assertEqual([r.fillColor[0] for r in self.bar.rectangles],
-                             [255, 0, 255, 0, 255] if edge % 2 == 0 else [0, 255, 0, 255, 0])
             self.now_ns = target_ns
             self.window.flip()
-            record, = self.bar.flush_events()
-            self.assertEqual(record.phase, (edge + 1) % 2)
-            self.assertEqual(record.transition_num, edge + 1)
-            self.assertEqual(record.actual_perf_ns, target_ns)
-        self.assertEqual(self.bar.phase, 0)
-        self.assertEqual(self.bar.block_start_end_perf_s, 14.0)
-        self.assertEqual(self.bar.next_flip_perf_s, 14.123)
-        rng.uniform.assert_called_once_with(1.0, 1.0)
-        self.assertFalse(self.bar.start(block_start=True))
-        self.assertFalse(self.bar.prepare_flip(14.0))
-        self.assertTrue(self.bar.prepare_flip(14.123))
-        self.now_ns = 14_123_000_000
-        self.window.flip()
-        record, = self.bar.flush_events()
-        self.assertEqual((record.transition_num, record.phase), (9, 1))
-        self.assertEqual(self.bar.next_flip_perf_s, 14.246)
-        self.assertEqual([call.args[2] for call in self.gpio.gpio_write.call_args_list], [1, 0] * 4 + [1])
+            records = self.bar.flush_events()
+            self.assertEqual(self.bar.phase, bit)
+            self.assertEqual(len(records), int(bit != previous))
+            if bit != previous:
+                changes.append(bit)
+            previous = bit
+        complete = (10_000_000_000 + len(bits) * BIT_PERIOD_NS) / 1e9
+        self.assertEqual(self.bar.word_end_perf_s, complete)
+        self.assertAlmostEqual(self.bar.next_flip_perf_s, complete + 1)
+        self.assertEqual([call.args[2] for call in self.gpio.gpio_write.call_args_list], changes)
+        self.assertFalse(self.bar.prepare_flip(complete))
+        self.now_ns += BIT_PERIOD_NS
+        footer = end_codeword(dt.date(2026, 11, 13))
+        self.bar.finish(dt.date(2026, 11, 13))
+        for bit in footer:
+            self.now_ns = round(self.bar.next_flip_perf_s * 1e9)
+            self.bar.prepare_flip(self.now_ns / 1e9)
+            self.window.flip()
+            self.bar.flush_events()
+            self.assertEqual(self.bar.phase, bit)
+        self.assertEqual(self.bar.next_flip_perf_s, math.inf)
+        self.assertEqual(self.bar.word_end_perf_s, (self.now_ns + BIT_PERIOD_NS) / 1e9)
 
-    def test_delayed_block_start_edge_preserves_full_following_half_period(self):
+    def test_delayed_codeword_bit_preserves_full_next_bit_without_catchup(self):
         self.bar.start(block_start=True)
         for actual_ns in (10_020_000_000, 11_200_000_000):
             self.assertTrue(self.bar.prepare_flip(actual_ns / 1e9))
@@ -201,9 +263,10 @@ class SyncTimingTests(unittest.TestCase):
             self.assertEqual(len(self.window.callbacks), 1)
             self.now_ns = actual_ns
             self.window.flip()
-            self.assertEqual(self.bar.next_flip_perf_s, (actual_ns + 500_000_000) / 1e9)
-            self.assertFalse(self.bar.prepare_flip((actual_ns + 100_000_000) / 1e9))
-        self.assertEqual([call.args[2] for call in self.gpio.gpio_write.call_args_list], [1, 0])
+            self.assertEqual(self.bar.next_flip_perf_s, (actual_ns + BIT_PERIOD_NS) / 1e9)
+            self.assertFalse(self.bar.prepare_flip((actual_ns + 10_000_000) / 1e9))
+        # The first two bits are both high: no invented second electrical edge.
+        self.assertEqual([call.args[2] for call in self.gpio.gpio_write.call_args_list], [1])
 
     def test_one_edge_per_refresh_and_no_overdue_catchup_burst(self):
         self.bar.start()

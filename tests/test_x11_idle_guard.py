@@ -308,6 +308,7 @@ class X11IdleGuardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             block_dir = Path(tmpdir) / "1_demo"
             block_dir.mkdir()
+            (block_dir / "config.json").write_text("{}\n", encoding="utf-8")
             block = PreparedBlock(
                 block_num=1,
                 block_name="demo",
@@ -373,6 +374,7 @@ class X11IdleGuardTests(unittest.TestCase):
             root = Path(tmpdir)
             block_dir = root / "1_demo"
             block_dir.mkdir()
+            (block_dir / "config.json").write_text("{}\n", encoding="utf-8")
             video_config = root / "video.json"
             video_config.write_text("{}\n", encoding="utf-8")
             block = PreparedBlock(
@@ -435,6 +437,7 @@ class X11IdleGuardTests(unittest.TestCase):
             root = Path(tmpdir)
             block_dir = root / "1_demo"
             block_dir.mkdir()
+            (block_dir / "config.json").write_text("{}\n", encoding="utf-8")
             block = PreparedBlock(
                 block_num=1,
                 block_name="demo",

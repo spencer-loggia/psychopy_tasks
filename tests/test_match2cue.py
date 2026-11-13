@@ -36,7 +36,7 @@ def load_task_without_display():
     for name in (
         "set_debug", "setup_task_window", "close_task_window", "resolve_frame_rate",
         "make_fixation_cross", "make_bg_rect", "make_initiation_cue_stims",
-        "configure_sync_bar", "service_sync_bar", "TrialBufferManager",
+        "configure_sync_bar", "service_sync_bar", "finish_block_sync", "TrialBufferManager",
     ):
         setattr(utils, name, Mock())
     path = Path(__file__).resolve().parents[1] / "task/match2cue.py"

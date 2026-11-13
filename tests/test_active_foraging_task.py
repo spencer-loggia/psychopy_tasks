@@ -30,7 +30,7 @@ def load_task():
                  "split_background_from_palette", "setup_task_window", "close_task_window",
                  "verify_task_window_vblank",
                  "resolve_frame_rate", "make_fixation_cross", "make_bg_rect",
-                 "configure_sync_bar", "service_sync_bar",
+                 "configure_sync_bar", "service_sync_bar", "finish_block_sync",
                  "make_initiation_cue_stims", "TrialBufferManager",
                  "present_trial_with_persistent_dots"):
         setattr(utils, name, Mock())

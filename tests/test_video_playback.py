@@ -1154,6 +1154,7 @@ class PlayVideoTaskTests(unittest.TestCase):
         fake_utils.make_bg_rect = Mock(return_value=object())
         fake_utils.configure_sync_bar = Mock()
         fake_utils.service_sync_bar = Mock()
+        fake_utils.finish_block_sync = Mock()
         fake_utils.resolve_frame_rate = Mock(
             return_value=(float(monitor_rate), 1.0 / float(monitor_rate))
         )
@@ -1679,6 +1680,7 @@ class PlayVideoTaskTests(unittest.TestCase):
         fake_utils.make_bg_rect = Mock(return_value=object())
         fake_utils.configure_sync_bar = Mock()
         fake_utils.service_sync_bar = Mock()
+        fake_utils.finish_block_sync = Mock()
         fake_utils.resolve_frame_rate = Mock(return_value=(60.0, 1.0 / 60.0))
         fake_utils.play_video_fill_screen = play_video_fill_screen
         fake_utils.verify_task_window_vblank = Mock(

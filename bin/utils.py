@@ -210,16 +210,30 @@ def close_task_window(win) -> str:
         raise RuntimeError("window was not created by setup_task_window")
     sync_display = getattr(win, "_neuro_tasks_sync_display", None)
     try:
-        if sync_display is not None:
-            sync_display.close()
+        try:
+            finish_block_sync(win)
+        finally:
+            if sync_display is not None:
+                sync_display.close()
     finally:
         result = session.close(win)
     return result
 
 
+def finish_block_sync(win, *, suppress_errors=False):
+    """Finish the mask/footer before releasing acquisition or display resources."""
+    callback = getattr(win, "_neuro_tasks_finish_sync", None)
+    if callback is not None:
+        try:
+            callback()
+        except Exception:
+            if not suppress_errors:
+                raise
+
+
 def configure_sync_bar(win, config=None, **kwargs):
-    from .sync_display import configure_sync_bar as configure
-    return configure(win, config, **kwargs)
+    from .block_sync import configure_task_sync
+    return configure_task_sync(win, config, **kwargs)
 
 
 def service_sync_bar(win, *, deadline_perf_s=None):

@@ -84,6 +84,7 @@ class ExperimentEyeTracker:
         self.warnings = EyeTrackerWarnings()
         self.pending_path = directory / ".eye_tracker_start_pending"
         self.ready_path = directory / ".eye_tracker_experiment_ready"
+        self.trace_path = directory / "eye_tracker_uart.log"
         self.subject = subject
         self.experiment_number = experiment_number
         self.experiment_id = experiment_id
@@ -130,18 +131,23 @@ class ExperimentEyeTracker:
 
     def _send(self, *, start: bool, queued_at: float):
         action = "start" if start else "end"
-        _LOG.info(
+        logger, handler = self._open_trace()
+        began = time.monotonic()
+        logger.info(
             "Eye UART %s queue wait %.3fs; opening %s",
             "START_EXPERIMENT" if start else "STOP_EXPERIMENT",
             time.monotonic() - queued_at, self.uart.device,
         )
+        logger.info("Experiment identity subject=%s number=%d id=%s timestamp_ns=%d",
+                    self.subject, self.experiment_number, self.experiment_id, self.timestamp_ns)
         try:
-            with SerialPacketChannel(self.uart.device, baud=self.uart.baud) as channel:
+            with SerialPacketChannel(self.uart.device, baud=self.uart.baud, logger=logger) as channel:
                 controller = EyeTrackerController(
                     channel,
                     response_timeout_s=self.uart.response_timeout_s,
                     state_timeout_s=self.start_timeout_s if start else self.uart.state_timeout_s,
                     retries=self.uart.state_retries,
+                    logger=logger,
                 )
                 status = (
                     controller.start_experiment(
@@ -158,6 +164,7 @@ class ExperimentEyeTracker:
                     # Numbered starts can replace remote blocks. Release them
                     # only after the intended experiment was acknowledged.
                     self.ready_path.touch()
+                    logger.info("Experiment start and UUID confirmed; block tracking handoff released")
                 elif not start and status.flags & (
                     StatusFlag.EXPERIMENT_ACTIVE | StatusFlag.TRACKING
                     | StatusFlag.RECORDING | StatusFlag.CALIBRATING
@@ -172,7 +179,13 @@ class ExperimentEyeTracker:
                         "but also reports a tracker health error. Check the tracker display/logs."
                     )
                 self.warnings.warn_many(problems)
+                logger.info("Experiment %s completed after %.3fs flags=%#x handoff_ready=%s",
+                            action, time.monotonic() - began, int(status.flags), self.ready_path.is_file())
+                for problem in problems.values():
+                    logger.warning(problem)
         except Exception as exc:
+            logger.error("Experiment %s unconfirmed after %.3fs: %s: %s; block tracking handoff_ready=%s",
+                         action, time.monotonic() - began, type(exc).__name__, exc, self.ready_path.is_file())
             self.warnings.warn(action, f"Could not confirm the eye tracker experiment {action} for {self.subject}: {exc}")
         finally:
             if start:
@@ -181,3 +194,22 @@ class ExperimentEyeTracker:
                     self.pending_path.unlink(missing_ok=True)
                 except OSError as exc:
                     self.warnings.warn("handoff", f"Could not release the eye tracker startup marker: {exc}")
+            if handler is not None:
+                logger.removeHandler(handler)
+                try:
+                    handler.close()
+                except OSError as exc:
+                    _LOG.warning("Could not close eye UART trace %s: %s", self.trace_path, exc)
+
+    def _open_trace(self):
+        """Own an append-only trace for this exchange without changing global logging."""
+        try:
+            handler = logging.FileHandler(self.trace_path, encoding="utf-8")
+        except OSError as exc:
+            _LOG.warning("Could not open eye UART trace %s: %s", self.trace_path, exc)
+            return _LOG, None
+        # Direct construction deliberately avoids the global logger registry.
+        logger = logging.Logger(f"{__name__}.experiment", level=logging.INFO)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(handler)
+        return logger, handler

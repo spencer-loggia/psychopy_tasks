@@ -744,6 +744,7 @@ def run_task(
     session_logs.set_eye_tracking_screen(main_scene_size, stimulus_rotation_degrees)
     utils.configure_sync_bar(
         win, sync_bar, sync_pin=sync_pin, event_logger=logger,
+        session_logs=session_logs, screen_config=screen_config,
         experimenter_preview=experimenter_preview,
         rotation_degrees=stimulus_rotation_degrees,
         frame_duration_s=frame_dur, msg_logger=msg_logger,
@@ -1312,6 +1313,7 @@ def run_task(
             _set_buzzer_pin(0, context="task_cleanup")
         except Exception:
             pass
+        utils.finish_block_sync(win, suppress_errors=True)
         _flush_between_trials()
         try:
             buffer_mgr.close()

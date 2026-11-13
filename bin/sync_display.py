@@ -12,7 +12,7 @@ import math
 import time
 
 from . import frame_timing
-from .sync_bar import SyncBar, SyncBarConfig
+from .sync_bar import BIT_RATE_HZ, SyncBar, SyncBarConfig
 from .video_playback import is_raspberry_pi
 
 
@@ -96,18 +96,29 @@ class PendingSceneBuffer:
 
 
 class SyncDisplay:
-    def __init__(self, win, bar, frame_duration_s, *, scene_buffer=None, gpio_module=None, gpio_chip=None):
+    def __init__(self, win, bar, frame_duration_s, *, scene_buffer=None, gpio_module=None,
+                 gpio_chip=None, codeword_callback=None):
         self.win = win
         self.bar = bar
+        self.codeword_callback = codeword_callback
         self.frame_duration_s = float(frame_duration_s)
         if not math.isfinite(self.frame_duration_s) or self.frame_duration_s <= 0:
             raise ValueError("frame_duration_s must be positive and finite")
-        self.buffer = PendingSceneBuffer(win) if scene_buffer is None else scene_buffer
         self.gpio_module, self.gpio_chip = gpio_module, gpio_chip
         self.original_flip = win.flip
         self.last_flip_perf_s = None
         self.extra_flip_count = 0
         self.closed = False
+        self._header_complete = False
+        self._footer_started = False
+        self._footer_complete = False
+        # A symbol occupies whole refreshes and is never shorter than 1/15 s.
+        frames = max(1, math.ceil(1 / (BIT_RATE_HZ * self.frame_duration_s) - 1e-9))
+        self.bar.bit_period_ns = math.ceil(max(1 / BIT_RATE_HZ, frames * self.frame_duration_s) * 1e9)
+        minimum = self.bar.config.interval_mean_seconds - self.bar.config.interval_variance_seconds
+        if minimum + 1e-8 < 3 * self.bar.bit_period_ns / 1e9:
+            raise ValueError("sync_bar minimum random interval must span at least three codeword bits")
+        self.buffer = PendingSceneBuffer(win) if scene_buffer is None else scene_buffer
         win.flip = self.flip
         atexit.register(self.close)
 
@@ -153,18 +164,66 @@ class SyncDisplay:
             return
         self._flip_sync_only()
 
-    def start_block_signal(self):
-        """Finish four 500 ms ON/OFF pulses before allowing task presentation."""
-        if self.closed or not self.bar.start(block_start=True):
-            return
-        while self.bar.block_start_end_perf_s is None:
+    def _run_word(self, kind, *, mask=False):
+        first = True
+        while self.bar.word_end_perf_s is None:
             frame_timing.wait_until_flip_submission(
                 self.bar.next_flip_perf_s, self.frame_duration_s,
             )
-            self._flip_sync_only()
-        frame_timing.wait_until(self.bar.block_start_end_perf_s)
+            self._flip_sync_only(mask=mask and first)
+            if first and self.bar.word_start_perf_ns is not None:
+                if self.bar.event_logger is not None:
+                    self.bar.event_logger.log_event(
+                        trial_num=None, event=f"sync_{kind}_begin", event_type="lifecycle",
+                        timestamp_perf_ns=self.bar.word_start_perf_ns,
+                    )
+                first = False
+        frame_timing.wait_until(self.bar.word_end_perf_s)
+        if self.bar.event_logger is not None:
+            self.bar.event_logger.log_event(
+                trial_num=None, event=f"sync_{kind}_end", event_type="lifecycle",
+                timestamp_perf_ns=time.perf_counter_ns(),
+            )
 
-    def _flip_sync_only(self):
+    def _codeword_mode(self, active):
+        self.bar.preview_enabled = not active
+        if not active and self.bar.preview_callback is not None:
+            self.bar.preview_callback(self.bar.phase)
+        if self.codeword_callback is not None:
+            self.codeword_callback(active)
+
+    def start_block_signal(self, experiment_number=0, block_number=0):
+        """Finish the identity codeword before allowing task presentation."""
+        if self.closed or not self.bar.start(
+            block_start=True, experiment_number=experiment_number, block_number=block_number,
+        ):
+            return
+        self._codeword_mode(True)
+        try:
+            self._run_word("start")
+            self._header_complete = True
+        finally:
+            self._codeword_mode(False)
+
+    def finish_block_signal(self, experiment_date):
+        """Mask the task and transmit the date before acquisition/window teardown."""
+        if self.closed or not self._header_complete or self._footer_complete:
+            return
+        if self._footer_started:
+            raise RuntimeError("The block end codeword was interrupted and is incomplete")
+        self._footer_started = True
+        self.bar.finish(experiment_date)
+        self._codeword_mode(True)
+        try:
+            self._run_word("end", mask=True)
+            # Return mask and GPIO to idle on a real swap after the final hold.
+            self.bar.idle()
+            self._flip_sync_only()
+            self._footer_complete = True
+        finally:
+            self._codeword_mode(False)
+
+    def _flip_sync_only(self, *, mask=False):
         """Swap just the bar, leaving the next task scene and callbacks queued."""
         pending = {}
         for name in ("_toCall", "_toLog", "_toDraw", "_toDrawDepths"):
@@ -174,6 +233,8 @@ class SyncDisplay:
         try:
             self.buffer.save_and_show_front()
             try:
+                if mask:
+                    self.win.clearBuffer()
                 self.flip()
                 self.extra_flip_count += 1
             finally:
@@ -202,7 +263,7 @@ class SyncDisplay:
 def configure_sync_bar(
     win, config=None, *, sync_pin=18, event_logger=None,
     experimenter_preview=None, rotation_degrees=0, frame_duration_s=1 / 60,
-    msg_logger=None,
+    msg_logger=None, experiment_number=0, block_number=0, before_start=None,
 ):
     config = SyncBarConfig.from_mapping(config, sync_pin=sync_pin)
     sync_pin = config.sync_pin
@@ -246,8 +307,14 @@ def configure_sync_bar(
             event_logger=event_logger, gpio_module=gpio, gpio_chip=chip,
             sync_pin=sync_pin, preview_callback=preview_callback,
         )
-        display = SyncDisplay(win, bar, frame_duration_s, gpio_module=gpio, gpio_chip=chip)
-        display.start_block_signal()
+        display = SyncDisplay(
+            win, bar, frame_duration_s, gpio_module=gpio, gpio_chip=chip,
+            codeword_callback=(getattr(experimenter_preview, "set_sync_codeword", None)
+                               if experimenter_preview is not None else None),
+        )
+        if before_start is not None:
+            before_start()
+        display.start_block_signal(experiment_number, block_number)
     except BaseException:
         if display is not None:
             display.close()

@@ -1,9 +1,12 @@
 import datetime as dt
+from dataclasses import replace
+import json
+import logging
 from pathlib import Path
 import tempfile
 import threading
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from bin.eye_tracking import (
     EXPERIMENT_BLOCK_NUMBER_ENV,
@@ -12,7 +15,8 @@ from bin.eye_tracking import (
     UARTEyeTracker,
     UARTEyeTrackerConfig,
 )
-from bin.eye_tracker_wire.protocol import StatusFlag
+from bin.eye_tracker_wire.protocol import CommandCode, StatusFlag, decode_command, decode_status
+from bin.eye_tracker_wire.controller import EyeTrackerController, ResponseTimeout
 from interface.experiment_eye_tracker import ExperimentEyeTracker, request_eye_tracker_shutdown
 
 
@@ -111,9 +115,70 @@ class ExperimentEyeTrackerTests(unittest.TestCase):
         tracker.stop_future.result(timeout=2)
         self.controller.stop_experiment.assert_called_once_with()
         self.assertEqual(self.channel.call_count, 2)
-        self.channel.assert_called_with("/dev/test", baud=460800)
+        self.channel.assert_called_with("/dev/test", baud=460800, logger=ANY)
         self.assertEqual(self.channel.return_value.__exit__.call_count, 2)
         self.warning.assert_not_called()
+
+    def test_trace_persists_start_uuid_stop_and_does_not_change_global_logging(self):
+        fixture = json.loads((Path(__file__).parent / "fixtures/eye_uart_v1.json").read_text())
+        status = decode_status(bytes.fromhex(fixture["status"]))
+        global_logger = logging.getLogger("bin.eye_tracker_wire.controller")
+        level, handlers = global_logger.level, list(global_logger.handlers)
+        registry = set(logging.Logger.manager.loggerDict)
+
+        def reply(packet, timeout):
+            command = decode_command(packet)
+            return replace(status, request_sequence=command.sequence,
+                           flags=StatusFlag(0) if command.code == CommandCode.STOP_EXPERIMENT
+                           else StatusFlag.EXPERIMENT_ACTIVE)
+
+        with patch("interface.experiment_eye_tracker.EyeTrackerController", wraps=EyeTrackerController), \
+             patch.object(EyeTrackerController, "_exchange", side_effect=reply):
+            tracker = self.create()
+            tracker.start_future.result(timeout=2)
+            tracker.finish()
+            tracker.stop_future.result(timeout=2)
+        trace = tracker.trace_path.read_text()
+        for text in ("START_EXPERIMENT", "SET_EXPERIMENT_ID", "STOP_EXPERIMENT", "sequence=",
+                     "status=OK", "flags=", "number=7", "handoff released", "handoff_ready=True"):
+            self.assertIn(text, trace)
+        self.assertEqual(global_logger.level, level)
+        self.assertEqual(global_logger.handlers, handlers)
+        self.assertEqual(set(logging.Logger.manager.loggerDict), registry)
+        for call in self.channel.call_args_list:
+            self.assertEqual(call.kwargs["logger"].handlers, [])
+
+    def test_trace_open_failure_does_not_block_confirmed_experiment(self):
+        with patch("interface.experiment_eye_tracker.logging.FileHandler", side_effect=OSError("disk unavailable")), \
+             self.assertLogs("interface.experiment_eye_tracker", level="WARNING"):
+            tracker = self.create()
+            tracker.start_future.result(timeout=2)
+        self.assertTrue(tracker.ready_path.is_file())
+        self.warning.assert_not_called()
+
+    def test_failed_start_or_uuid_is_identified_in_trace_and_warning(self):
+        fixture = json.loads((Path(__file__).parent / "fixtures/eye_uart_v1.json").read_text())
+        status = decode_status(bytes.fromhex(fixture["status"]))
+        self.config["eye_tracker_experiment"]["uart"]["state_retries"] = 0
+        for failed_code in (CommandCode.START_EXPERIMENT, CommandCode.SET_EXPERIMENT_ID):
+            with self.subTest(code=failed_code):
+                def reply(packet, timeout):
+                    command = decode_command(packet)
+                    if command.code == failed_code:
+                        raise ResponseTimeout("simulated missing reply")
+                    return replace(status, request_sequence=command.sequence,
+                                   flags=StatusFlag.EXPERIMENT_ACTIVE)
+                self.warning.reset_mock()
+                with patch("interface.experiment_eye_tracker.EyeTrackerController", wraps=EyeTrackerController), \
+                     patch.object(EyeTrackerController, "_exchange", side_effect=reply):
+                    tracker = self.create()
+                    tracker.start_future.result(timeout=2)
+                self.assertFalse(tracker.ready_path.exists())
+                self.assertFalse(tracker.pending_path.exists())
+                self.assertIn(failed_code.name, self.warning.call_args.args[0])
+                trace = tracker.trace_path.read_text()
+                self.assertIn(f"No acknowledgement for {failed_code.name}", trace)
+                self.assertIn("block tracking handoff_ready=False", trace)
 
     def test_commands_do_not_wait_on_ui_and_end_is_ordered_after_start(self):
         entered, release = threading.Event(), threading.Event()

@@ -1,8 +1,9 @@
 # Arducam quad-camera recording
 
 `recorder.py` sends the Arducam B0267 aggregate frame directly from
-`libcamera`/`rpicam-vid` to H.264 and disk. Python never receives or copies a
-frame.
+`libcamera`/`rpicam-vid` to H.264 and disk. Python does not decode or transport
+camera frames. An optional startup check reads bounded chunks of the initial
+encoded output to confirm acquisition.
 
 The HAT's default four-in-one mode is one horizontal `5120x720` RAW8 image:
 four synchronized `1280x720` camera images side by side. The default config
@@ -18,6 +19,7 @@ from video import record
 
 recording = record("/mnt/video/session_001.h264")
 try:
+    recording.wait_until_ready()
     run_time_sensitive_operation()
 finally:
     recording.stop()
@@ -26,9 +28,18 @@ finally:
 Or use a context manager:
 
 ```python
-with record("/mnt/video/session_001.h264"):
+with record("/mnt/video/session_001.h264") as recording:
+    recording.wait_until_ready()
     run_time_sensitive_operation()
 ```
+
+`wait_until_ready(timeout=15.0)` waits for a completed H.264 picture-slice NAL
+in the output while the recorder is still running. Creating the process or file,
+or writing codec headers, does not establish readiness. It raises `RecordingError`
+on timeout, an early process exit, or an output read error; the caller still stops
+the recorder in `finally`. The check stops reading once acquisition is confirmed.
+`--flush` makes each encoded output buffer visible promptly, including when a
+static scene produces very small frames.
 
 For a fixed duration:
 
@@ -54,6 +65,12 @@ When the launcher has `record_experiment_video: true`, it starts this recorder
 immediately before each block subprocess and stops it when that subprocess
 finishes. The output is `camera.h264` in the block's existing output directory;
 `video_config` in the launcher config selects this recorder configuration.
+With block synchronization enabled, the launcher confirms video acquisition
+before starting the block. After display setup and any eye-tracker confirmation,
+the task calls `wait_for_fresh_picture(path, timeout=15.0)` immediately before its
+start packet. This requires newly appended picture data, so a recorder that
+stopped during setup cannot pass using old frames. The task completes its
+end/date sync packet before exiting, so recording includes both packets.
 
 ## Live preview
 

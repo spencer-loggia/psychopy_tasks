@@ -73,6 +73,7 @@ class TaskEyeTrackingSession:
             block_id=block_id,
         )
         self.recorder = None
+        self._startup_error = None
         try:
             if output_dir is not None:
                 self.recorder = EyeDataRecorder(
@@ -80,14 +81,24 @@ class TaskEyeTrackingSession:
                     calibration=settings.calibration,
                 )
         except Exception as exc:
+            self._startup_error = str(exc)
             self.warnings.warn("recording", f"Could not start eye data acquisition/CSV recording: {exc}")
         try:
             self.tracker.start()
         except Exception as exc:
+            self._startup_error = str(exc)
             self.warnings.warn("tracking", f"Could not start eye acquisition: {exc}")
         # Normal cleanup goes through SessionLogBundle. Also stop tracking if a
         # legacy task exits before its main loop's finally block is established.
         atexit.register(self.close)
+
+    def wait_until_ready(self, timeout_s=None):
+        """Require live camera telemetry and a healthy local CSV recorder."""
+        if self._startup_error is not None:
+            raise RuntimeError(self._startup_error)
+        self.tracker.wait_until_ready(timeout_s)
+        if self.recorder is not None:
+            self.recorder.check_error()
 
     def _record_measurement(self, state):
         if self.recorder is not None:

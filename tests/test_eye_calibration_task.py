@@ -18,7 +18,7 @@ from bin.eye_tracking_config import load_eye_tracking_settings
 from bin.logger import EVENT_LOG_FILENAME
 from bin.screen import ScreenGeometry
 from bin.sync_bar import SyncBar
-from bin.sync_display import configure_sync_bar
+from bin.block_sync import configure_task_sync as configure_sync_bar
 
 
 def load_task():
@@ -36,6 +36,7 @@ def load_task():
         "verify_task_window_vblank",
         "configure_sync_bar",
         "service_sync_bar",
+        "finish_block_sync",
     ):
         setattr(utils, name, Mock())
     utils.resolve_frame_rate = Mock(return_value=(60.0, 1.0 / 60.0))
@@ -86,10 +87,12 @@ class EyeCalibrationTaskTests(unittest.TestCase):
                     return 0
 
                 win.callOnFlip, win.flip = call_on_flip, flip
+                win.clearBuffer = Mock()
                 task.utils.setup_task_window.return_value = (
                     win, ScreenGeometry(0, 0, 0, 800, 600), ScreenGeometry(1, 800, 0, 800, 600),
                 )
                 task.utils.configure_sync_bar.side_effect = configure_sync_bar
+                task.utils.finish_block_sync.side_effect = lambda win, **kw: win._neuro_tasks_finish_sync()
                 task.utils.close_task_window.side_effect = lambda win: win._neuro_tasks_sync_display.close()
                 preview, tracker, outputs = Mock(), Mock(), Mock()
                 preview.poll.side_effect = [False] * 8 + [True]
@@ -119,14 +122,14 @@ class EyeCalibrationTaskTests(unittest.TestCase):
                         output_dir=tmp, fullscreen=False, raspi=raspi,
                         uart_config=UARTEyeTrackerConfig(simulate=True),
                         sync_bar={"enabled": True, "sync_pin": 16,
-                                  "interval_mean_seconds": 0.03, "interval_variance_seconds": 0},
+                                  "interval_mean_seconds": 0.2, "interval_variance_seconds": 0},
                     )
                     with (result.parent / EVENT_LOG_FILENAME).open() as handle:
                         events = list(csv.DictReader(handle, delimiter="\t"))
                 daq.assert_called_once_with(address=0, module_name="piplates.DAQC2plate", enabled=raspi)
                 gpio.gpio_claim_output.assert_called_once_with(4, 16, 0)
                 transitions = [edge for edge in edges if edge[3]]
-                self.assertGreaterEqual(len(transitions), 11)  # Eight start-marker edges, then task sync.
+                self.assertGreaterEqual(len(transitions), 11)  # Header, task sync and date footer.
                 self.assertEqual(transitions, [(4, 16, (index + 1) % 2, True) for index in range(len(transitions))])
                 self.assertEqual(edges[-1], (4, 16, 0, False))
                 self.assertEqual(sum(row["event"] == "sync_bar_flip" for row in events), len(transitions))

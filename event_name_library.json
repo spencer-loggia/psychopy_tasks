@@ -221,6 +221,26 @@
       "code": 305,
       "event_type": "signal",
       "description": "Synchronization GPIO changed low on the display flip callback."
+    },
+    "sync_start_begin": {
+      "code": 121,
+      "event_type": "lifecycle",
+      "description": "Start marker first bit displayed."
+    },
+    "sync_start_end": {
+      "code": 122,
+      "event_type": "lifecycle",
+      "description": "Start packet final bit hold completed; presentation may begin."
+    },
+    "sync_end_begin": {
+      "code": 123,
+      "event_type": "lifecycle",
+      "description": "Task presentation ended and end marker first bit displayed."
+    },
+    "sync_end_end": {
+      "code": 124,
+      "event_type": "lifecycle",
+      "description": "End/date packet final bit hold completed."
     }
   },
   "task_event_sets": {
@@ -237,7 +257,11 @@
       "pump_off",
       "sync_bar_flip",
       "sync_signal_on",
-      "sync_signal_off"
+      "sync_signal_off",
+      "sync_start_begin",
+      "sync_start_end",
+      "sync_end_begin",
+      "sync_end_end"
     ],
     "random_image_sequence": [
       "gray_pre_sequence",
@@ -248,7 +272,11 @@
       "block_end",
       "sync_bar_flip",
       "sync_signal_on",
-      "sync_signal_off"
+      "sync_signal_off",
+      "sync_start_begin",
+      "sync_start_end",
+      "sync_end_begin",
+      "sync_end_end"
     ],
     "afc_trial_sequence": [
       "trial_cue",
@@ -264,7 +292,11 @@
       "block_end",
       "sync_bar_flip",
       "sync_signal_on",
-      "sync_signal_off"
+      "sync_signal_off",
+      "sync_start_begin",
+      "sync_start_end",
+      "sync_end_begin",
+      "sync_end_end"
     ],
     "play_video": [
       "video_clip_start",
@@ -277,7 +309,11 @@
       "block_end",
       "sync_bar_flip",
       "sync_signal_on",
-      "sync_signal_off"
+      "sync_signal_off",
+      "sync_start_begin",
+      "sync_start_end",
+      "sync_end_begin",
+      "sync_end_end"
     ],
     "calibrate_eye_tracker": [
       "pump_on",
@@ -286,7 +322,11 @@
       "block_end",
       "sync_bar_flip",
       "sync_signal_on",
-      "sync_signal_off"
+      "sync_signal_off",
+      "sync_start_begin",
+      "sync_start_end",
+      "sync_end_begin",
+      "sync_end_end"
     ],
     "active_foraging": [
       "fixation_accepted",
@@ -312,7 +352,11 @@
       "block_end",
       "sync_bar_flip",
       "sync_signal_on",
-      "sync_signal_off"
+      "sync_signal_off",
+      "sync_start_begin",
+      "sync_start_end",
+      "sync_end_begin",
+      "sync_end_end"
     ],
     "match2cue": [
       "onset_cue_on",
@@ -337,7 +381,11 @@
       "block_end",
       "sync_bar_flip",
       "sync_signal_on",
-      "sync_signal_off"
+      "sync_signal_off",
+      "sync_start_begin",
+      "sync_start_end",
+      "sync_end_begin",
+      "sync_end_end"
     ],
     "afc_csc1": [
       "onset_cue_on",
@@ -357,14 +405,22 @@
       "block_end",
       "sync_bar_flip",
       "sync_signal_on",
-      "sync_signal_off"
+      "sync_signal_off",
+      "sync_start_begin",
+      "sync_start_end",
+      "sync_end_begin",
+      "sync_end_end"
     ],
     "stim_set_gallery": [
       "block_start",
       "block_end",
       "sync_bar_flip",
       "sync_signal_on",
-      "sync_signal_off"
+      "sync_signal_off",
+      "sync_start_begin",
+      "sync_start_end",
+      "sync_end_begin",
+      "sync_end_end"
     ]
   },
   "event_templates": {
@@ -380,7 +436,9 @@
       "description_template": "Dot cue for option {option_index} became visible."
     },
     "afc_option_off": {
-      "task_names": ["active_foraging"],
+      "task_names": [
+        "active_foraging"
+      ],
       "event_name_regex": "^option_(?P<option_index>[1-9][0-9]*)_off$",
       "code_base": 1200,
       "code_group": "option_index",

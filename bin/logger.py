@@ -543,6 +543,7 @@ class SessionLogBundle:
         self.session_clock = TaskClock(started_at=when)
         block_start_perf_ns = time.perf_counter_ns()
         self._closed = False
+        self.finish_sync = None
         self.live_settings = live_settings
         exact_session_dir = os.environ.get(EXACT_SESSION_DIR_ENV)
         if exact_session_dir:
@@ -653,6 +654,13 @@ class SessionLogBundle:
     def close(self) -> None:
         if self._closed:
             return
+        sync_error = None
+        if self.finish_sync is not None:
+            try:
+                self.finish_sync()
+            except Exception as exc:
+                sync_error = exc
+                self.message_logger.log("ERROR", f"sync_footer_failed error={exc}")
         if self.eye_tracking is not None and self.eye_tracking.recorder is not None:
             self.eye_tracking.recorder.stop_accepting()
         block_end_perf_ns = time.perf_counter_ns()
@@ -689,3 +697,5 @@ class SessionLogBundle:
             raise eye_error
         if settings_error is not None:
             raise settings_error
+        if sync_error is not None:
+            raise sync_error

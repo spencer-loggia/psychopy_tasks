@@ -385,6 +385,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     session_logs.set_eye_tracking_screen(main_scene_size, stimulus_rotation_degrees)
     utils.configure_sync_bar(
         win, cfg.get("sync_bar"), sync_pin=sync_pin, event_logger=logger,
+        session_logs=session_logs, screen_config=screen_config,
         experimenter_preview=experimenter_preview,
         rotation_degrees=stimulus_rotation_degrees,
         frame_duration_s=frame_duration, msg_logger=msg_logger,
@@ -931,6 +932,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 set_choice_buzzer(False)
             except Exception:
                 pass
+        utils.finish_block_sync(win, suppress_errors=True)
         try:
             buffer_manager.close()
         except Exception:

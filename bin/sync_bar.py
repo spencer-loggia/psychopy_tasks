@@ -7,14 +7,34 @@ Static presenters also use ``next_flip_perf_s`` to wake for bar-only swaps.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import datetime as dt
 import math
 import random
 import time
 from typing import Any, Mapping
 
 
-BLOCK_START_PULSES = 4
-BLOCK_START_HALF_PERIOD_NS = 500_000_000
+BIT_RATE_HZ = 15
+BIT_PERIOD_NS = math.ceil(1_000_000_000 / BIT_RATE_HZ)
+START_CODE = "111001010110010010"
+END_CODE = "110110101001100010"
+
+
+def _unsigned_bits(value: int, width: int) -> tuple[int, ...]:
+    if type(value) is not int or not 0 <= value < 2 ** width:
+        raise ValueError(f"Sync value must be an unsigned {width}-bit integer: {value!r}")
+    return tuple(int(bit) for bit in f"{value:0{width}b}")
+
+
+def start_codeword(experiment_number: int, block_number: int) -> tuple[int, ...]:
+    return tuple(map(int, START_CODE)) + _unsigned_bits(experiment_number, 8) + _unsigned_bits(block_number, 8)
+
+
+def end_codeword(experiment_date: dt.date) -> tuple[int, ...]:
+    if not isinstance(experiment_date, dt.date):
+        raise ValueError("Sync experiment_date must be a date")
+    return (tuple(map(int, END_CODE)) + _unsigned_bits(experiment_date.year - 2000, 7)
+            + _unsigned_bits(experiment_date.month, 4) + _unsigned_bits(experiment_date.day, 5))
 
 
 def validate_sync_pin(pin):
@@ -47,6 +67,9 @@ class SyncBarConfig:
             raise ValueError(
                 "sync_bar.interval_variance_seconds must be non-negative and less than interval_mean_seconds"
             )
+
+        if self.enabled and self.interval_mean_seconds - self.interval_variance_seconds < 3 / BIT_RATE_HZ - 1e-12:
+            raise ValueError("sync_bar minimum random interval must be at least 0.2 seconds to distinguish codewords")
 
     @classmethod
     def from_mapping(
@@ -123,6 +146,7 @@ class SyncBar:
         self.win = win
         self.event_logger = event_logger
         self.preview_callback = preview_callback
+        self.preview_enabled = True
         self._clock = time.perf_counter_ns if clock is None else clock
         self._rng = random.Random() if rng is None else rng
         self._gpio = gpio_module
@@ -135,8 +159,12 @@ class SyncBar:
         self.transition_num = 0
         self._drawn_phase = None
         self._next_perf_ns = None
-        self._block_start_edges_remaining = 0
-        self._block_start_end_ns = None
+        self._word_bits = ()
+        self._word_index = 0
+        self._word_end_ns = None
+        self.word_start_perf_ns = None
+        self._word_kind = None
+        self.bit_period_ns = BIT_PERIOD_NS
         self._pending = False
         self._records: list[SyncFlipRecord] = []
         self._gpio_error = None
@@ -166,19 +194,39 @@ class SyncBar:
         spread = self.config.interval_variance_seconds
         return max(1, round(self._rng.uniform(mean - spread, mean + spread) * 1_000_000_000))
 
-    def start(self, now_perf_s: float | None = None, *, block_start: bool = False) -> bool:
-        """Start once, optionally prefacing the random schedule with four pulses."""
+    def start(self, now_perf_s: float | None = None, *, block_start: bool = False,
+              experiment_number=0, block_number=0) -> bool:
+        """Start once, optionally transmitting the block identity first."""
         if self.config.enabled and self._next_perf_ns is None and not self._closed:
             now_ns = self._clock() if now_perf_s is None else round(now_perf_s * 1_000_000_000)
-            self._block_start_edges_remaining = 2 * BLOCK_START_PULSES if block_start else 0
-            self._next_perf_ns = now_ns if block_start else now_ns + self._interval_ns()
+            if block_start:
+                self._begin_word(start_codeword(experiment_number, block_number), "start", now_ns)
+            else:
+                self._next_perf_ns = now_ns + self._interval_ns()
             return True
         return False
 
+    def _begin_word(self, bits, kind, now_ns):
+        if self._pending or self._word_bits:
+            raise RuntimeError("Cannot interrupt an active sync codeword")
+        self._word_bits = bits
+        self._word_index = 0
+        self._word_end_ns = None
+        self.word_start_perf_ns = None
+        self._word_kind = kind
+        self._next_perf_ns = now_ns
+
+    def finish(self, experiment_date):
+        if self.config.enabled and not self._closed:
+            self._begin_word(end_codeword(experiment_date), "end", self._clock())
+
+    def idle(self):
+        self._begin_word((0,), "end", self._clock())
+
     @property
-    def block_start_end_perf_s(self) -> float | None:
-        """End of the final 500 ms OFF hold, known after the eighth edge."""
-        return None if self._block_start_end_ns is None else self._block_start_end_ns / 1_000_000_000
+    def word_end_perf_s(self) -> float | None:
+        """Completion includes the entire final bit, including repeated levels."""
+        return None if self._word_end_ns is None else self._word_end_ns / 1_000_000_000
 
     @property
     def next_flip_perf_s(self) -> float:
@@ -196,18 +244,17 @@ class SyncBar:
         target_ns = self._clock() if target_perf_s is None else round(target_perf_s * 1_000_000_000)
         if not self._pending and target_ns >= self._next_perf_ns:
             self._pending = True
-            # Draw-time work stays out of the display/GPIO callback.
-            if self._block_start_edges_remaining:
-                next_interval_ns = BLOCK_START_HALF_PERIOD_NS
-                if self._block_start_edges_remaining == 1:
-                    # The random schedule starts after the final OFF hold.
+            if self._word_bits:
+                phase = self._word_bits[self._word_index]
+                next_interval_ns = self.bit_period_ns
+                if self._word_index == len(self._word_bits) - 1 and self._word_kind == "start":
                     next_interval_ns += self._interval_ns()
             else:
+                phase = self.phase ^ 1
                 next_interval_ns = self._interval_ns()
-            # The GPIO edge belongs to this realized swap, including when the
-            # original requested deadline was deferred for a task transition.
-            self.win.callOnFlip(self._on_flip, self._next_perf_ns, next_interval_ns)
-        draw_phase = self.phase ^ int(self._pending)
+            self.win.callOnFlip(self._on_flip, self._next_perf_ns, next_interval_ns, phase)
+            self._pending_phase = phase
+        draw_phase = self._pending_phase if self._pending else self.phase
         if draw_phase != self._drawn_phase:
             for index, rectangle in enumerate(self.rectangles):
                 level = 255 * ((index + draw_phase) % 2)
@@ -217,14 +264,17 @@ class SyncBar:
             rectangle.draw()
         return self._pending
 
-    def _on_flip(self, requested_ns: int, next_interval_ns: int) -> None:
+    def _on_flip(self, requested_ns: int, next_interval_ns: int, phase: int) -> None:
         if self._closed:
             return
         actual_ns = self._clock()
-        self.phase ^= 1
+        changed = phase != self.phase
+        self.phase = phase
+        if self._word_bits and self._word_index == 0:
+            self.word_start_perf_ns = actual_ns
         gpio_ns = None
         gpio_requested_ns = None
-        if self._gpio is not None:
+        if changed and self._gpio is not None:
             try:
                 gpio_requested_ns = self._clock()
                 result = self._gpio.gpio_write(self._chip, self._pin, self.phase)
@@ -234,15 +284,19 @@ class SyncBar:
             except Exception as error:
                 # Preserve the displayed event, then report outside the callback.
                 self._gpio_error = error
-        self.transition_num += 1
-        self._records.append(SyncFlipRecord(
-            requested_ns, actual_ns, self.phase, self.transition_num, gpio_ns, gpio_requested_ns,
-        ))
-        if self._block_start_edges_remaining:
-            self._block_start_edges_remaining -= 1
-            if not self._block_start_edges_remaining:
-                self._block_start_end_ns = actual_ns + BLOCK_START_HALF_PERIOD_NS
+        if changed:
+            self.transition_num += 1
+            self._records.append(SyncFlipRecord(
+                requested_ns, actual_ns, self.phase, self.transition_num, gpio_ns, gpio_requested_ns,
+            ))
         self._next_perf_ns = actual_ns + next_interval_ns
+        if self._word_bits:
+            self._word_index += 1
+            if self._word_index == len(self._word_bits):
+                self._word_end_ns = actual_ns + self.bit_period_ns
+                self._word_bits = ()
+                if self._word_kind == "end":
+                    self._next_perf_ns = math.inf
         self._pending = False
 
     def flush_events(self) -> list[SyncFlipRecord]:
@@ -269,7 +323,7 @@ class SyncBar:
                         sync_transition_num=record.transition_num,
                         sync_phase=record.phase,
                     )
-            if self.preview_callback is not None:
+            if self.preview_enabled and self.preview_callback is not None:
                 self.preview_callback(record.phase)
         if self._gpio_error is not None:
             error, self._gpio_error = self._gpio_error, None

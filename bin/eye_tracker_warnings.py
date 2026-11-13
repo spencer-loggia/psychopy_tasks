@@ -8,6 +8,50 @@ import sys
 import threading
 
 
+def confirm_without_eye_tracking(message: str, *, screen_config=None) -> bool:
+    """Require an explicit choice on the experimenter display; failure cancels."""
+    import json
+    try:
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--confirm", message,
+             json.dumps(screen_config)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        )
+        return result.returncode == 0
+    except Exception as exc:
+        print(f"Could not confirm unavailable eye tracking: {exc}", file=sys.stderr)
+        return False
+
+
+def _confirm_main(message, screen_config):
+    import tkinter as tk
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from bin.screen import load_screen_config, resolve_task_screens
+    from bin.tk_dialogs import choose_dialog
+
+    root = tk.Tk()
+    try:
+        main, secondary = resolve_task_screens(
+            screen_config if screen_config is not None else load_screen_config({}),
+            allow_same_screen=True,
+        )
+        screen = secondary or main
+        root.geometry(f"760x460+{screen.x + 20}+{screen.y + 20}")
+        root.title("Eye acquisition unavailable")
+        root.attributes("-topmost", True)
+        root.update_idletasks()
+        accepted = choose_dialog(
+            root, "Eye acquisition unavailable",
+            message + "\n\nEye tracking/recording could not be confirmed. "
+            "Continue this block with potentially missing eye data?",
+            [("Cancel block", False), ("Continue without confirmed eye data", True)],
+            cancel_value=False,
+        )
+        return 0 if accepted else 1
+    finally:
+        root.destroy()
+
+
 def show_eye_tracker_warning(message: str) -> None:
     """Log immediately and open a dismissible dialog without waiting for it."""
     print(f"Eye tracker warning: {message}", file=sys.stderr)
@@ -79,6 +123,11 @@ def _main(message: str) -> None:
 
 if __name__ == "__main__":
     try:
-        _main(sys.argv[1])
+        if sys.argv[1] == "--confirm":
+            import json
+            sys.exit(_confirm_main(sys.argv[2], json.loads(sys.argv[3])))
+        else:
+            _main(sys.argv[1])
     except Exception as exc:
         print(f"Could not display eye tracker warning: {exc}", file=sys.stderr)
+        sys.exit(1)

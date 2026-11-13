@@ -591,6 +591,7 @@ def main() -> None:
             utils.verify_task_window_vblank(win)
         utils.configure_sync_bar(
             win, cfg.get("sync_bar"), sync_pin=cfg.get("sync_pin", 18),
+            session_logs=logs, screen_config=screen_config,
             event_logger=logs.event_logger, experimenter_preview=preview,
             rotation_degrees=rotation, frame_duration_s=frame_duration_s,
             msg_logger=logs.message_logger,
@@ -735,6 +736,7 @@ def main() -> None:
             core.wait(poll_interval_s)
 
     finally:
+        utils.finish_block_sync(win, suppress_errors=True)
         try:
             if preview is not None:
                 preview.close()

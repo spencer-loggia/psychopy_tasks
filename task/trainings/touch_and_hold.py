@@ -122,9 +122,12 @@ def run_task(
 
         utils.configure_sync_bar(
             win, sync_bar, sync_pin=sync_pin, event_logger=logger,
+            session_logs=logs, screen_config=screen_config,
             experimenter_preview=preview, rotation_degrees=rotation,
             frame_duration_s=frame_duration_s, msg_logger=messages,
         )
+
+        cleanup.callback(utils.finish_block_sync, win, suppress_errors=True)
 
         # Cache the shared cue images once; send only scene/counter changes.
         preview_images = [dict(

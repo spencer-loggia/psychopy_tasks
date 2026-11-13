@@ -1706,12 +1706,17 @@ class TouchInterfaceApp:
         ready_path.unlink(missing_ok=True)
         release_path.unlink(missing_ok=True)
         env = self.experiment.subprocess_environment(block)
+        from bin.block_sync import VIDEO_PATH_ENV
+        env.pop(VIDEO_PATH_ENV, None)
         if self.idle_guard is not None:
             env[TASK_WINDOW_READY_ENV] = str(ready_path)
             env[TASK_WINDOW_RELEASE_ENV] = str(release_path)
         process: Optional[subprocess.Popen] = None
         recording = None
         try:
+            sync_enabled = SyncBarConfig.from_mapping(
+                json.loads(block.config_path.read_text()).get("sync_bar")
+            ).enabled
             self._hide_interface_for_process()
             if getattr(self, "cfg", {}).get("record_experiment_video", False):
                 video_config = self.cfg.get("video_config")
@@ -1727,7 +1732,12 @@ class TouchInterfaceApp:
                             (self.working_dir, self.config_dir),
                         ),
                     )
+                    if sync_enabled:
+                        recording.wait_until_ready()
+                        env[VIDEO_PATH_ENV] = str(block.output_dir / "camera.h264")
                 except RecordingError as exc:
+                    if sync_enabled:
+                        raise
                     print(
                         f"Video recording warning for block {block.block_num}: {exc}",
                         file=sys.stderr,
@@ -1753,6 +1763,9 @@ class TouchInterfaceApp:
             except BaseException:
                 stop_task_process(process)
                 raise
+            protocol_path = block.output_dir / "sync_protocol.json"
+            if protocol_path.exists() and not json.loads(protocol_path.read_text()).get("end_complete"):
+                raise RuntimeError("Block sync footer did not complete; the block sequence was stopped")
             return subprocess.CompletedProcess(cmd, returncode)
         finally:
             try:

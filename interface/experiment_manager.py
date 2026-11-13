@@ -19,6 +19,9 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Optional
 
 from bin.task_clock import EXPERIMENT_ORIGIN_ENV, TaskClock
 from bin.sync_bar import SyncBarConfig
+from bin.block_sync import (
+    EXPERIMENT_NUMBER_ENV, BLOCK_NUMBER_ENV, EXPERIMENT_DATE_ENV, validate_identity,
+)
 from bin.config import load_config
 from bin.config_snapshot import build_launch_config_snapshot, build_task_config_snapshot
 from bin.run_identity import BLOCK_ID_ENV, EXPERIMENT_ID_ENV, BLOCK_IDENTITY_FILENAME, new_run_id
@@ -369,6 +372,13 @@ class ExperimentManager:
         launch_value: str,
         config_value: Optional[str],
     ) -> PreparedBlock:
+        if self.blocks:
+            previous_protocol = self.experiment_dir / self.blocks[-1]["out_dir"] / "sync_protocol.json"
+            if previous_protocol.is_file() and not json.loads(previous_protocol.read_text()).get("end_complete"):
+                raise RuntimeError(
+                    "The previous block's date code did not complete. "
+                    "End this experiment before starting another block."
+                )
         launch_path = _resolve_path(launch_value, (self.working_dir, self.config_dir))
         if not launch_path.is_file():
             raise FileNotFoundError(f"Task launch script not found: {launch_path}")
@@ -384,6 +394,9 @@ class ExperimentManager:
         raw_block_name = block_config.get("config_name") or task_name
         block_name = str(raw_block_name).strip() or str(task_name)
         block_num = len(self.blocks) + 1
+        sync = self.sync_bar or SyncBarConfig.from_mapping(block_config.get("sync_bar"))
+        if sync.enabled:
+            validate_identity(self.experiment_number, block_num, self.started_at.date())
         block_id = new_run_id()
         output_dir = self.blocks_dir / f"{block_num}_{sanitize_filename_component(block_name)}"
         output_dir.mkdir(exist_ok=False)
@@ -492,6 +505,9 @@ class ExperimentManager:
         environment[EXPERIMENT_ORIGIN_ENV] = str(self.task_clock.origin_perf_ns)
         environment[EXPERIMENT_ID_ENV] = self.experiment_id
         environment[BLOCK_ID_ENV] = block.block_id
+        environment[EXPERIMENT_NUMBER_ENV] = str(self.experiment_number)
+        environment[BLOCK_NUMBER_ENV] = str(block.block_num)
+        environment[EXPERIMENT_DATE_ENV] = self.started_at.date().isoformat()
         for key in (EXPERIMENT_UART_PENDING_ENV, EXPERIMENT_UART_READY_ENV, EXPERIMENT_BLOCK_NUMBER_ENV):
             environment.pop(key, None)
         if self.eye_tracker.start_future is not None:

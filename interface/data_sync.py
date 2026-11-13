@@ -23,7 +23,62 @@ NFS_FILESYSTEM_TYPES = frozenset({"nfs", "nfs4"})
 FILESYSTEM_TYPE_PROBE_TIMEOUT_S = 5.0
 REMOTE_DIRECTORY_PROBE_TIMEOUT_S = 5.0
 RSYNC_IO_TIMEOUT_SECONDS = 30
+UPLOAD_COMPLETE_FILENAME = ".upload_complete"
+UPLOAD_MARKER_TIMEOUT_S = 30.0
 PROCESS_KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
+
+
+_UPLOAD_MARKER_SCRIPT = r"""
+import json
+import stat
+import sys
+from pathlib import Path
+
+complete = sys.argv[1] == "complete"
+for name in json.loads(sys.argv[2]):
+    directory = Path(name)
+    if directory.is_symlink():
+        raise OSError(f"Experiment destination is a symlink: {directory}")
+    if not complete and not directory.exists():
+        continue
+    if not directory.is_dir():
+        raise OSError(f"Experiment destination is not a directory: {directory}")
+    marker = directory / sys.argv[3]
+    if complete:
+        try:
+            with marker.open("xb"):
+                pass
+        except FileExistsError:
+            info = marker.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_size != 0:
+                raise OSError(f"Upload marker is not an empty regular file: {marker}")
+    else:
+        marker.unlink(missing_ok=True)
+"""
+
+
+def update_upload_markers(experiments: Sequence[Path], *, complete: bool) -> None:
+    """Update destination markers with a bounded wait on remote storage.
+
+    Call with complete=False before copying, and complete=True only after a
+    successful transfer (or for an explicitly requested historical backfill).
+    Never create missing experiment directories or follow directory symlinks.
+    """
+    if not experiments:
+        return
+    try:
+        run_command_bounded(
+            [sys.executable, "-c", _UPLOAD_MARKER_SCRIPT,
+             "complete" if complete else "clear",
+             json.dumps([str(path) for path in experiments]), UPLOAD_COMPLETE_FILENAME],
+            timeout_s=UPLOAD_MARKER_TIMEOUT_S,
+            check=True,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise OSError(f"Upload marker update timed out after {exc.timeout:g} seconds") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or str(exc)).strip()
+        raise OSError(f"Could not update upload markers: {detail}") from exc
 
 
 _REMOTE_DIRECTORY_PROBE_SCRIPT = r"""
@@ -230,6 +285,7 @@ class SyncPlan:
             "--no-group",
             *(f"--exclude={pattern}" for pattern in HISTORY_SYNC_EXCLUDES),
             f"--exclude={CALIBRATION_SYNC_EXCLUDE}",
+            f"--exclude={UPLOAD_COMPLETE_FILENAME}",
             "--",
             f"{self.source}/",
             f"{self.destination}/",
@@ -322,6 +378,18 @@ class ExperimentDataSync:
                 retained_experiment=retained,
                 destination=remote_root / "experiments",
             )
+        )
+
+    def clear_upload_markers(self, plan: SyncPlan) -> None:
+        """Invalidate previous completion markers before starting a new copy."""
+        update_upload_markers(
+            [plan.destination / path.name for path in plan.experiments], complete=False,
+        )
+
+    def mark_upload_complete(self, plan: SyncPlan) -> None:
+        """Mark every planned destination only after rsync succeeds."""
+        update_upload_markers(
+            [plan.destination / path.name for path in plan.experiments], complete=True,
         )
 
     def prune(self, plan: SyncPlan) -> tuple[Path, ...]:

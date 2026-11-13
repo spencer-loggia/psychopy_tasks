@@ -820,6 +820,12 @@ class TouchInterfaceApp:
         plan = preparation.plan
         self.status_var.set(f"Syncing {len(plan.experiments)} experiment(s)...")
         self.root.update_idletasks()
+        try:
+            data_sync.clear_upload_markers(plan)
+        except OSError as exc:
+            return self._data_sync_failed(
+                f"Could not clear upload markers at {plan.destination}; local data was retained: {exc}"
+            )
         with tempfile.TemporaryFile(
             mode="w+t", encoding="utf-8"
         ) as error_file, tempfile.TemporaryFile(
@@ -870,7 +876,17 @@ class TouchInterfaceApp:
                 + (f"\n{error_detail}" if error_detail else "")
             )
 
-        self._data_sync_detail = f"Copied {plan.source} to {plan.destination} successfully"
+        try:
+            data_sync.mark_upload_complete(plan)
+        except OSError as exc:
+            return self._data_sync_failed(
+                f"Copied data to {plan.destination}, but could not mark uploads complete; "
+                f"local data was retained: {exc}"
+            )
+
+        self._data_sync_detail = (
+            f"Copied {plan.source} to {plan.destination} successfully; upload completion markers written"
+        )
         try:
             removed = data_sync.prune(plan)
         except OSError as exc:

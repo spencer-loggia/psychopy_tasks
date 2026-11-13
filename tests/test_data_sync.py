@@ -11,12 +11,14 @@ from interface.data_sync import (
     DirectoryProbeResult,
     ExperimentDataSync,
     RSYNC_IO_TIMEOUT_SECONDS,
+    UPLOAD_COMPLETE_FILENAME,
     SyncPlan,
     SyncPreparation,
     probe_remote_directory,
     run_command_bounded,
     terminate_process,
     mounted_filesystem_type,
+    update_upload_markers,
 )
 from interface.experiment_history import ExperimentHistory, HISTORY_FILENAME
 from interface.touch_interface import (
@@ -110,6 +112,7 @@ class ExperimentDataSyncTests(unittest.TestCase):
                     "--exclude=/experiment_history.tsv",
                     "--exclude=/.experiment_history.*",
                     "--exclude=/.subject_calibrations/",
+                    "--exclude=.upload_complete",
                     "--",
                     f"{logs}/",
                     f"{remote / 'experiments'}/",
@@ -155,6 +158,7 @@ class ExperimentDataSyncTests(unittest.TestCase):
             experiment = logs / "exp_T_20261021_001"
             experiment.mkdir()
             (experiment / "state.json").write_text("{}")
+            (experiment / UPLOAD_COMPLETE_FILENAME).touch()
             history = ExperimentHistory(logs)
             history.import_existing([experiment])
             original = history.path.read_bytes()
@@ -163,12 +167,49 @@ class ExperimentDataSyncTests(unittest.TestCase):
             remote = root / "remote"
             remote.mkdir()
             plan = SyncPlan(logs, (experiment,), experiment, remote / "experiments")
+            sync = ExperimentDataSync(logs, remote)
+            sync.clear_upload_markers(plan)
             copied = subprocess.run(plan.command, capture_output=True, text=True, timeout=15)
             self.assertEqual(copied.returncode, 0, copied.stderr)
             self.assertEqual(sorted(p.name for p in plan.destination.iterdir()), [experiment.name, "interface_sync.log"])
-            ExperimentDataSync(logs, remote).prune(plan)
+            marker = plan.destination / experiment.name / UPLOAD_COMPLETE_FILENAME
+            self.assertFalse(marker.exists())
+            sync.mark_upload_complete(plan)
+            self.assertEqual(marker.read_bytes(), b"")
+            sync.mark_upload_complete(plan)  # A repeated completion is harmless.
+            sync.clear_upload_markers(plan)
+            self.assertFalse(marker.exists())
+            sync.mark_upload_complete(plan)
+            sync.prune(plan)
             self.assertEqual(history.path.read_bytes(), original)
             self.assertTrue((logs / ".experiment_history.lock").exists())
+
+    def test_completion_does_not_create_missing_experiments_or_follow_symlinks(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            missing = root / "missing"
+            update_upload_markers([missing], complete=False)
+            with self.assertRaises(OSError):
+                update_upload_markers([missing], complete=True)
+            self.assertFalse(missing.exists())
+            target = root / "target"
+            target.mkdir()
+            link = root / "linked-experiment"
+            link.symlink_to(target, target_is_directory=True)
+            for complete in (False, True):
+                with self.assertRaises(OSError):
+                    update_upload_markers([link], complete=complete)
+            marker = target / UPLOAD_COMPLETE_FILENAME
+            marker.symlink_to(root / "unrelated")
+            with self.assertRaises(OSError):
+                update_upload_markers([target], complete=True)
+            self.assertFalse((root / "unrelated").exists())
+
+    def test_upload_marker_timeout_reports_failure(self):
+        with patch("interface.data_sync.run_command_bounded",
+                   side_effect=subprocess.TimeoutExpired(["marker"], 30)):
+            with self.assertRaisesRegex(OSError, "Upload marker update timed out"):
+                update_upload_markers([Path("/remote/exp")], complete=True)
 
     def test_history_failure_prevents_pruning_any_experiments(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -511,9 +552,46 @@ class TouchInterfaceCleanupTests(unittest.TestCase):
                         result = app.sync_data()
 
                 self.assertIs(result, expected_result)
+                data_sync.clear_upload_markers.assert_called_once_with(plan)
+                data_sync.mark_upload_complete.assert_not_called()
                 data_sync.prune.assert_not_called()
                 if dialog_result is not SyncDialogResult.COMPLETED:
                     process.wait.assert_not_called()
+
+    def test_sync_marks_completion_before_pruning_and_retains_data_on_marker_failure(self):
+        for failed_step in (None, "clear_upload_markers", "mark_upload_complete"):
+            with self.subTest(failed_step=failed_step):
+                app = self._app()
+                plan = SyncPlan(Path("/work/logs"), (Path("/work/logs/exp"),),
+                                Path("/work/logs/exp"), Path("/mnt/data/experiments"))
+                sync = Mock()
+                sync.prepare.return_value = SyncPreparation(plan)
+                sync.prune.return_value = ()
+                if failed_step:
+                    getattr(sync, failed_step).side_effect = OSError("Permission denied")
+                process = Mock()
+                process.poll.return_value = 0
+                app._show_sync_dialog = Mock(return_value=SyncDialogResult.COMPLETED)
+                events = Mock()
+                events.attach_mock(sync.clear_upload_markers, "clear")
+                events.attach_mock(sync.mark_upload_complete, "complete")
+                events.attach_mock(sync.prune, "prune")
+                with patch("interface.touch_interface.ExperimentDataSync", return_value=sync), patch(
+                    "interface.touch_interface.subprocess.Popen", return_value=process,
+                ) as spawn:
+                    events.attach_mock(spawn, "copy")
+                    result = app.sync_data()
+                if failed_step:
+                    self.assertIs(result, CleanupResult.UNAVAILABLE)
+                    sync.prune.assert_not_called()
+                    self.assertIn("local data was retained", app._data_sync_detail)
+                    if failed_step == "clear_upload_markers":
+                        spawn.assert_not_called()
+                        sync.mark_upload_complete.assert_not_called()
+                else:
+                    self.assertIs(result, CleanupResult.SUCCESS)
+                    self.assertEqual([event[0] for event in events.mock_calls],
+                                     ["clear", "copy", "complete", "prune"])
 
     def test_sync_dialog_cancels_poll_before_destroying(self):
         app = self._app()

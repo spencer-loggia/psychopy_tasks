@@ -476,7 +476,12 @@ without progress; active transfers have no total-duration limit. Owner and group
 preserved because NFS root-squashing commonly rejects those changes; experiment contents, timestamps, permissions,
 directories, and symlinks are still preserved. A modal progress window prevents tasks from launching during the copy
 and offers **Cancel Sync**. Cancelling aborts the current operation without removing local data; during shutdown, it
-also cancels shutdown. Any rsync failure retains every local experiment. After a fully successful copy, all but the
+also cancels shutdown. Any rsync failure retains every local experiment. Before copying, any previous
+`.upload_complete` markers are removed from the destination experiments being synced. These markers are excluded
+from rsync so a local marker cannot signal completion early. After rsync succeeds, an empty file named exactly
+`.upload_complete` (no additional extension) is created in each synced experiment directory on remote storage.
+Marker operations have a 30-second timeout; a failure retains all local experiments and reports sync failure.
+After a fully successful copy and marker creation, all but the
 most recently modified experiment are removed from the local cache. Their names and numbers must first be saved
 in the permanent local history; a history read/write failure prevents pruning. The history remains in `logs`
 alongside the retained experiment. Generated data directories, including this local history, are excluded by

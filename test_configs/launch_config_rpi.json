@@ -35,7 +35,7 @@
         },
         "video": {
             "launch": "task/play_video.py",
-            "config": "test_configs/play_video_config.json"
+            "config": "config_files/video/play_video_config.json"
         },
         "setup": {
             "calibrate_eye_tracker": {

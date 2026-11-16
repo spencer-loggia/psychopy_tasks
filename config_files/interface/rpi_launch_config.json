@@ -109,7 +109,7 @@
         },
         "video": {
             "launch": "task/play_video.py",
-            "config": "test_configs/play_video_config.json"
+            "config": "config_files/video/play_video_config.json"
         },
         "loops": {
             "csc2_experiment": {
@@ -118,6 +118,16 @@
                 ],
                 "config": [
                     "config_files/csc2/yuri_rigtrain_seq_mem_20260908.json"
+                ],
+                "order_mode": "sequential",
+                "n_iters": null
+            },
+            "video_5min": {
+                "launch": [
+                    "task/play_video.py"
+                ],
+                "config": [
+                    "config_files/video/play_video_5min_config.json"
                 ],
                 "order_mode": "sequential",
                 "n_iters": null

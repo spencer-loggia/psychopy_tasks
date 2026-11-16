@@ -5,7 +5,7 @@
   ],
   "clip_duration_seconds": 80.0,
   "seek_timeout_seconds": 30.0,
-  "num_clips": 1, 
+  "num_clips": 1,
   "frame_rate": 24,
   "output_dir": "./logs",
   "screens": {
@@ -16,8 +16,8 @@
   "bg": [0, 0, 0],
 
   "pump_pin": 0,
-  "pump_pulse_time_seconds": 0.05,
-  "reward_interval": 7.0,
+  "pump_pulse_time_seconds": 0.03,
+  "reward_interval": 8.0,
 
   "eye_tracking": {"enabled": true},
   "sync_bar": {

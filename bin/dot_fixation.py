@@ -4,9 +4,8 @@ from dataclasses import replace
 import math
 import threading
 
-from .eye_tracking import FixationWindow, fraction_distance_px, pixels_to_fraction
+from .eye_tracking import FixationWindow, fraction_to_pixels
 from .automatic_recalibration import OffsetRecalibration
-from .screen import oriented_size, rotate_centered_point
 
 
 # A busy acquisition thread has not reported a fixation loss. Consumers must
@@ -54,10 +53,9 @@ def validate_dot_fixation_config(
 class DotFixationGate:
     """Require a complete continuous fixation on one displayed dot.
 
-    Targets and the radius use subject-display pixels. The caller supplies
-    native PsychoPy target positions; calibration already maps eye samples to
-    the oriented subject scene. UART acquisition calls ``observe`` and the
-    presentation thread reads ``status`` without waiting for the worker.
+    Targets, gaze, screen size and radius use participant-view pixels. UART
+    acquisition calls ``observe``, which maps camera samples into this space.
+    The presentation thread reads ``status`` without waiting for the worker.
     """
 
     def __init__(self, settings, *, fixation_criteria_s, fixation_window_radius):
@@ -77,16 +75,16 @@ class DotFixationGate:
         self._onset_perf_s = math.inf
         self._first_entry_perf_s = None
         self._last_accepted_sample_s = None
+        self._stable_window = None
+        self._stable_anchor = None
+        self._stable_session = None
 
-    def start(self, positions, *, native_size, rotation_degrees, onset_perf_s):
+    def start(self, positions, *, screen_size, onset_perf_s,
+              allow_unaccepted_recalibration=False):
         """Begin fresh histories at the actual dot flip, excluding older frames."""
         if not math.isfinite(onset_perf_s):
             raise ValueError("onset_perf_s must be finite")
-        screen_size = oriented_size(native_size, rotation_degrees)
-        targets = tuple(
-            pixels_to_fraction(rotate_centered_point(pos, -rotation_degrees), screen_size)
-            for pos in positions
-        )
+        targets = tuple(tuple(map(float, pos)) for pos in positions)
         windows = tuple(
             # History resets on every miss below. Allow only rounding error
             # in the fraction: subtracting large perf-counter times can make
@@ -102,6 +100,13 @@ class DotFixationGate:
             self._first_entry_perf_s = None
             self._last_accepted_sample_s = None
             self._recalibrated_targets.clear()
+            self._stable_anchor = None
+            self._stable_session = None
+            self._stable_window = (
+                FixationWindow(self.fixation_criteria_s, FIXATION_ACCEPT_FRACTION, max_gap_s=self._max_gap_s)
+                if self.recalibration is not None and allow_unaccepted_recalibration and len(targets) == 1
+                else None
+            )
             if self.recalibration is not None:
                 self.recalibration.reset_history()
 
@@ -114,12 +119,35 @@ class DotFixationGate:
                 self.recalibration.observe(state)
                 self._calibration = self.recalibration.calibration
             position = (
-                self._calibration.map_position(*state.smoothed_position)
+                fraction_to_pixels(
+                    self._calibration.map_position(*state.smoothed_position), self._screen_size,
+                )
                 if state.valid else None
             )
+            if self._stable_window is not None:
+                stable = self._stable_window
+                if position is None or not all(math.isfinite(v) for v in (*position, state.timestamp_perf_s)):
+                    stable.clear()
+                    self._stable_anchor = None
+                else:
+                    # The same radius/duration used by the target gate defines
+                    # stability around a measured anchor, independent of offset.
+                    reset = (
+                        self._stable_anchor is None
+                        or state.session_id != self._stable_session
+                        or (stable.history and not 0 <= state.timestamp_perf_s - stable.history[-1][0] <= self._max_gap_s)
+                        or (self._stable_anchor is not None and math.dist(
+                            position, self._stable_anchor,
+                        ) > self.fixation_window_radius + FIXATION_RADIUS_EPSILON_PX)
+                    )
+                    if reset:
+                        stable.clear()
+                        self._stable_anchor = position
+                        self._stable_session = state.session_id
+                    stable.update(state, True)
             for target, window in zip(self._targets, self._windows):
-                in_window = position is not None and fraction_distance_px(
-                    position, target, self._screen_size,
+                in_window = position is not None and math.dist(
+                    position, target,
                 ) <= self.fixation_window_radius + FIXATION_RADIUS_EPSILON_PX
                 if in_window:
                     if self._first_entry_perf_s is None:
@@ -160,9 +188,21 @@ class DotFixationGate:
                         self._recalibrated_targets.add(index)
                         self.recalibration.accept(
                             self._targets[index - 1], now_s=now_s,
+                            screen_size=self._screen_size,
                             fixation_start_s=window.history[0][0],
                         )
                     return index
+            if (self._stable_window is not None and 1 not in self._recalibrated_targets
+                    and self._stable_window.accepts(now_s=now_s)):
+                adjusted = self.recalibration.accept(
+                    self._targets[0], now_s=now_s,
+                    screen_size=self._screen_size,
+                    fixation_start_s=self._stable_window.history[0][0],
+                )
+                if adjusted:
+                    self._recalibrated_targets.add(1)
+                # A calibration correction is not a fixation acceptance. The
+                # usual target window still controls reveal and task timing.
             self._last_accepted_sample_s = None
             return None
         finally:
@@ -176,5 +216,8 @@ class DotFixationGate:
             self._onset_perf_s = math.inf
             self._first_entry_perf_s = None
             self._last_accepted_sample_s = None
+            self._stable_window = None
+            self._stable_anchor = None
+            self._stable_session = None
             if self.recalibration is not None:
                 self.recalibration.reset_history()

@@ -170,7 +170,7 @@ def build_task_config_snapshot(
                 result.pop("init_dot_color", None)
         distribution = result.get("placement_distribution", "circle")
         if isinstance(distribution, str) and distribution.strip().lower() == "uniform":
-            _drop(result, {"fixed_positions", "center_point", "stim_range_radius"})
+            _drop(result, {"fixed_positions", "center_point"})
         # A positive duration in this mode is invalid, not an inactive value:
         # preserve it so the task still rejects the inconsistent configuration.
         default_sequence = task == "active_foraging"

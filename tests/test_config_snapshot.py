@@ -21,9 +21,9 @@ class ConfigSnapshotTests(unittest.TestCase):
                "display_margin": 80, "image_size": [100, 150], "seed": 23,
                "extension": {"value": [1, 2]}}
         result = self.snapshot(cfg)
-        for key in ("center_point", "stim_range_radius", "fixed_positions"):
+        for key in ("center_point", "fixed_positions"):
             self.assertNotIn(key, result)
-        for key in ("display_margin", "image_size", "seed", "extension", "placement_distribution"):
+        for key in ("display_margin", "image_size", "seed", "extension", "placement_distribution", "stim_range_radius"):
             self.assertEqual(result[key], cfg[key])
         result["extension"]["value"].append(3)
         self.assertEqual(cfg["extension"]["value"], [1, 2])
@@ -38,14 +38,14 @@ class ConfigSnapshotTests(unittest.TestCase):
     def test_match2cue_uniform_uses_same_inactive_circle_rules(self):
         cfg = {"placement_distribution": "uniform", "center_point": [1, 2],
                "stim_range_radius": 200, "fixed_positions": True, "display_margin": 40}
-        self.assertEqual(self.snapshot(cfg, "match2cue"), {"placement_distribution": "uniform", "display_margin": 40})
+        self.assertEqual(self.snapshot(cfg, "match2cue"), {"placement_distribution": "uniform", "display_margin": 40, "stim_range_radius": 200})
 
     def test_uniform_pruning_matches_case_and_whitespace_normalization(self):
         for task in ("active_foraging", "match2cue"):
             for distribution in (" Uniform ", "UNIFORM", "uniform"):
                 cfg = {"placement_distribution": distribution, "center_point": [1, 2],
                        "stim_range_radius": 200, "fixed_positions": True}
-                self.assertEqual(self.snapshot(cfg, task), {"placement_distribution": distribution})
+                self.assertEqual(self.snapshot(cfg, task), {"placement_distribution": distribution, "stim_range_radius": 200})
             for invalid in (None, False, 1, ["uniform"], {"uniform": True}, "unknown"):
                 cfg = {"placement_distribution": invalid, "center_point": [1, 2], "stim_range_radius": 200}
                 self.assertEqual(self.snapshot(cfg, task), cfg)

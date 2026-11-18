@@ -37,6 +37,7 @@ def load_task_without_display():
         "set_debug", "setup_task_window", "close_task_window", "resolve_frame_rate",
         "make_fixation_cross", "make_bg_rect", "make_initiation_cue_stims",
         "configure_sync_bar", "service_sync_bar", "finish_block_sync", "TrialBufferManager",
+        "verify_task_window_vblank",
     ):
         setattr(utils, name, Mock())
     path = Path(__file__).resolve().parents[1] / "task/match2cue.py"
@@ -115,8 +116,8 @@ class Match2CueConfigurationTests(unittest.TestCase):
     def test_uniform_geometry_routes_margin_and_ignores_inactive_circle_values(self):
         task = load_task_without_display()
         cfg = self.config(
-            self_initiation=False, placement_distribution=" UNIFORM ", display_margin=37.5,
-            center_point="invalid inactive coordinates", stim_range_radius="invalid inactive radius",
+            self_initiation=False, placement_distribution=" UNIFORM ", display_margin=[37.5, 20, 60, 40],
+            center_point="invalid inactive coordinates", stim_range_radius=150,
             fixed_positions=True,
         )
         space = types.SimpleNamespace(
@@ -137,13 +138,13 @@ class Match2CueConfigurationTests(unittest.TestCase):
             stack.enter_context(patch.object(task, "resolve_scene_size", return_value=(800, 600)))
             stack.enter_context(patch.object(task, "_decode_trial_payload", return_value=(trial, preloaded)))
             placement = stack.enter_context(patch.object(
-                task, "compute_afc_positions", side_effect=RuntimeError("placement boundary"),
+                task, "prepare_afc_placement", side_effect=RuntimeError("placement boundary"),
             ))
             with self.assertRaisesRegex(RuntimeError, "placement boundary"):
                 task.run_task(cfg, screen_config={})
-        self.assertEqual(placement.call_args.args[2:4], (None, None))
+        self.assertEqual(placement.call_args.args[2:4], (None, 150))
         self.assertEqual(placement.call_args.kwargs["placement_distribution"], "uniform")
-        self.assertEqual(placement.call_args.kwargs["display_margin"], 37.5)
+        self.assertEqual(placement.call_args.kwargs["display_margin"], [37.5, 20, 60, 40])
         task.utils.make_initiation_cue_stims.assert_not_called()
 
     def test_choice_tone_wires_configured_buzzer_and_cleans_up_after_abort(self):
@@ -179,7 +180,7 @@ class Match2CueConfigurationTests(unittest.TestCase):
                     stack.enter_context(patch.object(task, "describe_screen", return_value="test screen"))
                     stack.enter_context(patch.object(task, "resolve_scene_size", return_value=(800, 600)))
                     stack.enter_context(patch.object(task, "_decode_trial_payload", return_value=(trial, preloaded)))
-                    stack.enter_context(patch.object(task, "compute_afc_positions", return_value=([], [(-50, 0), (50, 0)])))
+                    stack.enter_context(patch.object(task, "prepare_afc_placement", return_value=Mock(sample=Mock(return_value=[(-50, 0), (50, 0)]))))
                     daq = stack.enter_context(patch.object(task, "DAQC2DigitalOutputs"))
                     daq.return_value.bind_bit.side_effect = lambda bit: (
                         (pump_on, pump_off) if bit == 2 else (buzzer_on, buzzer_off)
@@ -205,6 +206,49 @@ class Match2CueConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "choice_period_idicator_tone must be true or false"):
             task.run_task(self.config(choice_period_idicator_tone="false"), screen_config={})
         task.utils.setup_task_window.assert_not_called()
+
+    def test_completed_choice_count_keeps_attempt_ids_and_counts_incorrect_choices(self):
+        task = load_task_without_display()
+        cfg = self.config(n=2, num_afc=2, self_initiation=False, iti=0, pump_pulse_time_seconds=0)
+        space = types.SimpleNamespace(bg=(128, 128, 128), stimuli=((1, None), (2, None)),
+                                      shapes={}, colors={})
+        trial = Match2CueTrial(cue=(1, None), options=space.stimuli, reward_draw=1)
+        preloaded = {option: Image.new("RGB", (20, 20)) for option in trial.options}
+        task.utils.setup_task_window.return_value = (
+            types.SimpleNamespace(size=(800, 600)), types.SimpleNamespace(rotation="normal"), object(),
+        )
+        task.utils.resolve_frame_rate.return_value = (60, 1 / 60)
+        task.utils.make_fixation_cross.return_value = None
+        task.utils.TrialBufferManager.return_value.get_next_trial.side_effect = [
+            {"trial_idx": i} for i in range(1, 5)
+        ]
+        choices = (None, 1, None, 2)
+
+        def present(**kwargs):
+            index = choices[kwargs["trial_num"] - 1]
+            kwargs["trial_meta"].update(gray_flip_perf_s=0, gray_flip_perf_ns=0)
+            return False, {"chosen_index": index} if index is not None else None
+
+        task.utils.present_trial_with_persistent_dots = Mock(side_effect=present)
+        logs = Mock()
+        preview = Mock()
+        preview.poll.return_value = False
+        preview.consume_manual_reward_request.return_value = False
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(task, "load_afc_stimulus_space", return_value=space))
+            stack.enter_context(patch.object(task, "SessionLogBundle", return_value=logs))
+            stack.enter_context(patch.object(task, "describe_screen", return_value="test screen"))
+            stack.enter_context(patch.object(task, "resolve_scene_size", return_value=(800, 600)))
+            stack.enter_context(patch.object(task, "_decode_trial_payload", return_value=(trial, preloaded)))
+            stack.enter_context(patch.object(task, "_meta_values", return_value=(1, 0, 0)))
+            stack.enter_context(patch.object(task, "ExperimenterPreview", return_value=preview))
+            self.assertEqual(task.run_task(cfg, screen_config={}), "done")
+        rows = [c.args[0] for c in logs.behavior_logger.writerow.call_args_list]
+        self.assertEqual([r["trial_num"] for r in rows], [1, 2, 3, 4])
+        self.assertEqual([r["choice_made_index"] for r in rows], ["", 0, "", 1])
+        self.assertEqual([r["choice_correct"] for r in rows], ["", 1, "", 0])
+        preview.set_trial_progress.assert_called_with(4, 2, completed_trials=2)
+        self.assertEqual(task.utils.TrialBufferManager.call_args.kwargs["config"]["n_trials"], 0)
 
 
 class Match2CueLogicTests(unittest.TestCase):

@@ -115,13 +115,14 @@ class ExperimentManagerTests(unittest.TestCase):
                 )
                 saved = json.loads(block.config_path.read_text(encoding="utf-8"))
                 for key in (
-                    "center_point", "stim_range_radius", "fixed_positions", "duration",
+                    "center_point", "fixed_positions", "duration",
                     "initiation_cue_style", "initiation_cue_center_position", "hold_before_choice",
                     "hold_cue_to_init_time_s", "fixation_criteria_s", "fixation_window_radius",
                     "saccade_wait_timeout_s", "sync_pin", "win_size", "pump_pin", "x_scale",
                 ):
                     self.assertNotIn(key, saved)
                 self.assertEqual(saved["placement_distribution"], "uniform")
+                self.assertEqual(saved["stim_range_radius"], 700)
                 self.assertEqual(saved["display_margin"], 300)
                 self.assertEqual(saved["pump_pulse_time_seconds"], .25)
                 self.assertEqual(saved["eye_tracking"], {"enabled": False})
@@ -738,7 +739,7 @@ class ExperimentManagerTests(unittest.TestCase):
                 session = TaskEyeTrackingSession(settings, output_dir=first.output_dir,
                                                  recalibration=gate.recalibration)
                 try:
-                    gate.start(((0, 0),), native_size=(1000, 1000), rotation_degrees=0, onset_perf_s=1)
+                    gate.start(((0, 0),), screen_size=(1000, 1000), onset_perf_s=1)
                     for index in range(12):
                         gate.observe(EyeTrackerState(timestamp_perf_s=1 + index / 100,
                                                     frame_sequence=index, valid=True,

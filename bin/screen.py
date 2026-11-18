@@ -289,8 +289,12 @@ def oriented_size(size, rotation_degrees) -> tuple[float, float]:
 
 def rotate_centered_point(point, rotation_degrees) -> tuple[float, float]:
     """Rotate a centered, y-up point clockwise by a quarter turn."""
+    return _rotate_centered_quarter_turn(point, _quarter_turn_degrees(rotation_degrees))
+
+
+def _rotate_centered_quarter_turn(point, rotation) -> tuple[float, float]:
+    """Apply an already validated quarter turn on display/input hot paths."""
     x, y = float(point[0]), float(point[1])
-    rotation = _quarter_turn_degrees(rotation_degrees)
     if rotation == 90:
         return y, -x
     if rotation == 180:
@@ -1570,6 +1574,7 @@ def format_experimenter_label(
     subject: Optional[str] = None,
     current_trial_num: Optional[int] = None,
     total_trials: Optional[int] = None,
+    completed_trials: Optional[int] = None,
 ) -> str:
     """Build the task/subject/trial label shown on an experimenter preview."""
     lines = []
@@ -1579,7 +1584,11 @@ def format_experimenter_label(
         lines.append(f"Subject: {str(subject).strip()}")
     if current_trial_num is not None:
         total_label = str(int(total_trials)) if total_trials is not None and int(total_trials) > 0 else "∞"
-        lines.append(f"Trial: {int(current_trial_num)} / {total_label}")
+        if completed_trials is None:
+            lines.append(f"Trial: {int(current_trial_num)} / {total_label}")
+        else:
+            lines.append(f"Trial: {int(current_trial_num)}")
+            lines.append(f"Completed: {int(completed_trials)} / {total_label}")
     return "\n".join(lines)
 
 
@@ -2104,6 +2113,7 @@ def _experimenter_preview_process(
             "subject": payload.get("subject"),
             "current_trial_num": payload.get("current_trial_num"),
             "total_trials": payload.get("total_trials"),
+            "completed_trials": payload.get("completed_trials"),
             "layout": layout,
             "main_rotation_deg": scene_rotation_deg,
         }
@@ -2245,6 +2255,7 @@ def _experimenter_preview_process(
                     subject=static_scene.get("subject"),
                     current_trial_num=static_scene.get("current_trial_num"),
                     total_trials=static_scene.get("total_trials"),
+                    completed_trials=static_scene.get("completed_trials"),
                 ),
             )
             task_label_text.draw()
@@ -2376,6 +2387,7 @@ def _experimenter_preview_process(
     current_subject = initial_subject
     current_trial_num = initial_current_trial_num
     current_total_trials = initial_total_trials
+    current_completed_trials = None
     current_main_size = tuple(preview_canvas_size)
     current_main_rotation_deg = 0
     static_scene = _build_static_scene(
@@ -2386,6 +2398,7 @@ def _experimenter_preview_process(
             "subject": current_subject,
             "current_trial_num": current_trial_num,
             "total_trials": current_total_trials,
+            "completed_trials": current_completed_trials,
             "status_counts": current_status_counts,
         }
     )
@@ -2407,6 +2420,7 @@ def _experimenter_preview_process(
                 win,
                 text=task_label,
                 units="pix",
+                anchorVert="bottom",
                 height=max(18.0, min(float(preview_canvas_size[0]), float(preview_canvas_size[1])) * 0.032),
                 pos=(0.0, -float(preview_canvas_size[1]) * 0.44),
                 color=_preview_rgb255_to_psychopy((230, 230, 230)),
@@ -2569,6 +2583,8 @@ def _experimenter_preview_process(
                         current_trial_num = payload.get("current_trial_num")
                     if "total_trials" in payload:
                         current_total_trials = payload.get("total_trials")
+                    if "completed_trials" in payload:
+                        current_completed_trials = payload.get("completed_trials")
                     if "main_size" in payload:
                         current_main_size = tuple(payload["main_size"])
                     if "main_rotation_deg" in payload:
@@ -2582,6 +2598,7 @@ def _experimenter_preview_process(
                     scene_payload["subject"] = current_subject
                     scene_payload["current_trial_num"] = current_trial_num
                     scene_payload["total_trials"] = current_total_trials
+                    scene_payload["completed_trials"] = current_completed_trials
                     scene_payload.setdefault("main_size", current_main_size)
                     scene_payload.setdefault(
                         "main_rotation_deg",
@@ -2594,6 +2611,7 @@ def _experimenter_preview_process(
                             "subject": current_subject,
                             "current_trial_num": current_trial_num,
                             "total_trials": current_total_trials,
+                            "completed_trials": current_completed_trials,
                         }
                     )
                     if command_type == "static_scene":
@@ -2831,6 +2849,7 @@ def _experimenter_preview_process(
                         "subject": current_subject,
                         "current_trial_num": current_trial_num,
                         "total_trials": current_total_trials,
+                        "completed_trials": current_completed_trials,
                     }
                 )
             core.wait(max(0.02, float(update_interval_ms) / 1000.0))
@@ -2880,6 +2899,7 @@ class ExperimenterPreview:
         self.subject = subject
         self.current_trial_num = current_trial_num
         self.total_trials = total_trials
+        self.completed_trials = None
         self.status_counts = dict(status_counts) if status_counts is not None else None
         self.start_perf_s = time.perf_counter() if start_perf_s is None else float(start_perf_s)
         self.update_interval_s = max(0.05, float(update_interval_s))
@@ -3184,9 +3204,11 @@ class ExperimenterPreview:
             "calibration_points": [list(point) for point in calibration_points],
         })
 
-    def set_trial_progress(self, current_trial_num: int, total_trials: Optional[int]) -> None:
+    def set_trial_progress(self, current_trial_num: int, total_trials: Optional[int],
+                           *, completed_trials: Optional[int] = None) -> None:
         self.current_trial_num = int(current_trial_num)
         self.total_trials = None if total_trials is None else int(total_trials)
+        self.completed_trials = None if completed_trials is None else int(completed_trials)
 
     def set_status_counts(self, status_counts: Optional[Dict[str, int]]) -> None:
         self.status_counts = dict(status_counts) if status_counts is not None else None
@@ -3239,6 +3261,8 @@ class ExperimenterPreview:
             self.current_trial_num = payload["current_trial_num"]
         if "total_trials" in payload:
             self.total_trials = payload["total_trials"]
+        if "completed_trials" in payload:
+            self.completed_trials = payload["completed_trials"]
         if "status_counts" in payload:
             value = payload["status_counts"]
             self.status_counts = dict(value) if value is not None else None
@@ -3263,6 +3287,7 @@ class ExperimenterPreview:
         subject = getattr(self, "subject", None)
         current_trial_num = getattr(self, "current_trial_num", None)
         total_trials = getattr(self, "total_trials", None)
+        completed_trials = getattr(self, "completed_trials", None)
         status_counts = getattr(self, "status_counts", None)
         payload["subject"] = None if subject is None else str(subject)
         payload["current_trial_num"] = (
@@ -3271,6 +3296,7 @@ class ExperimenterPreview:
         payload["total_trials"] = (
             None if total_trials is None else int(total_trials)
         )
+        payload["completed_trials"] = completed_trials
         payload["status_counts"] = (
             None if status_counts is None else dict(status_counts)
         )

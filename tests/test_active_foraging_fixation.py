@@ -1,5 +1,6 @@
 """Headless regressions for gaze-gated AFC presentation and flip timing."""
 
+import ast
 import csv
 import importlib.util
 import json
@@ -16,6 +17,8 @@ import numpy as np
 
 from bin.logger import EventCodeLibrary, EventLogger, load_task_event_definitions
 from bin.dot_fixation import FIXATION_UNAVAILABLE
+from bin.participant_view import ParticipantView
+from bin.screen import oriented_size, rotate_centered_point
 from bin.task_clock import TaskClock
 from tests.test_active_foraging_timing import FakeClock
 
@@ -33,10 +36,11 @@ class Stimulus:
             self.win.pending_images.append(tuple(self.pos))
 
     def contains(self, position):
+        position = rotate_centered_point((position[0] - self.pos[0], position[1] - self.pos[1]), -getattr(self, "ori", 0))
         return (
             hasattr(self, "width") and hasattr(self, "height")
-            and abs(position[0] - self.pos[0]) <= self.width / 2
-            and abs(position[1] - self.pos[1]) <= self.height / 2
+            and abs(position[0]) <= self.width / 2
+            and abs(position[1]) <= self.height / 2
         )
 
 
@@ -147,7 +151,7 @@ class ActiveForagingFixationTests(unittest.TestCase):
                 on_choice_start=None, event_profile="active_foraging", hold_cue=False,
                 require_saccade_to_all_options=True, num_options=2, msg_logger=None,
                 hold_cue_to_init_time_s=0.0, setup_mouse=None, stop_after_s=None,
-                require_hold=None):
+                require_hold=None, rotation=0):
         clock = FakeClock()
         module, psychopy = load_presenter(clock)
         window = Display(clock)
@@ -175,7 +179,7 @@ class ActiveForagingFixationTests(unittest.TestCase):
             )
         if click_after is not None or click_intervals is not None:
             mouse = psychopy.event.Mouse.return_value
-            mouse.getPos.return_value = positions[click_index - 1]
+            mouse.getPos.return_value = ParticipantView(rotation).to_native(positions[click_index - 1])
             intervals = click_intervals if click_intervals is not None else [(click_after, math.inf)]
             mouse.getPressed.side_effect = lambda **kwargs: (
                 (bool(window.flips and any(start <= clock.seconds() - window.flips[0] / 1e9 < stop
@@ -184,7 +188,7 @@ class ActiveForagingFixationTests(unittest.TestCase):
             )
         if buffered_touch is not None:
             mouse = psychopy.event.Mouse.return_value
-            mouse.getPos.return_value = positions[click_index - 1]
+            mouse.getPos.return_value = ParticipantView(rotation).to_native(positions[click_index - 1])
             reset_s = [clock.seconds()]
             sent = []
             mouse.clickReset.side_effect = lambda: reset_s.__setitem__(0, clock.seconds())
@@ -223,7 +227,8 @@ class ActiveForagingFixationTests(unittest.TestCase):
                 isi=isi, bg_rgb_255=(128, 128, 128), fps=60,
                 sequential=sequential, is_memory=memory, trial_meta=metadata,
                 experimenter_preview=preview, external_abort_checker=abort,
-                scene_main_size=window.size, event_profile=event_profile,
+                scene_main_size=oriented_size(window.size, rotation), event_profile=event_profile,
+                stimulus_rotation_degrees=rotation,
                 reward_levels=[3] + [0] * (num_options - 1),
                 dot_fixation_gate=gate, saccade_wait_timeout_s=timeout,
                 require_saccade_to_all_options=require_saccade_to_all_options,
@@ -242,6 +247,40 @@ class ActiveForagingFixationTests(unittest.TestCase):
             if "timestamp_perf_ns" not in event and "timestamp_perf_s" in event:
                 event["timestamp_perf_ns"] = round(event["timestamp_perf_s"] * 1e9)
         return result, events, metadata, gate, window, preview
+
+    def test_touch_display_and_logs_share_participant_coordinates_for_all_rotations(self):
+        for rotation, native_expected in ((0, (-100, 0)), (90, (0, 100)),
+                                          (180, (100, 0)), (270, (0, -100))):
+            expected = (-100, 0)
+            with self.subTest(rotation=rotation):
+                messages = Mock()
+                result, _, _, _, window, _ = self.present(
+                    sequential=False, memory=False, gated=False, click_after=.12,
+                    choice_time=.5, rotation=rotation, msg_logger=messages,
+                )
+                self.assertFalse(result[0])
+                choice = result[1]
+                self.assertEqual(choice["chosen_index"], 1)
+                self.assertEqual(choice["chosen_pos"], expected)
+                self.assertEqual((choice["touch_x"], choice["touch_y"]), expected)
+                self.assertTrue(any(native_expected in scene for scene in window.scenes))
+                attempts = [c.args[1] for c in messages.log.call_args_list
+                            if c.args[1].startswith("choice_touch_attempt ")]
+                self.assertTrue(attempts)
+                self.assertEqual(ast.literal_eval(attempts[0].split("click_xy=", 1)[1].split(" matched_idx=", 1)[0]), expected)
+
+    def test_recalibration_fallback_is_enabled_only_for_first_unambiguous_af_dot(self):
+        for sequential, count, profile, expected in (
+            (True, 2, "active_foraging", [True, False]),
+            (False, 2, "active_foraging", [False]),
+            (False, 1, "active_foraging", [True]),
+            (True, 2, "match2cue", [False, False]),
+        ):
+            with self.subTest(sequential=sequential, count=count, profile=profile):
+                _, _, _, gate, _, _ = self.present(
+                    sequential=sequential, num_options=count, event_profile=profile,
+                )
+                self.assertEqual([kwargs["allow_unaccepted_recalibration"] for _, kwargs in gate.starts], expected)
 
     def test_choice_callback_matches_opening_flip_in_all_modes(self):
         for profile in ("active_foraging", "match2cue"):

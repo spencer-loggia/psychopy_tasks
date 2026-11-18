@@ -73,6 +73,8 @@ from .touch_input import (
 )
 from .dot_fixation import FIXATION_UNAVAILABLE
 from .initiation import build_initiation_cue_image
+from .participant_view import ParticipantView
+from .afc_geometry import prepare_afc_placement
 
 # Global debug flag: when True, utilities may write debug files (PNG) to logs/
 # Default is False; tasks can enable it via CLI (--debug) or config.
@@ -2021,9 +2023,8 @@ def make_initiation_cue_stims(
     }
     idle_cue = make_onset_cue_stim(win, **cue_kwargs)
     pressed_cue = make_onset_cue_stim(win, pressed=True, **cue_kwargs)
-    idle_cue.pos = position
-    pressed_cue.pos = position
-    return idle_cue, pressed_cue
+    view = ParticipantView(ori)
+    return view.stimulus(idle_cue, pos=position), view.stimulus(pressed_cue, pos=position)
 
 
 def present_trial_with_persistent_dots(
@@ -2064,6 +2065,7 @@ def present_trial_with_persistent_dots(
     pre_options_cue_event: str = "match_cue_on",
     pre_options_delay_event: str = "delay_start",
     stimulus_rotation_degrees: float = 0.0,
+    stimulus_orientation_degrees: float = 0.0,
     detect_pre_options_cue_touch: bool = False,
     on_pre_options_cue_touch: Optional[Callable[[], bool]] = None,
     pre_options_cue_touch_event: str = "match_cue_touch",
@@ -2079,10 +2081,10 @@ def present_trial_with_persistent_dots(
     - aborted: True if the task should stop immediately.
     - choice_info: None if no choice was made during the choice period, or a dict with keys:
         - chosen_index: int (1-based index within the trial options)
-        - chosen_pos: (x,y) psychopy pixel coords
+        - chosen_pos: (x,y) participant-view pixels, relative to screen center
         - choice_time_perf_s: perf_counter timestamp when the choice was made
         - reaction_time_s: time from choice_start to option_touch
-        - touch_x / touch_y: screen coordinates of the option touch
+        - touch_x / touch_y: participant-view pixels of the option touch
 
     When ``detect_pre_options_cue_touch`` is enabled, a fresh press on the
     pre-options cue is logged once. ``on_pre_options_cue_touch`` runs after the
@@ -2134,6 +2136,8 @@ def present_trial_with_persistent_dots(
     rotation_degrees = float(stimulus_rotation_degrees)
     if not math.isfinite(rotation_degrees):
         raise ValueError("stimulus_rotation_degrees must be finite")
+    view = ParticipantView(rotation_degrees)
+    subject_size = tuple(scene_main_size) if scene_main_size is not None else oriented_size(win.size, rotation_degrees)
     hold_cue_to_init_time_s = float(hold_cue_to_init_time_s)
     if not math.isfinite(hold_cue_to_init_time_s) or hold_cue_to_init_time_s < 0.0:
         raise ValueError("hold_cue_to_init_time_s must be finite and non-negative")
@@ -2160,7 +2164,7 @@ def present_trial_with_persistent_dots(
         trial_meta["initiation_task_time_ns"] = logger.task_time_ns(timestamp_perf_ns=perf_ns)
 
     from psychopy import event as _event
-    mouse = _event.Mouse(win=win)
+    mouse = view.mouse(_event.Mouse(win=win))
     mouse_presses = MousePressTracker(mouse)
     initiation_hold = TouchHoldTracker(
         hold_cue_to_init_time_s,
@@ -2322,7 +2326,7 @@ def present_trial_with_persistent_dots(
                         float(value)
                         for value in getattr(pressed_onset_cue, "size", (200.0, 200.0))
                     ),
-                    "ori": float(getattr(pressed_onset_cue, "ori", rotation_degrees)),
+                    "ori": float(getattr(pressed_onset_cue, "ori", 0)),
                 }
             )
         fixation_size = None
@@ -2332,7 +2336,7 @@ def present_trial_with_persistent_dots(
             fixation_size = None
         experimenter_preview.show_static_scene(
             bg_rgb_255=bg_rgb_255,
-            main_size=tuple(scene_main_size) if scene_main_size is not None else tuple(win.size),
+            main_size=subject_size,
             images=_preview_images(preview_items),
             dots=_preview_dots(),
             circles=[
@@ -2346,7 +2350,7 @@ def present_trial_with_persistent_dots(
             ),
             fixation_size=fixation_size,
             fixation_color=fixation_color,
-            main_rotation_deg=rotation_degrees,
+            main_rotation_deg=0,
             **option_overlays,
         )
 
@@ -2377,7 +2381,7 @@ def present_trial_with_persistent_dots(
             "image_payload": serialize_preview_image(image_obj),
             "pos": tuple(float(v) for v in getattr(stim_obj, "pos", (0.0, 0.0))),
             "size": tuple(float(v) for v in getattr(stim_obj, "size", (64.0, 64.0))),
-            "ori": float(getattr(stim_obj, "ori", rotation_degrees)),
+            "ori": float(getattr(stim_obj, "ori", 0)),
         }
         if reward_level is not None:
             entry["reward_level"] = int(reward_level)
@@ -2485,10 +2489,10 @@ def present_trial_with_persistent_dots(
             pressed_onset_cue = onset_cue
         try:
             onset_cue.opacity = 1.0
-            onset_cue.ori = rotation_degrees
+            onset_cue.ori = 0
             pressed_onset_cue.pos = onset_cue.pos
             pressed_onset_cue.opacity = 1.0
-            pressed_onset_cue.ori = rotation_degrees
+            pressed_onset_cue.ori = 0
         except Exception:
             pass
         bg_rect.draw()
@@ -2501,7 +2505,7 @@ def present_trial_with_persistent_dots(
                         "image_payload": serialize_preview_image(getattr(onset_cue, "image", None)),
                         "pos": tuple(float(v) for v in getattr(onset_cue, "pos", (0.0, 0.0))),
                         "size": tuple(float(v) for v in getattr(onset_cue, "size", (200.0, 200.0))),
-                        "ori": float(getattr(onset_cue, "ori", rotation_degrees)),
+                        "ori": float(getattr(onset_cue, "ori", 0)),
                     }
                 ]
             )
@@ -2569,7 +2573,7 @@ def present_trial_with_persistent_dots(
                                 ),
                                 "pos": tuple(float(value) for value in pressed_onset_cue.pos),
                                 "size": tuple(float(value) for value in pressed_onset_cue.size),
-                                "ori": float(getattr(pressed_onset_cue, "ori", rotation_degrees)),
+                                "ori": float(getattr(pressed_onset_cue, "ori", 0)),
                             }
                         ]
                     )
@@ -2615,7 +2619,7 @@ def present_trial_with_persistent_dots(
                                     ),
                                     "pos": tuple(float(value) for value in onset_cue.pos),
                                     "size": tuple(float(value) for value in onset_cue.size),
-                                    "ori": float(getattr(onset_cue, "ori", rotation_degrees)),
+                                    "ori": float(getattr(onset_cue, "ori", 0)),
                                 }
                             ]
                         )
@@ -2638,13 +2642,13 @@ def present_trial_with_persistent_dots(
             bg_rgb_255=bg_rgb_255,
             ori=rotation_degrees,
         )
-        cue_stim.pos = (0.0, 0.0)
+        cue_stim = view.stimulus(cue_stim)
         cue_preview = [
             {
                 "image_payload": serialize_preview_image(pre_options_cue_image),
                 "pos": [0.0, 0.0],
                 "size": [float(cue_stim.size[0]), float(cue_stim.size[1])],
-                "ori": rotation_degrees,
+                "ori": 0,
             }
         ]
         _show_preview(cue_preview)
@@ -2655,7 +2659,7 @@ def present_trial_with_persistent_dots(
             # A held initiation press must be released before the matching cue
             # can accept a touch.
             mouse_presses.reset()
-            cue_touch_target = visual.Rect(
+            cue_touch_target = view.stimulus(visual.Rect(
                 win,
                 width=max(1.0, float(cue_stim.size[0]) * float(choice_hitbox_scale)),
                 height=max(1.0, float(cue_stim.size[1]) * float(choice_hitbox_scale)),
@@ -2665,7 +2669,7 @@ def present_trial_with_persistent_dots(
                 lineColor=None,
                 opacity=0.0,
                 ori=rotation_degrees,
-            )
+            ))
 
         def _poll_pre_options_cue_touch() -> None:
             nonlocal pre_options_cue_touched
@@ -2691,7 +2695,7 @@ def present_trial_with_persistent_dots(
                 "INFO",
                 (
                     f"match_cue_touch_attempt trial_num={trial_num} "
-                    f"click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f}) "
+                    f"click_xy={tuple(click_pos)} "
                     f"matched={int(cue_contains_touch)}"
                 ),
             )
@@ -2847,7 +2851,7 @@ def present_trial_with_persistent_dots(
                 h = max(1.0, float(stim_size[1]) * float(choice_hitbox_scale))
             except Exception:
                 w, h = (64.0, 64.0)
-            target = visual.Rect(
+            target = view.stimulus(visual.Rect(
                 win,
                 width=w,
                 height=h,
@@ -2857,7 +2861,7 @@ def present_trial_with_persistent_dots(
                 lineColor=None,
                 opacity=0.0,
                 ori=rotation_degrees,
-            )
+            ), pos=ppos, ori=stimulus_orientation_degrees)
             choice_hit_targets.append(target)
 
     def _match_choice_target(click_pos: Tuple[float, float]) -> Optional[int]:
@@ -2900,7 +2904,7 @@ def present_trial_with_persistent_dots(
                 "INFO",
                 (
                     f"choice_touch_attempt trial_num={trial_num} "
-                    f"click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f}) "
+                    f"click_xy={tuple(click_pos)} "
                     f"matched_idx={chosen_idx} origin={origin}"
                 ),
                 timestamp_perf_ns=timestamp_perf_ns,
@@ -2921,14 +2925,15 @@ def present_trial_with_persistent_dots(
                 )
             return False
         click_perf_capture = float(click_perf)
+        touch_x, touch_y = click_pos
         chosen_info = {
             "chosen_index": int(chosen_idx),
             "chosen_pos": tuple(pos_list[chosen_idx - 1]),
             "choice_start_perf_s": float(choice_perf),
             "choice_time_perf_s": float(click_perf_capture),
             "reaction_time_s": float(click_perf_capture - choice_perf),
-            "touch_x": float(click_pos[0]),
-            "touch_y": float(click_pos[1]),
+            "touch_x": touch_x,
+            "touch_y": touch_y,
         }
         logger.log_interaction(
             trial_num=trial_num,
@@ -3068,7 +3073,7 @@ def present_trial_with_persistent_dots(
             bg_rgb_255=bg_rgb_255,
             ori=rotation_degrees,
         )
-        stim.pos = pos
+        stim = view.stimulus(stim, pos=pos, ori=stimulus_orientation_degrees)
         return pil_img, stim
 
     def _make_dot(pos, color_rgb):
@@ -3080,8 +3085,7 @@ def present_trial_with_persistent_dots(
             lineColor=None,
             units="pix",
         )
-        dot.pos = pos
-        return dot
+        return view.stimulus(dot, pos=pos)
 
     def _flip_prepared_scene(
         target_perf_s: Optional[float],
@@ -3102,14 +3106,14 @@ def present_trial_with_persistent_dots(
             before_flip_callback=before_flip_callback,
         )
 
-    def _start_dot_fixation(timing, targets):
+    def _start_dot_fixation(timing, targets, *, first_option_alone=False):
         if dot_fixation_gate is not None:
             fixation_positions[:] = targets
             dot_fixation_gate.start(
                 targets,
-                native_size=tuple(scene_main_size) if scene_main_size is not None else tuple(win.size),
-                rotation_degrees=rotation_degrees,
+                screen_size=subject_size,
                 onset_perf_s=timing.actual_perf_s,
+                allow_unaccepted_recalibration=is_active_foraging and first_option_alone,
             )
 
     def _log_fixation_accepted(option_index, now_s):
@@ -3336,7 +3340,7 @@ def present_trial_with_persistent_dots(
                 )
                 if dot_timing is None:
                     return _interrupted_result()
-                _start_dot_fixation(dot_timing, [pos])
+                _start_dot_fixation(dot_timing, [pos], first_option_alone=idx == 1)
                 _record_option_scene(dot_timing, [])
                 dot_perf = dot_timing.actual_perf_s
                 _set_initiation_time(perf_ns=dot_timing.actual_perf_ns)
@@ -3475,7 +3479,7 @@ def present_trial_with_persistent_dots(
             )
             if dot_timing is None:
                 return _interrupted_result()
-            _start_dot_fixation(dot_timing, list(positions))
+            _start_dot_fixation(dot_timing, list(positions), first_option_alone=len(positions) == 1)
             _record_option_scene(dot_timing, [])
             dot_perf = dot_timing.actual_perf_s
             _set_initiation_time(perf_ns=dot_timing.actual_perf_ns)
@@ -3644,44 +3648,14 @@ def sample_non_overlapping_positions(
     win_size: Tuple[int, int],
     max_attempts: int = 2000,
     margin: int = 50,
+    choice_hitbox_scale: float = 1.0,
 ) -> List[Tuple[float, float]]:
-    """Public helper: wrapper around the non-overlap placement algorithm.
-
-    Returns a list of (x, y) positions in PsychoPy pixel coords (centered at 0,0).
-    """
-    w_win, h_win = win_size
-    w_stim, h_stim = stim_size
-    half_w = w_win / 2.0
-    half_h = h_win / 2.0
-
-    # Enforce margin from window edges
-    min_x = -half_w + w_stim / 2.0 + margin
-    max_x = half_w - w_stim / 2.0 - margin
-    min_y = -half_h + h_stim / 2.0 + margin
-    max_y = half_h - h_stim / 2.0 - margin
-
-    if min_x > max_x or min_y > max_y:
-        raise ValueError("Stimulus size is larger than window; cannot place stimuli")
-
-    rects: List[Tuple[float, float, float, float]] = []
-    positions: List[Tuple[float, float]] = []
-    attempts = 0
-    while len(positions) < count and attempts < max_attempts:
-        attempts += 1
-        x = random.uniform(min_x, max_x)
-        y = random.uniform(min_y, max_y)
-        ok = True
-        for (cx, cy, ww, hh) in rects:
-            if abs(x - cx) < (w_stim + ww) / 2.0 and abs(y - cy) < (h_stim + hh) / 2.0:
-                ok = False
-                break
-        if ok:
-            rects.append((x, y, w_stim, h_stim))
-            positions.append((x, y))
-
-    if len(positions) < count:
-        raise RuntimeError(f"Could not place {count} non-overlapping stimuli after {max_attempts} attempts")
-    return positions
+    """Sample participant-view positions using the shared hit-box-safe geometry."""
+    return prepare_afc_placement(
+        False, count, None, None, stim_size, win_size,
+        display_margin=margin, placement_distribution="uniform",
+        choice_hitbox_scale=choice_hitbox_scale,
+    ).sample(max_attempts=max_attempts)
 
 
 def clamp_positions(
@@ -3852,6 +3826,7 @@ def present_delayed_afc_trial(
     cue_pos: Tuple[float, float] = (0.0, 0.0),
     external_abort_checker=None,
     show_fixation: bool = False,
+    stimulus_rotation_degrees: float = 0.0,
 ) -> Tuple[bool, Optional[Dict[str, Any]]]:
     """Present one delayed AFC trial with frame-locked cue/delay/choice timing.
 
@@ -3868,6 +3843,9 @@ def present_delayed_afc_trial(
     the ``make_onset_cue_stim`` checkerboard stimulus.
     """
     from psychopy import core as _core
+
+    rotation_degrees = float(stimulus_rotation_degrees)
+    view = ParticipantView(rotation_degrees)
 
     if len(trial_options) != len(positions):
         raise ValueError("trial_options and positions must have the same length")
@@ -4052,7 +4030,7 @@ def present_delayed_afc_trial(
         )
 
     cue_stim = make_image_stim_from_array(win, cue_img, size=None, bg_rgb_255=bg_rgb_255)
-    cue_stim.pos = cue_pos
+    cue_stim = view.stimulus(cue_stim, pos=cue_pos, ori=-rotation_degrees)
 
     choice_stims: List[visual.ImageStim] = []
     choice_hit_targets: List[visual.Rect] = []
@@ -4064,14 +4042,14 @@ def present_delayed_afc_trial(
             role="choice",
         )
         stim = make_image_stim_from_array(win, choice_img, size=None, bg_rgb_255=bg_rgb_255)
-        stim.pos = pos
+        stim = view.stimulus(stim, pos=pos, ori=-rotation_degrees)
         choice_stims.append(stim)
         try:
             w, h = stim.size
         except Exception:
             w, h = (64.0, 64.0)
         choice_hit_targets.append(
-            visual.Rect(
+            view.stimulus(visual.Rect(
                 win,
                 width=max(1.0, float(w) * float(choice_hitbox_scale)),
                 height=max(1.0, float(h) * float(choice_hitbox_scale)),
@@ -4080,10 +4058,10 @@ def present_delayed_afc_trial(
                 fillColor=None,
                 lineColor=None,
                 opacity=0.0,
-            )
+            ), pos=pos, ori=-rotation_degrees)
         )
 
-    mouse = event.Mouse(win=win)
+    mouse = view.mouse(event.Mouse(win=win))
     mouse_presses = MousePressTracker(mouse)
     try:
         event.clearEvents(eventType="mouse")
@@ -4165,7 +4143,7 @@ def present_delayed_afc_trial(
                     "INFO",
                     (
                         f"checkerboard_onset_cue_touch trial_num={trial_num} "
-                        f"click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f})"
+                        f"click_xy={tuple(click_pos)}"
                     ),
                 )
                 # Prevent the onset-cue press from carrying into the choice window.
@@ -4354,7 +4332,7 @@ def present_delayed_afc_trial(
                 "INFO",
                 (
                     f"choice_touch_attempt trial_num={trial_num} "
-                    f"click_xy=({click_pos[0]:.1f},{click_pos[1]:.1f}) matched_idx={chosen_idx}"
+                    f"click_xy={tuple(click_pos)} matched_idx={chosen_idx}"
                 ),
             )
             if chosen_idx is not None:

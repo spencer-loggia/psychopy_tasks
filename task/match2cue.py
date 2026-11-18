@@ -27,11 +27,8 @@ if str(_project_root) not in sys.path:
 
 from bin import utils
 from bin.afc_geometry import (
-    compute_afc_positions,
+    prepare_afc_placement,
     normalize_placement_distribution,
-    screen_px_to_psychopy,
-    stimulus_size,
-    subject_centered_to_screen_px,
 )
 from bin.afc_stimuli import (
     AFCStimulusSpace,
@@ -44,7 +41,7 @@ from bin.afc_stimuli import (
     stimulus_to_json,
 )
 from bin.config import load_config, validate_config
-from bin.initiation import INITIATION_CONFIG_KEYS, resolve_initiation_config
+from bin.initiation import INITIATION_CONFIG_KEYS, initiation_cue_position, resolve_initiation_config
 from bin.daqc2_outputs import DAQC2DigitalOutputs
 from bin.choice_tone import ChoicePeriodTone, validate_choice_tone
 from bin.frame_timing import (
@@ -413,19 +410,8 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     onset_stim = None
     pressed_onset_stim = None
     if self_initiation:
-        onset_position = (
-            (0.0, 0.0)
-            if initiation_config.cue_center_position is None
-            else screen_px_to_psychopy(
-                subject_centered_to_screen_px(
-                    initiation_config.cue_center_position,
-                    main_scene_size,
-                    stimulus_rotation_degrees,
-                    field_name="initiation_cue_center_position",
-                ),
-                main_scene_size,
-                field_name="initiation_cue_center_position",
-            )
+        onset_position = initiation_cue_position(
+            initiation_config.cue_center_position, main_scene_size, stimulus_rotation_degrees,
         )
         onset_stim, pressed_onset_stim = utils.make_initiation_cue_stims(
             win,
@@ -445,14 +431,14 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
             return
         experimenter_preview.show_static_scene(
             bg_rgb_255=space.bg,
-            main_size=main_scene_size,
+            main_size=subject_scene_size,
             images=[],
             dots=[],
             fixation_size=(int(getattr(fix, "height", 0)) if fix is not None else None),
             fixation_color=(255, 255, 255),
             status_counts=status_counts,
             highlight_box=None,
-            main_rotation_deg=stimulus_rotation_degrees,
+            main_rotation_deg=0,
         )
 
     pylogging.console.setLevel(pylogging.CRITICAL)
@@ -619,7 +605,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
         )
 
     worker_config = {
-        "n_trials": n_trials,
+        "n_trials": 0,  # Stop on registered choices, not generated attempts.
         "num_afc": num_afc,
         "stimuli": [stimulus_to_json(value) for value in space.stimuli],
         "shapes": {str(key): str(value) for key, value in space.shapes.items()},
@@ -643,24 +629,29 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
     run_indefinitely = n_trials <= 0
     fixed_positions = bool(cfg.get("fixed_positions", False))
     center_value = cfg.get("center_point") if placement_distribution == "circle" else None
-    center_point = (
-        subject_centered_to_screen_px(
-            center_value, main_scene_size, stimulus_rotation_degrees,
-            field_name="center_point",
-        ) if center_value is not None else None
-    )
-    radius_value = cfg.get("stim_range_radius") if placement_distribution == "circle" else None
+    center_point = tuple(center_value) if center_value is not None else None
+    radius_value = cfg.get("stim_range_radius")
     stim_range_radius = float(radius_value) if radius_value is not None else None
 
     show_preview_idle()
     try:
+        placement = prepare_afc_placement(
+            fixed_positions, num_afc, center_point, stim_range_radius,
+            image_size, subject_scene_size,
+            display_margin=cfg.get("display_margin", 0.0),
+            placement_distribution=placement_distribution,
+            choice_hitbox_scale=1.25 if touchscreen else 1.0,
+            initiation_cue_position_px=initiation_config.cue_center_position or (0, 0),
+            fixed_layout_rotation_degrees=stimulus_rotation_degrees,
+        )
         trial_num = 1
-        while run_indefinitely or trial_num <= n_trials:
+        completed_trials = 0
+        while run_indefinitely or completed_trials < n_trials:
             pump_pulse_time = pump_control.apply_pending(msg_logger)
             if cfg.get("inter_pump_interval") is None:
                 inter_pump_interval_s = pump_pulse_time
             if experimenter_preview is not None:
-                experimenter_preview.set_trial_progress(trial_num, n_trials)
+                experimenter_preview.set_trial_progress(trial_num, n_trials, completed_trials=completed_trials)
             if poll_controls():
                 if task_end_status == "done":
                     task_end_status = "experimenter_exit"
@@ -672,32 +663,15 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 break
             trial_num = int(payload["trial_idx"])
             cue_image = preloaded[trial.cue]
-            effective_win_size = main_scene_size
-            sampled_positions, positions = compute_afc_positions(
-                fixed_positions,
-                num_afc,
-                center_point,
-                stim_range_radius,
-                oriented_size(
-                    stimulus_size(preloaded, trial.options[0]),
-                    stimulus_rotation_degrees,
-                ),
-                effective_win_size,
-                rng=position_rng,
-                display_margin=float(cfg.get("display_margin", 0.0)),
-                placement_distribution=placement_distribution,
-            )
+            positions = placement.sample(rng=position_rng)
             msg_logger.log(
                 "INFO",
                 f"trial_loaded trial_num={trial_num} cue={trial.cue} options={trial.options} matches={trial.matching_count}",
             )
-            for option_num, (screen_pos, psycho_pos) in enumerate(
-                zip(sampled_positions, positions),
-                start=1,
-            ):
+            for option_num, pos in enumerate(positions, start=1):
                 msg_logger.log(
                     "INFO",
-                    f"position_assigned trial_num={trial_num} option_num={option_num} screen_px={screen_pos} psychopy_pos={psycho_pos}",
+                    f"position_assigned trial_num={trial_num} option_num={option_num} screen_px={pos}",
                 )
 
             match_cue_reward_state = {"delivered": False}
@@ -757,7 +731,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 trial_meta=trial_meta,
                 experimenter_preview=experimenter_preview,
                 external_abort_checker=lambda: poll_controls(service_sync=False),
-                scene_main_size=effective_win_size,
+                scene_main_size=subject_scene_size,
                 event_profile="match2cue",
                 on_choice_start=(lambda: choice_tone.start(trial_num)) if choice_tone is not None else None,
                 pre_options_cue_image=cue_image,
@@ -771,6 +745,10 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
                 break
 
             chosen_index = choice_info.get("chosen_index") if choice_info is not None else None
+            if chosen_index is not None:
+                completed_trials += 1
+            if experimenter_preview is not None:
+                experimenter_preview.set_trial_progress(trial_num, n_trials, completed_trials=completed_trials)
             outcome = score_match2cue_choice(
                 trial,
                 chosen_index,

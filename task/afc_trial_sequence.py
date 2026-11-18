@@ -15,7 +15,7 @@ Configuration keys used (in addition to common ones):
 - dot_size: pixels
 - dot_color: [r,g,b] 0-255
 - choice_time: seconds to show all dots before clearing
-- n: number of trials (overrides previous meaning)
+- n: number of completed trials with a registered choice
 
 Usage example:
 python task/afc_trial_sequence.py --config test_configs/csc_shape_config
@@ -42,6 +42,7 @@ from bin.logger import SessionLogBundle
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.config import load_config, validate_config
 from bin.screen import (
+    oriented_size,
     ExperimenterPreview,
     describe_screen,
     load_screen_config,
@@ -54,7 +55,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="AFC trial sequence task")
     p.add_argument("--config", help="Path to JSON config file. CLI overrides config keys.")
     p.add_argument("--images_dir", help="Path to images dir (overrides config)")
-    p.add_argument("--n", type=int, default=None, help="Number of trials (overrides config n)")
+    p.add_argument("--n", type=int, default=None, help="Number of completed trials with a registered choice (overrides config n)")
     p.add_argument("--num_afc", type=int, default=None, help="Number of options per trial")
     p.add_argument("--duration", type=float, default=None, help="Stimulus duration (s)")
     p.add_argument("--choice_time", type=float, default=None, help="Choice display duration (s)")
@@ -182,6 +183,7 @@ def run_task(
     )
     rotation = software_stimulus_rotation(main_screen.rotation)
     session_logs.set_eye_tracking_screen(effective_win_size, rotation)
+    subject_size = oriented_size(effective_win_size, rotation)
     logger = session_logs.event_logger
     msg_logger = session_logs.message_logger
     behavior_logger = session_logs.behavior_logger
@@ -240,16 +242,20 @@ def run_task(
     except Exception:
         pass
 
-    # Pre-sample independent trial option sets.
-    trials = utils.sample_trial_options(image_files, num_afc, n_trials, seed=seed)
+    # A local RNG can generate replacement attempts without a finite trial cap.
+    option_rng = random.Random(seed)
+    if not 1 <= num_afc <= len(image_files):
+        raise ValueError("num_afc must be between 1 and the number of available images")
 
     msg_logger.log("INFO", f"task_ready n_trials={n_trials} num_afc={num_afc}")
 
     # Main trial loop
     aborted_task = False
-    for trial_num in range(1, n_trials + 1):
+    trial_num = 1
+    completed_trials = 0
+    while completed_trials < n_trials:
         if preview is not None:
-            preview.set_trial_progress(trial_num, n_trials)
+            preview.set_trial_progress(trial_num, n_trials, completed_trials=completed_trials)
         if isi_fr > 0:
             bg_rect.draw()
             if fix is not None:
@@ -264,28 +270,30 @@ def run_task(
             )
             if preview is not None:
                 preview.show_static_scene(
-                    bg_rgb_255=bg, main_size=effective_win_size,
-                    main_rotation_deg=rotation, fixation_size=32,
+                    bg_rgb_255=bg, main_size=subject_size,
+                    main_rotation_deg=0, fixation_size=32,
                 )
             if not wait_until(cue_timing.actual_perf_s + isi_plan.scheduled_s, poll_callback=poll_exit):
                 aborted_task = True
                 break
 
-        trial_options = trials[trial_num - 1]
+        trial_options = option_rng.sample(image_files, num_afc)
         msg_logger.log("INFO", f"trial_loaded trial_num={trial_num} stimuli={[p.name for p in trial_options]}")
 
         # compute native stim size from preloaded images (we will use same size for all)
-        first_p = trial_options[0]
-        pil0 = preloaded[first_p]
-        stim_size = pil0.size  # (W,H) in pixels
+        # Preserve this task's existing artwork orientation in the framebuffer;
+        # its participant-facing footprint is quarter-turned on mounted screens.
+        stim_size = oriented_size(
+            tuple(max(preloaded[p].size[axis] for p in trial_options) for axis in (0, 1)), rotation,
+        )
 
         # Compute non-overlapping positions for all options in this trial.
         sampled_positions = utils.sample_non_overlapping_positions(
-            num_afc, stim_size, effective_win_size, margin=margin
+            num_afc, stim_size, subject_size, margin=margin
         )
 
         # Defensive clamp via utility (keeps behavior identical but centralizes logic)
-        positions = utils.clamp_positions(sampled_positions, stim_size, effective_win_size, margin=margin)
+        positions = utils.clamp_positions(sampled_positions, stim_size, subject_size, margin=margin)
 
         # Log sampled vs clamped positions for debugging (one row per assign).
         for i, (spos, cpos) in enumerate(zip(sampled_positions, positions), start=1):
@@ -294,7 +302,8 @@ def run_task(
                 img = trial_options[i - 1].name if i - 1 < len(trial_options) else ""
             except Exception:
                 img = ""
-            msg_logger.log("INFO", f"position_assigned trial_num={trial_num} option_num={i} image={img} sampled={spos} clamped={cpos}")
+            msg_logger.log("INFO", f"position_assigned trial_num={trial_num} option_num={i} image={img} "
+                           f"sampled={spos} clamped={cpos}")
 
         trial_meta = {}
         aborted, choice_info = utils.present_trial_with_persistent_dots(
@@ -317,7 +326,9 @@ def run_task(
             fps=fps,
             experimenter_preview=preview,
             external_abort_checker=poll_exit,
-            scene_main_size=effective_win_size,
+            scene_main_size=subject_size,
+            stimulus_rotation_degrees=rotation,
+            stimulus_orientation_degrees=-rotation,
             trial_meta=trial_meta,
         )
         if aborted:
@@ -341,6 +352,10 @@ def run_task(
         for idx, path in enumerate(trial_options):
             behavior_row[f"stimulus_{idx}"] = path.name
         chosen_idx = choice_info.get("chosen_index") if choice_info is not None else None
+        if chosen_idx is not None:
+            completed_trials += 1
+        if preview is not None:
+            preview.set_trial_progress(trial_num, n_trials, completed_trials=completed_trials)
         behavior_row["choice_made_index"] = int(chosen_idx - 1) if chosen_idx is not None else ""
         behavior_row["choice_touch_x"] = (
             f"{float(choice_info['touch_x']):.9f}" if choice_info is not None and choice_info.get("touch_x") is not None else ""
@@ -375,6 +390,8 @@ def run_task(
                 if not wait_until(float(gray_start_perf) + iti_plan.scheduled_s, poll_callback=poll_exit):
                     aborted_task = True
                     break
+
+        trial_num += 1
 
     utils.finish_block_sync(win, suppress_errors=True)
     # finished

@@ -636,7 +636,7 @@ class SessionLogBundle:
             self.message_logger.log(
                 "INFO",
                 f"eye_recording_screen native_size={tuple(native_size)} "
-                f"rotation_deg={rotation_degrees} coordinates=centered_native_pixels",
+                f"rotation_deg={rotation_degrees} coordinates=centered_subject_pixels",
             )
 
     def flush(self) -> None:

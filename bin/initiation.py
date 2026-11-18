@@ -27,19 +27,16 @@ class InitiationConfig:
 
 
 def initiation_cue_position(position, main_scene_size, rotation_degrees=0):
-    """Map subject-centered cue coordinates to the native PsychoPy window."""
-    from .afc_geometry import screen_px_to_psychopy, subject_centered_to_screen_px
+    """Validate and return the cue in participant-view centered pixels."""
+    from .screen import oriented_size
 
     if position is None:
         return (0.0, 0.0)
-    return screen_px_to_psychopy(
-        subject_centered_to_screen_px(
-            position, main_scene_size, rotation_degrees,
-            field_name="initiation_cue_center_position",
-        ),
-        main_scene_size,
-        field_name="initiation_cue_center_position",
-    )
+    width, height = oriented_size(main_scene_size, rotation_degrees)
+    x, y = map(float, position)
+    if not (math.isfinite(x) and math.isfinite(y) and abs(x) <= width / 2 and abs(y) <= height / 2):
+        raise ValueError("initiation_cue_center_position is outside the main screen bounds")
+    return x, y
 
 
 def build_initiation_cue_image(

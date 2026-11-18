@@ -1,8 +1,10 @@
-"""Small offset corrections from accepted dot fixations; no fitting or I/O."""
+"""Small offset corrections from dot fixation samples; no fitting or I/O."""
 
 from collections import deque
 from copy import copy
 import math
+
+from .eye_tracking import pixels_to_fraction
 
 
 class OffsetRecalibration:
@@ -41,11 +43,12 @@ class OffsetRecalibration:
         while len(self._history) > 1 and self._history[1].timestamp_perf_s <= cutoff:
             self._history.popleft()
 
-    def accept(self, target, *, now_s, fixation_start_s):
+    def accept(self, target, *, screen_size, now_s, fixation_start_s):
         """Use the sample holding at acceptance minus 50 ms, if trustworthy.
 
-        The gate calls this once per displayed target while holding its history
-        lock. Short fixations, gaps and invalid samples cannot seed a correction.
+        The gate supplies a participant-pixel target while holding its history
+        lock. Only calibration math uses screen fractions. Short fixations,
+        gaps and invalid samples cannot seed a correction.
         """
         reference_s = now_s - self.LOOKBACK_S
         sample = next((state for state in reversed(self._history)
@@ -55,15 +58,17 @@ class OffsetRecalibration:
             and -1e-9 <= reference_s - sample.timestamp_perf_s <= self.max_gap_s
             and 0 <= now_s - self._history[-1].timestamp_perf_s <= self.max_gap_s
         ):
-            return
+            return False
         calibration = copy(self.calibration)
+        target = pixels_to_fraction(target, screen_size)
         position = calibration.map_position(*sample.smoothed_position)
         offsets = (
             calibration.x_offset + self.ADJUSTMENT_FRACTION * (target[0] - position[0]),
             calibration.y_offset + self.ADJUSTMENT_FRACTION * (target[1] - position[1]),
         )
         if not all(math.isfinite(value) for value in offsets):
-            return
+            return False
         calibration.x_offset, calibration.y_offset = offsets
         self.calibration = calibration
         self.update_count += 1
+        return True

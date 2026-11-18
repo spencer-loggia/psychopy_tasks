@@ -53,11 +53,11 @@ class EyeDataRecorderTests(unittest.TestCase):
 
     def test_calibrated_screen_pixels_match_stimulus_coordinates_for_all_rotations(self):
         # Calibration maps (120, 60) camera pixels to (0.2, -0.2) of the
-        # subject-oriented screen. Expected coordinates are native stimulus
-        # coordinates, including the rig's normal-output clockwise turn.
+        # subject-oriented screen. Expected coordinates use the participant view,
+        # with dimensions swapped for quarter-turn displays.
         for rotation, expected in (
-            (0, (160, -120)), (90, (-160, -120)),
-            (180, (-160, 120)), (270, (160, 120)),
+            (0, (160, -120)), (90, (120, -160)),
+            (180, (160, -120)), (270, (120, -160)),
         ):
             with self.subTest(rotation=rotation):
                 rows, recorder, _ = self.record(
@@ -71,7 +71,7 @@ class EyeDataRecorderTests(unittest.TestCase):
                 self.assertEqual(int(row["camera_time_ns"]), 1234567890123456789)
                 self.assertEqual(row["screen_ready"], "1")
 
-    def test_normal_screen_subject_up_and_left_use_native_psychopy_axes(self):
+    def test_normal_screen_subject_up_and_left_use_participant_axes(self):
         rotation = software_stimulus_rotation("normal")
         self.assertEqual(rotation, 90)
         # The default test calibration centers camera (100, 50). Moving the
@@ -80,39 +80,37 @@ class EyeDataRecorderTests(unittest.TestCase):
         up = replace(center, y_smooth_px=45, frame_sequence=8)
         left = replace(center, x_smooth_px=90, frame_sequence=9)
         rows, _, _ = self.record([center, up, left], geometry=((800, 600), rotation))
-        expected_screen_positions = ((400, 300), (480, 300), (400, 240))
+        expected_screen_positions = ((0, 0), (0, 80), (-60, 0))
         for row, (screen_x, screen_y) in zip(rows, expected_screen_positions):
-            self.assertAlmostEqual(float(row["x_screen_px"]), screen_x - 800 / 2)
-            self.assertAlmostEqual(float(row["y_screen_px"]), 600 / 2 - screen_y)
+            self.assertAlmostEqual(float(row["x_screen_px"]), screen_x)
+            self.assertAlmostEqual(float(row["y_screen_px"]), screen_y)
 
-    def test_full_affine_calibration_is_saved_in_native_psychopy_coordinates(self):
+    def test_full_affine_calibration_is_saved_in_participant_coordinates(self):
         calibration = EyeCalibration(
             x_scale=0.002, y_scale=-0.004, x_cross=0.003, y_cross=-0.001,
             x_offset=-0.2, y_offset=0.5,
         )
         # Camera (120,60) maps to subject fractions (.22,.14). The native
-        # 800x600 screen's subject scene is 600x800, giving native screen pixel
-        # (512,432), or PsychoPy (112,-132), after the one clockwise turn.
+        # 800x600 screen's subject scene is 600x800, giving (132,112) pixels.
         rows, _, _ = self.record(
             [self.valid_state()],
             geometry=((800, 600), software_stimulus_rotation("normal")),
             calibration=calibration,
         )
-        self.assertAlmostEqual(float(rows[0]["x_screen_px"]), 512 - 800 / 2)
-        self.assertAlmostEqual(float(rows[0]["y_screen_px"]), 600 / 2 - 432)
+        self.assertAlmostEqual(float(rows[0]["x_screen_px"]), 132)
+        self.assertAlmostEqual(float(rows[0]["y_screen_px"]), 112)
 
     def test_quadratic_mapping_is_recorded_with_display_rotation(self):
         calibration = EyeCalibration(
             x_scale=0, y_scale=0, x_quad_xx=1e-5, x_quad_xy=-2e-5, x_quad_yy=3e-5,
             y_quad_xx=-4e-5, y_quad_xy=5e-5, y_quad_yy=-6e-5,
         )
-        # (120,60) gives subject (.108,-.432). Clockwise display rotation maps
-        # subject y to native x, and subject x to negative native y.
+        # (120,60) gives subject (.108,-.432) in the 600x800 participant view.
         rows, _, _ = self.record(
             [self.valid_state()], geometry=((800, 600), 90), calibration=calibration,
         )
-        self.assertAlmostEqual(float(rows[0]['x_screen_px']), -0.432 * 800)
-        self.assertAlmostEqual(float(rows[0]['y_screen_px']), -0.108 * 600)
+        self.assertAlmostEqual(float(rows[0]['x_screen_px']), 0.108 * 600)
+        self.assertAlmostEqual(float(rows[0]['y_screen_px']), -0.432 * 800)
 
     def test_invalid_rows_use_nan_instead_of_last_valid_gaze_or_zero_pupil(self):
         valid = self.valid_state()

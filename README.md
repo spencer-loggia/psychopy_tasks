@@ -1109,8 +1109,10 @@ Its running counts are `Correct`, `Incorrect`, and `Rewards delivered`; it does 
 Main-display sizes and `win_size` overrides always use native framebuffer order. On the current rig that is
 `2560x1600`, with the OS output set to `normal`. `active_foraging`, `match2cue`, and `play_video` compensate by
 turning subject-facing stimuli 90 degrees clockwise. If the OS output is returned to RandR `right`, the software
-compensation becomes zero to avoid a double rotation. Positions and touch coordinates remain in native framebuffer
-coordinates. The experimenter process transposes the entire scene to the subject-facing `1600x2560` view.
+compensation becomes zero to avoid a double rotation. Placement, hit testing, fixation targets, preview scenes and logged positions use participant-view
+pixels directly: screen center is `(0, 0)`, X is right, and Y is up. A shared PsychoPy adapter
+handles rotation at the drawing/device-input boundary. AFC previews consume these participant-view
+scenes directly; video previews transpose native frames to the same subject-facing view.
 
 Eye Tracker Calibration
 -----------------------
@@ -1365,14 +1367,16 @@ The CSV columns are:
 | --- | --- |
 | `task_time_ns` | Local acquisition time in integer nanoseconds from the experiment origin, captured when the UART response is received. Same clock as events; never the writer/flush time or an age-adjusted estimate. |
 | `camera_time_ns` | Original `sensor_timestamp_ns` from the UART status, retained exactly as an integer. This is the camera's clock and must not be subtracted directly from `task_time_ns`. |
-| `x_screen_px`, `y_screen_px` | Calibrated, filtered position in native PsychoPy pixel coordinates: `x = screen_x - W/2`, `y = H/2 - screen_y`, where screen coordinates start at the top left. The full quadratic transform, scene size and display rotation are applied, matching stimulus positions. Offscreen positions are retained without clamping. |
+| `x_screen_px`, `y_screen_px` | Calibrated, filtered position in participant-view pixels: actual screen center is `(0, 0)`, X points right and Y points up. Subject-scene fractions are multiplied by the participant-facing width and height. These match logged option/dot and touch positions regardless of native display rotation. Offscreen positions are retained without clamping. |
 | `pupil_diameter_px` | Eye 0 pupil diameter in camera pixels, as supplied by the tracker. |
 | `eye_valid`, `rejection_reason` | Eye validity (`1`/`0`) and reason such as `blink`, `lost`, `stale`, or `tracker_error`. Invalid samples write `nan` for both position coordinates and pupil diameter. |
 | `screen_ready` | `1` once the task has supplied its screen geometry. During setup, `0` means screen coordinates are still `nan`; a valid pupil measurement can already be recorded. |
 | `session_id`, `frame_sequence` | Tracker service and camera frame identifiers. There is no poll/sample index. |
 
 Thus, after accurate calibration, looking at a stimulus positioned at `(x, y)` should record that same
-centered pixel position. The existing main-thread `get_position()` API continues returning subject-scene
+participant-centered pixel position. Column names are unchanged. Older eye CSVs used native centered axes;
+the existing `eye_recording_screen` message now identifies `coordinates=centered_subject_pixels`.
+The existing main-thread `get_position()` API continues returning subject-scene
 fractions. Applied calibration, UART/filter settings and screen geometry are recorded in
 the block's message log. Calibration and geometry are captured when each measurement is queued. CSV storage
 uses a fixed-size buffer and an 8192-measurement queue, flushes about once per second, and drains accepted
@@ -1447,7 +1451,14 @@ position as ground truth for the smoothed eye sample at or immediately before **
 before acceptance**. It moves `x_offset` and `y_offset` **5% toward** the offsets that
 would map that sample to the target. Gains, cross terms and quadratic terms stay unchanged.
 Repeated polls or refixations on an already accepted dot do not apply more corrections;
-a new dot presentation starts a fresh opportunity. Missing, stale, invalid or pre-dot
+a new dot presentation starts a fresh opportunity. Active foraging also allows one correction on the
+first dot of each attempt when it is shown alone, even if gaze is outside its acceptance window.
+Valid gaze must remain within `fixation_window_radius` of its measured anchor for
+`fixation_criteria_s`; movement beyond that radius, missing samples or invalidity restarts the stability
+interval. The same 50 ms lookback and 5% offset correction apply. This fallback does not accept
+fixation or reveal the option, and does not apply when multiple dots are visible or to later
+unaccepted dots. A later accepted fixation on that same presentation cannot apply a second correction.
+Missing, stale, invalid or pre-dot
 samples are ignored; fixations without sufficient history at the reference time are skipped.
 
 Corrected mappings are shared immediately with gaze reads, preview and subsequent CSV
@@ -1558,15 +1569,31 @@ Active Foraging Positioning
 `placement_distribution` selects option placement for active foraging and match-to-cue. The default,
 `"circle"`, preserves the existing circle placement and random sampling. `"uniform"` samples X and Y
 uniformly over the allowed screen rectangle on each trial, rejecting overlaps with previously placed
-stimuli. The rectangle accounts for `display_margin` and the full rotated image dimensions, so every
-stimulus stays inside the allowed area. In uniform mode, `center_point`, `stim_range_radius`, and
-`fixed_positions` are inactive; the independent initiation-cue position still applies.
+stimuli. The rectangle accounts for `display_margin` and the full participant-facing image dimensions, so every
+stimulus stays inside the allowed area. In uniform mode, `center_point` and `fixed_positions`
+are inactive. A non-null `stim_range_radius` instead defines an exclusion disk around the initiation
+cue: every option/dot center must be at least that many pixels from the cue center. `null` or zero
+means no exclusion; negative or non-finite values are rejected. With initiation disabled, the reference
+is screen center. A disk that covers the entire allowed rectangle raises a configuration error.
+Sampling is uniform in area over the remaining region, subject to hit-box separation.
 
-In circle mode, `center_point` uses PsychoPy-style centered pixel coordinates in the participant's view: `[0, 0]` is screen center, positive X is right, and positive Y is up. `[-500, -500]` therefore means 500 pixels left and down from screen center. `null` also means `[0, 0]`. The task applies the display's software rotation when converting these positions to native framebuffer coordinates for rendering and logging. These settings previously used upper-left-origin native pixels; existing non-null positions authored in that convention must be converted.
+In circle mode, `center_point` uses PsychoPy-style centered pixel coordinates in the participant's view: `[0, 0]` is screen center, positive X is right, and positive Y is up. `[-500, -500]` therefore means 500 pixels left and down from screen center. `null` also means `[0, 0]`. The task uses these coordinates directly for placement, touch/fixation tests and logging; the display
+adapter alone maps them to the native framebuffer for rendering.
+`screen_px` in `position_assigned` now uses the actual screen center as its origin, and the redundant
+`psychopy_pos` entry is omitted. Circle placement never changes the coordinate origin.
+`choice_touch_x`/`choice_touch_y`, and the existing `sampled`/`clamped` position diagnostics in the
+other AFC tasks, use this same participant frame. The existing `resolved_main_scene_size` message
+records native size, participant-facing size, OS output rotation and `stimulus_rotation_deg`.
+In `stimulus_placement`, `center_bounds_px` is `(left, bottom, right, top)` in this frame, and
+`valid_arcs_rad` uses counterclockwise angles from participant-right. The checked-in configuration
+positions already use participant coordinates and retain their displayed locations; no runtime
+conversion of configuration coordinates is performed.
 
 `stim_range_radius` is the circle radius in pixels. When it is `null`, it defaults to half the distance from an interior `center_point` to the closest screen edge. Circle centers on or outside the screen edge require an explicit positive radius; circles may extend off-screen.
 
-`display_margin` is the minimum clearance in pixels between **any part of the stimulus image** and each screen edge (default `0`). In circle mode, active foraging intersects the circle with the rectangle inset by that margin plus half the rotated image dimensions before the first trial. Random positions are sampled directly and uniformly along the remaining arcs, so no off-screen proposals need to be rejected at trial time. Overlap rejection between stimuli still applies. Authored image sizes remain `[width, height]`; their native axis-aligned bounds swap after a 90- or 270-degree software turn. The calculation uses the actual native framebuffer size and the same output-dependent software rotation as rendering, so the margin also holds in the participant's view. A circle with no usable arc raises a configuration error before trials begin.
+`display_margin` is the minimum clearance in participant-view pixels between **any part of the stimulus image** and each screen edge (default `0`). A single number applies to all four edges. A tuple, or JSON array, specifies `(left, right, top, bottom)` separately; for example, `"display_margin": [100, 150, 200, 50]`. Edge names always refer to the participant’s view, including on rotated displays. Every value must be finite and non-negative. In circle mode, active foraging intersects the circle with the rectangle inset by that margin plus half the participant-facing image dimensions before the first trial. Random positions are sampled directly and uniformly along the remaining arcs, so no off-screen proposals need to be rejected at trial time. Overlap rejection uses the actual touch hit boxes (1.25 times image size for touchscreen active
+foraging and match-to-cue). Fixed layouts with intersecting hit boxes are rejected. Image edge
+clearance still uses the full image footprint. Geometry is prepared outside the presentation loop. All AFC variants share the same overlap checks. Authored image sizes remain `[width, height]`; their native axis-aligned bounds swap after a 90- or 270-degree software turn. Placement uses the participant-facing dimensions of the actual framebuffer, so margins hold across display rotations. A circle with no usable arc raises a configuration error before trials begin.
 
 For example, on the rig's `1600x2560` participant-facing screen, `center_point: [-500, -500]`, `stim_range_radius: 500`, `image_size: [150, 150]`, and `display_margin: 200` produce an arc toward the central region while excluding positions too near the left edge. A radius of approximately `707.1068` would make that circle pass through `[0, 0]` exactly. The initiation cue is separate and must still have an on-screen center or `null`.
 
@@ -1607,7 +1634,7 @@ The option is currently enabled only in
 - In circle mode, `fixed_positions=true`: locations retain their evenly spaced native-framebuffer layout around the circle. The spacing angle is `2*pi / num_afc`, and the first location is offset by half that spacing from the point directly below the circle center in native coordinates. A fixed location whose full image crosses `display_margin` raises a configuration error rather than moving or dropping an option.
 - In circle mode, `fixed_positions=false`: locations are random points on the circle, with rejected draws when stimulus bounding boxes would overlap.
 - Active foraging accepts `--placement_distribution circle` or `--placement_distribution uniform` to override JSON placement.
-- Custom `center_point`, `stim_range_radius`, and `display_margin` values can be provided in JSON or as `--center_point X Y --stim_range_radius R --display_margin M`.
+- Custom `center_point`, `stim_range_radius`, and `display_margin` values can be provided in JSON or as `--center_point X Y --stim_range_radius R --display_margin M`. The margin flag also accepts four values: `--display_margin LEFT RIGHT TOP BOTTOM`.
 
 Active Foraging Subject Maps
 ----------------------------
@@ -1716,7 +1743,12 @@ All tasks in this repository must support loading a JSON configuration file as a
 - `config_name` (string): stable, broad analysis-family identifier following the convention above; it is not a per-run or per-variant label
 - `images_dir` (string): path to image resources
 - `output_dir` (string): path where logs and metadata will be saved
-- `n` (int): number of trials for tasks that use this field; `play_video` uses `num_clips` instead
+- `n` (int): number of completed trials for AFC tasks (`active_foraging`, `match2cue`, `afc_csc1`,
+  `afc_trial_sequence`). Completion requires a successfully registered choice, including incorrect
+  or unrewarded choices. Cue-release aborts, gaze timeouts and unanswered response windows remain
+  logged under unique, increasing `trial_num` values but do not consume `n`, in every configuration.
+  The experimenter display shows both the attempt number and `Completed: completed / n`.
+  Other tasks retain their existing trial semantics; `play_video` uses `num_clips` instead.
 - `duration` (number): stimulus presentation duration in seconds. For `active_foraging` and `match2cue`, this must be positive when `sequential=true` or `is_memory=true`; when both are false, it must be `0` or omitted.
 - `isi` (number): pre-stimulus / inter-stimulus interval in seconds; exact meaning is task-specific
 - `iti` (number): inter-trial interval in seconds for trial-based tasks
@@ -1728,8 +1760,9 @@ All tasks in this repository must support loading a JSON configuration file as a
 - `image_size` (array of 2 ints, optional)
 - `placement_distribution` (`"circle"` or `"uniform"`, optional): active-foraging and match-to-cue option placement; default `"circle"` preserves existing behavior
 - `center_point` (array of 2 ints or null, optional): AFC-style stimulus circle center in participant-centered pixels (X right, Y up; null means `[0, 0]`)
-- `stim_range_radius` (int or null, optional): AFC-style stimulus circle radius in pixels
-- `display_margin` (non-negative number, optional): active-foraging and match-to-cue minimum full-image clearance from each screen edge in pixels (default `0`)
+- `stim_range_radius` (number or null, optional): circle radius in circle mode, or minimum option-center
+  distance from the initiation cue in uniform mode, in pixels
+- `display_margin` (non-negative number or four-number array, optional): active-foraging and match-to-cue minimum full-image clearance in participant-view pixels; a scalar applies to every edge, or use `[left, right, top, bottom]` (default `0`)
 - `sync_bar.sync_pin` (int or null, optional): BCM GPIO pin for display-synchronized sync bar signals, default `18`; null keeps visual synchronization without GPIO
 - `sync_bar` (object, optional): shared display synchronization options described below
 - `daq.address` or `daq_address` (int, optional): DAQC2plate address for task hardware outputs

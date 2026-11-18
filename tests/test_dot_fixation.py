@@ -5,7 +5,7 @@ import unittest
 from bin.dot_fixation import DotFixationGate, FIXATION_UNAVAILABLE, validate_dot_fixation_config
 from bin.eye_tracking import EyeCalibration, EyeTrackerState, UARTEyeTrackerConfig
 from bin.eye_tracking_config import EyeTrackingSettings
-from bin.screen import oriented_size, rotate_centered_point
+from bin.screen import oriented_size
 
 
 class DotFixationConfigTests(unittest.TestCase):
@@ -70,7 +70,7 @@ class DotFixationGateTests(unittest.TestCase):
             ),
             fixation_criteria_s=criteria, fixation_window_radius=radius,
         )
-        gate.start(positions, native_size=size, rotation_degrees=rotation, onset_perf_s=onset)
+        gate.start(positions, screen_size=oriented_size(size, rotation), onset_perf_s=onset)
         return gate
 
     def feed(self, gate, start_ms=1000, end_ms=1110, *, position=(0, 0)):
@@ -127,7 +127,7 @@ class DotFixationGateTests(unittest.TestCase):
         gate = self.gate()
         self.feed(gate)
         self.assertTrue(gate.reached_dot_before(1.1))
-        gate.start(((200, 0),), native_size=(1000, 600), rotation_degrees=0, onset_perf_s=1.2)
+        gate.start(((200, 0),), screen_size=(1000, 600), onset_perf_s=1.2)
         self.feed(gate, 1190, 1190, position=(0.2, 0))
         self.feed(gate, 1200, 1200)
         self.assertFalse(gate.reached_dot_before(1.3))
@@ -170,7 +170,7 @@ class DotFixationGateTests(unittest.TestCase):
         gate.stop()
         self.feed(gate, 1120, 1200)
         self.assertIsNone(gate.status(now_s=1.2))
-        gate.start(((0, 0),), native_size=(1000, 600), rotation_degrees=0, onset_perf_s=1.2)
+        gate.start(((0, 0),), screen_size=(1000, 600), onset_perf_s=1.2)
         self.feed(gate, 1100, 1190)
         self.assertIsNone(gate.status(now_s=1.2))
         self.feed(gate, 1200, 1310)
@@ -184,15 +184,14 @@ class DotFixationGateTests(unittest.TestCase):
         self.feed(gate, 1140, 1180, position=(0.2, 0))
         self.assertEqual(gate.status(now_s=1.18), 2)
 
-    def test_rotated_native_targets_use_oriented_subject_pixel_radius(self):
+    def test_targets_use_participant_pixel_radius_for_all_display_rotations(self):
         for rotation in (0, 90, 180, 270):
             size = (1000, 600)
             subject_size = oriented_size(size, rotation)
             target = (150, -100)
-            native_target = rotate_centered_point(target, rotation)
             for offset, accepted in ((49, True), (50, True), (51, False)):
                 with self.subTest(rotation=rotation, offset=offset):
-                    gate = self.gate((native_target,), size=size, rotation=rotation)
+                    gate = self.gate((target,), size=size, rotation=rotation)
                     self.feed(gate, position=(
                         (target[0] + offset) / subject_size[0], target[1] / subject_size[1],
                     ))
@@ -232,7 +231,7 @@ class DotFixationGateTests(unittest.TestCase):
         gate = self.gate()
         self.feed(gate)
         self.assertEqual(gate.status(now_s=1.11), 1)
-        gate.start(((0, 0),), native_size=(1000, 600), rotation_degrees=0, onset_perf_s=2)
+        gate.start(((0, 0),), screen_size=(1000, 600), onset_perf_s=2)
         with gate._lock:
             self.assertIs(gate.status(now_s=2), FIXATION_UNAVAILABLE)
         self.assertIsNone(gate.status(now_s=2))

@@ -44,6 +44,8 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from bin import utils
+from bin.afc_geometry import assert_non_overlapping_positions
+from bin.participant_view import ParticipantView
 from bin.config import load_config, validate_config
 from bin.daqc2_outputs import DAQC2DigitalOutputs
 from bin.frame_timing import plan_frame_duration, wait_until
@@ -56,6 +58,7 @@ from bin.screen import (
     describe_screen,
     load_screen_config,
     resolve_scene_size,
+    oriented_size,
     serialize_preview_image,
     set_window_mouse_visible,
     software_stimulus_rotation,
@@ -78,7 +81,7 @@ def parse_args():
     p.add_argument("--config", help="Path to JSON config file. CLI overrides config keys.")
     p.add_argument("--colors_tsv", help="Path to color TSV (overrides config)")
     p.add_argument("--shapes_tsv", help="Path to shapes TSV (overrides config)")
-    p.add_argument("--n", type=int, default=None, help="Number of trials")
+    p.add_argument("--n", type=int, default=None, help="Number of completed trials with a registered choice")
     p.add_argument("--num_afc", type=int, default=None, help="Number of choices per trial")
     p.add_argument("--num_stim", type=int, default=None, help="Pool size for matched shape-color pairs")
     p.add_argument("--pairing_mode", choices=["matched", "all"], default=None, help="matched: shape_i-color_i pool; all: full shape x color pool")
@@ -359,21 +362,15 @@ def _sample_shape_to_shape_options(
     return trial_options, target_index
 
 
-def _fixed_circle_positions(num_afc: int, radius_px: float) -> List[Tuple[float, float]]:
+def _fixed_circle_positions(num_afc: int, radius_px: float, rotation_degrees=90) -> List[Tuple[float, float]]:
     if num_afc < 1:
         raise ValueError("num_afc must be >= 1")
     spacing = (2.0 * math.pi) / float(num_afc)
-    start = (math.pi / 2.0) + (spacing / 2.0)
+    start = math.radians(rotation_degrees) + (spacing / 2.0)
     return [
         (float(radius_px) * math.cos(start + idx * spacing), float(radius_px) * math.sin(start + idx * spacing))
         for idx in range(num_afc)
     ]
-
-
-def _rotate_position_clockwise(position: Tuple[float, float]) -> Tuple[float, float]:
-    """Map portrait coordinates to landscape: (x, y) -> (y, -x)."""
-    x, y = position
-    return float(y), -float(x)
 
 
 def _compute_positions(
@@ -384,27 +381,28 @@ def _compute_positions(
     fixed_positions: bool,
     position_spacing: Optional[int],
     margin: int,
+    choice_hitbox_scale: float = 1.0,
+    fixed_layout_rotation_degrees: float = 90,
 ) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
-    # Rotate layout positions into the native landscape window. The displayed
-    # artwork's footprint in portrait layout
-    # coordinates has the opposite width/height order to the displayed image.
-    layout_size = (effective_win_size[1], effective_win_size[0])
-    layout_stim_size = (stim_size[1], stim_size[0])
+    # All dimensions and centers are defined in participant-view pixels.
+    layout_size = effective_win_size
+    layout_stim_size = stim_size
     if fixed_positions:
         radius = float(position_spacing) if position_spacing is not None else min(layout_size) * 0.25
-        sampled_positions = _fixed_circle_positions(num_afc, radius)
+        sampled_positions = _fixed_circle_positions(num_afc, radius, fixed_layout_rotation_degrees)
     else:
         sampled_positions = utils.sample_non_overlapping_positions(
             num_afc,
             layout_stim_size,
             layout_size,
             margin=margin,
+            choice_hitbox_scale=choice_hitbox_scale,
         )
     positions = utils.clamp_positions(sampled_positions, layout_stim_size, layout_size, margin=margin)
-    return (
-        [_rotate_position_clockwise(pos) for pos in sampled_positions],
-        [_rotate_position_clockwise(pos) for pos in positions],
+    assert_non_overlapping_positions(
+        positions, tuple(max(v, 1.0, v * choice_hitbox_scale) for v in layout_stim_size),
     )
+    return sampled_positions, positions
 
 
 def _log_global_timing(msg_logger, fps: float, frame_dur: float, timings: Dict[str, float]) -> Dict[str, Tuple[int, float]]:
@@ -760,9 +758,9 @@ def run_task(
             requested_size=win_size,
             realized_size=tuple(win.size),
         )
-        session_logs.set_eye_tracking_screen(
-            main_scene_size, software_stimulus_rotation(main_screen.rotation)
-        )
+        rotation = software_stimulus_rotation(main_screen.rotation)
+        subject_size = oriented_size(main_scene_size, rotation)
+        session_logs.set_eye_tracking_screen(main_scene_size, rotation)
         utils.configure_sync_bar(
             win, sync_bar, sync_pin=sync_pin, event_logger=logger,
             session_logs=session_logs, screen_config=screen_config,
@@ -820,7 +818,8 @@ def run_task(
 
             total = int(afc_counts.get("total", 0))
             planned = int(n_trials)
-            remaining = max(0, planned - total)
+            completed = total - int(afc_counts.get("no_choice", 0))
+            remaining = max(0, planned - completed)
             correct = int(afc_counts.get("correct", 0))
             incorrect = int(afc_counts.get("incorrect", 0))
             no_choice = int(afc_counts.get("no_choice", 0))
@@ -830,7 +829,7 @@ def run_task(
             y += 34
             draw.text((16, y), f"phase: {phase}", fill=(40, 40, 40, 255), font=font_small)
             y += 30
-            draw.text((16, y), f"trials: {total}/{planned}   remaining: {remaining}", fill=(0, 0, 0, 255), font=font_body)
+            draw.text((16, y), f"completed: {completed}/{planned}   remaining: {remaining}", fill=(0, 0, 0, 255), font=font_body)
             y += 24
             draw.text((16, y), f"correct: {correct}   incorrect: {incorrect}", fill=(0, 0, 0, 255), font=font_body)
             y += 24
@@ -876,8 +875,8 @@ def run_task(
             return {
                 "image_payload": payload,
                 "pos": [
-                    float(-main_scene_size[0] / 2.0 + panel_w / 2.0 + 20.0),
-                    float(main_scene_size[1] / 2.0 - panel_h / 2.0 - 20.0),
+                    float(-subject_size[0] / 2.0 + panel_w / 2.0 + 20.0),
+                    float(subject_size[1] / 2.0 - panel_h / 2.0 - 20.0),
                 ],
                 "size": [float(panel_w), float(panel_h)],
             }
@@ -917,6 +916,7 @@ def run_task(
                                     "image_payload": cue_payload,
                                     "pos": [0.0, 0.0],
                                     "size": [float(cue_w), float(cue_h)],
+                                    "ori": -rotation,
                                 }
                             )
                     except Exception:
@@ -933,6 +933,7 @@ def run_task(
                             "image_payload": payload,
                             "pos": [float(pos[0]), float(pos[1])],
                             "size": [float(choice_image_size[0]), float(choice_image_size[1])],
+                            "ori": -rotation,
                         }
                     )
 
@@ -950,11 +951,12 @@ def run_task(
                         "size": [float(choice_image_size[0]) * 1.15, float(choice_image_size[1]) * 1.15],
                         "color": list(color),
                         "line_width": 6.0,
+                        "ori": -rotation,
                     }
 
             experimenter_preview.show_static_scene(
                 bg_rgb_255=bg_rgb,
-                main_size=main_scene_size,
+                main_size=subject_size,
                 images=images,
                 dots=[],
                 fixation_size=preview_fixation_size,
@@ -1119,8 +1121,11 @@ def run_task(
             ori=90.0,
         )
 
-        onset_stim.pos = _rotate_position_clockwise(
-            (0.0, -float(main_scene_size[0]) / 4.0)
+        cue_angle = math.pi + math.radians(rotation)
+        cue_radius = float(main_scene_size[0]) / 4.0
+        onset_stim = ParticipantView(rotation).stimulus(
+            onset_stim, pos=(cue_radius * math.cos(cue_angle), cue_radius * math.sin(cue_angle)),
+            ori=90 - rotation,
         )
         msg_logger.log(
             "INFO",
@@ -1130,7 +1135,11 @@ def run_task(
 
         msg_logger.log("INFO", f"task_ready n_trials={n_trials} num_afc={num_afc} delay_time={delay_time:.6f}")
 
-        for trial_num in range(1, int(n_trials) + 1):
+        trial_num = 1
+        completed_trials = 0
+        while completed_trials < int(n_trials):
+            if experimenter_preview is not None:
+                experimenter_preview.set_trial_progress(trial_num, n_trials, completed_trials=completed_trials)
             reward_pulse_s = pump_control.apply_pending(msg_logger)
             if _poll_experimenter_controls():
                 task_end_notes = "experimenter_exit"
@@ -1188,16 +1197,20 @@ def run_task(
             )
             sampled_positions, positions = _compute_positions(
                 num_afc=int(num_afc),
-                stim_size=stim_size,
-                effective_win_size=effective_win_size,
+                stim_size=oriented_size(stim_size, rotation),
+                effective_win_size=subject_size,
+                fixed_layout_rotation_degrees=rotation,
                 fixed_positions=bool(fixed_positions),
                 position_spacing=position_spacing,
                 margin=int(margin),
+                choice_hitbox_scale=float(choice_hitbox_scale) * (1.25 if touchscreen else 1.0),
             )
             for idx, (sampled, pos) in enumerate(zip(sampled_positions, positions), start=1):
                 msg_logger.log(
                     "INFO",
-                    f"position_assigned trial_num={trial_num} idx={idx} sampled={sampled} clamped={pos}",
+                    f"position_assigned trial_num={trial_num} idx={idx} "
+                    f"sampled={sampled} "
+                    f"clamped={pos}",
                 )
 
             trial_meta: Dict[str, Any] = {}
@@ -1231,6 +1244,7 @@ def run_task(
                 trial_meta=trial_meta,
                 external_abort_checker=lambda: _poll_experimenter_controls(service_sync=False),
                 show_fixation=bool(show_fixation),
+                stimulus_rotation_degrees=software_stimulus_rotation(main_screen.rotation),
             )
             if aborted:
                 if task_end_notes == "done" and _poll_experimenter_controls():
@@ -1242,6 +1256,10 @@ def run_task(
                 break
 
             chosen_idx_1based = choice_info.get("chosen_index") if choice_info is not None else None
+            if chosen_idx_1based is not None:
+                completed_trials += 1
+            if experimenter_preview is not None:
+                experimenter_preview.set_trial_progress(trial_num, n_trials, completed_trials=completed_trials)
             chosen_idx_zero_based = int(chosen_idx_1based - 1) if chosen_idx_1based is not None else ""
             is_correct = bool(choice_info.get("is_correct")) if choice_info is not None else False
 
@@ -1419,6 +1437,7 @@ def run_task(
                 session_logs.flush()
             except Exception:
                 pass
+            trial_num += 1
 
     finally:
         try:

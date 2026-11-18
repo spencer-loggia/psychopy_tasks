@@ -1,6 +1,7 @@
 """Run the real trial loop and logs with a simulated clock and display."""
 
 import csv
+import ast
 import importlib.util
 import json
 from pathlib import Path
@@ -93,10 +94,10 @@ class ActiveForagingTaskTests(unittest.TestCase):
         cfg = json.loads(path.read_text())
         cfg["screens"] = {"main": 0, "experimenter": 1}
         cfg.update(self_initiation=False, placement_distribution="uniform",
-                   center_point="inactive", stim_range_radius="inactive", subject="Yuri",
+                   center_point="inactive", stim_range_radius=100, subject="Yuri",
                    eye_tracking={"enabled": False}, daq_address=2, daq={"address": 0})
         snapshot = build_task_config_snapshot(cfg, launch_path="task/active_foraging.py")
-        for key in (*task.INITIATION_CONFIG_KEYS, "duration", "center_point", "stim_range_radius"):
+        for key in (*task.INITIATION_CONFIG_KEYS, "duration", "center_point"):
             self.assertNotIn(key, snapshot)
         with tempfile.TemporaryDirectory() as temporary:
             saved_path = Path(temporary) / "config.json"
@@ -109,7 +110,7 @@ class ActiveForagingTaskTests(unittest.TestCase):
         self.assertFalse(run.call_args.kwargs["self_initiation"])
         self.assertIsNone(run.call_args.kwargs["initiation_cue_center_position"])
         self.assertIsNone(run.call_args.kwargs["center_point"])
-        self.assertIsNone(run.call_args.kwargs["stim_range_radius"])
+        self.assertEqual(run.call_args.kwargs["stim_range_radius"], 100)
         self.assertEqual(run.call_args.kwargs["daq_address"], 2)
         self.assertEqual(set(run.call_args.kwargs["freq_space_tsv"]), {"Yuri"})
         self.assertEqual(run.call_args.kwargs["saccade_wait_timeout_s"], 4.0)
@@ -132,7 +133,12 @@ class ActiveForagingTaskTests(unittest.TestCase):
     def test_display_margin_config_and_cli_reach_task(self):
         config_path = Path(__file__).resolve().parents[1] / "config_files/csc2/yuri_headfix_train_noseq_nomem_20260930.json"
         cfg = json.loads(config_path.read_text())
-        for configured, cli, expected in ((None, [], 0), (200, [], 200), (200, ["--display_margin", "75.5"], 75.5)):
+        for configured, cli, expected in (
+            (None, [], 0), (200, [], 200), (200, ["--display_margin", "75.5"], 75.5),
+            ([10, 20, 30, 40], [], [10, 20, 30, 40]),
+            (200, ["--display_margin", "10", "20", "30", "40"], [10, 20, 30, 40]),
+            ([10, 20, 30, 40], ["--display_margin", "75.5"], 75.5),
+        ):
             with self.subTest(configured=configured, cli=cli):
                 task = load_task()
                 config = dict(cfg)
@@ -147,6 +153,15 @@ class ActiveForagingTaskTests(unittest.TestCase):
                 ), patch.object(task, "run_task", return_value="done") as run:
                     task.main()
                 self.assertEqual(run.call_args.kwargs["display_margin"], expected)
+
+    def test_cli_rejects_wrong_number_of_edge_margins(self):
+        task = load_task()
+        for values in ((10, 20), (10, 20, 30), (0, 0, 0, 0, 0)):
+            with self.subTest(values=values), patch.object(sys, "argv", [
+                "active_foraging", "--display_margin", *map(str, values),
+            ]), patch.object(sys, "stderr"), self.assertRaises(SystemExit) as error:
+                task.parse_args()
+            self.assertEqual(error.exception.code, 2)
 
     def test_sync_config_and_pin_cli_override_reach_task(self):
         config_path = Path(__file__).resolve().parents[1] / "config_files/csc2/yuri_headfix_train_noseq_nomem_20260930.json"
@@ -266,7 +281,7 @@ class ActiveForagingTaskTests(unittest.TestCase):
             with self.subTest(rotation=rotation), tempfile.TemporaryDirectory() as tmp:
                 self._exercise_task(
                     Path(tmp), True, True, image_size=(80, 20), output_rotation=rotation,
-                    placement_options=dict(center_point=(-235, 0), stim_range_radius=200, display_margin=50,
+                    placement_options=dict(center_point=(-235, 0), stim_range_radius=200, display_margin=(30, 70, 90, 50),
                                            initiation_cue_center_position=(-120, -75)),
                 )
 
@@ -276,7 +291,7 @@ class ActiveForagingTaskTests(unittest.TestCase):
                 self._exercise_task(
                     Path(tmp), False, False, image_size=(80, 20), output_rotation=rotation,
                     placement_options=dict(placement_distribution="uniform", fixed_positions=True,
-                                           center_point="unused", stim_range_radius="unused", display_margin=50,
+                                           center_point="unused", stim_range_radius=150, display_margin=(30, 70, 90, 50),
                                            initiation_cue_center_position=(-120, -75)),
                 )
 
@@ -317,9 +332,10 @@ class ActiveForagingTaskTests(unittest.TestCase):
             trial_option_meta=[(sid, 0, 0) for sid in range(4)],
             rendered={f"{sid}_1": image for sid in range(4)},
         ) for i in range(1, len(choices) + 1)]
-        cue_times, gray_times = [], []
+        cue_times, gray_times, position_trials = [], [], []
 
         def present(**kwargs):
+            position_trials.append(kwargs["positions"])
             self.assertIs(kwargs["require_saccade_to_all_options"],
                           placement_options.get("require_saccade_to_all_options", True))
             if tone_enabled:
@@ -341,7 +357,7 @@ class ActiveForagingTaskTests(unittest.TestCase):
                 # A gaze 200 pixels from the target changes from outside to
                 # inside only on the trial after the edit is confirmed.
                 onset = clock.seconds()
-                gate.start([(0, 0)], native_size=(800, 600), rotation_degrees=0, onset_perf_s=onset)
+                gate.start([(0, 0)], screen_size=(800, 600), onset_perf_s=onset)
                 for index in range(12):
                     gate.observe(EyeTrackerState(
                         timestamp_perf_s=onset + index * 0.01, frame_sequence=index,
@@ -352,14 +368,22 @@ class ActiveForagingTaskTests(unittest.TestCase):
             self.assertEqual(kwargs["sequential"], sequential)
             self.assertEqual(kwargs["is_memory"], memory)
             margin = placement_options.get("display_margin", 0)
-            stim_w, stim_h = oriented_size(image_size, software_stimulus_rotation(output_rotation))
+            left, right, top, bottom = margin if isinstance(margin, (list, tuple)) else (margin,) * 4
+            stim_w, stim_h = image_size
+            screen_w, screen_h = oriented_size((800, 600), software_stimulus_rotation(output_rotation))
             for x, y in kwargs["positions"]:
-                self.assertLessEqual(abs(x) + stim_w / 2, 400 - margin + 1e-9)
-                self.assertLessEqual(abs(y) + stim_h / 2, 300 - margin + 1e-9)
+                self.assertGreaterEqual(x - stim_w / 2, -screen_w / 2 + left - 1e-9)
+                self.assertLessEqual(x + stim_w / 2, screen_w / 2 - right + 1e-9)
+                self.assertLessEqual(y + stim_h / 2, screen_h / 2 - top + 1e-9)
+                self.assertGreaterEqual(y - stim_h / 2, -screen_h / 2 + bottom - 1e-9)
                 if "center_point" in placement_options and placement_options.get("placement_distribution", "circle") == "circle":
-                    sx, sy = rotate_centered_point((x, y), -software_stimulus_rotation(output_rotation))
+                    sx, sy = x, y
                     cx, cy = placement_options["center_point"]
                     self.assertAlmostEqual(np.hypot(sx - cx, sy - cy), placement_options["stim_range_radius"])
+                if placement_options.get("placement_distribution") == "uniform" and placement_options.get("stim_range_radius"):
+                    sx, sy = x, y
+                    cx, cy = placement_options.get("initiation_cue_center_position", (0, 0))
+                    self.assertGreaterEqual(np.hypot(sx - cx, sy - cy), placement_options["stim_range_radius"])
             cue_times.append(clock.ns)
             kwargs["logger"].log_frame_flip(trial_num=kwargs["trial_num"], event="onset_cue_on",
                                             timestamp_perf_ns=clock.ns)
@@ -387,7 +411,7 @@ class ActiveForagingTaskTests(unittest.TestCase):
             "bin.task_eye_tracking.TaskEyeTrackingSession",
         ):
             result = task.run_task(
-                colors_tsv="colors.tsv", shapes_tsv="shapes.tsv", n_trials=len(choices), num_afc=4,
+                colors_tsv="colors.tsv", shapes_tsv="shapes.tsv", n_trials=sum(c is not None for c in choices), num_afc=4,
                 duration=0.1 if sequential or memory else 0, choice_time=1, isi=0.1, iti=0.2,
                 init_dot_color=None, dot_size=10, dot_color=(128, 128, 128),
                 output_dir=str(root / "logs"), subject="Test", image_size=image_size, seed=4,
@@ -413,10 +437,12 @@ class ActiveForagingTaskTests(unittest.TestCase):
                          placement_options.get("placement_distribution", "circle"))
         cue_pos = utils.make_initiation_cue_stims.call_args.kwargs["position"]
         self.assertEqual(
-            rotate_centered_point(cue_pos, -software_stimulus_rotation(output_rotation)),
+            cue_pos,
             placement_options.get("initiation_cue_center_position", (0, 0)),
         )
         self.assertEqual(result, "done")
+        self.assertEqual(len(cue_times), 6)  # Five registered choices plus one incomplete attempt.
+        self.assertEqual(utils.TrialBufferManager.call_args.kwargs["config"]["n_trials"], 0)
         if tone_enabled:
             tone_factory.assert_called_once()
             self.assertEqual(tone_factory.return_value.start.call_count, len(choices))
@@ -424,6 +450,11 @@ class ActiveForagingTaskTests(unittest.TestCase):
         else:
             tone_factory.assert_not_called()
         if with_preview:
+            progress = preview.set_trial_progress.call_args_list
+            self.assertEqual(progress[-1].args, (6, 5))
+            self.assertEqual(progress[-1].kwargs, {"completed_trials": 5})
+            self.assertEqual([call.kwargs["completed_trials"] for call in progress],
+                             [0, 1, 1, 2, 2, 3, 3, 4, 4, 4, 4, 5])
             task.ExperimenterPreview.assert_called_once()
             self.assertTrue(task.ExperimenterPreview.call_args.kwargs["preserve_scene_transitions"])
             # Presentation owns every image and status event. The task loop
@@ -444,6 +475,14 @@ class ActiveForagingTaskTests(unittest.TestCase):
             self.assertEqual(cue_times[trial + 1] - gray_times[trial], duration_ns)
 
         event_path = next((root / "logs").rglob("event_log.tsv"))
+        with (event_path.parent / "message_log.tsv").open() as handle:
+            positions_logged = [row["message"] for row in csv.DictReader(handle, delimiter="\t")
+                                if row["message"].startswith("position_assigned ")]
+        self.assertEqual(len(positions_logged), 24)
+        for message, position in zip(positions_logged, (p for trial in position_trials for p in trial)):
+            self.assertNotIn("psychopy_pos", message)
+            self.assertEqual(ast.literal_eval(message.split("screen_px=", 1)[1]),
+                             tuple(position))
         with (event_path.parent / "message_log.tsv").open() as handle:
             block_settings = [json.loads(row["message"].removeprefix("active_foraging_settings "))
                               for row in csv.DictReader(handle, delimiter="\t")

@@ -12,22 +12,61 @@ from bin.dot_fixation import DotFixationGate, FIXATION_UNAVAILABLE
 from bin.eye_tracking import EyeCalibration, EyeTrackerState, UARTEyeTrackerConfig
 from bin.eye_tracking_config import EyeTrackingSettings, load_eye_tracking_settings
 from bin.logger import SessionLogBundle
-from bin.screen import rotate_centered_point
 from bin.task_eye_tracking import read_preview_gaze
 
 
 class AutomaticRecalibrationTests(unittest.TestCase):
-    def make_gate(self, *, enabled=True, criteria=0.1, calibration=None, rotation=0):
+    def make_gate(self, *, enabled=True, criteria=0.1, calibration=None, fallback=False):
         settings = EyeTrackingSettings(
             calibration=calibration or EyeCalibration(x_scale=1, y_scale=1),
             uart=UARTEyeTrackerConfig(max_sample_age_s=0.04),
             automatic_recalibration=enabled,
         )
         gate = DotFixationGate(settings, fixation_criteria_s=criteria, fixation_window_radius=100)
-        # Use a square scene to isolate rotation from the sample arithmetic.
-        gate.start((rotate_centered_point((200, -100), rotation),), native_size=(1000, 1000),
-                   rotation_degrees=rotation, onset_perf_s=1)
+        gate.start(((200, -100),), screen_size=(1000, 1000), onset_perf_s=1, allow_unaccepted_recalibration=fallback)
         return settings, gate
+
+    def test_first_single_dot_stable_outside_gaze_corrects_once_without_acceptance(self):
+        _, gate = self.make_gate(fallback=True)
+        self.feed(gate, end=1090, position=(.5, .2))
+        self.assertIsNone(gate.status(now_s=1.09))
+        self.assertEqual(gate.recalibration.update_count, 0)
+        self.feed(gate, start=1100, end=1110, position=(.5, .2))
+        self.assertIsNone(gate.status(now_s=1.11))
+        self.assertEqual(gate.recalibration.update_count, 1)
+        self.assertAlmostEqual(gate.recalibration.calibration.x_offset, -.015)
+        self.assertAlmostEqual(gate.recalibration.calibration.y_offset, -.015)
+        self.assertFalse(gate.reached_dot_before(2))
+        for _ in range(10):
+            self.assertIsNone(gate.status(now_s=1.11))
+        self.feed(gate, start=1120, end=1240)
+        self.assertEqual(gate.status(now_s=1.24), 1)
+        self.assertEqual(gate.recalibration.update_count, 1)
+
+    def test_fallback_rejects_movement_invalid_stale_gapped_and_ambiguous_samples(self):
+        for fault in ("moving", "invalid", "stale", "gap", "multiple", "disabled", "later_dot", "duplicate"):
+            with self.subTest(fault=fault):
+                _, gate = self.make_gate(fallback=fault != "disabled")
+                if fault == "multiple":
+                    gate.start(((200, -100), (-200, 100)), screen_size=(1000, 1000), onset_perf_s=1, allow_unaccepted_recalibration=True)
+                if fault == "later_dot":
+                    gate.stop()
+                    gate.start(((200, -100),), screen_size=(1000, 1000), onset_perf_s=1)
+                for ms in range(1000, 1111, 10):
+                    sample_ms = 1000 if fault == "duplicate" else ms
+                    x = .5 if fault != "moving" or ms % 20 == 0 else .8
+                    gate.observe(self.state(sample_ms, position=(x, .2)))
+                now = 1.11
+                if fault == "invalid":
+                    gate.observe(replace(self.state(1120), valid=False))
+                    now = 1.12
+                elif fault == "gap":
+                    gate.observe(self.state(1250, position=(.5, .2)))
+                    now = 1.25
+                elif fault == "stale":
+                    now = 1.25
+                self.assertIsNone(gate.status(now_s=now))
+                self.assertEqual(gate.recalibration.update_count, 0)
 
     def state(self, ms, position=(0.22, -0.12), **kwargs):
         return EyeTrackerState(
@@ -58,20 +97,18 @@ class AutomaticRecalibrationTests(unittest.TestCase):
         self.assertIsNone(gate.recalibration)
         self.assertEqual(settings.calibration.x_offset, 0)
 
-    def test_uses_sample_50_ms_before_actual_acceptance_with_rotated_targets(self):
-        for rotation in (0, 90, 180, 270):
-            with self.subTest(rotation=rotation):
-                settings, gate = self.make_gate(rotation=rotation)
-                self.feed(gate, end=1050)
-                self.feed(gate, start=1060, end=1120, position=(0.24, -0.14))
-                # Actual acceptance is later than the earliest possible dwell.
-                self.assertEqual(gate.status(now_s=1.103), None)  # future sample
-                self.assertEqual(gate.status(now_s=1.123), 1)
-                updated = gate.recalibration.calibration
-                self.assertAlmostEqual(updated.x_offset, -0.002)
-                self.assertAlmostEqual(updated.y_offset, 0.002)
-                self.assertEqual(settings.calibration.x_offset, 0)
-                self.assertIsNot(updated, settings.calibration)
+    def test_uses_sample_50_ms_before_actual_acceptance(self):
+        settings, gate = self.make_gate()
+        self.feed(gate, end=1050)
+        self.feed(gate, start=1060, end=1120, position=(0.24, -0.14))
+        # Actual acceptance is later than the earliest possible dwell.
+        self.assertEqual(gate.status(now_s=1.103), None)  # future sample
+        self.assertEqual(gate.status(now_s=1.123), 1)
+        updated = gate.recalibration.calibration
+        self.assertAlmostEqual(updated.x_offset, -0.002)
+        self.assertAlmostEqual(updated.y_offset, 0.002)
+        self.assertEqual(settings.calibration.x_offset, 0)
+        self.assertIsNot(updated, settings.calibration)
 
     def test_earlier_sample_not_latest_sample_is_used_without_changing_other_terms(self):
         calibration = EyeCalibration(
@@ -106,7 +143,7 @@ class AutomaticRecalibrationTests(unittest.TestCase):
         self.assertEqual(gate.status(now_s=1.23), 1)
         self.assertIs(gate.recalibration.calibration, updated)
         gate.stop()
-        gate.start(((200, -100),), native_size=(1000, 1000), rotation_degrees=0, onset_perf_s=2)
+        gate.start(((200, -100),), screen_size=(1000, 1000), onset_perf_s=2)
         self.feed(gate, start=2000, end=2110)
         self.assertEqual(gate.status(now_s=2.11), 1)
         self.assertEqual(gate.recalibration.update_count, 2)
@@ -146,7 +183,7 @@ class AutomaticRecalibrationTests(unittest.TestCase):
         self.assertLessEqual(len(gate.recalibration._history), 256)
         gate.stop()
         self.assertFalse(gate.recalibration._history)
-        gate.start(((200, -100),), native_size=(1000, 1000), rotation_degrees=0, onset_perf_s=2)
+        gate.start(((200, -100),), screen_size=(1000, 1000), onset_perf_s=2)
         self.feed(gate)
         self.assertFalse(gate.recalibration._history)
 

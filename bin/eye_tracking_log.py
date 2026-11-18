@@ -10,7 +10,7 @@ import threading
 import time
 
 from .eye_tracking import fraction_to_pixels
-from .screen import oriented_size, rotate_centered_point
+from .screen import oriented_size
 
 
 EYE_DATA_FILENAME = "eye_tracking.csv"
@@ -24,8 +24,8 @@ EYE_DATA_FIELDS = (
 class EyeDataRecorder:
     """Buffer acquisition snapshots without polling the latest state.
 
-    Screen pixels use native PsychoPy coordinates, centered and right/up
-    positive. The camera clock is preserved verbatim and is not synchronized
+    Screen pixels use the participant's view, centered and right/up positive.
+    The camera clock is preserved verbatim and is not synchronized
     with the experiment's task clock.
     """
 
@@ -57,7 +57,7 @@ class EyeDataRecorder:
         if not math.isfinite(rotation_degrees):
             raise ValueError("Eye recording screen rotation must be finite")
         with self._lock:
-            self._geometry = (oriented_size(size, rotation_degrees), rotation_degrees)
+            self._geometry = oriented_size(size, rotation_degrees)
 
     def submit(self, state, *, calibration=None):
         """Enqueue a measurement without waiting for disk or queue capacity.
@@ -84,8 +84,7 @@ class EyeDataRecorder:
         if state.valid:
             pupil = state.pupil_diameter_px
             if geometry is not None:
-                subject_size, rotation = geometry
-                x, y = rotate_centered_point(fraction_to_pixels(fraction, subject_size), rotation)
+                x, y = fraction_to_pixels(fraction, geometry)
         self._writer.writerow((
             state.task_time_ns, state.camera_time_ns,
             f"{x:.6f}", f"{y:.6f}", f"{pupil:.6f}",

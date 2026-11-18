@@ -700,6 +700,7 @@ class ScreenConfigTests(unittest.TestCase):
         preview.subject = "Yuri"
         preview.current_trial_num = 17
         preview.total_trials = 2000
+        preview.completed_trials = 12
 
         preview._send({"type": "static_scene"})
 
@@ -708,6 +709,7 @@ class ScreenConfigTests(unittest.TestCase):
         self.assertEqual(payload["subject"], "Yuri")
         self.assertEqual(payload["current_trial_num"], 17)
         self.assertEqual(payload["total_trials"], 2000)
+        self.assertEqual(payload["completed_trials"], 12)
         self.assertIsNone(payload["status_counts"])
         self.assertIsNone(payload["reward_counts"])
         self.assertIsNone(payload["highlight_box"])
@@ -834,6 +836,14 @@ class ScreenConfigTests(unittest.TestCase):
             ),
             "csc2_foraging_classic\nSubject: Yuri\nTrial: 17 / ∞",
         )
+
+    def test_experimenter_progress_separates_attempt_id_from_completed_choices(self):
+        preview = ExperimenterPreview.__new__(ExperimenterPreview)
+        preview.set_trial_progress(17, 2000, completed_trials=12)
+        self.assertEqual(format_experimenter_label(
+            "Foraging", current_trial_num=preview.current_trial_num,
+            total_trials=preview.total_trials, completed_trials=preview.completed_trials,
+        ), "Foraging\nTrial: 17\nCompleted: 12 / 2000")
 
     def test_none_screen_values_inherit_environment(self):
         cfg = {"screens": {"main": None, "experimenter": None}}

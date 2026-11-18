@@ -13,7 +13,7 @@ Config keys required/additional:
 - colors_tsv: path to TSV file with ID, R, G, B
 - shapes_tsv: path to TSV file with ID, PATH (SVG)
 - image_size: [W, H]
-- display_margin: minimum clearance in pixels between the full stimulus and each screen edge
+- display_margin: full-image clearance in pixels; scalar or [left, right, top, bottom]
 - num_afc, n, duration, isi, iti, choice_time, dot_size, dot_color, init_dot_color
 - initiation_cue_center_position, initiation_cue_style, hold_before_choice,
   hold_cue_to_init_time_s
@@ -52,9 +52,9 @@ from bin.affinity import (
 from bin.daqc2_outputs import DAQC2DigitalOutputs
 from bin.choice_tone import ChoicePeriodTone, validate_choice_tone
 from bin.afc_geometry import (
+    DisplayMargin,
     normalize_placement_distribution,
     prepare_afc_placement,
-    subject_centered_to_screen_px,
 )
 from bin.afc_stimuli import render_afc_stimulus
 from bin.frame_timing import (
@@ -231,7 +231,7 @@ def parse_args():
         ),
     )
     p.add_argument("--shapes_tsv", help="Path to shapes TSV (overrides config)")
-    p.add_argument("--n", type=int, default=None, help="Number of trials (overrides config n)")
+    p.add_argument("--n", type=int, default=None, help="Number of completed trials with a registered choice (overrides config n)")
     p.add_argument("--num_afc", type=int, default=None, help="Number of options per trial")
     p.add_argument(
         "--duration",
@@ -268,7 +268,8 @@ def parse_args():
     p.add_argument("--placement_distribution", choices=("circle", "uniform"), default=None, help="Option placement: circle (default) or uniform over the allowed screen area")
     p.add_argument("--center_point", type=int, nargs=2, default=None, help="Stimulus circle center in participant-centered pixels: X right, Y up; 0 0 is screen center")
     p.add_argument("--stim_range_radius", type=int, default=None, help="Stimulus circle radius in pixels")
-    p.add_argument("--display_margin", type=float, default=None, help="Minimum clearance from the full stimulus to each screen edge in pixels (default: 0)")
+    p.add_argument("--display_margin", type=float, nargs="+", metavar="PX", default=None,
+                   help="Full-image clearance in participant pixels: one value or left right top bottom (default: 0)")
     p.add_argument("--is_memory", action="store_true", default=None, help="If set, items are removed and replaced by dots for the choice period (memory task). If not set, config value or default True is used")
     p.add_argument("--sequential", action="store_true", default=None, help="Present stimuli sequentially (one at a time). If not set, config value or default True is used")
     p.add_argument("--refresh_rate", type=float, default=None, help="Override detected display refresh rate (Hz); skip auto-detection if provided")
@@ -302,7 +303,13 @@ def parse_args():
     p.add_argument("--stroke_linecap", default=None, help="Optional SVG stroke-linecap override: butt, round, or square")
     p.add_argument("--main_screen", default=None, help="Main task screen index or output name")
     p.add_argument("--experimenter_screen", default=None, help="Experimenter screen index or output name")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.display_margin is not None:
+        if len(args.display_margin) not in (1, 4):
+            p.error("--display_margin requires one value or four values: left right top bottom")
+        if len(args.display_margin) == 1:
+            args.display_margin = args.display_margin[0]
+    return args
 
 
 def run_task(
@@ -364,7 +371,7 @@ def run_task(
     stroke_linecap: Optional[str] = None,
     screen_config: Optional[Dict[str, Any]] = None,
     eye_tracking_config=None,
-    display_margin: float = 0.0,
+    display_margin: DisplayMargin = 0.0,
     wait_for_saccade_on_dot: bool = False,
     saccade_wait_timeout_s: Optional[float] = 1.0,
     fixation_criteria_s: float = 0.1,
@@ -774,14 +781,14 @@ def run_task(
         preview_fixation_size = int(getattr(fix, "height", 0)) if fix is not None else None
         experimenter_preview.show_static_scene(
             bg_rgb_255=bg,
-            main_size=main_scene_size,
+            main_size=subject_scene_size,
             images=[],
             dots=[],
             fixation_size=preview_fixation_size,
             fixation_color=(255, 255, 255),
             reward_counts=reward_counts,
             highlight_box=None,
-            main_rotation_deg=stimulus_rotation_degrees,
+            main_rotation_deg=0,
         )
 
     # If self-initiation requested, build an onset cue ImageStim via utility
@@ -946,7 +953,9 @@ def run_task(
         "flat_probs": flat_probs.tolist(),
         "num_afc": int(num_afc),
         "n_lum_levels": int(n_lum_levels),
-        "n_trials": int(n_trials),
+        # Attempts continue until n registered choices, including replacement
+        # attempts after hold failures, gaze timeouts and unanswered choices.
+        "n_trials": 0,
         "image_size": list(image_size),
         "bg": list(bg),
         "total_nonzero": int(total_nonzero),
@@ -1033,29 +1042,27 @@ def run_task(
         return f"{float(value):.9f}"
 
     try:
-        # Prepare the allowed region once using the renderer's actual native
-        # orientation, including the full rotated stimulus footprint.
+        # Prepare participant-space geometry once; the display adapter alone
+        # handles native framebuffer orientation.
         placement = prepare_afc_placement(
             fixed_positions=fixed_positions,
             num_afc=num_afc,
-            center_point=(
-                None if placement_distribution == "uniform" or center_point is None else subject_centered_to_screen_px(
-                    center_point, main_scene_size, stimulus_rotation_degrees,
-                    field_name="center_point",
-                )
-            ),
+            center_point=center_point if placement_distribution == "circle" else None,
             stim_range_radius=stim_range_radius,
-            stim_size=oriented_size(image_size, stimulus_rotation_degrees),
-            effective_win_size=main_scene_size,
+            stim_size=image_size,
+            effective_win_size=subject_scene_size,
             display_margin=display_margin,
             placement_distribution=placement_distribution,
+            choice_hitbox_scale=1.25 if touchscreen else 1.0,
+            initiation_cue_position_px=initiation_cue_center_position or (0, 0),
+            fixed_layout_rotation_degrees=stimulus_rotation_degrees,
         )
         msg_logger.log(
             "INFO",
             f"stimulus_placement distribution={placement_distribution} "
             f"subject_center={center_point if placement_distribution == 'circle' else None} "
             f"center_px={placement.center_px} radius_px={placement.radius_px} "
-            f"stim_size={placement.stim_size} display_margin={display_margin} "
+            f"stim_size={tuple(image_size)} display_margin={display_margin} "
             f"valid_arcs_rad={placement.valid_arcs} center_bounds_px={placement.center_bounds}",
         )
         msg_logger.log(
@@ -1067,7 +1074,8 @@ def run_task(
         )
 
         trial_num = 1
-        while True:
+        completed_trials = 0
+        while run_indefinitely or completed_trials < n_trials:
             settings = pump_control.settings.apply_pending(msg_logger)
             pump_pulse_time_seconds = settings["pump_pulse_time"]
             if dot_fixation_gate is not None:
@@ -1082,14 +1090,11 @@ def run_task(
                 inter_pump_interval=inter_pump_interval_seconds, reward_to_pulse_map=reward_to_pulse_map,
             )
             if experimenter_preview is not None:
-                experimenter_preview.set_trial_progress(trial_num, n_trials)
+                experimenter_preview.set_trial_progress(trial_num, n_trials, completed_trials=completed_trials)
             if _poll_experimenter_controls():
                 task_end_notes = "experimenter_exit"
                 msg_logger.log("WARN", "experimenter_exit_before_trial_start")
                 break
-            if (not run_indefinitely) and trial_num > n_trials:
-                break
-
             payload = buffer_mgr.get_next_trial()
             trial_options, trial_option_meta, preloaded = _decode_trial_payload(payload)
             if payload.get("type") == "done":
@@ -1100,10 +1105,10 @@ def run_task(
                 f"trial_loaded trial_num={trial_num} trial_option_meta={trial_option_meta}",
             )
 
-            sampled_positions, positions = placement.sample()
+            positions = placement.sample()
 
-            for i, (spos, cpos) in enumerate(zip(sampled_positions, positions), start=1):
-                msg_logger.log("INFO", f"position_assigned trial_num={trial_num} option_num={i} screen_px={spos} psychopy_pos={cpos}")
+            for i, pos in enumerate(positions, start=1):
+                msg_logger.log("INFO", f"position_assigned trial_num={trial_num} option_num={i} screen_px={pos}")
 
             trial_meta: Dict[str, Any] = {}
             _show_preview_idle()
@@ -1136,7 +1141,7 @@ def run_task(
                 trial_meta=trial_meta,
                 experimenter_preview=experimenter_preview,
                 external_abort_checker=lambda: _poll_experimenter_controls(service_sync=False),
-                scene_main_size=main_scene_size,
+                scene_main_size=subject_scene_size,
                 event_profile="active_foraging",
                 reward_levels=[reward_map.get(pair, 0) for pair in trial_options],
                 stimulus_rotation_degrees=stimulus_rotation_degrees,
@@ -1155,6 +1160,10 @@ def run_task(
                 break
 
             chosen_idx_row_1based = choice_info.get("chosen_index") if choice_info is not None else None
+            if chosen_idx_row_1based is not None:
+                completed_trials += 1
+            if experimenter_preview is not None:
+                experimenter_preview.set_trial_progress(trial_num, n_trials, completed_trials=completed_trials)
             chosen_idx_row = int(chosen_idx_row_1based - 1) if chosen_idx_row_1based is not None else ""
             chosen_pair_row = trial_options[chosen_idx_row_1based - 1] if chosen_idx_row_1based is not None else None
             reward_level_row = reward_map.get(chosen_pair_row, "") if chosen_pair_row is not None else ""
@@ -1416,9 +1425,9 @@ def main():
     placement_distribution = normalize_placement_distribution(_get("placement_distribution", "circle"))
     center_point_val = _get("center_point") if placement_distribution == "circle" else None
     center_point = tuple(center_point_val) if center_point_val is not None else None
-    stim_range_radius_val = _get("stim_range_radius") if placement_distribution == "circle" else None
+    stim_range_radius_val = _get("stim_range_radius")
     stim_range_radius = float(stim_range_radius_val) if stim_range_radius_val is not None else None
-    display_margin = float(_get("display_margin", cfg.get("display_margin", 0.0)))
+    display_margin = _get("display_margin", 0.0)
     
     # New reward system parameters
     freq_space_tsv = cfg.get("freq_space_tsv")

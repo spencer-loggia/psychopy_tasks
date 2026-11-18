@@ -488,7 +488,7 @@ class TouchAndHoldTaskTests(unittest.TestCase):
             with self.subTest(rotation=rotation):
                 _, _, _, utils, _ = self.exercise(contacts=[], until=0.05, rotation=rotation)
                 pos = utils.make_initiation_cue_stims.call_args.kwargs["position"]
-                self.assertEqual(rotate_centered_point(pos, -software_stimulus_rotation(rotation)), (120, -75))
+                self.assertEqual(pos, (120, -75))
 
     def test_launcher_config_and_cue_settings_match_reference(self):
         launcher = json.loads((ROOT / "config_files/interface/rpi_launch_config.json").read_text())

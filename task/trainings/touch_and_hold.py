@@ -30,6 +30,8 @@ from bin.screen import (
     serialize_preview_image, set_window_mouse_visible, software_stimulus_rotation,
 )
 from bin.task_lifecycle import USER_EXIT_CODE
+from bin.participant_view import ParticipantView
+from bin.screen import oriented_size
 from bin.touch_input import MousePressTracker
 from interface.rig_mode import IS_RIG_ENV_VAR, experimenter_cursor_visible_for_touchscreen
 from task.trainings.touch_and_hold_state import TouchAndHoldState, seconds
@@ -132,7 +134,7 @@ def run_task(
         # Cache the shared cue images once; send only scene/counter changes.
         preview_images = [dict(
             image_payload=serialize_preview_image(stim.image),
-            pos=list(stim.pos), size=list(stim.size), ori=rotation,
+            pos=list(stim.pos), size=list(stim.size), ori=0,
         ) for stim in (cue, pressed_cue)] if preview is not None else []
         automatic_rewards = 0
         manual_rewards = 0
@@ -180,7 +182,7 @@ def run_task(
                 automatic_rewards += 1
                 state.reward_delivered(actual_ns / 1e9)
 
-        mouse = MousePressTracker(event.Mouse(win=win))
+        mouse = MousePressTracker(ParticipantView(rotation).mouse(event.Mouse(win=win)))
         display_key = None
         preview_key = None
         cue_on_s = None
@@ -220,7 +222,7 @@ def run_task(
                         state.trial_num + (state.phase == "waiting"), n,
                     )
                 preview.show_static_scene(
-                    bg_rgb_255=bg, main_size=scene_size, main_rotation_deg=rotation,
+                    bg_rgb_255=bg, main_size=oriented_size(scene_size, rotation), main_rotation_deg=0,
                     images=[preview_images[int(state.touching)]] if state.cue_visible else [],
                     status_counts={"Completed trials": counts[0], "Hold rewards": counts[1],
                                    "Manual rewards": counts[2]},

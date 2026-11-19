@@ -26,7 +26,7 @@
         "uart": {"device": "/dev/ttyAMA10", "baud": 460800}
     },
     "external_aquisition": true,
-    
+
     "main_touchscreen_xinput": "WaveShare WaveShare",
     "remote_git_url": "/mnt/data/task_mirror",
     "remote_data_url": "/mnt/data/",
@@ -90,6 +90,10 @@
             "headfix_train_hold_saccade": {
                 "launch": "task/active_foraging.py",
                 "config": "config_files/csc2/yuri_headfix_train_seq_mem_hold_saccade_20261111.json"
+            },
+            "ephys_hold_and_saccade_seq": {
+                "launch": "task/active_foraging.py",
+                "config": "config_files/csc2/yuri_af_ephys_20261118.json"
             }
             
         },

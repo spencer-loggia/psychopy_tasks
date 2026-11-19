@@ -65,7 +65,7 @@
   "stroke_linejoin": "round",
   "stroke_linecap": "round",
   "image_size": [170, 170],
-  "display_margin": 300,
+  "display_margin": [200, 200, 700, 200], 
 
   "initiation_cue_center_position": [300, -480],
   "initiation_cue_style": "dotted_checker",

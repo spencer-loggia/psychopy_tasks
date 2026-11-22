@@ -51,8 +51,15 @@ class UARTEyeTrackerConfig:
     manage_tracking: bool = True
     expect_recording: bool = True
     simulate: bool = False
+    record_video: Optional[bool] = None
 
     def __post_init__(self):
+        if self.record_video is not None:
+            if not isinstance(self.record_video, bool):
+                raise ValueError("eye_tracking.record_video must be true or false")
+            if not self.manage_tracking:
+                raise ValueError("eye_tracking.record_video requires uart.manage_tracking=true")
+            object.__setattr__(self, "expect_recording", self.record_video)
         for name in ("manage_tracking", "expect_recording", "simulate"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"uart.{name} must be true or false")
@@ -485,6 +492,8 @@ class UARTEyeTracker:
             problems["configuration"] = "Eye tracker is not configured; eye measurements are unavailable."
         if not starting and self.config.expect_recording and not status.flags & StatusFlag.RECORDING:
             problems["recording"] = "Eye tracker recording did not start, or has stopped. Check the tracker Pi's recording settings and storage."
+        if self.config.record_video is False and status.flags & StatusFlag.RECORDING:
+            problems["recording"] = "Eye tracker is recording video despite eye_tracking.record_video=false. Update the tracker software and restart the block."
         if self.get_state().rejection_reason == "service_restarted":
             problems["restart"] = "Eye tracker restarted; gaze will remain unavailable for this task. Check calibration before the next task."
         self.warnings.warn_many(problems)
@@ -550,6 +559,7 @@ class UARTEyeTracker:
                 required |= StatusFlag.RECORDING
             ready = (
                 status.status == StatusCode.OK and status.flags & required == required
+                and not (self.config.record_video is False and status.flags & StatusFlag.RECORDING)
                 and not status.flags & (StatusFlag.ERROR | StatusFlag.RESULT_STALE
                                         | StatusFlag.CALIBRATING | StatusFlag.SHUTTING_DOWN)
                 and status.configured_eye_count > 0 and status.sensor_timestamp_ns > 0
@@ -590,6 +600,8 @@ class UARTEyeTracker:
                     start_attempted = True
                     block_id = self.block_id or os.environ.get(BLOCK_ID_ENV)
                     identity = {"block_id": block_id} if block_id is not None else {}
+                    if self.config.record_video is not None:
+                        identity["record_video"] = self.config.record_video
                     status = controller.start_tracking(block_number=block_number, **identity)
                     received_perf_ns = time.perf_counter_ns()
                     self._consume_measurement(status, received_perf_ns=received_perf_ns)

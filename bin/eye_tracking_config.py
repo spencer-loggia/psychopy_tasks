@@ -74,6 +74,10 @@ def load_eye_tracking_settings(cfg, *, for_calibration=False):
     if "record_rate_hz" in section:
         raise ValueError("eye_tracking.record_rate_hz was removed; recording follows new camera measurements")
     enabled = _boolean(section.get("enabled", False), "eye_tracking.enabled")
+    record_video = (
+        _boolean(section["record_video"], "eye_tracking.record_video")
+        if "record_video" in section else None
+    )
     automatic_recalibration = _boolean(
         section.get("automatic_recalibration", False), "eye_tracking.automatic_recalibration"
     )
@@ -130,6 +134,8 @@ def load_eye_tracking_settings(cfg, *, for_calibration=False):
     uart = dict(_object(saved.get("uart"), "saved uart"))
     uart.update(_object(cfg.get("uart"), "uart"))
     uart.update(_object(section.get("uart"), "eye_tracking.uart"))
+    # Video policy belongs to this block, never to inherited calibration/UART settings.
+    uart["record_video"] = record_video
     for key in ("simulate", "manage_tracking", "expect_recording"):
         if key in uart:
             _boolean(uart[key], f"uart.{key}")

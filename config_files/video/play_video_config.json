@@ -19,7 +19,7 @@
   "pump_pulse_time_seconds": 0.03,
   "reward_interval": 8.0,
 
-  "eye_tracking": {"enabled": true},
+  "eye_tracking": {"record_video": true, "enabled": true},
   "sync_bar": {
     "sync_pin": 18,
     "enabled": false,

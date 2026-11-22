@@ -51,7 +51,7 @@ from bin.daqc2_outputs import DAQC2DigitalOutputs
 from bin.frame_timing import plan_frame_duration, wait_until
 from bin.eye_tracking_config import load_eye_tracking_settings
 from bin.pump_control import PumpPulseControl
-from bin.logger import SessionLogBundle
+from bin.logger import SessionLogBundle, option_position_columns, option_position_values
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.screen import (
     ExperimenterPreview,
@@ -179,7 +179,7 @@ def _build_behavior_fieldnames(num_afc: int) -> List[str]:
         "initiation_task_time_ns",
     ]
     for idx in range(int(num_afc)):
-        fields.extend([f"option_{idx}_shape", f"option_{idx}_color"])
+        fields.extend([f"option_{idx}_shape", f"option_{idx}_color", *option_position_columns(idx)])
     fields.extend(
         [
             "choice_made_index",
@@ -1405,6 +1405,7 @@ def run_task(
                 chosen_sid, chosen_cid = trial_options[int(chosen_idx_1based) - 1]
                 behavior_row["choice_made_shape"] = int(chosen_sid)
                 behavior_row["choice_made_color"] = _fmt_optional_int(chosen_cid)
+            behavior_row.update(option_position_values(positions))
             behavior_logger.writerow(behavior_row)
 
             if iti_frames > 0:

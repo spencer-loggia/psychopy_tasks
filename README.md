@@ -235,6 +235,7 @@ Selecting a subject queues UART `START_EXPERIMENT` (code 6) with the selected fu
 (for example, `Yuri`, not its directory code `Y`), the numeric ID allocated for the local
 experiment directory (`007` sends number `7`), and the experiment start datetime converted
 to Unix UTC nanoseconds. When a task block starts eye tracking, its `START_TRACKING`
+(or `START_TRACKING_MODE` with an explicit video policy)
 command carries the local `block_num`, including calibration tasks and gaps from blocks
 without eye tracking. For example, local `blocks/3_fixation/` corresponds to tracker
 `blocks/3/`. Directory names retain each device's format; the tracker uses the full subject
@@ -338,9 +339,9 @@ the camera opens later, on tracking start.
 
 The tty uses nonblocking writes and raw 8-N-1 with no flow control or deliberate pre-send sleep.
 Quiet-mode preparation and experiment-number reservation still precede experiment creation;
-pending earlier STOP commands must finish before the next START. Task recording uses
-START_TRACKING and the tracker's `record_on_tracking` setting, rather than a separate
-START_RECORDING command.
+pending earlier STOP commands must finish before the next START. Task recording starts
+with tracking. `eye_tracking.record_video` selects whether that block saves eye video;
+when omitted, the tracker uses its `record_on_tracking` default.
 
 Experiment synchronization defaults to disabled when this launcher section is absent;
 set `enabled` to `false` (or `uart.simulate` to `true`) for hardware-free operation.
@@ -834,6 +835,7 @@ Active-foraging behavior log columns:
 - `shape_0 ... shape_(k-1)`
 - `color_0 ... color_(k-1)`
 - `lum_0 ... lum_(k-1)`
+- `option_0_x`, `option_0_y` ... `option_(k-1)_x`, `option_(k-1)_y`
 - `choice_made_index`
 - `choice_made_color`
 - `choice_made_shape`
@@ -861,6 +863,14 @@ For `active_foraging`:
 - `choice_made_index` is zero-based.
 - `reaction_time` is the time from `choice_start` until `option_touch`.
 - `choice_reaction_time` is currently the same quantity as `reaction_time`, retained because it is part of the requested task-specific schema.
+
+Every AFC behavior row (`active_foraging`, `match2cue`, `afc_csc1`, and
+`afc_trial_sequence`) records each option's assigned center in `option_{i}_x` and
+`option_{i}_y`, using the same zero-based index as its stimulus metadata. Values are
+participant-view pixels: actual screen center `(0, 0)`, X right, Y up, independent
+of the initiation cue and display rotation. These are the final placement coordinates
+used for display and hit testing. They are also recorded on unsuccessful attempts;
+display events indicate which options were actually shown.
 
 For `match2cue`, the behavior log additionally records the match cue, whether that displayed match cue was tapped,
 the number of matching options, the tie mode, whether the choice was correct, the resulting choice-reward
@@ -1145,8 +1155,14 @@ Connection and protocol:
 - Use `uart.baud: 460800`, raw 8-N-1 without flow control, matching the tracker. `uart.poll_rate_hz` defaults
   to 100; this is a request/response protocol, not an unsolicited byte stream. Each exchange consists of a
   64-byte command and 64-byte status with CRC-32C and echoed command sequence.
-- `uart.manage_tracking: true` sends acknowledged START_TRACKING on entry and STOP_TRACKING on exit.
-  START can also start recording if the tracker config enables `record_on_tracking`; STOP flushes it.
+- `uart.manage_tracking: true` sends an acknowledged tracking start on entry and STOP_TRACKING on exit.
+  `eye_tracking.record_video: false` starts live gaze and saves eye measurements without
+  video; `true` also records eye video. This per-block setting overrides the tracker's
+  `record_on_tracking` default and is never inherited from a saved calibration.
+  Explicit policies use START_TRACKING_MODE (code 11); update both repositories on
+  the rigs before using them. Older tracker software rejects this command; there is
+  no fallback that could silently record video. Omitting the setting retains legacy
+  START_TRACKING and the tracker's local default. STOP flushes the saved measurements/video.
   Set this option to `false` to poll an already-running tracker without changing its state.
   State commands retry the identical command `uart.state_retries` times (default 1).
   Retry attempts start after the short `uart.response_timeout_s` wait (0.25 s) and a
@@ -1154,10 +1170,11 @@ Connection and protocol:
   Calibration and video tasks start their UART workers before display initialization
   and vblank checks, so those operations no longer delay START_TRACKING. Configuration
   and required media validation still precede task startup. Close may wait for ACKs.
-- `uart.expect_recording` defaults to `true`: a missing `RECORDING` status flag shows a
-  warning while allowing the task and valid gaze acquisition to continue. Set it to `false`
-  when recording on the tracker Pi is intentionally disabled. Error, stopped/unconfigured,
-  calibration, and restarted-service states also produce warnings without aborting tasks.
+- `uart.expect_recording` defaults to `true` for legacy starts. An explicit
+  `eye_tracking.record_video` sets the expected video state automatically, so live tracking
+  without video can become ready normally. A mismatched video state prevents startup
+  readiness and shows a warning. Explicit video policies require `uart.manage_tracking: true`.
+  Error, stopped/unconfigured, calibration, and restarted-service states also produce warnings.
 
 Eye data and calibration:
 
@@ -1312,6 +1329,7 @@ For a standalone task, reference a saved file instead:
 ```json
 "eye_tracking": {
   "enabled": true,
+  "record_video": false,
   "calibration_file": "../calibrations/calibration.json"
 }
 ```
@@ -1323,6 +1341,10 @@ presentation tasks. Explicit `eye_tracking.uart` and `eye_tracking.filter` setti
 (for example, `"uart": {"simulate": true}` for a hardware-free check). Eye tracking defaults to disabled and
 is independent of `raspi`, which controls reward hardware. Saved UART settings include `simulate`; override
 it to `false` when switching a simulated calibration to hardware, and recalibrate on the rig.
+
+The checked-in configs enable eye video only in `csc2/yuri_af_ephys_20261118.json`
+and `video/play_video_config.json`. All other eye-tracked configs, including
+`video/play_video_5min_config.json`, disable eye video while retaining eye measurements.
 
 Tasks with an experimenter preview show a blue gaze marker in the subject-oriented scene, including video.
 Invalid, stale and offscreen gaze is hidden. The two sequence tasks currently have no experimenter preview,

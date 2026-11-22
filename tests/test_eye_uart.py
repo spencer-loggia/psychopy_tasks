@@ -48,6 +48,47 @@ def status_bytes(*, sequence=42, code=0, edits=()):
 
 
 class UARTProtocolTests(unittest.TestCase):
+    def test_explicit_video_policy_preserves_block_identity_and_retries(self):
+        identifier = "00112233-4455-4677-8899-aabbccddeeff"
+        for record_video in (False, True):
+            with self.subTest(record_video=record_video):
+                channel = Mock()
+                channel.exchange.side_effect = [ResponseTimeout("lost start ACK"),
+                                                status_bytes(), status_bytes(sequence=43)]
+                controller = EyeTrackerController(channel, initial_sequence=42, retries=1, retry_delay_s=0)
+                controller.start_tracking(block_number=7, block_id=identifier, record_video=record_video)
+                packets = [call.args[0] for call in channel.exchange.call_args_list]
+                self.assertEqual(packets[0], packets[1])
+                command = decode_command(packets[0])
+                self.assertEqual(command.code, CommandCode.START_TRACKING_MODE)
+                self.assertIs(command.record_video, record_video)
+                self.assertEqual(command.block_number, 7)
+                self.assertEqual(decode_command(packets[2]).block_id, identifier)
+
+    def test_explicit_video_policy_requires_tracker_support(self):
+        channel = Mock()
+        channel.exchange.return_value = status_bytes(code=StatusCode.UNKNOWN_COMMAND)
+        controller = EyeTrackerController(channel, initial_sequence=42, retries=0)
+        with self.assertRaises(CommandRejected):
+            controller.start_tracking(record_video=False)
+        channel.exchange.assert_called_once()
+        self.assertEqual(decode_command(channel.exchange.call_args.args[0]).code,
+                         CommandCode.START_TRACKING_MODE)
+
+    def test_video_mode_packets_match_tracker_codec_and_reject_unknown_flags(self):
+        for flag in (0, 1):
+            command = CommandPacket(CommandCode.START_TRACKING_MODE, 42, flags=flag, block_number=7)
+            packet = encode_command(command)
+            self.assertEqual(packet.hex(), FIXTURE[f"tracking_video_{flag}"])
+            self.assertEqual(decode_command(packet), command)
+        with self.assertRaises(ValueError):
+            encode_command(CommandPacket(CommandCode.START_TRACKING_MODE, 42, flags=2))
+        packet = bytearray(packet)
+        struct.pack_into("<H", packet, 4, 2)
+        struct.pack_into("<I", packet, 60, crc32c(packet[:60]))
+        with self.assertRaisesRegex(ProtocolError, "BAD_FLAGS"):
+            decode_command(bytes(packet))
+
     def test_start_and_uuid_ack_failures_name_the_command(self):
         identifier = "00112233-4455-4677-8899-aabbccddeeff"
         for failed_code in (CommandCode.START_EXPERIMENT, CommandCode.SET_EXPERIMENT_ID):
@@ -316,12 +357,14 @@ class UARTProtocolTests(unittest.TestCase):
         for code in CommandCode:
             for field, allowed in (
                 ("experiment_number", (CommandCode.START_EXPERIMENT, CommandCode.SET_EXPERIMENT_ID)),
-                ("block_number", (CommandCode.START_TRACKING, CommandCode.START_RECORDING, CommandCode.SET_BLOCK_ID)),
+                ("block_number", (CommandCode.START_TRACKING, CommandCode.START_RECORDING,
+                                  CommandCode.START_TRACKING_MODE, CommandCode.SET_BLOCK_ID)),
             ):
                 if code not in allowed:
                     with self.subTest(code=code, field=field), self.assertRaises(ValueError):
                         encode_command(CommandPacket(code, 42, 1, **{field: 7}))
             if code not in (CommandCode.START_EXPERIMENT, CommandCode.START_TRACKING, CommandCode.START_RECORDING,
+                            CommandCode.START_TRACKING_MODE,
                             CommandCode.SET_EXPERIMENT_ID, CommandCode.SET_BLOCK_ID):
                 packet = bytearray(encode_command(CommandPacket(code, 42)))
                 struct.pack_into("<I", packet, 12, 7)

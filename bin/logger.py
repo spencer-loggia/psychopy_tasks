@@ -28,6 +28,20 @@ ALLOWED_EVENT_TYPES = frozenset({"frame_flip", "interaction", "signal", "lifecyc
 ALLOWED_MESSAGE_LEVELS = frozenset({"INFO", "WARN", "ERROR"})
 
 
+def option_position_columns(index: int) -> tuple[str, str]:
+    """Behavior columns for one zero-based option's participant-pixel center."""
+    return (f"option_{index}_x", f"option_{index}_y")
+
+
+def option_position_values(positions: Iterable[Iterable[float]]) -> dict[str, str]:
+    """Serialize final participant-pixel centers without a coordinate transform."""
+    return {
+        name: f"{float(value):.9f}"
+        for index, position in enumerate(positions)
+        for name, value in zip(option_position_columns(index), position)
+    }
+
+
 @dataclass(frozen=True)
 class EventDefinition:
     code: int

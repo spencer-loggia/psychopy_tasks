@@ -53,3 +53,11 @@ UUID packet after the original start ACK. Metadata retries do not resend starts.
 The fixture file records that codec's SHA-256 and both UUID command packets.
 Existing starts, sequence numbers, subject capacity, telemetry, packet size and
 version remain unchanged. Deploy both sides before sending these new commands.
+
+Per-block video selection (`START_TRACKING_MODE`, code 11) was synchronized with
+companion working-tree changes on 2026-11-21. Flags 0/1 disable/enable video while
+retaining tracking and saved measurements. The optional `record_video` start
+argument selects this command; omitted policies retain legacy code 1. The fixture
+records both mode packets and the companion codec SHA-256. Version, packet size,
+telemetry, numbered/UUID starts, and retry semantics are unchanged. Deploy both
+sides together; unsupported trackers reject the new command without fallback.

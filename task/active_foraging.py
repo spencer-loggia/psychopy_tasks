@@ -70,7 +70,7 @@ from bin.dot_fixation import (
 )
 from bin.touch_input import AFC_HOLD_MAX_BREAK_S, AFC_INPUT_POLL_INTERVAL_S, AFC_TOUCH_ACQUIRE_WINDOW_S
 from bin.pump_control import PumpPulseControl
-from bin.logger import SessionLogBundle
+from bin.logger import SessionLogBundle, option_position_columns, option_position_values
 from bin.task_lifecycle import USER_EXIT_CODE
 import numpy as np
 from bin.config import load_config, resolve_subject_mapped_value, validate_config
@@ -197,7 +197,10 @@ def _build_behavior_fieldnames(num_afc: int) -> List[str]:
     fieldnames = ["trial_num", "pump_pulse_time", "fixation_window_radius",
                   "initiation_task_time_ns", "initiation_cue_release_task_time_ns"]
     for opt_idx in range(int(num_afc)):
-        fieldnames.extend([f"shape_{opt_idx}", f"color_{opt_idx}", f"lum_{opt_idx}"])
+        fieldnames.extend([
+            f"shape_{opt_idx}", f"color_{opt_idx}", f"lum_{opt_idx}",
+            *option_position_columns(opt_idx),
+        ])
     fieldnames.extend(
         [
             "choice_made_index",
@@ -1280,6 +1283,7 @@ def run_task(
             behavior_row["main_display_max_transition_error_s"] = (
                 _fmt_optional(maximum_transition_error_s)
             )
+            behavior_row.update(option_position_values(positions))
             behavior_logger.writerow(behavior_row)
             msg_logger.log(
                 "INFO",

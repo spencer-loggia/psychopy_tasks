@@ -247,6 +247,10 @@ class Match2CueConfigurationTests(unittest.TestCase):
         self.assertEqual([r["trial_num"] for r in rows], [1, 2, 3, 4])
         self.assertEqual([r["choice_made_index"] for r in rows], ["", 0, "", 1])
         self.assertEqual([r["choice_correct"] for r in rows], ["", 1, "", 0])
+        for row, call in zip(rows, task.utils.present_trial_with_persistent_dots.call_args_list):
+            for index, (x, y) in enumerate(call.kwargs["positions"]):
+                self.assertAlmostEqual(float(row[f"option_{index}_x"]), x, places=8)
+                self.assertAlmostEqual(float(row[f"option_{index}_y"]), y, places=8)
         preview.set_trial_progress.assert_called_with(4, 2, completed_trials=2)
         self.assertEqual(task.utils.TrialBufferManager.call_args.kwargs["config"]["n_trials"], 0)
 

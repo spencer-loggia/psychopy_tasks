@@ -49,6 +49,7 @@ class CommandCode(enum.IntEnum):
     SHUTDOWN = 8
     SET_EXPERIMENT_ID = 9
     SET_BLOCK_ID = 10
+    START_TRACKING_MODE = 11
 
 
 class StatusCode(enum.IntEnum):
@@ -91,6 +92,11 @@ class CommandPacket:
     block_number: int | None = None
     experiment_id: str | None = None
     block_id: str | None = None
+
+    @property
+    def record_video(self) -> bool | None:
+        """Explicit per-start video policy; legacy START_TRACKING uses local config."""
+        return bool(self.flags & 1) if self.code is CommandCode.START_TRACKING_MODE else None
 
 
 @dataclass(frozen=True)
@@ -163,6 +169,8 @@ def encode_command(command: CommandPacket) -> bytes:
         raise ValueError("command sequence must be nonzero")
     if not 0 <= command.flags <= 0xFFFF:
         raise ValueError("command flags must fit in uint16")
+    if command.code is CommandCode.START_TRACKING_MODE and command.flags not in (0, 1):
+        raise ValueError("START_TRACKING_MODE flags must be 0 (no video) or 1 (video)")
     if not 0 <= command.controller_timestamp_ns <= 0xFFFFFFFFFFFFFFFF:
         raise ValueError("controller_timestamp_ns must fit in uint64")
     subject_bytes = b""
@@ -173,9 +181,9 @@ def encode_command(command: CommandPacket) -> bytes:
     ):
         raise ValueError("Only START_EXPERIMENT/SET_EXPERIMENT_ID accept an experiment number")
     if block_number is not None and command.code not in (
-        CommandCode.START_TRACKING, CommandCode.START_RECORDING, CommandCode.SET_BLOCK_ID,
+        CommandCode.START_TRACKING, CommandCode.START_RECORDING, CommandCode.START_TRACKING_MODE, CommandCode.SET_BLOCK_ID,
     ):
-        raise ValueError("Only START_TRACKING/START_RECORDING/SET_BLOCK_ID accept a block number")
+        raise ValueError("Only tracking/recording starts and SET_BLOCK_ID accept a block number")
     if command.code == CommandCode.START_EXPERIMENT:
         if command.controller_timestamp_ns == 0:
             raise ValueError("START_EXPERIMENT requires a nonzero Unix UTC timestamp")
@@ -236,8 +244,11 @@ def decode_command(packet: bytes) -> CommandPacket:
         command_code = CommandCode(code)
     except ValueError as exc:
         raise ProtocolError("UNKNOWN_COMMAND") from exc
+    if command_code is CommandCode.START_TRACKING_MODE and flags not in (0, 1):
+        raise ProtocolError("BAD_FLAGS")
     if related and command_code not in (
         CommandCode.START_EXPERIMENT, CommandCode.START_TRACKING, CommandCode.START_RECORDING,
+        CommandCode.START_TRACKING_MODE,
         CommandCode.SET_EXPERIMENT_ID, CommandCode.SET_BLOCK_ID,
     ):
         raise ProtocolError("BAD_RESERVED")
@@ -274,7 +285,7 @@ def decode_command(packet: bytes) -> CommandPacket:
         experiment_number=(related or None)
         if command_code in (CommandCode.START_EXPERIMENT, CommandCode.SET_EXPERIMENT_ID) else None,
         block_number=(related or None)
-        if command_code in (CommandCode.START_TRACKING, CommandCode.START_RECORDING, CommandCode.SET_BLOCK_ID) else None,
+        if command_code in (CommandCode.START_TRACKING, CommandCode.START_RECORDING, CommandCode.START_TRACKING_MODE, CommandCode.SET_BLOCK_ID) else None,
         experiment_id=identifier if command_code is CommandCode.SET_EXPERIMENT_ID else None,
         block_id=identifier if command_code is CommandCode.SET_BLOCK_ID else None,
     )

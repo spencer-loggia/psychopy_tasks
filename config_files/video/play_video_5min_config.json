@@ -16,10 +16,11 @@
   "bg": [0, 0, 0],
 
   "pump_pin": 0,
-  "pump_pulse_time_seconds": 0.03,
+  "pump_pulse_time_seconds": 0.00,
   "reward_interval": 8.0,
 
-  "eye_tracking": {"enabled": true},
+  "eye_tracking": {"enabled": true,
+                   "record_video": false},
   "sync_bar": {
     "sync_pin": 18,
     "enabled": false,

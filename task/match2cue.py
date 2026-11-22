@@ -51,7 +51,7 @@ from bin.frame_timing import (
 )
 from bin.eye_tracking_config import load_eye_tracking_settings
 from bin.pump_control import PumpPulseControl
-from bin.logger import SessionLogBundle
+from bin.logger import SessionLogBundle, option_position_columns, option_position_values
 from bin.match2cue_logic import (
     Match2CueTrial,
     execute_reward_train,
@@ -164,6 +164,7 @@ def _build_behavior_fieldnames(num_afc: int) -> List[str]:
                 f"shape_{option_idx}",
                 f"color_{option_idx}",
                 f"lum_{option_idx}",
+                *option_position_columns(option_idx),
             ]
         )
     fields.extend(
@@ -874,6 +875,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
             behavior_row["main_display_max_transition_error_s"] = (
                 _optional_float(maximum_transition_error_s)
             )
+            behavior_row.update(option_position_values(positions))
             behavior_logger.writerow(behavior_row)
             msg_logger.log(
                 "INFO",

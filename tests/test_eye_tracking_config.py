@@ -218,6 +218,43 @@ class EyeTrackingConfigTests(unittest.TestCase):
                     },
                 })
 
+    def test_video_policy_is_per_block_and_overrides_saved_recording_expectation(self):
+        for record_video in (False, True):
+            cfg = {
+                **asdict(EyeCalibration()),
+                "eye_tracking": {"enabled": True, "record_video": record_video},
+                "eye_tracker_calibration": {"uart": {"expect_recording": not record_video,
+                                                      "record_video": not record_video}},
+            }
+            settings = load_eye_tracking_settings(cfg)
+            self.assertIs(settings.uart.record_video, record_video)
+            self.assertIs(settings.uart.expect_recording, record_video)
+            del cfg["eye_tracking"]["record_video"]
+            self.assertIsNone(load_eye_tracking_settings(cfg).uart.record_video)
+        with self.assertRaisesRegex(ValueError, "manage_tracking"):
+            load_eye_tracking_settings({
+                "eye_tracking": {"record_video": False}, "uart": {"manage_tracking": False},
+            }, for_calibration=True)
+        for invalid in (None, 0, 1, "false"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "record_video"):
+                load_eye_tracking_settings({"eye_tracking": {"record_video": invalid}}, for_calibration=True)
+
+    def test_only_selected_task_configs_record_eye_video(self):
+        root = Path(__file__).resolve().parents[1]
+        enabled = set()
+        for directory in ("config_files", "test_configs"):
+            for path in (root / directory).rglob("*.json"):
+                cfg = json.loads(path.read_text())
+                if not isinstance(cfg, dict):
+                    continue
+                section = cfg.get("eye_tracking", {})
+                if section.get("enabled") or cfg.get("config_name") == "eye_calibration":
+                    self.assertIsInstance(section.get("record_video"), bool, str(path))
+                    if section["record_video"]:
+                        enabled.add(str(path.relative_to(root)))
+        self.assertEqual(enabled, {"config_files/csc2/yuri_af_ephys_20261118.json",
+                                   "config_files/video/play_video_config.json"})
+
     def test_recording_has_no_polling_rate_and_uart_defaults_to_100_hz(self):
         cfg = {**asdict(EyeCalibration()), "eye_tracking": {"enabled": True}}
         self.assertEqual(load_eye_tracking_settings(cfg).uart.poll_rate_hz, 100)

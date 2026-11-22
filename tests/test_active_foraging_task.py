@@ -520,6 +520,10 @@ class ActiveForagingTaskTests(unittest.TestCase):
             rows = list(csv.DictReader(handle, delimiter="\t"))
         with (event_path.parent / "behavior_log.tsv").open() as handle:
             behavior = list(csv.DictReader(handle, delimiter="\t"))
+        for row, positions in zip(behavior, position_trials):
+            for index, (x, y) in enumerate(positions):
+                self.assertAlmostEqual(float(row[f"option_{index}_x"]), x, places=8)
+                self.assertAlmostEqual(float(row[f"option_{index}_y"]), y, places=8)
         self.assertEqual([float(row["pump_pulse_time"]) for row in behavior], widths)
         self.assertEqual([row["fixation_window_radius"] for row in behavior],
                          ["150.0"] * 2 + ["225.0"] * 4 if change_fixation else [""] * 6)

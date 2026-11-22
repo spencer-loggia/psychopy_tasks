@@ -39,6 +39,45 @@ def sample(frame=1, **kwargs):
 
 
 class EyeTrackingTests(unittest.TestCase):
+    def test_live_tracking_readiness_obeys_explicit_video_policy(self):
+        for record_video in (False, True):
+            with self.subTest(record_video=record_video):
+                tracker = UARTEyeTracker(uart_config=UARTEyeTrackerConfig(record_video=record_video))
+                tracker._thread = Mock()
+                flags = StatusFlag.TRACKING | StatusFlag.CONFIGURED
+                if record_video:
+                    flags |= StatusFlag.RECORDING
+                status = sample(flags=flags)
+                tracker._consume_measurement(status, received_perf_ns=time.perf_counter_ns())
+                tracker.wait_until_ready(0)
+                self.assertTrue(tracker.get_state().valid)
+                tracker._check_status(status)
+                self.warning.assert_not_called()
+                wrong = replace(status, flags=flags ^ StatusFlag.RECORDING)
+                tracker._consume_measurement(wrong, received_perf_ns=time.perf_counter_ns())
+                with self.assertRaises(TimeoutError):
+                    tracker.wait_until_ready(0)
+                tracker._check_status(wrong)
+                self.warning.assert_called_once()
+                self.warning.reset_mock()
+
+    def test_worker_sends_explicit_video_policy_with_block_number(self):
+        for record_video in (False, True):
+            with self.subTest(record_video=record_video):
+                tracker = UARTEyeTracker(uart_config=UARTEyeTrackerConfig(record_video=record_video))
+                controller = Mock()
+                controller.send_state_command.return_value = sample(flags=StatusFlag(0))
+                def started(**kwargs):
+                    tracker._stop.set()
+                    return sample()
+                controller.start_tracking.side_effect = started
+                with patch.dict("os.environ", {EXPERIMENT_BLOCK_NUMBER_ENV: "7"}), patch(
+                    "bin.eye_tracking.SerialPacketChannel"
+                ), patch("bin.eye_tracking.EyeTrackerController", return_value=controller):
+                    tracker._run()
+                controller.start_tracking.assert_called_once_with(block_number=7, record_video=record_video)
+                controller.send_state_command.assert_called_once_with(CommandCode.STOP_TRACKING)
+
     def test_readiness_requires_fresh_recording_but_accepts_blinks(self):
         tracker = UARTEyeTracker()
         tracker._thread = Mock()

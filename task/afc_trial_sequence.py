@@ -38,7 +38,7 @@ if str(_project_root) not in sys.path:
 from bin import utils
 from bin.frame_timing import flip_with_timestamps, plan_frame_duration, wait_until
 from bin.eye_tracking_config import load_eye_tracking_settings
-from bin.logger import SessionLogBundle
+from bin.logger import SessionLogBundle, option_position_columns, option_position_values
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.config import load_config, validate_config
 from bin.screen import (
@@ -158,7 +158,10 @@ def run_task(
     bg_rect = utils.make_bg_rect(win, bg)
 
     resolved_config_name = str(config_name).strip() if config_name else "afc_trial_sequence"
-    behavior_fieldnames = ["trial_num"] + [f"stimulus_{idx}" for idx in range(int(num_afc))] + [
+    behavior_fieldnames = ["trial_num"]
+    for idx in range(int(num_afc)):
+        behavior_fieldnames.extend([f"stimulus_{idx}", *option_position_columns(idx)])
+    behavior_fieldnames.extend([
         "choice_made_index",
         "choice_touch_x",
         "choice_touch_y",
@@ -166,7 +169,7 @@ def run_task(
         "main_display_transition_count",
         "main_display_transition_misses",
         "main_display_max_transition_error_s",
-    ]
+    ])
     session_logs = SessionLogBundle(
         eye_tracking_config=eye_tracking_config,
         output_root=output_dir,
@@ -382,6 +385,7 @@ def run_task(
             if maximum_transition_error_s is None
             else f"{float(maximum_transition_error_s):.9f}"
         )
+        behavior_row.update(option_position_values(positions))
         behavior_logger.writerow(behavior_row)
 
         if iti_frames > 0:

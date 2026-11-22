@@ -135,6 +135,10 @@ class RelatedAFCTaskTests(unittest.TestCase):
                 rows = [c.args[0] for c in logs.behavior_logger.writerow.call_args_list]
                 self.assertEqual([r["trial_num"] for r in rows], [1, 2, 3, 4])
                 self.assertEqual([r["choice_made_index"] for r in rows], ["", 0, "", 1])
+                for row, attempt in zip(rows, attempts):
+                    for index, (x, y) in enumerate(attempt["positions"]):
+                        self.assertAlmostEqual(float(row[f"option_{index}_x"]), x, places=8)
+                        self.assertAlmostEqual(float(row[f"option_{index}_y"]), y, places=8)
                 preview.set_trial_progress.assert_called_with(4, 2, completed_trials=2)
 
 

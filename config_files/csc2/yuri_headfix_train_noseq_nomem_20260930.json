@@ -88,7 +88,7 @@
   "raspi": true,
   "touchscreen": true,
 
-  "eye_tracking": {"enabled": true, 
+  "eye_tracking": {"record_video": false, "enabled": true,
                    "calibrate_online": true},
   "sync_bar": {
     "sync_pin": 16,

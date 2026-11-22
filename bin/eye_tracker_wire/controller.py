@@ -194,15 +194,19 @@ class EyeTrackerController:
 
     def send_state_command(
         self, code: CommandCode, *, block_number: int | None = None,
-        block_id: str | None = None,
+        block_id: str | None = None, record_video: bool | None = None,
     ) -> DecodedStatus:
+        if record_video is not None:
+            if not isinstance(record_video, bool) or code is not CommandCode.START_TRACKING:
+                raise ValueError("record_video must be boolean and only applies to START_TRACKING")
+            code = CommandCode.START_TRACKING_MODE
         if code is CommandCode.POLL:
             raise ValueError("Use poll() for POLL commands")
         if code is CommandCode.START_EXPERIMENT:
             raise ValueError("Use start_experiment() with a subject for START_EXPERIMENT")
         if block_id is not None:
             validate_run_id(block_id)
-            if code not in (CommandCode.START_TRACKING, CommandCode.START_RECORDING):
+            if code not in (CommandCode.START_TRACKING, CommandCode.START_RECORDING, CommandCode.START_TRACKING_MODE):
                 raise ValueError("Only tracking/recording starts accept a block ID")
         status = self._send_state_packet(
             CommandPacket(
@@ -210,6 +214,7 @@ class EyeTrackerController:
                 sequence=self._take_sequence(),
                 controller_timestamp_ns=time.monotonic_ns(),
                 block_number=block_number,
+                flags=int(record_video) if record_video is not None else 0,
             )
         )
         return self._identify(status, CommandCode.SET_BLOCK_ID, block_id, block_number)
@@ -234,9 +239,11 @@ class EyeTrackerController:
         )
         return self._identify(status, CommandCode.SET_EXPERIMENT_ID, experiment_id, experiment_number)
 
-    def start_tracking(self, *, block_number: int | None = None, block_id: str | None = None) -> DecodedStatus:
+    def start_tracking(self, *, block_number: int | None = None, block_id: str | None = None,
+                       record_video: bool | None = None) -> DecodedStatus:
         """Start tracking, optionally replacing a numbered Pi Tracker block."""
-        return self.send_state_command(CommandCode.START_TRACKING, block_number=block_number, block_id=block_id)
+        return self.send_state_command(CommandCode.START_TRACKING, block_number=block_number,
+                                       block_id=block_id, record_video=record_video)
 
     def start_recording(self, *, block_number: int | None = None, block_id: str | None = None) -> DecodedStatus:
         """Start a saved run while tracking, optionally replacing a numbered block."""

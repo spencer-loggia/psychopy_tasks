@@ -1017,8 +1017,12 @@ Other tasks use the same session packaging and shared schemas but simpler task-s
   video-only `sync_interval_frames` and `sync_pulse_frames` options have been removed.
 - On Raspberry Pi, `play_video` also drives the reward pump through Pi-Plates
   DAQC2 `DOUT pump_pin`. Both `reward_interval` and
-  `pump_pulse_time_seconds` are required, with a positive pulse duration shorter
-  than `reward_interval`. `reward_interval` is the standard interval name for
+  `pump_pulse_time_seconds` are required, with a non-negative pulse duration shorter
+  than the positive `reward_interval`. A pulse duration of `0` disables rewards
+  while video playback and eye tracking continue; it does not emit zero-length
+  pump pulses. Live edits can disable or re-enable rewards at the next clip boundary.
+  An active pulse finishes at its original duration, and re-enabling rewards starts
+  a full new interval. `reward_interval` is the standard interval name for
   timed fixation rewards, shared with eye tracker calibration; it replaces
   `pump_interval`. With eye tracking disabled, the first onset occurs one
   `reward_interval` after task startup and subsequent onsets remain on one

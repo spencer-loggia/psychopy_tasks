@@ -1,4 +1,5 @@
 from collections import deque
+from dataclasses import asdict
 import ctypes
 import importlib.util
 import json
@@ -24,8 +25,8 @@ from bin.buffered_video import (
     copy_ffpyplayer_rgb24,
     plan_video_chunks,
 )
-from bin.eye_tracking import EyeTrackerState
-from bin.eye_tracking_config import EyeTrackingSettings
+from bin.eye_tracking import EyeCalibration, EyeTrackerState
+from bin.eye_tracking_config import EyeTrackingSettings, load_eye_tracking_settings
 from bin.video_playback import (
     SharedVideoFrameBuffer,
     SharedVideoFrameReader,
@@ -1397,6 +1398,45 @@ class PlayVideoTaskTests(unittest.TestCase):
                 self.assertEqual(module.PeriodicDOUTPulseController.call_args.kwargs["interval_s"], 1)
                 schedule = "screen_fixation" if enabled else "absolute_onset"
                 self.assertTrue(any(f"schedule={schedule}" in message for _, message in messages))
+
+    def test_checked_in_video_configs_start_with_their_reward_and_recording_settings(self):
+        root = Path(__file__).resolve().parents[1]
+        for filename in ("play_video_5min_config.json", "play_video_config.json"):
+            with self.subTest(config=filename), tempfile.TemporaryDirectory() as tmp:
+                cfg = json.loads((root / "config_files/video" / filename).read_text())
+                module, utils, _ = self._make_validation_harness(
+                    source_rate="24/1", monitor_rate=60,
+                )
+                module.probe_video_stream.return_value["duration"] = "600"
+                path = Path(tmp) / "clip.mp4"
+                path.touch()
+                cfg.update(asdict(EyeCalibration()))
+                settings = load_eye_tracking_settings(cfg)
+                outputs = Mock(validate_bit=int)
+                module.DAQC2DigitalOutputs = Mock(
+                    return_value=outputs, validate_bit=int, validate_address=int,
+                )
+                utils.play_video_fill_screen.return_value = {
+                    "video_name": "clip.mp4", "aborted": False,
+                }
+                self.assertEqual(module.run_task(
+                    video_files=[str(path)], output_dir=tmp, raspi=True,
+                    clip_duration_seconds=cfg["clip_duration_seconds"],
+                    num_clips=cfg["num_clips"], frame_rate=cfg["frame_rate"],
+                    pump_pulse_time_seconds=cfg["pump_pulse_time_seconds"],
+                    reward_interval=cfg["reward_interval"], eye_tracking_config=settings,
+                ), "done")
+                session_args = module.SessionLogBundle.call_args.kwargs
+                self.addCleanup(session_args["live_settings"].close,
+                                module.SessionLogBundle.return_value.message_logger)
+                self.assertIs(session_args["eye_tracking_config"].uart.record_video,
+                              cfg["eye_tracking"]["record_video"])
+                self.assertEqual(utils.play_video_fill_screen.call_count, 1)
+                row = module.SessionLogBundle.return_value.behavior_logger.writerow.call_args.args[0]
+                self.assertEqual(row["pump_pulse_time"], cfg["pump_pulse_time_seconds"])
+                self.assertEqual(float(row["requested_clip_duration_seconds"]), cfg["clip_duration_seconds"])
+                self.assertTrue(outputs.write.call_args_list)
+                self.assertTrue(all(call.args == (0, False) for call in outputs.write.call_args_list))
 
     def test_pulse_edit_updates_next_clip_controller_and_behavior_row(self):
         from bin.pump_control import PumpPulseControl

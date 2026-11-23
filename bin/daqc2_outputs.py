@@ -137,7 +137,8 @@ class PeriodicDOUTPulseController:
     An optional fixation reward policy continuously checks rolling gaze windows
     once a full interval can exist, resetting their history at each reward onset.
     Timing updates publish one immutable snapshot without waiting for the worker
-    or performing hardware I/O on the presentation thread.
+    or performing hardware I/O on the presentation thread. Zero duration disables
+    pulses; re-enabling them starts a full new interval.
     """
 
     _TIMING_POLL_SECONDS = 0.005
@@ -173,8 +174,8 @@ class PeriodicDOUTPulseController:
         pulse_duration_s = float(pulse_duration_s)
         if not math.isfinite(interval_s) or interval_s <= 0.0:
             raise ValueError("reward_interval must be a positive finite value")
-        if not math.isfinite(pulse_duration_s) or pulse_duration_s <= 0.0:
-            raise ValueError("pump_pulse_time_seconds must be a positive finite value")
+        if not math.isfinite(pulse_duration_s) or pulse_duration_s < 0.0:
+            raise ValueError("pump_pulse_time_seconds must be a non-negative finite value")
         if pulse_duration_s >= interval_s:
             raise ValueError(
                 "pump_pulse_time_seconds must be shorter than reward_interval"
@@ -220,7 +221,8 @@ class PeriodicDOUTPulseController:
         """Publish timing for subsequent pulses without blocking presentation.
 
         Call from the task's settings thread. An interval change requires a full
-        new interval from this call; a width-only change keeps the schedule.
+        new interval from this call, as does re-enabling a zero-duration pump.
+        Other width-only changes keep the schedule.
         The worker captures each pulse's width before raising the output, so an
         in-flight pulse always completes with its original width. When changing
         a separate fixation policy, publish this timing before updating that
@@ -230,12 +232,14 @@ class PeriodicDOUTPulseController:
             interval_s, pulse_duration_s,
         )
         previous = self._timing
-        interval_changed = interval_s != previous.interval_s
+        restart_interval = interval_s != previous.interval_s or (
+            previous.pulse_duration_s == 0 and pulse_duration_s > 0
+        )
         self._timing = _PulseTiming(
             interval_s,
             pulse_duration_s,
-            previous.interval_revision + int(interval_changed),
-            self._clock() if interval_changed else previous.interval_changed_perf_s,
+            previous.interval_revision + int(restart_interval),
+            self._clock() if restart_interval else previous.interval_changed_perf_s,
         )
 
     def drain_edges(self) -> list[DOUTPulseEdge]:
@@ -299,6 +303,9 @@ class PeriodicDOUTPulseController:
 
                 now_perf_s = self._clock()
                 if self._timing is not timing or now_perf_s < next_on_perf_s:
+                    continue
+                if timing.pulse_duration_s == 0:
+                    next_on_perf_s = now_perf_s + self._TIMING_POLL_SECONDS
                     continue
                 if self._reward_policy is not None:
                     if not self._reward_policy.status(now_s=now_perf_s).due:

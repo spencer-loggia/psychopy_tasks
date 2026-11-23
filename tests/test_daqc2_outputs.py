@@ -113,6 +113,56 @@ class DAQC2DigitalOutputsTests(unittest.TestCase):
                 pulse_duration_s=0.25,
             )
 
+    def test_zero_duration_never_pulses_or_reports_a_reward(self):
+        for policy in (None, Mock()):
+            with self.subTest(fixation=policy is not None):
+                now = 0.0
+                def wait(seconds):
+                    nonlocal now
+                    self.assertGreater(seconds, 0)  # A disabled pump must not spin.
+                    now = round(now + seconds, 9)
+                    return now >= 3
+                outputs = types.SimpleNamespace(validate_bit=int, write=Mock())
+                controller = PeriodicDOUTPulseController(
+                    outputs, bit=0, interval_s=1, pulse_duration_s=0,
+                    clock=lambda: now, reward_policy=policy,
+                )
+                controller._anchor_perf_s = 0
+                controller._stop_event = types.SimpleNamespace(wait=wait)
+                controller._run()
+                self.assertIsNone(controller.failure)
+                outputs.write.assert_not_called()
+                self.assertEqual(controller.drain_edges(), [])
+                if policy is not None:
+                    policy.reward_delivered.assert_not_called()
+
+    def test_zero_duration_edit_finishes_active_pulse_and_can_resume(self):
+        now = 0.0
+        resumed = False
+        writes = []
+        def wait(seconds):
+            nonlocal now, resumed
+            now = round(now + seconds, 9)
+            if now >= 2.5 and not resumed:
+                resumed = True
+                controller.set_pulse_duration(0.2)
+            return now >= 3.8
+        def write(bit, active):
+            writes.append((active, now))
+            if len(writes) == 1:
+                controller.set_pulse_duration(0)
+        controller = PeriodicDOUTPulseController(
+            types.SimpleNamespace(validate_bit=int, write=write),
+            bit=0, interval_s=1, pulse_duration_s=0.1, clock=lambda: now,
+        )
+        controller._anchor_perf_s = 0
+        controller._stop_event = types.SimpleNamespace(wait=wait)
+        controller._run()
+        self.assertIsNone(controller.failure)
+        self.assertEqual(writes, [(True, 1), (False, 1.1), (True, 3.5), (False, 3.7)])
+        self.assertEqual([edge.pulse_duration_s for edge in controller.drain_edges() if edge.active],
+                         [0.1, 0.2])
+
     def test_duration_update_during_hardware_on_keeps_active_width_and_edge_history(self):
         now = 0.0
         writes = []
@@ -139,7 +189,7 @@ class DAQC2DigitalOutputsTests(unittest.TestCase):
         self.assertAlmostEqual(writes[1][1] - writes[0][1], 0.1)
         self.assertAlmostEqual(writes[3][1] - writes[2][1], 0.3)
         self.assertEqual([edge.pulse_duration_s for edge in controller.drain_edges() if edge.active], [0.1, 0.3])
-        for invalid in (0, -0.1, 1, float("nan"), float("inf")):
+        for invalid in (-0.1, 1, float("nan"), float("inf")):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 controller.set_pulse_duration(invalid)
         self.assertEqual(controller.pulse_duration_s, 0.3)
@@ -163,7 +213,7 @@ class DAQC2DigitalOutputsTests(unittest.TestCase):
         snapshot = controller._timing
         for interval, width in (
             (0, 0.01), (-1, 0.01), (float("nan"), 0.01),
-            (float("inf"), 0.01), (1, 0), (1, -0.01),
+            (float("inf"), 0.01), (1, -0.01),
             (1, float("nan")), (1, float("inf")), (1, 1), (1, 2),
         ):
             with self.subTest(interval=interval, width=width), self.assertRaises(ValueError):

@@ -153,7 +153,7 @@ def run_task(
     pump_outputs = None
     pump_controller = None
     pump_control = (
-        PumpPulseControl(pump_pulse_time_seconds, allow_zero=False, reward_interval=float(reward_interval),
+        PumpPulseControl(pump_pulse_time_seconds, reward_interval=float(reward_interval),
                          boundary="clip", interval_label="Fix interval" if eye_tracking_config is not None else "Reward interval")
         if raspi else None
     )

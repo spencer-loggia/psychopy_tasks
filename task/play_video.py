@@ -28,6 +28,7 @@ from bin.fixation_reward import ScreenAutoReward
 from bin.pump_control import PumpPulseControl
 from bin.sync_bar import SyncBarConfig
 from bin.logger import SessionLogBundle
+from bin.network_events import load_network_event_settings
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.video_playback import (
     SharedVideoFrameBuffer,
@@ -103,6 +104,7 @@ def run_task(
     frame_rate: float = 30.0,
     video_buffer_megabytes: float = DEFAULT_BUFFER_BYTES / (1024 * 1024),
     eye_tracking_config=None,
+    network_events_config=None,
 ):
     sync_pin = SyncBarConfig.from_mapping(sync_bar, sync_pin=sync_pin).sync_pin
     if isinstance(num_clips, bool) or not isinstance(num_clips, int) or num_clips <= 0:
@@ -168,6 +170,7 @@ def run_task(
     )
     resolved_config_name = str(config_name).strip() if config_name else "play_video"
     session_logs = SessionLogBundle(
+        network_events_config=network_events_config,
         eye_tracking_config=eye_tracking_config,
         on_eye_state=screen_reward.observe if screen_reward is not None else None,
         output_root=output_dir,
@@ -1066,6 +1069,7 @@ def main():
 
     try:
         stop_reason = run_task(
+            network_events_config=load_network_event_settings(cfg, config_path=args.config),
             eye_tracking_config=load_eye_tracking_settings(cfg),
             video_files=_get("video_files", []),
             clip_duration_seconds=_get("clip_duration_seconds", None),

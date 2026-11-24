@@ -65,6 +65,8 @@ from .stimulus_files import (
     split_background_from_palette as _split_background_from_palette,
 )
 from .touch_input import (
+    AFC_HOLD_CONFIRMATION_WINDOW_S,
+    AFC_HOLD_HITBOX_SCALE,
     AFC_HOLD_MAX_BREAK_S,
     AFC_INPUT_POLL_INTERVAL_S,
     AFC_TOUCH_ACQUIRE_WINDOW_S,
@@ -2169,7 +2171,9 @@ def present_trial_with_persistent_dots(
     initiation_hold = TouchHoldTracker(
         hold_cue_to_init_time_s,
         max_break_s=AFC_HOLD_MAX_BREAK_S,
+        confirmation_window_s=AFC_HOLD_CONFIRMATION_WINDOW_S,
     )
+    initiation_can_progress = False
     held_initiation_cue_visible = False
     enforce_initiation_hold = hold_before_choice
     initiation_cue_released = False
@@ -2186,7 +2190,7 @@ def present_trial_with_persistent_dots(
         except Exception:
             pass
 
-    def _cue_contains(position: Tuple[float, float]) -> bool:
+    def _cue_contains(position: Tuple[float, float], *, holding=False) -> bool:
         if onset_cue is None:
             return False
         try:
@@ -2194,10 +2198,28 @@ def present_trial_with_persistent_dots(
         except Exception:
             cue_width, cue_height = (200.0, 200.0)
         cue_x, cue_y = getattr(onset_cue, "pos", (0.0, 0.0))
+        # Acquire inside the original cue; allow small edge jitter only after
+        # acquisition. This margin never enlarges the choice hit boxes.
+        scale = AFC_HOLD_HITBOX_SCALE if holding else 1.0
         return bool(
-            abs(float(position[0]) - float(cue_x)) <= float(cue_width) / 2.0
-            and abs(float(position[1]) - float(cue_y)) <= float(cue_height) / 2.0
+            abs(float(position[0]) - float(cue_x)) <= float(cue_width) * scale / 2.0
+            and abs(float(position[1]) - float(cue_y)) <= float(cue_height) * scale / 2.0
         )
+
+    def _update_cue_hold(touch_sample):
+        near_cue = _cue_contains(touch_sample.position, holding=True)
+        contact_ns = (
+            touch_sample.contact_time_ns(max_age_s=AFC_HOLD_CONFIRMATION_WINDOW_S)
+            if near_cue else None
+        )
+        hold_sample = initiation_hold.update(
+            contact_ns is not None, touch_sample.observed_perf_s,
+            timestamp_perf_ns=touch_sample.observed_perf_ns,
+            contact_perf_ns=contact_ns if not touch_sample.down else None,
+        )
+        # An observed position outside the hold region blocks progression even
+        # while the release timer allows a transient location glitch to recover.
+        return hold_sample, near_cue and hold_sample.qualified
 
     def _draw_pre_choice_overlay() -> None:
         if held_initiation_cue_visible and pressed_onset_cue is not None:
@@ -2447,23 +2469,20 @@ def present_trial_with_persistent_dots(
         return False, None
 
     def _poll_held_initiation_cue() -> bool:
+        nonlocal initiation_can_progress
         if not enforce_initiation_hold or initiation_cue_released:
             return initiation_cue_released
         touch_sample = mouse_presses.poll()
-        now = touch_sample.observed_perf_s
-        hold_sample = initiation_hold.update(
-            touch_sample.down and _cue_contains(touch_sample.position),
-            now, timestamp_perf_ns=touch_sample.observed_perf_ns,
-        )
+        hold_sample, initiation_can_progress = _update_cue_hold(touch_sample)
         if hold_sample.released:
             _log_initiation_cue_release(hold_sample.missing_since_perf_ns)
             return True
         return False
 
     def _poll_pre_choice_input(reason: str) -> bool:
-        # A short registration gap preserves the hold, but is not permission
-        # to reveal the next stimulus or open choice without actual contact.
-        # Poll until contact returns or the bounded release tolerance expires.
+        # Preserve holds across registration gaps, but use a much shorter
+        # evidence window to reveal stimuli or open choice. Longer gaps wait
+        # for renewed contact and expire without reviving an abandoned hold.
         while True:
             if experimenter_preview is not None:
                 experimenter_preview.poll_settings_keyboard()
@@ -2472,7 +2491,7 @@ def present_trial_with_persistent_dots(
                 return True
             if _poll_held_initiation_cue() or _should_abort(reason):
                 return True
-            if not enforce_initiation_hold or initiation_hold.touch_registered:
+            if not enforce_initiation_hold or initiation_can_progress:
                 return False
             service_sync_bar(win)
             _core.wait(AFC_INPUT_POLL_INTERVAL_S)
@@ -2536,15 +2555,16 @@ def present_trial_with_persistent_dots(
 
             touch_sample = mouse_presses.poll()
             click_pos = touch_sample.position
-            now = touch_sample.observed_perf_s
             if (
                 not initiation_started
-                and (touch_sample.down or (touch_sample.press_started and not initiation_requires_contact))
+                and (touch_sample.contact_time_ns(max_age_s=AFC_HOLD_CONFIRMATION_WINDOW_S) is not None
+                     or (touch_sample.press_started and not initiation_requires_contact))
                 and _cue_contains(click_pos)
             ):
                 initiation_started = True
-                # Required holds earn time only from observed contact with the
-                # displayed cue, never from an old/buffered press timestamp.
+                # Required holds start when evidence is observed with the cue
+                # visible. A buffered initial tap alone cannot qualify: fresh
+                # evidence after feedback must span the requested duration.
                 start_perf_ns = max(
                     oc_timing.actual_perf_ns,
                     touch_sample.observed_perf_ns if initiation_requires_contact or not touch_sample.press_started
@@ -2582,15 +2602,10 @@ def present_trial_with_persistent_dots(
                 if initiation_requires_contact:
                     # The pressed-feedback flip may have dispatched a release.
                     touch_sample = mouse_presses.poll()
-                    click_pos = touch_sample.position
-                    now = touch_sample.observed_perf_s
 
             if initiation_started:
-                hold_sample = initiation_hold.update(
-                    touch_sample.down and _cue_contains(click_pos),
-                    now, timestamp_perf_ns=touch_sample.observed_perf_ns,
-                )
-                if hold_sample.qualified or not initiation_requires_contact:
+                hold_sample, initiation_can_progress = _update_cue_hold(touch_sample)
+                if initiation_can_progress or not initiation_requires_contact:
                     held_initiation_cue_visible = hold_before_choice
                     _show_preview([])
                     break

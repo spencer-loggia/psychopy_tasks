@@ -14,6 +14,8 @@ from typing import Any, Iterable, Mapping, Optional
 
 from .task_clock import TaskClock
 from .run_identity import prepare_block_identity
+from .block_sync import EXPERIMENT_NUMBER_ENV, BLOCK_NUMBER_ENV
+from .network_events import NetworkEventsConfig, NetworkEventSender
 
 
 EVENT_LOG_FILENAME = "event_log.tsv"
@@ -26,6 +28,10 @@ EXACT_SESSION_DIR_ENV = "NEURO_TASK_SESSION_DIR"
 EVENT_LIBRARY_ENV = "NEURO_EVENT_NAME_LIBRARY"
 ALLOWED_EVENT_TYPES = frozenset({"frame_flip", "interaction", "signal", "lifecycle"})
 ALLOWED_MESSAGE_LEVELS = frozenset({"INFO", "WARN", "ERROR"})
+EVENT_FIELDS = (
+    "trial_num", "requested_task_time_ns", "task_time_ns", "event", "event_code",
+    "event_type", "requested_duration", "sync_transition_num", "sync_phase",
+)
 
 
 def option_position_columns(index: int) -> tuple[str, str]:
@@ -299,6 +305,7 @@ class EventLogger:
         event_library: EventCodeLibrary,
         filename: str = EVENT_LOG_FILENAME,
         auto_flush: bool = True,
+        network_sender: Optional[NetworkEventSender] = None,
     ):
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -309,19 +316,8 @@ class EventLogger:
         self._pending_rows: list[list[str]] = []
         self._clock = session_clock
         self._library = event_library
-        self._writer.writerow(
-            [
-                "trial_num",
-                "requested_task_time_ns",
-                "task_time_ns",
-                "event",
-                "event_code",
-                "event_type",
-                "requested_duration",
-                "sync_transition_num",
-                "sync_phase",
-            ]
-        )
+        self._network_sender = network_sender
+        self._writer.writerow(EVENT_FIELDS)
 
     def task_time_ns(self, timestamp_perf_s=None, *, timestamp_perf_ns=None) -> int:
         return self._clock.task_time_ns(timestamp_perf_s, timestamp_perf_ns=timestamp_perf_ns)
@@ -382,6 +378,8 @@ class EventLogger:
             self._file.flush()
         else:
             self._pending_rows.append(row)
+        if self._network_sender is not None:
+            self._network_sender.submit("event_log", row, EVENT_FIELDS)
 
     def log_frame_flip(
         self,
@@ -506,6 +504,7 @@ class BehaviorLogger:
         fieldnames: list[str],
         filename: str = BEHAVIOR_LOG_FILENAME,
         auto_flush: bool = True,
+        network_sender: Optional[NetworkEventSender] = None,
     ):
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -515,14 +514,23 @@ class BehaviorLogger:
         self._writer.writeheader()
         self.auto_flush = bool(auto_flush)
         self._pending_rows: list[dict[str, Any]] = []
+        self._network_sender = network_sender
 
     def writerow(self, row: Mapping[str, Any]) -> None:
+        if self._file.closed:
+            raise ValueError("Behavior log is closed")
         normalized = {key: row.get(key, "") for key in self._writer.fieldnames}
+        if self._network_sender is not None:
+            # Freeze the exact TSV cells for both outputs before callers can
+            # mutate or reuse their row, including non-JSON scalar types.
+            normalized = {key: "" if value is None else str(value) for key, value in normalized.items()}
         if self.auto_flush:
             self._writer.writerow(normalized)
             self._file.flush()
         else:
             self._pending_rows.append(normalized)
+        if self._network_sender is not None:
+            self._network_sender.submit("behavior_log", normalized)
 
     def flush(self) -> None:
         if self._pending_rows:
@@ -553,6 +561,7 @@ class SessionLogBundle:
         on_eye_state=None,
         eye_recalibration=None,
         live_settings=None,
+        network_events_config: Optional[NetworkEventsConfig] = None,
     ):
         self.session_clock = TaskClock(started_at=when)
         block_start_perf_ns = time.perf_counter_ns()
@@ -583,11 +592,34 @@ class SessionLogBundle:
             library_path=event_name_library_path,
         )
         self.event_library = EventCodeLibrary(definitions, event_patterns=event_patterns)
+        self.network_events = None
+        self._network_error_reported = False
+        if network_events_config is not None:
+            started_at = self.session_clock.started_at.astimezone()
+            experiment_number = os.environ.get(EXPERIMENT_NUMBER_ENV)
+            block_number = os.environ.get(BLOCK_NUMBER_ENV)
+            self.network_events = NetworkEventSender(network_events_config, {
+                "date": started_at.date().isoformat(),
+                "time": started_at.timetz().isoformat(timespec="microseconds"),
+                "experiment_number": (
+                    int(experiment_number) if experiment_number is not None
+                    else network_events_config.experiment_number
+                ),
+                "subject": network_events_config.subject,
+                "block_config_name": config_name,
+                "config_file_name": network_events_config.config_file_name,
+                "task_name": task_name,
+                "block_number": int(block_number) if block_number is not None else None,
+                "experiment_id": self.identity["experiment_id"],
+                "block_id": self.identity["block_id"],
+                "task_time_ns": self.session_clock.task_time_ns(timestamp_perf_ns=block_start_perf_ns),
+            })
         self.event_logger = EventLogger(
             self.session_dir,
             session_clock=self.session_clock,
             event_library=self.event_library,
             auto_flush=auto_flush,
+            network_sender=self.network_events,
         )
         self.event_logger.log_event(
             trial_num=None, event="block_start", event_type="lifecycle",
@@ -603,7 +635,8 @@ class SessionLogBundle:
         if self.live_settings is not None:
             self.live_settings.log_initial(self.message_logger)
         self.behavior_logger = (
-            BehaviorLogger(self.session_dir, fieldnames=behavior_fieldnames, auto_flush=auto_flush)
+            BehaviorLogger(self.session_dir, fieldnames=behavior_fieldnames, auto_flush=auto_flush,
+                           network_sender=self.network_events)
             if behavior_fieldnames
             else None
         )
@@ -654,6 +687,9 @@ class SessionLogBundle:
             )
 
     def flush(self) -> None:
+        if self.network_events is not None and self.network_events.error and not self._network_error_reported:
+            self.message_logger.log("WARN", f"network_events_failed error={self.network_events.error}")
+            self._network_error_reported = True
         if self.eye_tracking is not None:
             self.eye_tracking.check_recording_error()
         if self.live_settings is not None:
@@ -691,6 +727,9 @@ class SessionLogBundle:
             trial_num=None, event="block_end", event_type="lifecycle",
             timestamp_perf_ns=block_end_perf_ns,
         )
+        if self.network_events is not None:
+            self.network_events.close()
+            self.message_logger.log("INFO", self.network_events.summary())
         eye_error = None
         if self.eye_tracking is not None:
             try:

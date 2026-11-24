@@ -52,6 +52,7 @@ from bin.frame_timing import plan_frame_duration, wait_until
 from bin.eye_tracking_config import load_eye_tracking_settings
 from bin.pump_control import PumpPulseControl
 from bin.logger import SessionLogBundle, option_position_columns, option_position_values
+from bin.network_events import load_network_event_settings
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.screen import (
     ExperimenterPreview,
@@ -479,6 +480,7 @@ def run_task(
     config_name: Optional[str] = None,
     screen_config: Optional[Dict[str, Any]] = None,
     eye_tracking_config=None,
+    network_events_config=None,
 ) -> None:
     utils.set_debug(debug)
     if raspi:
@@ -597,6 +599,7 @@ def run_task(
     resolved_config_name = str(config_name).strip() if config_name else "afc_csc1"
     behavior_fieldnames = _build_behavior_fieldnames(num_afc)
     session_logs = SessionLogBundle(
+        network_events_config=network_events_config,
         eye_tracking_config=eye_tracking_config,
         output_root=output_dir,
         task_name="afc_csc1",
@@ -1538,6 +1541,7 @@ def main():
 
     try:
         task_end_status = run_task(
+            network_events_config=load_network_event_settings(cfg, config_path=args.config),
             eye_tracking_config=load_eye_tracking_settings(cfg),
             colors_tsv=_get("colors_tsv", cfg.get("colors_tsv")),
             shapes_tsv=_get("shapes_tsv", cfg.get("shapes_tsv")),

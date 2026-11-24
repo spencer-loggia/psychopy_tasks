@@ -788,6 +788,87 @@ Initiation timestamps use `initiation_task_time_ns`. Video behavior uses `first_
 `last_frame_end_task_time_ns`; `video_frame_timing.tsv` uses `requested_task_time_ns`, `expected_task_time_ns`,
 and `task_time_ns` for submission, planned, and realized flips.
 
+Network Events
+--------------
+Enable publishing in a task config or at the top level of the launcher config:
+
+```json
+{
+  "send_network_events": {
+    "enabled": true,
+    "port": 5556
+  }
+}
+```
+
+An explicit launcher `send_network_events` value overrides the task/state value in every block.
+Without a launcher override, each task's settings apply. Sending defaults to disabled.
+`"send_network_events": true` is also accepted and uses the defaults: port `5556` and
+`bind_address: "*"` (all local network interfaces). Set `bind_address` inside the object to a
+specific local address if needed. Ports must be integers from 1 to 65535; port 5556 avoids the
+elevated permissions often needed for ports below 1024. Simultaneous publishers on one computer
+need different ports; publishers on different computers can use the same port.
+PyZMQ is included in `requirements.txt` and is imported only by enabled sessions.
+
+The task binds a **PUB** socket. A collector connects a **SUB** socket to one or more task
+endpoints; multiple collectors can subscribe to the same publisher. Each message is a single
+UTF-8 JSON object. No application acknowledgment, receipt check, or delivery retry is used.
+Start the collector before starting a block, replacing these example addresses/ports with the
+task computers' addresses and configured ports:
+
+```python
+import zmq
+
+context = zmq.Context()
+receiver = context.socket(zmq.SUB)
+receiver.setsockopt(zmq.SUBSCRIBE, b"")  # receive every message
+for endpoint in ("tcp://192.168.1.100:5556", "tcp://192.168.1.101:5557"):
+    receiver.connect(endpoint)
+try:
+    while True:
+        print(receiver.recv_json(), flush=True)
+finally:
+    receiver.close(linger=0)
+    context.term()
+```
+
+The first message published in each block has `type: "block_start"` and a `metadata` object containing:
+
+- `date` and `time`: local block-start date and time in ISO format, with a UTC offset on the time.
+- `experiment_number`, `subject`, `block_config_name`, and `config_file_name`.
+- `task_name`, `block_number`, `experiment_id`, `block_id`, and the captured block-start `task_time_ns`.
+
+`config_file_name` is the original task config's filename; the launcher retains it through
+`source_config_file` in its generated block config. For standalone runs, `subject` and optionally
+`experiment_number` come from the task config. Unavailable metadata is JSON `null`.
+
+Every accepted data row in `event_log.tsv` or `behavior_log.tsv` is then offered to the sender,
+including the `block_start` and `block_end` event rows. Rows are queued when logged, even if disk
+writes are buffered. Message and auxiliary table logs are not streamed. Row messages have
+`type: "event_log"` or `type: "behavior_log"` and a `row` object mapping column names to the same
+string cell values as the TSV (empty cells stay `""`; nanosecond values retain their exact digits).
+Every message also has `version: 1`, `experiment_id`, `block_id`, and a per-block `sequence`
+starting at zero for metadata. Sequence gaps identify missing messages within a received stream.
+
+**Task timing takes priority over delivery.** The task thread only queues prepared rows; a worker
+owns the socket and performs JSON serialization and nonblocking sends. After binding, the worker
+allows 200 ms for existing subscribers to reconnect before publishing queued messages; the task
+continues immediately. This delay does not check or guarantee a connection and is interrupted
+on shutdown. The application queue and ZeroMQ's per-subscriber send queues are bounded,
+defaulting to 8,192 messages each. Optional positive integer `queue_size` and
+`send_high_water_mark` inside `send_network_events` adjust those limits.
+Full queues drop new messages. There are no per-drop disk writes.
+The local TSV logs remain complete even if the receiver is slow, disconnected, or absent.
+Shutdown allows a bounded local worker drain (at most 300 ms), with socket linger set to zero;
+unsent messages can be lost, including initial metadata or final rows. No delivery is guaranteed.
+Worker failures and a final send/drop summary go to `message_log.tsv`; `sent` means accepted by
+ZeroMQ, not confirmed reception. PUB silently discards messages for absent/slow subscribers, so
+the summary cannot count those losses. These queues protect against network waits, but do not provide
+hard real-time scheduling guarantees.
+
+See the [PyZMQ send API](https://pyzmq.readthedocs.io/en/stable/api/zmq.html#zmq.Socket.send)
+and [socket thread-safety guidance](https://pyzmq.readthedocs.io/en/stable/howto/morethanbindings.html#thread-safety).
+
 Task-Specific Logging
 ---------------------
 `active_foraging` is the most fully specified task and defines the current repo-wide target for event semantics.
@@ -849,11 +930,12 @@ For `active_foraging`:
 
 - Each block writes one `active_foraging_settings` JSON message with effective gate,
   hold, and presentation settings, including defaults. Its implementation section records
-  the 120 ms hold-break tolerance, 2 ms input poll interval, 50 ms touch-target acquisition
-  window, fixation acceptance/radius tolerances, and flip-submission lead fraction.
+  the 250 ms hold-break tolerance, 50 ms hold-confirmation window, 1.20 hold-region scale,
+  2 ms input poll interval, 50 ms touch-target acquisition window, fixation acceptance/radius
+  tolerances, and flip-submission lead fraction.
   Initial values and timestamped `live_setting` confirmations/applications remain in
   `message_log.tsv`; trial rows record the values actually applied to that trial.
-- `cue_touch` for required holds records the first current contact detected inside the
+- `cue_touch` for required holds records the first current or fresh buffered contact detected inside the
   displayed cue. Tap-only initiation and `option_touch` preserve the buffered press timestamp
   when available, otherwise the first button-state detection before position lookup.
   Choice-attempt and rejection messages use that same timestamp. `initiation_cue_release` and its behavior
@@ -1630,15 +1712,30 @@ They may be omitted when self-initiation is disabled. `initiation_cue_center_pos
 `"dotted_checker"` for that checkerboard with a centered black dot (diameter approximately 20% of cue width),
 or `"blob"` for a Gaussian-faded cue in `init_dot_color`. All styles have the same dimensions and
 Gaussian mask and darken when pressed; the dotted checker's center dot stays black.
-`hold_cue_to_init_time_s` is the continuous cue-hold duration required to initiate a trial.
+`hold_cue_to_init_time_s` is the cue-hold duration required to initiate a trial.
 `hold_before_choice=true` keeps the pressed cue visible and requires that hold through the pre-choice phases.
 A current touch anywhere inside the cue counts, including a finger already down when the cue
-appears or sliding into it. Required hold time starts when that contact is observed with the
-cue visible; buffered taps and cursor position without contact cannot satisfy a required hold.
-A missing or out-of-cue touch lasting at most 120 ms is tolerated. During that gap, initiation
-cannot qualify and a required pre-choice hold pauses progression until contact returns.
+appears or sliding into it. A buffered touch that began and ended between polls also counts
+when its validated event time is at most 50 ms old and its position is inside the cue.
+Required hold time starts when contact is observed with the cue visible. Further contact
+evidence must span the requested duration; an isolated tap or a stationary cursor cannot
+complete a required hold. A touch released during the pressed-feedback flip needs renewed
+contact before initiation can qualify, including when the requested duration is zero.
+
+Once acquired, the hold region is 1.20 times the cue width and height (10% of each dimension
+added at each edge). This tolerates small finger-position changes near the cue without
+enlarging the initial acquisition region or the option hit boxes. Missing or out-of-region
+contact can recover within 250 ms without restarting the hold. Pre-choice transitions require
+contact evidence from the last 50 ms and a position inside the hold region. Older evidence
+pauses progression until renewed contact arrives; cursor position alone never refreshes it.
+Buffered contacts use their event times rather than their later poll times for freshness and
+hold timing. Recovery after the gap deadline cannot rescue an expired hold.
 A longer break aborts only the current trial and logs `initiation_cue_release` at the first
-missing-touch detection. In active foraging, the normal
+missing-touch observation. These tolerances apply to the shared main-task presenter;
+touch-and-hold training retains its separate release behavior. Active-foraging block settings
+record `hold_max_break_s`, `hold_confirmation_window_s`, and `hold_hitbox_scale` for analysis.
+The thresholds bound software tolerance; their effect on false positives and false negatives
+still needs observation on the rig. In active foraging, the normal
 outcome interval without pump pulses precedes the full inter-trial interval. When a fixation cross is enabled, it is white
 before and after choice and black while the choice window is open.
 

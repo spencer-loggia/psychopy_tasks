@@ -46,6 +46,22 @@ def load_task():
 
 
 class ActiveForagingTaskTests(unittest.TestCase):
+    def test_network_metadata_uses_the_effective_cli_subject(self):
+        task = load_task()
+        path = Path(__file__).resolve().parents[1] / "config_files/csc2/af_classic_eyetrack_20261106.json"
+        cfg = json.loads(path.read_text())
+        cfg.update(subject="config subject", send_network_events=True,
+                   screens={"main": 0, "experimenter": 1})
+        with patch.object(sys, "argv", ["active_foraging", "--config", str(path), "--subject", " CLI subject "]), \
+                patch.object(task, "load_config", return_value=cfg), \
+                patch.object(task, "load_eye_tracking_settings", return_value=None), \
+                patch.object(task, "run_task", return_value="done") as run:
+            task.main()
+        settings = run.call_args.kwargs["network_events_config"]
+        self.assertEqual(settings.subject, "CLI subject")
+        self.assertEqual(settings.config_file_name, path.name)
+        self.assertEqual(cfg["subject"], "config subject")
+
     def test_choice_tone_config_defaults_to_false_and_reaches_task(self):
         path = Path(__file__).resolve().parents[1] / "config_files/csc2/af_classic_eyetrack_20261106.json"
         for configured in (None, False, True):
@@ -500,7 +516,9 @@ class ActiveForagingTaskTests(unittest.TestCase):
             self_initiation=True, hold_before_choice=placement_options.get("hold_before_choice", False),
             hold_cue_to_init_time_s=placement_options.get("hold_cue_to_init_time_s", 0.0),
         ))
-        self.assertEqual(block_settings["implementation"]["hold_max_break_s"], 0.120)
+        self.assertEqual(block_settings["implementation"]["hold_max_break_s"], 0.250)
+        self.assertEqual(block_settings["implementation"]["hold_confirmation_window_s"], 0.050)
+        self.assertEqual(block_settings["implementation"]["hold_hitbox_scale"], 1.20)
         self.assertEqual(block_settings["implementation"]["input_poll_interval_s"], 0.002)
         self.assertEqual(block_settings["implementation"]["touch_acquire_window_s"], 0.050)
         if change_fixation:

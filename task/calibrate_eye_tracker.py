@@ -38,6 +38,7 @@ from bin.eye_tracking import (
 )
 from bin.pump_control import PumpPulseControl
 from bin.logger import SessionLogBundle
+from bin.network_events import load_network_event_settings
 from bin.screen import (
     ExperimenterPreview,
     describe_screen,
@@ -169,6 +170,7 @@ def run_task(
     seed=None,
     sync_bar=None,
     sync_pin=18,
+    network_events_config=None,
 ) -> Path:
     uart_config = uart_config or UARTEyeTrackerConfig()
     filter_config = filter_config or EyeFilterConfig()
@@ -220,6 +222,7 @@ def run_task(
     )
     pump_pin = outputs.validate_bit(pump_pin)
     session_logs = SessionLogBundle(
+        network_events_config=network_events_config,
         output_root=Path(output_dir),
         task_name="calibrate_eye_tracker",
         config_name=config_name,
@@ -713,6 +716,7 @@ def main():
             value if value is not None else cfg.get(name, default)
         )
     path = run_task(
+        network_events_config=load_network_event_settings(cfg, config_path=args.config),
         output_dir=args.output_dir or cfg.get("output_dir", "logs"),
         config_name=cfg.get("config_name", "calibrate_eye_tracker"),
         fullscreen=(

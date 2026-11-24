@@ -68,9 +68,13 @@ from bin.dot_fixation import (
     DotFixationGate, validate_dot_fixation_config,
     FIXATION_ACCEPT_FRACTION, FIXATION_RADIUS_EPSILON_PX,
 )
-from bin.touch_input import AFC_HOLD_MAX_BREAK_S, AFC_INPUT_POLL_INTERVAL_S, AFC_TOUCH_ACQUIRE_WINDOW_S
+from bin.touch_input import (
+    AFC_HOLD_CONFIRMATION_WINDOW_S, AFC_HOLD_HITBOX_SCALE, AFC_HOLD_MAX_BREAK_S,
+    AFC_INPUT_POLL_INTERVAL_S, AFC_TOUCH_ACQUIRE_WINDOW_S,
+)
 from bin.pump_control import PumpPulseControl
 from bin.logger import SessionLogBundle, option_position_columns, option_position_values
+from bin.network_events import load_network_event_settings
 from bin.task_lifecycle import USER_EXIT_CODE
 import numpy as np
 from bin.config import load_config, resolve_subject_mapped_value, validate_config
@@ -381,6 +385,7 @@ def run_task(
     fixation_window_radius: float = 150.0,
     choice_period_idicator_tone: bool = False,
     require_saccade_to_all_options: bool = True,
+    network_events_config=None,
 ):
     validate_choice_tone(choice_period_idicator_tone)
     placement_distribution = normalize_placement_distribution(placement_distribution)
@@ -449,6 +454,7 @@ def run_task(
     resolved_config_name = str(config_name).strip() if config_name else "active_foraging"
     behavior_fieldnames = _build_behavior_fieldnames(num_afc)
     session_logs = SessionLogBundle(
+        network_events_config=network_events_config,
         eye_tracking_config=eye_tracking_config,
         on_eye_state=dot_fixation_gate.observe if dot_fixation_gate is not None else None,
         eye_recalibration=dot_fixation_gate.recalibration if dot_fixation_gate is not None else None,
@@ -1031,6 +1037,8 @@ def run_task(
         },
         "implementation": {
             "hold_max_break_s": AFC_HOLD_MAX_BREAK_S,
+            "hold_confirmation_window_s": AFC_HOLD_CONFIRMATION_WINDOW_S,
+            "hold_hitbox_scale": AFC_HOLD_HITBOX_SCALE,
             "input_poll_interval_s": AFC_INPUT_POLL_INTERVAL_S,
             "touch_acquire_window_s": AFC_TOUCH_ACQUIRE_WINDOW_S,
             "fixation_accept_fraction": FIXATION_ACCEPT_FRACTION,
@@ -1457,6 +1465,7 @@ def main():
 
     try:
         task_end_status = run_task(
+            network_events_config=load_network_event_settings({**cfg, "subject": subject}, config_path=args.config),
             eye_tracking_config=load_eye_tracking_settings(cfg),
             colors_tsv=colors_tsv,
             shapes_tsv=shapes_tsv,

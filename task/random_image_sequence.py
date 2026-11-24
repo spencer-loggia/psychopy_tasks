@@ -36,6 +36,7 @@ from bin.frame_timing import (
 )
 from bin.eye_tracking_config import load_eye_tracking_settings
 from bin.logger import SessionLogBundle
+from bin.network_events import load_network_event_settings
 from bin.task_lifecycle import USER_EXIT_CODE
 from bin.config import load_config, validate_config
 from bin.screen import (
@@ -86,6 +87,7 @@ def run_task(
     eye_tracking_config=None,
     sync_bar=None,
     sync_pin=18,
+    network_events_config=None,
 ):
     # Enable or disable debug outputs (writing debug PNGs)
     utils.set_debug(debug)
@@ -128,6 +130,7 @@ def run_task(
 
     resolved_config_name = str(config_name).strip() if config_name else "random_image_sequence"
     session_logs = SessionLogBundle(
+        network_events_config=network_events_config,
         eye_tracking_config=eye_tracking_config,
         output_root=output_dir,
         task_name="random_image_sequence",
@@ -388,6 +391,7 @@ def main():
 
     try:
         aborted_by_user = run_task(
+            network_events_config=load_network_event_settings(cfg, config_path=args.config),
             eye_tracking_config=load_eye_tracking_settings(cfg),
             images_dir=_get("images_dir", cfg.get("images_dir")),
             n=int(_get("n", cfg.get("n", 10))),

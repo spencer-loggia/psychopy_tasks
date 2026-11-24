@@ -47,6 +47,7 @@ if str(_project_root) not in sys.path:
 from bin import utils
 from bin.config import load_config
 from bin.logger import SessionLogBundle
+from bin.network_events import load_network_event_settings
 from bin.screen import (
     ExperimenterPreview, load_screen_config, resolve_scene_size,
     serialize_preview_image, software_stimulus_rotation,
@@ -577,6 +578,7 @@ def main() -> None:
         )
         rotation = software_stimulus_rotation(main_screen.rotation)
         logs = SessionLogBundle(
+            network_events_config=load_network_event_settings(cfg, config_path=args.config),
             output_root=cfg.get("output_dir", "logs"), task_name="stim_set_gallery",
             config_name=cfg.get("config_name", "stim_set_gallery"), auto_flush=False,
         )

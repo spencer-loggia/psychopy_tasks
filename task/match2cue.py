@@ -52,6 +52,7 @@ from bin.frame_timing import (
 from bin.eye_tracking_config import load_eye_tracking_settings
 from bin.pump_control import PumpPulseControl
 from bin.logger import SessionLogBundle, option_position_columns, option_position_values
+from bin.network_events import load_network_event_settings
 from bin.match2cue_logic import (
     Match2CueTrial,
     execute_reward_train,
@@ -205,7 +206,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
+def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any], config_path=None) -> str:
     choice_period_idicator_tone = validate_choice_tone(cfg.get("choice_period_idicator_tone", False))
     self_initiation = bool(cfg.get("self_initiation", True))
     initiation_config = resolve_initiation_config(
@@ -295,6 +296,7 @@ def run_task(cfg: Dict[str, Any], *, screen_config: Dict[str, Any]) -> str:
 
     config_name = str(cfg.get("config_name", "match2cue")).strip() or "match2cue"
     session_logs = SessionLogBundle(
+        network_events_config=load_network_event_settings(cfg, config_path=config_path),
         eye_tracking_config=load_eye_tracking_settings(cfg),
         output_root=str(cfg.get("output_dir", "./logs")),
         task_name="match2cue",
@@ -964,7 +966,7 @@ def main() -> None:
             cli_main=args.main_screen,
             cli_experimenter=args.experimenter_screen,
         )
-        status = run_task(cfg, screen_config=screen_config)
+        status = run_task(cfg, screen_config=screen_config, config_path=args.config)
         if status != "done":
             raise SystemExit(USER_EXIT_CODE)
     except SystemExit:

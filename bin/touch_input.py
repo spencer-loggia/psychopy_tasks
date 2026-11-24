@@ -17,7 +17,9 @@ from typing import Any, Callable, Optional, Sequence
 # Shared AFC presenter constants, also recorded in each active-foraging block.
 AFC_INPUT_POLL_INTERVAL_S = 0.002
 AFC_TOUCH_ACQUIRE_WINDOW_S = 0.050
-AFC_HOLD_MAX_BREAK_S = 0.120
+AFC_HOLD_MAX_BREAK_S = 0.250
+AFC_HOLD_CONFIRMATION_WINDOW_S = 0.050
+AFC_HOLD_HITBOX_SCALE = 1.20
 
 
 @dataclass(frozen=True)
@@ -30,6 +32,7 @@ class MousePressSample:
     buffered_press: bool
     observed_perf_ns: int
     timestamp_perf_ns: int
+    press_timestamp_valid: bool = False
 
     @property
     def timestamp_perf_s(self) -> float:
@@ -48,6 +51,20 @@ class MousePressSample:
         """Whether this sample represents a held or newly buffered press."""
         return self.down or self.press_started
 
+    def contact_time_ns(self, *, max_age_s: float) -> Optional[int]:
+        """Return current pressure or a fresh, validated buffered touch time.
+
+        A cursor position alone, a consumed event, or a fallback timestamp is
+        not evidence of contact. Buffered positions are only trusted briefly.
+        """
+        if self.down:
+            return self.observed_perf_ns
+        if self.press_started and self.press_timestamp_valid:
+            age_ns = self.observed_perf_ns - self.timestamp_perf_ns
+            if 0 <= age_ns <= round(max_age_s * 1_000_000_000):
+                return self.timestamp_perf_ns
+        return None
+
 
 @dataclass(frozen=True)
 class TouchHoldSample:
@@ -62,11 +79,13 @@ class TouchHoldSample:
 class TouchHoldTracker:
     """Track a held touch while tolerating short input-registration gaps.
 
-    ``touch_registered`` should be true only while a touch is both down and
-    within its required target. Tolerated gaps remain part of the elapsed hold
-    because they represent presumed registration errors rather than releases.
-    Qualification additionally requires current contact, even within a gap's
-    grace period; ``touch_registered`` exposes the latest contact state.
+    ``touch_registered`` means current pressure or a validated buffered touch
+    within the required target. Supply ``contact_perf_ns`` only for a buffered
+    touch that has already ended. Tolerated gaps remain part of the hold.
+    Qualification requires contact evidence spanning the requested duration.
+    By default it also requires current contact. A nonzero confirmation window
+    allows recent evidence at transitions, without letting a lone tap earn
+    hold time just by waiting. Cursor position never refreshes that evidence.
     """
 
     def __init__(
@@ -74,31 +93,41 @@ class TouchHoldTracker:
         required_hold_s: float,
         *,
         max_break_s: float = 0.100,
+        confirmation_window_s: float = 0.0,
         clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         required_hold_s = float(required_hold_s)
         max_break_s = float(max_break_s)
+        confirmation_window_s = float(confirmation_window_s)
         if not math.isfinite(required_hold_s) or required_hold_s < 0.0:
             raise ValueError("required_hold_s must be finite and non-negative")
         if not math.isfinite(max_break_s) or max_break_s < 0.0:
             raise ValueError("max_break_s must be finite and non-negative")
+        if (not math.isfinite(confirmation_window_s)
+                or not 0 <= confirmation_window_s <= max_break_s):
+            raise ValueError("confirmation_window_s must be finite and between zero and max_break_s")
         self.required_hold_s = required_hold_s
         self.max_break_s = max_break_s
+        self.confirmation_window_s = confirmation_window_s
         self._clock = clock
         self.reset()
 
     def reset(self) -> None:
         self._started_s: Optional[float] = None
+        self._last_contact_s: Optional[float] = None
         self._missing_since_s: Optional[float] = None
         self._missing_since_perf_ns: Optional[int] = None
+        self._break_deadline_s: Optional[float] = None
         self._released = False
         self.touch_registered = False
 
     def start(self, timestamp_s: Optional[float] = None) -> None:
         now = self._resolve_time(timestamp_s)
         self._started_s = now
+        self._last_contact_s = None
         self._missing_since_s = None
         self._missing_since_perf_ns = None
+        self._break_deadline_s = None
         self._released = False
         self.touch_registered = False
 
@@ -108,23 +137,43 @@ class TouchHoldTracker:
         timestamp_s: Optional[float] = None,
         *,
         timestamp_perf_ns: Optional[int] = None,
+        contact_perf_ns: Optional[int] = None,
     ) -> TouchHoldSample:
         now = self._resolve_time(timestamp_s)
         self.touch_registered = bool(touch_registered)
+        contact_s = now if contact_perf_ns is None else contact_perf_ns / 1_000_000_000
+        if self.touch_registered and (not math.isfinite(contact_s) or contact_s > now):
+            raise ValueError("contact time must be finite and no later than its observation")
         if self._started_s is None:
-            if touch_registered:
-                self._started_s = now
-            return self._sample(now)
+            if not self.touch_registered:
+                return self._sample(now)
+            self._started_s = contact_s
+
+        latest_contact_s = self._started_s if self._last_contact_s is None else self._last_contact_s
+        if self.touch_registered and contact_s < latest_contact_s:
+            self.touch_registered = False
 
         if not self._released:
             # A late returning touch cannot erase a break that already exceeded
             # tolerance while the display or event loop was busy.
-            if (self._missing_since_s is not None
-                    and now - self._missing_since_s > self.max_break_s + 1e-9):
+            evidence_s = contact_s if self.touch_registered else now
+            if self._break_deadline_s is not None and evidence_s > self._break_deadline_s + 1e-9:
                 self._released = True
-            elif touch_registered:
-                self._missing_since_s = None
-                self._missing_since_perf_ns = None
+            elif self.touch_registered:
+                self._last_contact_s = contact_s
+                # A buffered press has already ended. Its event time, not the
+                # delayed poll, bounds hold survival; log the actual first
+                # missing-contact observation separately from that deadline.
+                if contact_perf_ns is not None:
+                    self._missing_since_s = now
+                    self._missing_since_perf_ns = (
+                        round(now * 1_000_000_000) if timestamp_perf_ns is None else timestamp_perf_ns
+                    )
+                    self._break_deadline_s = contact_s + self.max_break_s
+                else:
+                    self._missing_since_s = None
+                    self._missing_since_perf_ns = None
+                    self._break_deadline_s = None
             else:
                 if self._missing_since_s is None:
                     self._missing_since_s = now
@@ -132,6 +181,13 @@ class TouchHoldTracker:
                         round(now * 1_000_000_000) if timestamp_perf_ns is None
                         else timestamp_perf_ns
                     )
+                    # start() records the acquisition before feedback is
+                    # drawn. A slow feedback flip must not extend an initial
+                    # tap's lifetime when no later contact has been observed.
+                    gap_start_s = self._started_s if self._last_contact_s is None else now
+                    self._break_deadline_s = gap_start_s + self.max_break_s
+            if self._break_deadline_s is not None and now > self._break_deadline_s + 1e-9:
+                self._released = True
         return self._sample(now)
 
     def _resolve_time(self, timestamp_s: Optional[float]) -> float:
@@ -141,11 +197,15 @@ class TouchHoldTracker:
         return now
 
     def _sample(self, now: float) -> TouchHoldSample:
-        started = self._started_s is not None
-        elapsed_s = max(0.0, now - self._started_s) if started else 0.0
+        evidenced = self._last_contact_s is not None
+        elapsed_s = max(0.0, self._last_contact_s - self._started_s) if evidenced else 0.0
+        recent = evidenced and (
+            (self.touch_registered or self.confirmation_window_s > 0)
+            and now - self._last_contact_s <= self.confirmation_window_s + 1e-9
+        )
         return TouchHoldSample(
-            qualified=bool(started and self.touch_registered and not self._released
-                           and elapsed_s >= self.required_hold_s),
+            qualified=bool(recent and not self._released
+                           and elapsed_s + 1e-9 >= self.required_hold_s),
             released=self._released,
             missing_since_s=self._missing_since_s,
             missing_since_perf_ns=self._missing_since_perf_ns,
@@ -228,6 +288,7 @@ class MousePressTracker:
         down = any(buttons)
         buffered_press = _has_press_timestamp(press_times)
         timestamp_perf_ns = self._observed_perf_ns
+        press_timestamp_valid = False
         if buffered_press and self._reset_perf_ns is not None:
             candidates = []
             for elapsed in press_times:
@@ -241,6 +302,7 @@ class MousePressTracker:
                         candidates.append(candidate)
             if candidates:
                 timestamp_perf_ns = min(candidates)
+                press_timestamp_valid = True
         press_started = (down and not self._previous_down) or buffered_press
         self._previous_down = down
 
@@ -257,4 +319,5 @@ class MousePressTracker:
             buffered_press=bool(buffered_press),
             observed_perf_ns=self._observed_perf_ns,
             timestamp_perf_ns=timestamp_perf_ns,
+            press_timestamp_valid=press_timestamp_valid,
         )

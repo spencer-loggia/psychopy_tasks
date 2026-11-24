@@ -98,5 +98,10 @@
     "height": 20,
     "interval_mean_seconds": 1.0,
     "interval_variance_seconds": 0.2
+  },
+
+  "send_network_events": {
+    "enabled": true,
+    "port": 5556
   }
 }

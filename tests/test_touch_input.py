@@ -2,7 +2,9 @@ import unittest
 from unittest.mock import patch
 
 from bin.touch_input import (
+    AFC_HOLD_CONFIRMATION_WINDOW_S,
     AFC_HOLD_MAX_BREAK_S,
+    MousePressSample,
     MousePressTracker,
     TouchHoldTracker,
 )
@@ -68,6 +70,25 @@ class MousePressTrackerTests(unittest.TestCase):
                 with patch("bin.touch_input.time.perf_counter_ns", return_value=2_000_000_003):
                     sample = tracker.poll()
                 self.assertEqual(sample.timestamp_perf_ns, 2_000_000_003)
+                self.assertFalse(sample.press_timestamp_valid)
+
+    def test_contact_evidence_expires_and_never_uses_cursor_or_fallback_time(self):
+        def sample(**kwargs):
+            return MousePressSample(**dict(dict(
+                position=(0, 0), buttons=(False, False, False),
+                press_started=True, buffered_press=True, press_timestamp_valid=True,
+                timestamp_perf_ns=1_000_000_000, observed_perf_ns=1_050_000_000,
+            ), **kwargs))
+
+        self.assertEqual(sample().contact_time_ns(max_age_s=.05), 1_000_000_000)
+        for changes in (
+            dict(observed_perf_ns=1_050_000_001), dict(press_started=False),
+            dict(press_timestamp_valid=False), dict(timestamp_perf_ns=1_060_000_000),
+        ):
+            with self.subTest(changes=changes):
+                self.assertIsNone(sample(**changes).contact_time_ns(max_age_s=.05))
+        self.assertEqual(sample(buttons=(True, False, False)).contact_time_ns(max_age_s=.05),
+                         1_050_000_000)
 
     def test_completed_tap_is_reported_from_buffered_press_time(self):
         mouse = FakeMouse(
@@ -165,27 +186,99 @@ class MousePressTrackerTests(unittest.TestCase):
 
 
 class TouchHoldTrackerTests(unittest.TestCase):
-    def test_afc_tolerance_includes_120_ms_but_never_qualifies_without_contact(self):
-        self.assertEqual(AFC_HOLD_MAX_BREAK_S, .120)
+    def test_afc_tolerance_includes_250_ms_but_default_requires_current_contact(self):
+        self.assertEqual(AFC_HOLD_MAX_BREAK_S, .250)
         for recovered in (False, True):
             tracker = TouchHoldTracker(.1, max_break_s=AFC_HOLD_MAX_BREAK_S)
             tracker.update(True, 10)
             missing = tracker.update(False, 10.1)
             self.assertFalse(missing.qualified)
             self.assertFalse(missing.released)
-            final = tracker.update(recovered, 10.22)
+            final = tracker.update(recovered, 10.35)
             self.assertFalse(final.released)
             self.assertEqual(final.qualified, recovered)
 
-    def test_return_after_120_ms_cannot_rescue_hold_even_without_intermediate_polls(self):
+    def test_return_after_250_ms_cannot_rescue_hold_even_without_intermediate_polls(self):
         for recovered in (False, True):
             tracker = TouchHoldTracker(.1, max_break_s=AFC_HOLD_MAX_BREAK_S)
             tracker.update(True, 10)
             tracker.update(False, 10.1, timestamp_perf_ns=10_100_000_000)
-            final = tracker.update(recovered, 10.220001)
+            final = tracker.update(recovered, 10.350001)
             self.assertTrue(final.released)
             self.assertFalse(final.qualified)
             self.assertEqual(final.missing_since_perf_ns, 10_100_000_000)
+
+    def test_recent_evidence_allows_transition_but_expires_before_hold_is_lost(self):
+        tracker = TouchHoldTracker(.1, max_break_s=AFC_HOLD_MAX_BREAK_S,
+                                   confirmation_window_s=AFC_HOLD_CONFIRMATION_WINDOW_S)
+        tracker.update(True, 10)
+        self.assertTrue(tracker.update(True, 10.1).qualified)
+        self.assertTrue(tracker.update(False, 10.15).qualified)
+        missing = tracker.update(False, 10.150001)
+        self.assertFalse(missing.qualified)
+        self.assertFalse(missing.released)
+        self.assertTrue(tracker.update(True, 10.3).qualified)
+
+    def test_single_tap_or_last_contact_before_required_duration_cannot_qualify(self):
+        for last_contact in (10, 10.099):
+            tracker = TouchHoldTracker(.1, max_break_s=.25, confirmation_window_s=.05)
+            tracker.update(True, 10)
+            tracker.update(True, last_contact)
+            self.assertFalse(tracker.update(False, 10.1).qualified)
+            self.assertFalse(tracker.update(False, 10.14).qualified)
+            self.assertTrue(tracker.update(False, 10.36).released)
+
+    def test_buffered_recontacts_sustain_hold_using_event_not_poll_time(self):
+        tracker = TouchHoldTracker(.1, max_break_s=.25, confirmation_window_s=.05)
+        tracker.start(10)
+        self.assertFalse(tracker.update(True, 10.04, contact_perf_ns=10_030_000_000).qualified)
+        tracker.update(False, 10.05)
+        self.assertTrue(tracker.update(True, 10.16, contact_perf_ns=10_130_000_000).qualified)
+        self.assertTrue(tracker.update(False, 10.18).qualified)
+        self.assertFalse(tracker.update(False, 10.181).qualified)
+        self.assertTrue(tracker.update(False, 10.381).released)
+        self.assertFalse(tracker.update(True, 10.39).qualified)
+
+    def test_buffered_touch_before_hold_deadline_does_not_gain_delayed_poll_time(self):
+        tracker = TouchHoldTracker(.1, max_break_s=.25, confirmation_window_s=.05)
+        tracker.start(10)
+        self.assertFalse(tracker.update(True, 10.12, contact_perf_ns=10_090_000_000).qualified)
+        self.assertFalse(tracker.update(False, 10.14).qualified)
+
+    def test_slow_feedback_does_not_extend_an_isolated_initial_tap(self):
+        tracker = TouchHoldTracker(.1, max_break_s=.25, confirmation_window_s=.05)
+        tracker.start(10)
+        tracker.update(False, 10.2, timestamp_perf_ns=10_200_000_000)
+        late_return = tracker.update(True, 10.26)
+        self.assertTrue(late_return.released)
+        self.assertFalse(late_return.qualified)
+        self.assertEqual(late_return.missing_since_perf_ns, 10_200_000_000)
+
+    def test_stale_buffered_contact_cannot_refresh_a_hold(self):
+        tracker = TouchHoldTracker(.1, max_break_s=.25, confirmation_window_s=.05)
+        tracker.update(True, 10)
+        tracker.update(True, 10.1)
+        tracker.update(False, 10.11)
+        self.assertFalse(tracker.update(True, 10.2, contact_perf_ns=10_050_000_000).qualified)
+        self.assertTrue(tracker.update(False, 10.361).released)
+
+    def test_buffered_recovery_must_precede_expiry_even_if_poll_is_late(self):
+        for contact_ns, expired in ((10_240_000_000, False), (10_260_000_000, True)):
+            with self.subTest(contact_ns=contact_ns):
+                tracker = TouchHoldTracker(.1, max_break_s=.25, confirmation_window_s=.05)
+                tracker.update(True, 9.9)
+                tracker.update(False, 10, timestamp_perf_ns=10_000_000_000)
+                recovered = tracker.update(True, 10.27, contact_perf_ns=contact_ns,
+                                           timestamp_perf_ns=10_270_000_000)
+                self.assertEqual(recovered.released, expired)
+                self.assertEqual(recovered.qualified, not expired)
+                self.assertEqual(recovered.missing_since_perf_ns,
+                                 10_000_000_000 if expired else 10_270_000_000)
+
+    def test_confirmation_window_must_fit_inside_release_tolerance(self):
+        for window in (-.1, .251, float("nan"), float("inf")):
+            with self.subTest(window=window), self.assertRaisesRegex(ValueError, "confirmation_window_s"):
+                TouchHoldTracker(.1, max_break_s=.25, confirmation_window_s=window)
 
     def test_release_retains_first_detection_ns_across_grace_period(self):
         tracker = TouchHoldTracker(0.5, max_break_s=0.1)

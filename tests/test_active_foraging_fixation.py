@@ -142,6 +142,21 @@ def load_presenter(clock):
     return module, psychopy
 
 
+def buffered_cue_mouse(clock, window, mouse, press_times, *, delivery_delay_s=0):
+    """Touchscreen contacts that begin and end between event-loop polls."""
+    reset_ns = [window.anchor_ns]
+    mouse.clickReset.side_effect = lambda: reset_ns.__setitem__(0, clock.ns)
+
+    def buttons(**kwargs):
+        events = [window.anchor_ns + round(t * 1e9) for t in press_times]
+        buffered = [ns for ns in events if reset_ns[0] < ns
+                    and ns + round(delivery_delay_s * 1e9) <= clock.ns]
+        elapsed = (max(buffered) - reset_ns[0]) / 1e9 if buffered else 0
+        return ((False, False, False), (elapsed, 0, 0))
+
+    mouse.getPressed.side_effect = buttons
+
+
 class ActiveForagingFixationTests(unittest.TestCase):
     def present(self, *, accepted_after=0.2, sequential=True, memory=True,
                 isi=0.1, timeout=0.5, gated=True, abort_after=None,
@@ -497,7 +512,7 @@ class ActiveForagingFixationTests(unittest.TestCase):
                 self.assertEqual(int(release["task_time_ns"]), captures["release"] - 10_000_000_000)
                 self.assertEqual(metadata["initiation_cue_release_perf_ns"], captures["release"])
                 self.assertEqual(metadata["initiation_cue_release_task_time_ns"], int(release["task_time_ns"]))
-                self.assertGreater(metadata["gray_flip_perf_ns"] - captures["release"], 120_000_000)
+                self.assertGreater(metadata["gray_flip_perf_ns"] - captures["release"], 250_000_000)
                 if not during_initiation:
                     offsets = [row for row in rows if row["event"] == "option_1_off"]
                     self.assertEqual(len(offsets), 1)
@@ -524,13 +539,13 @@ class ActiveForagingFixationTests(unittest.TestCase):
                     self.assertGreaterEqual(choice["timestamp_perf_ns"] - touch["timestamp_perf_ns"], 50_000_000)
                     self.assertNotIn("initiation_cue_released", metadata)
 
-    def test_required_hold_rejects_cursor_only_outside_contact_and_buffered_taps(self):
-        for mode in ("cursor", "outside", "buffered"):
+    def test_required_hold_rejects_cursor_only_and_outside_contact(self):
+        for mode in ("cursor", "outside"):
             for require_hold, hold_s in ((True, 0), (False, .05)):
                 with self.subTest(mode=mode, require_hold=require_hold):
                     def setup(clock, window, mouse):
                         mouse.getPressed.side_effect = lambda **kw: (
-                            (mode == "outside", False, False), (.001 if mode == "buffered" else 0, 0, 0)
+                            (mode == "outside", False, False), (0, 0, 0)
                         )
                         mouse.getPos.return_value = (100, 100) if mode == "outside" else (0, 0)
 
@@ -541,6 +556,68 @@ class ActiveForagingFixationTests(unittest.TestCase):
                     self.assertEqual(result, (True, None))
                     self.assertNotIn("choice_start", [event["event"] for event in events])
                     self.assertNotIn("cue_touch", [event["event"] for event in events])
+
+    def test_frequent_buffered_contacts_can_acquire_and_sustain_a_required_hold(self):
+        for profile in ("active_foraging", "match2cue"):
+            for require_hold in (False, True):
+                with self.subTest(profile=profile, require_hold=require_hold):
+                    def setup(clock, window, mouse):
+                        buffered_cue_mouse(clock, window, mouse, [.02 + i * .08 for i in range(10)])
+
+                    result, events, metadata, _, _, _ = self.present(
+                        hold_cue=True, setup_mouse=setup, stop_after_s=2,
+                        event_profile=profile, hold_cue_to_init_time_s=.1, require_hold=require_hold,
+                        sequential=False, memory=False, gated=False,
+                    )
+                    self.assertEqual(result, (False, None))
+                    touch = next(e for e in events if e["event"] == "cue_touch")
+                    dots = next(e for e in events if e["event"] == "options_dot")
+                    self.assertGreaterEqual(dots["timestamp_perf_ns"] - touch["timestamp_perf_ns"], 100_000_000)
+                    self.assertIn("choice_start", [e["event"] for e in events])
+                    self.assertNotIn("initiation_cue_released", metadata)
+
+    def test_isolated_or_stale_buffered_tap_cannot_satisfy_required_hold(self):
+        for delay in (0, .1):
+            for hold_s in (0, .1):
+                with self.subTest(delay=delay, hold_s=hold_s):
+                    def setup(clock, window, mouse):
+                        buffered_cue_mouse(clock, window, mouse, [.02], delivery_delay_s=delay)
+
+                    _, events, _, _, _, _ = self.present(
+                        hold_cue=True, setup_mouse=setup, stop_after_s=.6,
+                        hold_cue_to_init_time_s=hold_s,
+                        sequential=False, memory=False, gated=False,
+                    )
+                    names = [e["event"] for e in events]
+                    self.assertNotIn("options_dot", names)
+                    self.assertNotIn("choice_start", names)
+                    self.assertEqual("cue_touch" in names, delay == 0)
+
+    def test_hold_margin_tolerates_edge_jitter_but_cannot_acquire_or_follow_arm_away(self):
+        for rotation in (0, 90, 180, 270):
+            for mode in ("edge", "acquire_outside", "withdraw"):
+                with self.subTest(rotation=rotation, mode=mode):
+                    def setup(clock, window, mouse):
+                        mouse.getPressed.side_effect = lambda **kw: ((True, False, False), (0, 0, 0))
+
+                        def position():
+                            x = (11 if mode == "acquire_outside" else 0) if clock.ns - window.anchor_ns < 40_000_000 else (
+                                13 if mode == "withdraw" else 11
+                            )
+                            return ParticipantView(rotation).to_native((x, 0))
+
+                        mouse.getPos.side_effect = position
+
+                    _, events, metadata, _, _, _ = self.present(
+                        hold_cue=True, setup_mouse=setup, stop_after_s=.6, rotation=rotation,
+                        hold_cue_to_init_time_s=.1, sequential=False, memory=False, gated=False,
+                    )
+                    names = [e["event"] for e in events]
+                    self.assertEqual("choice_start" in names, mode == "edge")
+                    if mode == "acquire_outside":
+                        self.assertNotIn("cue_touch", names)
+                    elif mode == "withdraw":
+                        self.assertTrue(metadata["initiation_cue_released"])
 
     def test_initiation_waits_for_contact_to_return_and_tolerates_100_ms_gap(self):
         for profile in ("active_foraging", "match2cue"):
@@ -582,14 +659,14 @@ class ActiveForagingFixationTests(unittest.TestCase):
         self.assertNotIn("options_dot", [event["event"] for event in events])
         self.assertNotIn("choice_start", [event["event"] for event in events])
 
-    def test_no_choice_opens_during_registration_gap_and_long_release_aborts(self):
+    def test_choice_waits_when_evidence_is_older_than_50_ms_and_long_release_aborts(self):
         for profile in ("active_foraging", "match2cue"):
-            for release_length in (.1, .15):
+            for release_length in (.1, .2, .3):
                 for memory in (False, True):
                     with self.subTest(profile=profile, release_length=release_length, memory=memory):
                         # Dot onset is 50 ms, choice would normally open at
                         # 150 ms (non-memory) or 250 ms (memory).
-                        missing_start = .22 if memory else .12
+                        missing_start = .18 if memory else .08
 
                         def setup(clock, window, mouse):
                             mouse.getPressed.side_effect = lambda **kw: (
@@ -603,7 +680,7 @@ class ActiveForagingFixationTests(unittest.TestCase):
                         )
                         self.assertEqual(result, (False, None))
                         choices = [event for event in events if event["event"] == "choice_start"]
-                        if release_length < .12:
+                        if release_length < .25:
                             self.assertEqual(len(choices), 1)
                             self.assertGreaterEqual((choices[0]["timestamp_perf_ns"] - window.anchor_ns) / 1e9,
                                                     missing_start + release_length)
@@ -611,6 +688,31 @@ class ActiveForagingFixationTests(unittest.TestCase):
                         else:
                             self.assertFalse(choices)
                             self.assertTrue(metadata["initiation_cue_released"])
+
+    def test_choice_can_open_with_recent_evidence_but_never_at_an_outside_position(self):
+        for outside in (False, True):
+            with self.subTest(outside=outside):
+                def setup(clock, window, mouse):
+                    mouse.getPressed.side_effect = lambda **kw: (
+                        (outside or clock.ns - window.anchor_ns < 120_000_000, False, False), (0, 0, 0)
+                    )
+                    mouse.getPos.side_effect = lambda: (
+                        (100, 100) if outside and clock.ns - window.anchor_ns >= 120_000_000 else (0, 0)
+                    )
+
+                _, events, metadata, _, window, _ = self.present(
+                    hold_cue=True, setup_mouse=setup, stop_after_s=1,
+                    sequential=False, memory=False, gated=False,
+                )
+                choices = [e for e in events if e["event"] == "choice_start"]
+                if outside:
+                    self.assertFalse(choices)
+                    self.assertTrue(metadata["initiation_cue_released"])
+                else:
+                    self.assertEqual(len(choices), 1)
+                    self.assertEqual(choices[0]["timestamp_perf_ns"] - window.anchor_ns, 150_000_000)
+                    self.assertNotIn("initiation_cue_released", metadata)
+
     def test_buffered_choice_touch_keeps_press_timestamp_in_event_and_attempt_log(self):
         messages = Mock()
         _, events, _, _, window, _ = self.present(

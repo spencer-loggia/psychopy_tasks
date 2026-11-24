@@ -51,6 +51,63 @@ class FakeClock:
 
 
 class ExperimentManagerTests(unittest.TestCase):
+    def test_invalid_network_port_can_be_corrected_before_preparing_the_same_block(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config, path = self._project(root)
+            source = root / "configs/demo.json"
+            task_config = json.loads(source.read_text())
+            task_config["send_network_events"] = {"enabled": True, "port": 420420}
+            source.write_text(json.dumps(task_config))
+            manager = ExperimentManager(working_dir=root, launch_config_path=path, launch_config=config,
+                                        subject_name="Yuri", subject_code="Y")
+            try:
+                kwargs = dict(task_name="demo", launch_value="task/demo.py", config_value="configs/demo.json")
+                with self.assertRaisesRegex(ValueError, "port"):
+                    manager.prepare_block(**kwargs)
+                self.assertEqual(list(manager.blocks_dir.iterdir()), [])
+                task_config["send_network_events"]["port"] = 5556
+                source.write_text(json.dumps(task_config))
+                self.assertEqual(manager.prepare_block(**kwargs).block_num, 1)
+            finally:
+                manager.finish()
+
+    def test_network_settings_and_original_config_name_reach_every_block(self):
+        from bin.network_events import load_network_event_settings
+
+        for enabled in (None, False, True):
+            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config, path = self._project(root)
+                source = root / "configs/demo.json"
+                task_config = json.loads(source.read_text())
+                task_config["send_network_events"] = {"enabled": True, "port": 5556}
+                source.write_text(json.dumps(task_config))
+                if enabled is not None:
+                    config["send_network_events"] = {"enabled": enabled, "port": 5557}
+                manager = ExperimentManager(
+                    working_dir=root, launch_config_path=path, launch_config=config,
+                    subject_name="Yuri", subject_code="Y",
+                )
+                try:
+                    for _ in range(2):
+                        block = manager.prepare_block(task_name="demo", launch_value="task/demo.py",
+                                                      config_value="configs/demo.json")
+                        saved = json.loads(block.config_path.read_text())
+                        settings = load_network_event_settings(saved, config_path=block.config_path)
+                        self.assertEqual(saved["source_config_file"], str(source.resolve()))
+                        if enabled is False:
+                            self.assertIsNone(settings)
+                        else:
+                            expected = "tcp://*:5556" if enabled is None else "tcp://*:5557"
+                            self.assertEqual(settings.endpoint, expected)
+                            self.assertEqual(settings.subject, "Yuri")
+                            self.assertEqual(settings.config_file_name, "demo.json")
+                        manager.finish_block(block)
+                    self.assertEqual(json.loads(source.read_text()), task_config)
+                finally:
+                    manager.finish()
+
     def test_incomplete_footer_blocks_manual_relaunch_as_well_as_loops(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

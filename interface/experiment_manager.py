@@ -23,6 +23,7 @@ from bin.block_sync import (
     EXPERIMENT_NUMBER_ENV, BLOCK_NUMBER_ENV, EXPERIMENT_DATE_ENV, validate_identity,
 )
 from bin.config import load_config
+from bin.network_events import load_network_event_settings
 from bin.config_snapshot import build_launch_config_snapshot, build_task_config_snapshot
 from bin.run_identity import BLOCK_ID_ENV, EXPERIMENT_ID_ENV, BLOCK_IDENTITY_FILENAME, new_run_id
 from bin.eye_tracking import (
@@ -221,6 +222,7 @@ class ExperimentManager:
         self.launch_config_path = Path(launch_config_path).resolve()
         self.config_dir = self.launch_config_path.parent
         self.launch_config = copy.deepcopy(dict(launch_config))
+        load_network_event_settings(self.launch_config)
         self.sync_bar = (
             SyncBarConfig.from_mapping(self.launch_config["sync_bar"])
             if "sync_bar" in self.launch_config else None
@@ -383,6 +385,7 @@ class ExperimentManager:
         if not launch_path.is_file():
             raise FileNotFoundError(f"Task launch script not found: {launch_path}")
 
+        source_config = None
         if config_value is None:
             block_config: dict[str, Any] = {}
         else:
@@ -399,12 +402,11 @@ class ExperimentManager:
             validate_identity(self.experiment_number, block_num, self.started_at.date())
         block_id = new_run_id()
         output_dir = self.blocks_dir / f"{block_num}_{sanitize_filename_component(block_name)}"
-        output_dir.mkdir(exist_ok=False)
 
         injected: dict[str, Any] = {}
 
         def _inject(key: str, value: Any, state_name: str) -> None:
-            if key in {"config_name", "output_dir", "subject", "experiment_id", "block_id"}:
+            if key in {"config_name", "output_dir", "subject", "experiment_id", "block_id", "source_config_file"}:
                 raise ValueError(
                     f"Experiment state field '{state_name}' cannot inject reserved config key '{key}'"
                 )
@@ -431,6 +433,12 @@ class ExperimentManager:
         block_config["output_dir"] = str(output_dir)
         block_config["subject"] = self.subject_name
         block_config.update(injected)
+        # Explicit launcher settings apply to every block; otherwise task/state
+        # settings remain usable. Retain the original input's name for streaming.
+        if "send_network_events" in self.launch_config:
+            block_config["send_network_events"] = copy.deepcopy(self.launch_config["send_network_events"])
+        block_config["source_config_file"] = str(source_config) if source_config is not None else None
+        load_network_event_settings(block_config)
         if self.sync_bar is not None:
             block_config["sync_bar"] = asdict(self.sync_bar)
             block_config.pop("sync_pin", None)
@@ -464,6 +472,9 @@ class ExperimentManager:
                 "experimenter": os.environ.get(SECONDARY_SCREEN_ENV, ""),
             }
 
+        # Invalid settings must not leave a directory that blocks retrying the
+        # same block after the operator corrects the config.
+        output_dir.mkdir(exist_ok=False)
         config_path = output_dir / BLOCK_CONFIG_FILENAME
         # Filter after state, calibration, sync, and display overrides so this
         # executable record reflects the settings that actually reach the task.

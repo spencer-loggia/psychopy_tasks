@@ -25,6 +25,7 @@ from bin.frame_timing import flip_with_timestamps
 from bin.initiation import initiation_cue_position, resolve_initiation_config
 from bin.pump_control import PumpPulseControl
 from bin.logger import SessionLogBundle
+from bin.network_events import load_network_event_settings
 from bin.screen import (
     ExperimenterPreview, describe_screen, load_screen_config, resolve_scene_size,
     serialize_preview_image, set_window_mouse_visible, software_stimulus_rotation,
@@ -46,6 +47,7 @@ def run_task(
     raspi=False, daq_address=0, daq_module_name="piplates.DAQC2plate",
     pump_pin=0, pump_pulse_time_seconds=0.275, eye_tracking_config=None,
     sync_bar=None, sync_pin=18,
+    network_events_config=None,
 ):
     state = TouchAndHoldState(
         duration=duration, iti=iti, reward_interval=reward_interval,
@@ -68,6 +70,7 @@ def run_task(
     bg, _ = utils.split_background_from_palette(utils.load_color_palette(Path(colors_tsv)))
     with ExitStack() as cleanup:
         logs = SessionLogBundle(
+            network_events_config=network_events_config,
             output_root=output_dir, task_name="touch_and_hold", config_name=config_name,
             eye_tracking_config=eye_tracking_config, auto_flush=False,
             live_settings=pump_control.settings,
@@ -326,6 +329,7 @@ def main():
         initiation = resolve_initiation_config(cfg, require_keys=False)
         daq = cfg.get("daq", {})
         status = run_task(
+            network_events_config=load_network_event_settings(cfg, config_path=args.config),
             colors_tsv=cfg["colors_tsv"], duration=cfg.get("duration", 5.0), iti=cfg.get("iti", 0.2),
             reward_interval=cfg.get("reward_interval", 1.0), end_on_release=cfg.get("end_on_release", True),
             n=cfg.get("n"), output_dir=cfg.get("output_dir", "logs/trainings"),
